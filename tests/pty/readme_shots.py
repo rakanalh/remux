@@ -31,6 +31,11 @@ import time
 
 import pexpect
 import pyte
+
+# The shared stand-ins for the desktop notifier: a run must not pop real
+# notifications for this test's agents.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pty_harness import install_agent_standin, install_notify_shims  # noqa: E402
 import pyte.graphics
 from PIL import Image
 
@@ -102,6 +107,7 @@ class Env:
         for d in ("run", "state", "data", "config/remux", "bin", "home"):
             os.makedirs(f"{self.run}/{d}", exist_ok=True)
         os.chmod(f"{self.run}/run", 0o700)
+        install_notify_shims(f"{self.run}/bin")
         with open(f"{self.run}/config/remux/config.toml", "w") as f:
             f.write(config)
         self.server = None
@@ -712,8 +718,8 @@ def demo_repo(env):
 
 
 def install_standins(env):
-    env.install("claude", AGENT)
-    env.install("codex", AGENT)
+    install_agent_standin(f"{env.run}/bin", "claude", AGENT)
+    install_agent_standin(f"{env.run}/bin", "codex", AGENT)
     env.install("cargo", CARGO)
     env.install("kubectl", KUBECTL)
     env.install("npm", NPM)

@@ -3,7 +3,10 @@
 Speaks the length-prefixed JSON wire protocol directly against a throwaway
 server with isolated XDG dirs and a short socket path.
 """
-import atexit, json, os, shutil, signal, socket, struct, subprocess, time
+import atexit, json, os, shutil, signal, socket, struct, subprocess, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import home_guard  # noqa: E402,F401  (installs the real-HOME refusal)
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 
@@ -200,7 +203,7 @@ class Server:
         isolated `$XDG_CONFIG_HOME/remux/config.toml` before launch."""
         guard_rundir(self.rundir)
         shutil.rmtree(self.rundir, ignore_errors=True)
-        for s in ("run", "state", "data", "config"):
+        for s in ("run", "state", "data", "config", "home"):
             os.makedirs(f"{self.rundir}/{s}", exist_ok=True)
         if config is not None:
             os.makedirs(f"{self.rundir}/config/remux", exist_ok=True)
@@ -208,6 +211,9 @@ class Server:
                 f.write(config)
         self.env = {
             **os.environ,
+            # A test may have pointed HOME somewhere deliberate (see
+            # browser_listing.py); only the real home is replaced.
+            "HOME": home_guard.throwaway_home(f"{self.rundir}/home"),
             "XDG_RUNTIME_DIR": f"{self.rundir}/run",
             "XDG_STATE_HOME": f"{self.rundir}/state",
             "XDG_DATA_HOME": f"{self.rundir}/data",

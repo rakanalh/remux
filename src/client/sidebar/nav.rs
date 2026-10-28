@@ -42,12 +42,64 @@ use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 
-use super::draw_text;
+use super::{draw_text, draw_text_with};
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
 
 /// Rows of chrome above a panel's list: the header.
 pub const HEADER_ROWS: usize = 1;
+
+/// Where a list's rows start and how tall each one is.
+///
+/// Every sidebar style shares one layout: a header row plus a blank row, one
+/// column of left padding, and rows whose height belongs to the panel (the
+/// agents panel's are two lines). [`ListLayout::PLAIN`] is the older shape the
+/// plain functions below assume (a one-row header, no padding, one-line rows),
+/// and a bare [`NavList`] starts with it. The selection, the scroll offset and
+/// every count in the `NavList` are in ITEMS, never in screen rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListLayout {
+    pub header_rows: usize,
+    pub row_height: usize,
+    pad: u16,
+}
+
+impl ListLayout {
+    pub const PLAIN: Self = Self {
+        header_rows: HEADER_ROWS,
+        row_height: 1,
+        pad: 0,
+    };
+
+    /// The layout the sidebar panels draw with, for rows `row_height` lines
+    /// tall.
+    pub fn new(row_height: usize) -> Self {
+        Self {
+            header_rows: LIST_HEADER_ROWS,
+            row_height: row_height.max(1),
+            pad: 1,
+        }
+    }
+
+    /// Columns of left padding before any content.
+    pub fn pad(&self) -> u16 {
+        self.pad
+    }
+
+    /// How many whole items fit in `rows` rows below the header.
+    pub fn visible(&self, rows: u16) -> usize {
+        (rows as usize).saturating_sub(self.header_rows) / self.row_height
+    }
+
+    /// The panel row an item `i` places in the window (`i` counted from the
+    /// window's first item) starts on.
+    pub fn row_of(&self, i: usize) -> u16 {
+        (self.header_rows + i * self.row_height) as u16
+    }
+}
+
+/// A panel's header: the title row and one blank row.
+pub const LIST_HEADER_ROWS: usize = 2;
 
 /// A list command, independent of what the rows mean.
 ///
@@ -112,8 +164,15 @@ pub fn move_selection(selected: &mut usize, len: usize, cmd: NavKey) {
 /// above its content loop). A pure function of `(selected, rows)`, which is
 /// what lets `render(&self)` compute it: a panel is not told its height until
 /// it is asked to paint.
+#[cfg(test)]
 pub fn scroll_offset(selected: usize, rows: u16) -> usize {
-    let visible = (rows as usize).saturating_sub(HEADER_ROWS);
+    scroll_offset_in(ListLayout::PLAIN, selected, rows)
+}
+
+/// [`scroll_offset`] for a given layout. `selected` and the result are item
+/// indices.
+pub fn scroll_offset_in(layout: ListLayout, selected: usize, rows: u16) -> usize {
+    let visible = layout.visible(rows);
     if visible == 0 {
         return 0;
     }
@@ -141,11 +200,17 @@ pub enum Hit {
 ///
 /// `on_mouse` is not told the panel's height, and the selection cannot have
 /// moved since that paint -- a click is what moves it.
+#[cfg(test)]
 pub fn hit_test(y: u16, top: usize, selected: usize, len: usize) -> Hit {
-    let Some(offset) = (y as usize).checked_sub(HEADER_ROWS) else {
+    hit_test_in(ListLayout::PLAIN, y, top, selected, len)
+}
+
+/// [`hit_test`] for a given layout: any line of a multi-line row hits that row.
+pub fn hit_test_in(layout: ListLayout, y: u16, top: usize, selected: usize, len: usize) -> Hit {
+    let Some(offset) = (y as usize).checked_sub(layout.header_rows) else {
         return Hit::Nothing;
     };
-    let idx = top + offset;
+    let idx = top + offset / layout.row_height;
     if idx >= len {
         Hit::Nothing
     } else if idx == selected {
@@ -160,25 +225,26 @@ pub fn is_select_click(kind: MouseEventKind) -> bool {
     matches!(kind, MouseEventKind::Down(MouseButton::Left))
 }
 
-/// `(fg, bg)` for one list row.
+/// `(fg, bg, bold)` for one list row.
 ///
-/// An UNFOCUSED panel still marks its selection, dimmer: the row is where the
-/// keyboard would land on re-entry, so losing it entirely would make focusing
-/// the panel feel like it moved.
+/// The selection keeps its focused/unfocused distinction: the band is always
+/// painted, and the name takes the bright selected colour only while the panel
+/// holds the keyboard.
 pub fn row_colors(
     theme: &CompositorTheme,
     focused: bool,
     selected: bool,
     bg: &CellColor,
-) -> (CellColor, CellColor) {
+) -> (CellColor, CellColor, bool) {
     if !selected {
-        return (theme.status_bar_fg.clone(), bg.clone());
+        return (theme.status_bar_fg.clone(), bg.clone(), false);
     }
-    if focused {
-        (theme.tab_active_fg.clone(), theme.tab_active_bg.clone())
+    let fg = if focused {
+        theme.sidebar_name_selected_fg.clone()
     } else {
-        (theme.tab_inactive_fg.clone(), theme.tab_inactive_bg.clone())
-    }
+        theme.status_bar_fg.clone()
+    };
+    (fg, theme.sidebar_selection_bg.clone(), true)
 }
 
 /// Paint row `y` edge to edge in `bg`.
@@ -196,20 +262,57 @@ pub fn fill_row(grid: &mut [Vec<RenderCell>], y: u16, cols: u16, fg: &CellColor,
     );
 }
 
-/// Paint a panel's header row.
+/// The colour of a panel's header title: its own accent while the panel holds
+/// the keyboard, so the user can tell which of several stacked panels takes
+/// their keys, and the dim colour otherwise.
+fn header_fg(focused: bool, theme: &CompositorTheme) -> CellColor {
+    if focused {
+        theme.sidebar_header_active_fg.clone()
+    } else {
+        theme.sidebar_dim_fg.clone()
+    }
+}
+
+/// The background of a panel's header bar.
+fn header_bg(focused: bool, theme: &CompositorTheme) -> CellColor {
+    if focused {
+        theme.sidebar_header_active_bg.clone()
+    } else {
+        theme.sidebar_header_bg.clone()
+    }
+}
+
+/// Paint a panel's header bar: row 0 filled edge to edge in [`header_bg`], with
+/// `text` bold from column `x`.
 ///
-/// A panel's header tracks focus with the SAME theme roles its frame does --
-/// that is why they match on screen -- so it asks the same rule rather than
-/// restating the choice.
+/// The bar spans the same extent as the selection band, and `text` is drawn as
+/// given, so a panel whose header is not a fixed name (the files panel's path)
+/// sits on the same bar.
+pub fn draw_header_bar(
+    grid: &mut [Vec<RenderCell>],
+    x: u16,
+    text: &str,
+    focused: bool,
+    theme: &CompositorTheme,
+) {
+    let Some(cols) = grid.first().map(Vec::len) else {
+        return;
+    };
+    let fg = header_fg(focused, theme);
+    let bg = header_bg(focused, theme);
+    fill_row(grid, 0, cols as u16, &fg, &bg);
+    draw_text_with(grid, x, 0, text, fg, bg, true);
+}
+
+/// Paint a panel's header: the title in lowercase and bold, one column in, on
+/// the header bar.
 pub fn draw_header(
     grid: &mut [Vec<RenderCell>],
     title: &str,
     focused: bool,
     theme: &CompositorTheme,
-    bg: &CellColor,
 ) {
-    let header_fg = crate::server::compositor::border_fg(theme, focused);
-    draw_text(grid, 0, 0, title, header_fg, bg.clone());
+    draw_header_bar(grid, 1, &title.to_lowercase(), focused, theme);
 }
 
 /// A cursor and a viewport over a panel's rows.
@@ -218,7 +321,7 @@ pub fn draw_header(
 /// cursor in. It stores neither the rows nor their length: the panel owns those
 /// and passes the length in, which is what keeps this usable by a panel whose
 /// rows are rebuilt wholesale on every push.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NavList {
     selected: usize,
     /// The row index the last `render` started its window at.
@@ -235,11 +338,31 @@ pub struct NavList {
     /// resolve a click on that something else to whatever row index happened to
     /// sit at the same offset.
     last_shown: Cell<usize>,
+    layout: ListLayout,
+}
+
+impl Default for NavList {
+    fn default() -> Self {
+        Self {
+            selected: 0,
+            last_top: Cell::new(0),
+            last_shown: Cell::new(0),
+            layout: ListLayout::PLAIN,
+        }
+    }
 }
 
 impl NavList {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_layout(&mut self, layout: ListLayout) {
+        self.layout = layout;
+    }
+
+    pub fn layout(&self) -> ListLayout {
+        self.layout
     }
 
     pub fn selected(&self) -> usize {
@@ -266,8 +389,8 @@ impl NavList {
     /// The window start for a panel `rows` tall holding `len` rows, recording
     /// what this paint will show for [`NavList::hit`].
     pub fn top_for(&self, rows: u16, len: usize) -> usize {
-        let top = scroll_offset(self.selected, rows);
-        let capacity = (rows as usize).saturating_sub(HEADER_ROWS);
+        let top = scroll_offset_in(self.layout, self.selected, rows);
+        let capacity = self.layout.visible(rows);
         self.last_top.set(top);
         self.last_shown.set(len.saturating_sub(top).min(capacity));
         top
@@ -289,7 +412,20 @@ impl NavList {
     ///   coming.
     pub fn hit(&self, y: u16, len: usize) -> Hit {
         let painted = self.last_top.get() + self.last_shown.get();
-        hit_test(y, self.last_top.get(), self.selected, painted.min(len))
+        hit_test_in(
+            self.layout,
+            y,
+            self.last_top.get(),
+            self.selected,
+            painted.min(len),
+        )
+    }
+
+    /// The row a context-menu press at panel-local row `y` lands on, with the
+    /// cursor moved onto it. [`NavList::hit`] paired with [`pick_row`].
+    pub fn pick(&mut self, y: u16, len: usize) -> Option<usize> {
+        let hit = self.hit(y, len);
+        pick_row(hit, &mut self.selected)
     }
 
     /// Resolve a click at panel-local row `y`, move the cursor, and say what is
@@ -362,6 +498,42 @@ pub fn action_for_hit(hit: Hit, selected: &mut usize) -> HitOutcome {
             HitOutcome::Moved
         }
         Hit::Activate(_) => HitOutcome::Activate,
+    }
+}
+
+/// The row a context-menu press at `hit` lands on, with the cursor moved onto
+/// it. Unlike [`action_for_hit`], a press on the selected row is not an
+/// activation here: the menu offers the activation as a row of its own.
+pub fn pick_row(hit: Hit, selected: &mut usize) -> Option<usize> {
+    match hit {
+        Hit::Nothing => None,
+        Hit::Select(idx) | Hit::Activate(idx) => {
+            *selected = idx;
+            Some(idx)
+        }
+    }
+}
+
+/// Test helper shared by every panel: row 0 is one bar edge to edge in the
+/// state's bar colour with the title in the state's fg, row 1 has no bar.
+#[cfg(test)]
+pub fn assert_header_bar(grid: &[Vec<RenderCell>], focused: bool, theme: &CompositorTheme) {
+    let (want_bg, want_fg) = if focused {
+        (
+            &theme.sidebar_header_active_bg,
+            &theme.sidebar_header_active_fg,
+        )
+    } else {
+        (&theme.sidebar_header_bg, &theme.sidebar_dim_fg)
+    };
+    for (x, cell) in grid[0].iter().enumerate() {
+        assert_eq!(&cell.bg, want_bg, "header cell {x} (focused={focused})");
+    }
+    let title = grid[0].iter().position(|c| c.c != ' ').expect("a title");
+    assert_eq!(&grid[0][title].fg, want_fg);
+    assert!(grid[0][title].bold);
+    for (x, cell) in grid[1].iter().enumerate() {
+        assert_ne!(&cell.bg, want_bg, "blank row cell {x} carries the bar");
     }
 }
 
@@ -588,5 +760,25 @@ mod tests {
         nav.set_selected(0);
         assert_eq!(nav.top_for(5, 5), 0);
         assert_eq!(nav.hit(2, 5), Hit::Select(1));
+    }
+
+    #[test]
+    fn the_header_bar_spans_the_row_and_follows_focus() {
+        let theme = CompositorTheme::default();
+        for focused in [false, true] {
+            let mut grid = vec![vec![RenderCell::default(); 12]; 3];
+            draw_header(&mut grid, "Agents", focused, &theme);
+            assert_header_bar(&grid, focused, &theme);
+            assert_eq!(grid[0][1].c, 'a', "lowercased, one column in");
+            assert!(
+                grid[2].iter().all(|c| c.bg == RenderCell::default().bg),
+                "rows below the blank row are untouched"
+            );
+        }
+        assert_ne!(
+            header_bg(true, &theme),
+            header_bg(false, &theme),
+            "focus must change the bar"
+        );
     }
 }

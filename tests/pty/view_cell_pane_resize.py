@@ -222,7 +222,7 @@ def main_scenario(fails):
                              f"top={back.get(top)} bottom={back.get(bot)}")
 
         # --- phase 3: zoom -- the non-zoomed cells impose no demand ----------
-        t.prefix(b"f", 1.0)
+        t.prefix(b"z", 1.0)
         zoom = obs.sizes()
         print(f"view (zoomed)     : top={zoom.get(top)} bottom={zoom.get(bot)}")
         if zoom.get(top) == grid.get(top):
@@ -231,7 +231,7 @@ def main_scenario(fails):
         if zoom.get(bot) != grid.get(bot):
             fails.append(f"a cell hidden by ZOOM clamped its pane: "
                          f"{grid.get(bot)} -> {zoom.get(bot)}")
-        t.prefix(b"f", 1.0)                      # unzoom
+        t.prefix(b"z", 1.0)                      # unzoom
         unzoom = obs.sizes()
         print(f"view (unzoomed)   : top={unzoom.get(top)} bottom={unzoom.get(bot)}")
         if unzoom.get(top) != grid.get(top):

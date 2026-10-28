@@ -1,7 +1,9 @@
 # =============================================================================
 # Remux Configuration — Complete Reference
 # =============================================================================
-# Place this file at ~/.config/remux/config.toml
+# Place this file at $XDG_CONFIG_HOME/remux/config.toml when that is set to an
+# absolute path; otherwise ~/.config/remux/config.toml on Linux and
+# ~/Library/Application Support/remux/config.toml on macOS.
 #
 # EVERY option below is shown COMMENTED OUT set to its DEFAULT value. This file
 # is therefore a complete reference: copying it verbatim yields exactly the
@@ -11,12 +13,13 @@
 # marked as such, so uncommenting one changes the look.
 #
 # WHEN AN EDIT APPLIES. The client watches this file and applies these on save:
-# keybindings, `which_key_position`, `pane_title`, `tab_style`, [remotes.*],
-# [[sidebar]], and the theme colours of what the client draws (overlays,
+# keybindings, `which_key_position`, `pane_title`, `tab_style`, `popup_position`,
+# `popup_width_pct`/`popup_height_pct`, [remotes.*],
+# [[sidebar]], [notifications], and the theme colours of what the client draws (overlays,
 # which-key, sidebars, Views, search highlights). The server reads this file
 # once, at startup, so these need `remux restart`: everything under [general],
-# `border_style`, `default_layout`, `popup_width_pct`/`popup_height_pct`,
-# [layouts], [agents], and the theme colours of what the server draws (pane
+# `border_style`, `default_layout`,
+# [layouts], [zoom], [agents], and the theme colours of what the server draws (pane
 # borders, tab strips and the status bar in ordinary tabs).
 #
 # When you uncomment options, keep TOML ordering in mind: a table's own flat
@@ -90,11 +93,26 @@
 # bar row) (default: "anchored").
 # which_key_position = "anchored"
 
-# Popup terminal size, as a percentage of the session's content area. One popup
-# per session, toggled with Alt-p or `Ctrl-a p o`; it floats centered on top of
-# the layout and takes no space from it. Clamped to 20..=100, and resizable at
-# runtime with the pane-resize keys (`Ctrl-a p R h/j/k/l`) while it is open --
-# that adjustment sticks for the session. (default: 80 / 80).
+# Popup terminal. One popup per tab, toggled with Alt-p or `Ctrl-a p o`: the first
+# toggle in a tab starts a shell in that tab's focused pane's directory, and the
+# popup stays open while you work in other tabs. It is drawn over the layout and
+# takes no space from it. The client places it, so all three keys apply on save.
+#   popup_position: "float" | "left" | "right" | "top" | "bottom" (default "float").
+#     "float" is a framed box centred on the whole window, over every sidebar.
+#     "top" and "bottom" dock a drawer across the full window width, over the
+#     sidebars. "left" and "right" dock one beside the sidebars. A drawer leaves
+#     its outer edge open. The status bar row is never covered.
+#   popup_width_pct: percent of the window width ("float") or of the content area
+#     ("left", "right"). Ignored by "top" and "bottom".
+#   popup_height_pct: percent of the window height minus the status bar row
+#     ("float", "top", "bottom"). Ignored by "left" and "right".
+# Both are clamped to 20..=100 (default: 80 / 80). While the popup is open the
+# pane-resize keys (`Ctrl-a p R h/j/k/l`) resize it on the axis its position uses;
+# that adjustment is kept for that position, and key size, only (widening a right drawer leaves
+# the float as it was) and lasts until one of these three keys changes. The popup's
+# terminal is as large as the smallest popup any client attached to the session
+# asks for.
+# popup_position = "float"
 # popup_width_pct = 80
 # popup_height_pct = 80
 
@@ -149,6 +167,39 @@
 # grid = true
 # columns = true
 # rows = true
+
+# -----------------------------------------------------------------------------
+# ZOOM
+# -----------------------------------------------------------------------------
+# How `PaneToggleZoom` (Alt-z, Ctrl-a z, Ctrl-a p z) zooms the focused pane.
+#   mode: "fullscreen" (default) or "float".
+#     "fullscreen" fills the tab with the pane and hides the rest of the layout.
+#     "float" draws the pane in a framed box, centred over the tab, and leaves
+#     the layout under it as it was: the other panes keep their place and size,
+#     and the floated pane's slot shows an empty frame. The pane's terminal is
+#     resized to the box, and to its slot again when the zoom ends.
+#   width, height: the size of the float, in percent of the area the tab's
+#     layout fills (the window minus sidebars and the status bar). Clamped to
+#     20..=100, like the popup (default: 90 / 90). Ignored by "fullscreen".
+# `PaneToggleZoomFloat` always zooms as a float and `PaneToggleZoomFullscreen`
+# always fills the tab, whatever `mode` says. Neither has a default key; bind
+# one in [keybindings.command] (for example "Alt-u" = "PaneToggleZoomFloat") or
+# in the leader tree. Either action ends a zoom of either kind.
+#
+# A float zoom ends when you click anywhere outside the box, a sidebar included
+# (the click then acts as it would have), press Alt-h/j/k/l, split, cycle the
+# layout or close the pane. It and the popup terminal are never open together:
+# opening one closes the other.
+# In Monocle a float zoom is allowed, a fullscreen one has nothing to do. A View
+# has one zoom, the focused cell filling the view, so a float request there is
+# a fullscreen zoom.
+#
+# Read by the server at startup: `remux restart` after a change.
+#
+# [zoom]
+# mode = "fullscreen"
+# width = 90
+# height = 90
 
 # -----------------------------------------------------------------------------
 # APPEARANCE - THEME
@@ -210,10 +261,33 @@
 # tab_style = "plain"
 
 # The agents sidebar panel paints the row of the pane you are currently in as a
-# full-width bar in this colour. Keep it distinct from `tab_active_bg` and
-# `tab_inactive_bg`, which the panel uses for its j/k selection (focused and
-# unfocused); the selection wins on a row that is both.
+# full-width bar in this colour. Keep it distinct from `sidebar_selection_bg`,
+# which the panels use for their j/k selection; the selection wins on a row
+# that is both.
 # sidebar_current_bg = "#3e385e"
+
+# Colours for the sidebar panels (see [[sidebar]] below).
+# sidebar_divider_fg = "#313244"          # a flat sidebar's divider
+# sidebar_selection_bg = "#313244"        # the band behind the selected row, both lines of an agent
+# sidebar_dim_fg = "#6c7086"              # section headers and an agent row's second line
+# sidebar_name_selected_fg = "#cdd6f4"    # the selected item's name (others use status_bar_fg)
+
+# The header bar: the first row of every sidebar panel, filled edge to edge.
+# Unfocused it is `sidebar_header_bg` with the title in `sidebar_dim_fg`; while
+# the panel holds the keyboard it is `sidebar_header_active_bg` with the title
+# in `sidebar_header_active_fg`. A collapse chip that lands on a focused bar
+# (the bottom sidebar's) is drawn in those two colours reversed instead of in
+# `sidebar_button_bg`, so a theme cannot make it blend into the bar.
+# sidebar_header_bg = "#181825"           # unfocused header bar
+# sidebar_header_active_bg = "#89b4fa"    # focused header bar
+# sidebar_header_active_fg = "#1e1e2e"    # focused header title
+
+# The collapse button (a three-cell chip on the last row of an expanded left or
+# right sidebar, and on the first row inside a bottom one)
+# and the strip a collapsed sidebar leaves behind. The chip's glyph is drawn
+# bold in `sidebar_name_selected_fg`.
+# sidebar_button_bg = "#45475a"           # the chip behind the glyph
+# sidebar_strip_bg = "#313244"            # the whole collapsed strip
 
 # Background-activity markers on inactive status-bar tabs: `!` for a bell,
 # `●` for output, `✓` for a tab that has gone quiet.
@@ -355,6 +429,20 @@
 # "Alt-p" = "PopupToggle"
 # "Alt-m" = "SetMaster"
 # "Alt-Space" = "LayoutNext"
+#
+# Popup keys. `PopupToggle` takes an optional position, so separate keys can
+# open the popup in different places. Every popup key is a show/hide toggle:
+# a hidden popup opens where its key says (or at `popup_position` with none),
+# and while it is visible ANY popup key closes it. A size follows the
+# position, in percent (clamped to 20-100): "float 80" is 80% on both axes,
+# "float 80x60" is width x height, and a drawer takes one number for its
+# axis ("right 40" is the width, "bottom 30" the height). With no size the
+# popup uses popup_width_pct / popup_height_pct. An example, NOT defaults:
+# "Alt-p"  = "PopupToggle"
+# "Alt--"  = "PopupToggle bottom"
+# "Alt-\\" = "PopupToggle right"
+# "Alt-f"  = "PopupToggle float 90x70"
+# "Alt-]"  = "PopupToggle right 40"
 
 # --- Command-mode leader tree (defaults) ---
 # The tables below mirror the built-in leader (Ctrl-a) tree. They are shown for
@@ -488,7 +576,7 @@
 #   v     = "EnterVisualMode"                — enter Visual (scrollback) mode
 #   g     = "ToggleStyle; EnterNormal"       — toggle border style
 #   Space = "LayoutNext; EnterNormal"        — cycle layout (key is a literal space)
-#   f     = "PaneToggleZoom; EnterNormal"    — zoom the focused pane
+#   z     = "PaneToggleZoom; EnterNormal"    — zoom the focused pane
 #   ":"   = "CommandPaletteOpen"             — open the command palette
 #   a     = "SendKey Ctrl-a; EnterNormal"    — send the prefix key to the terminal
 #   "}"   = "TabNext; EnterNormal"           — quick next tab
@@ -593,10 +681,20 @@
 #   PaneUnstackRight                — Take focused pane out of its stack, to the right of it
 #   PaneUnstackUp                   — Take focused pane out of its stack, above it
 #   PaneUnstackDown                 — Take focused pane out of its stack, below it
-#   PaneToggleZoom                  — Toggle zoom (fullscreen) for the focused pane
+#   PaneToggleZoom                  — Toggle zoom for the focused pane, as [zoom] mode says
+#                                     (fullscreen, or a float over the layout)
+#   PaneToggleZoomFullscreen        — Toggle a fullscreen zoom for the focused pane, whatever
+#                                     [zoom] mode says (refused in Monocle)
+#   PaneToggleZoomFloat             — Toggle a float zoom for the focused pane, whatever
+#                                     [zoom] mode says
 #   PaneRename                      — Rename the focused pane (prompts)
 #   PaneMoveToTab                   — Move the focused pane to another tab (opens a picker)
-#   PopupToggle                     — Toggle the floating popup terminal
+#   PopupToggle [position [size]]   — Toggle the popup terminal. A hidden popup opens
+#                                     at the position ("float", "left", "right",
+#                                     "top", "bottom"; default popup_position), at
+#                                     size percent ("80", "80x60" for a float; one
+#                                     number for a drawer); a visible one closes,
+#                                     whatever position is named
 #
 # View commands (client-side; a view's cells alias real panes on any machine):
 #   ViewNew                         — Create a new view (prompts for a name)
@@ -608,9 +706,9 @@
 #   ViewDelete                      — Delete the active view for everyone
 #
 # Sidebar commands (client-side chrome; sidebars are declared with [[sidebar]]):
-#   SidebarToggleLeft               — Show/hide the left sidebar
-#   SidebarToggleRight              — Show/hide the right sidebar
-#   SidebarToggleBottom             — Show/hide the bottom sidebar
+#   SidebarToggleLeft               — Collapse/expand the left sidebar
+#   SidebarToggleRight              — Collapse/expand the right sidebar
+#   SidebarToggleBottom             — Collapse/expand the bottom sidebar
 #   SidebarFocusLeft                — Focus the left sidebar, opening it if hidden
 #   SidebarFocusRight               — Focus the right sidebar, opening it if hidden
 #   SidebarFocusBottom              — Focus the bottom sidebar, opening it if hidden
@@ -702,6 +800,36 @@
 #             the default border style.
 #   visible — whether it starts open (default: true). Toggling it at runtime
 #             also persists, so this is only the very first run's state.
+#   style   — "boxed" | "flat" (default: "boxed"). Only the EDGE treatment:
+#             "boxed" frames the sidebar with the pane border style; "flat" has
+#             no frame, just a single quiet divider column (row, for "bottom")
+#             against the panes, in `sidebar_divider_fg`. The divider takes one
+#             column of `size`. Everything inside is the same in both styles:
+#             one column of left padding, a lowercase bold header
+#             on a full-width bar (`sidebar_header_bg` and `sidebar_dim_fg`, or
+#             `sidebar_header_active_bg` and `sidebar_header_active_fg` while
+#             that panel has the keyboard) and a blank row above each panel's list, a
+#             rule between stacked panels, and a full-width band
+#             (`sidebar_selection_bg`) behind the selected row. An unknown
+#             value is a parse error. Applies on config reload.
+#   collapse_to_strip — true | false (default: true). Every expanded sidebar
+#             shows a small chip on its last row (the first row inside, for
+#             "bottom"), against the divider or frame: ` ◀ ` on a left sidebar,
+#             ` ▶ ` on a right one, ` ▼ ` on the bottom one. Click it to
+#             collapse the sidebar. With `collapse_to_strip = true` a collapsed
+#             sidebar shrinks to a one-cell strip along its edge (one column,
+#             or one row for "bottom"), filled with `sidebar_strip_bg` and
+#             carrying a chip with the opposite glyph (`▶`, `◀`, `▲`); click
+#             anywhere on the strip to expand it again.
+#             The strip is chrome: it holds no panel and never takes the
+#             keyboard, and the panes get the rest of the terminal. The
+#             keyboard does the same: `Prefix b h`/`l`/`j` collapse to and
+#             expand from the strip, and focusing a collapsed sidebar
+#             (`Alt+h`/`Alt+l`, `Prefix b b`) expands it. With `false`,
+#             collapsing hides the sidebar entirely, as before, and only the
+#             keyboard brings it back. A sidebar with `visible = false` starts
+#             as a strip. The strip is dropped, like any sidebar, on a terminal
+#             too small to keep the minimum pane area.
 #
 # Runtime state (each sidebar's visibility and size, and each panel's weight)
 # is saved to `$XDG_STATE_HOME/remux/sidebar.json` and restored on the next
@@ -777,8 +905,10 @@
 #   agents      — the panes running an AI coding agent (`claude`, `codex`, ...),
 #                 on the local server and every connected remote, each with a
 #                 colour-coded state: RED needs your input, YELLOW is working,
-#                 dim is idle. `j`/`k`/`g`/`G` move and Enter jumps to that
-#                 pane, wherever it is. Configure WHICH commands count as an
+#                 dim is idle. Each agent takes two lines: the state dot and
+#                 `session · tab`, then the agent (and the host, for a
+#                 remote). `j`/`k`/`g`/`G` move by agent and Enter jumps to
+#                 that pane, wherever it is. Configure WHICH commands count as an
 #                 agent, and what a blocked one looks like, under `[agents]`
 #                 below — the defaults cover `claude`, `codex`, `omp` and
 #                 `opencode` with no setup.
@@ -829,7 +959,7 @@
 # panels (none declared, or every name unknown) is dropped entirely, also with
 # a warning: an empty strip of chrome would just be stolen space.
 #
-# FRAMES. A sidebar is framed in the same border style as the panes beside it
+# FRAMES (`style = "boxed"`, the default). A sidebar is framed in the same border style as the panes beside it
 # (`appearance.border_style`), so it reads as part of the same screen: one frame
 # per SIDEBAR — not one per panel — with a rule between stacked panels. Under
 # "zellij_style" that is a rounded box around the whole sidebar; under
@@ -1168,6 +1298,35 @@
 #
 # [messaging.submit.copilot]
 # focus_in = true
+
+# -----------------------------------------------------------------------------
+# NOTIFICATIONS
+# -----------------------------------------------------------------------------
+# Desktop notifications for the agents in every server this client is connected
+# to, local and remote. The CLIENT sends them, so they appear on the machine you
+# are sitting at, follow THIS file's settings for remote agents too, and stop
+# while no client is running. Applied on save.
+#
+# An agent whose pane is focused in any attached client is skipped, and so is
+# the pane this client is showing you (including a View cell). Two clients on
+# the same machine attached to the same server show one notification between
+# them.
+#
+# Which panes are focused in other clients comes from the server. An older
+# server (a remote you have not upgraded) does not say, so only this client's
+# own knowledge skips a notification there: a View cell, or the focused pane
+# while a sessions, agents or files panel is configured.
+#
+# macOS uses `osascript`, Linux `notify-send` (libnotify). `command` replaces
+# either with an argv of your own: an argument that is exactly "{title}" or
+# "{body}" is replaced by that text, and no shell is involved.
+#
+# [notifications]
+# enabled = true        # desktop notifications for agents in any connected server
+# needs_input = true    # the agent is waiting on an approval, question or permission prompt
+# finished = true       # the agent stopped working (3 s of quiet after at least 3 s of work)
+# exited = true         # the agent left its pane
+# command = ["terminal-notifier", "-title", "{title}", "-message", "{body}"]
 
 # -----------------------------------------------------------------------------
 # REMOTES

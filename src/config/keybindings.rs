@@ -318,7 +318,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         leaf_chain("layout next", &["LayoutNext", "EnterNormal"]),
     );
     root.insert(
-        'f',
+        'z',
         leaf_chain("zoom pane", &["PaneToggleZoom", "EnterNormal"]),
     );
 
@@ -395,6 +395,23 @@ impl KeybindingTree {
         collect_leaves(&self.root, &mut Vec::new(), &mut out);
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// The key path that runs `action`, as the first non-`EnterNormal` action
+    /// of a leaf's chain. When several leaves run it, the shortest path wins,
+    /// then the lowest keys, so the answer does not depend on map order.
+    pub fn path_for(&self, action: &str) -> Option<Vec<char>> {
+        self.leaves()
+            .into_iter()
+            .filter(|(_, chain)| {
+                chain
+                    .iter()
+                    .find(|a| a.as_str() != "EnterNormal")
+                    .map(String::as_str)
+                    == Some(action)
+            })
+            .map(|(path, _)| path)
+            .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
     }
 
     /// Merge another tree on top of this one. Keys in `overrides` replace keys
@@ -542,6 +559,27 @@ impl ShortcutBindings {
     pub fn lookup(&self, key: &KeyEvent) -> Option<&InterceptAction> {
         let normalized = NormalizedKeyEvent::from(key);
         self.bindings.get(&normalized)
+    }
+
+    /// The notation of the shortcut that runs `action` alone, as the first
+    /// non-`EnterNormal` command of its chain. Ties break on the notation, so
+    /// the answer does not depend on map order.
+    pub fn notation_for(&self, action: &str) -> Option<String> {
+        self.bindings
+            .iter()
+            .filter_map(|(key, bound)| match bound {
+                InterceptAction::Command(cmds)
+                    if cmds
+                        .iter()
+                        .find(|c| c.as_str() != "EnterNormal")
+                        .map(String::as_str)
+                        == Some(action) =>
+                {
+                    Some(format_key_notation(key))
+                }
+                _ => None,
+            })
+            .min()
     }
 
     /// Merge another set of bindings on top of this one.
@@ -986,6 +1024,15 @@ fn action_problem(action: &str) -> Option<String> {
     let name = tokens.first()?;
     match action_spec(name) {
         None => Some(format!("unknown action '{name}'")),
+        Some(_) if name == "PopupToggle" && resolve_action(action).is_none() => {
+            let reason = match crate::config::PopupPlacement::from_args(&tokens[1..]) {
+                Err(reason) => reason,
+                // `resolve_action` builds the command from the same parse, so
+                // it cannot fail where `from_args` succeeds.
+                Ok(_) => "arguments that do not resolve".to_string(),
+            };
+            Some(format!("action 'PopupToggle' has {reason}"))
+        }
         Some(_) if resolve_action(action).is_none() => {
             Some(format!("action '{name}' is missing a required argument"))
         }
@@ -1089,7 +1136,11 @@ fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
         "LayoutNext" => Some(RemuxCommand::LayoutNext),
         "SetMaster" => Some(RemuxCommand::SetMaster),
         "PaneToggleZoom" => Some(RemuxCommand::PaneToggleZoom),
-        "PopupToggle" => Some(RemuxCommand::PopupToggle),
+        "PaneToggleZoomFullscreen" => Some(RemuxCommand::PaneToggleZoomFullscreen),
+        "PaneToggleZoomFloat" => Some(RemuxCommand::PaneToggleZoomFloat),
+        "PopupToggle" => crate::config::PopupPlacement::from_args(args)
+            .ok()
+            .map(RemuxCommand::PopupToggle),
         "SessionSave" => Some(RemuxCommand::SessionSave),
         "EnterNormal" => Some(RemuxCommand::EnterNormal),
         "EnterCommandMode" => Some(RemuxCommand::EnterCommandMode),
@@ -1565,6 +1616,25 @@ impl Default for SessionManagerBindings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_shortcut_that_runs_an_action_names_it() {
+        let shortcuts = ShortcutBindings::default();
+        assert_eq!(
+            shortcuts.notation_for("PaneToggleZoom").as_deref(),
+            Some("Alt-z")
+        );
+        assert_eq!(shortcuts.notation_for("PaneRename"), None);
+    }
+
+    #[test]
+    fn a_leaf_that_runs_an_action_gives_its_key_path() {
+        let tree = KeybindingTree::default();
+        assert_eq!(tree.path_for("PaneClose"), Some(vec!['p', 'x']));
+        assert_eq!(tree.path_for("TabClose"), Some(vec!['t', 'x']));
+        assert_eq!(tree.path_for("PaneRename"), Some(vec!['p', 'r']));
+        assert_eq!(tree.path_for("NoSuchAction"), None);
+    }
+
     use super::*;
     use crate::protocol::{action_specs, command_names, ClientAction};
 
@@ -1686,6 +1756,138 @@ mod tests {
     #[test]
     fn parse_command_tab_goto_missing_arg() {
         assert_eq!(parse_command("TabGoto"), None);
+    }
+
+    #[test]
+    fn parse_command_popup_toggle_takes_an_optional_position() {
+        use crate::config::PopupPosition::*;
+        assert_eq!(
+            parse_command("PopupToggle"),
+            Some(RemuxCommand::PopupToggle(None))
+        );
+        for (arg, position) in [
+            ("float", Float),
+            ("left", Left),
+            ("right", Right),
+            ("top", Top),
+            ("bottom", Bottom),
+        ] {
+            assert_eq!(
+                parse_command(&format!("PopupToggle {arg}")),
+                Some(RemuxCommand::PopupToggle(Some(position.into()))),
+                "{arg}"
+            );
+        }
+        assert_eq!(parse_command("PopupToggle sideways"), None);
+    }
+
+    #[test]
+    fn a_bad_popup_position_is_a_named_config_error() {
+        let toml_str = r#"
+            "Alt-p" = "PopupToggle sideways"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let shortcuts = ShortcutBindings::from_toml(&value).unwrap();
+        let tree = KeybindingTree::from_toml(&toml::Value::Table(Default::default())).unwrap();
+        let problems = unresolved_actions(&tree, &shortcuts);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(
+            problems[0].contains("'PopupToggle' has an invalid position 'sideways'"),
+            "{problems:#?}"
+        );
+    }
+
+    #[test]
+    fn parse_command_popup_toggle_takes_an_optional_size() {
+        use crate::config::{PopupPlacement, PopupPosition::*, PopupSize};
+        let size = |position, width, height| {
+            Some(RemuxCommand::PopupToggle(Some(PopupPlacement {
+                position,
+                size: Some(PopupSize { width, height }),
+            })))
+        };
+        assert_eq!(
+            parse_command("PopupToggle float 80"),
+            size(Float, Some(80), Some(80))
+        );
+        assert_eq!(
+            parse_command("PopupToggle float 80x60"),
+            size(Float, Some(80), Some(60))
+        );
+        assert_eq!(
+            parse_command("PopupToggle right 40"),
+            size(Right, Some(40), None)
+        );
+        assert_eq!(
+            parse_command("PopupToggle bottom 30"),
+            size(Bottom, None, Some(30))
+        );
+        assert_eq!(
+            parse_command("PopupToggle float 5"),
+            size(Float, Some(20), Some(20)),
+            "clamped"
+        );
+        for bad in [
+            "PopupToggle 80",
+            "PopupToggle float wide",
+            "PopupToggle right 80x60",
+            "PopupToggle float 80 60",
+        ] {
+            assert_eq!(parse_command(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_bad_popup_size_is_a_named_config_error() {
+        for (action, want) in [
+            (
+                "PopupToggle 80",
+                "'PopupToggle' has a size '80' that needs a position before it",
+            ),
+            (
+                "PopupToggle float wide",
+                "'PopupToggle' has an invalid size 'wide'",
+            ),
+            (
+                "PopupToggle right 80x60",
+                "'PopupToggle' has a size '80x60' for 'right' that takes one number, the width",
+            ),
+        ] {
+            let toml_str = format!("\"Alt-p\" = \"{action}\"\n");
+            let value: toml::Value = toml_str.parse().unwrap();
+            let shortcuts = ShortcutBindings::from_toml(&value).unwrap();
+            let tree = KeybindingTree::from_toml(&toml::Value::Table(Default::default())).unwrap();
+            let problems = unresolved_actions(&tree, &shortcuts);
+            assert_eq!(problems.len(), 1, "{action}: {problems:#?}");
+            assert!(problems[0].contains(want), "{action}: {problems:#?}");
+        }
+    }
+
+    #[test]
+    fn the_popup_example_bindings_parse() {
+        // The bindings the docs show, as TOML writes them.
+        let toml_str = r#"
+            "Alt-p" = "PopupToggle"
+            "Alt--" = "PopupToggle bottom"
+            "Alt-\\" = "PopupToggle right"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let shortcuts = ShortcutBindings::from_toml(&value).unwrap();
+        for (c, command) in [
+            ('p', "PopupToggle"),
+            ('-', "PopupToggle bottom"),
+            ('\\', "PopupToggle right"),
+        ] {
+            assert!(
+                matches!(
+                    shortcuts.bindings.get(&alt_key(c)),
+                    Some(InterceptAction::Command(v)) if v == &[command.to_string()]
+                ),
+                "Alt-{c}"
+            );
+        }
+        let tree = KeybindingTree::from_toml(&toml::Value::Table(Default::default())).unwrap();
+        assert!(unresolved_actions(&tree, &shortcuts).is_empty());
     }
 
     #[test]
@@ -1845,7 +2047,8 @@ mod tests {
         assert!(tree.root.contains_key(&'p'));
         assert!(tree.root.contains_key(&'s')); // Search group
         assert!(tree.root.contains_key(&'x')); // Session group (moved from 's')
-        assert!(tree.root.contains_key(&'f')); // Zoom pane toggle
+        assert!(tree.root.contains_key(&'z')); // Zoom pane toggle
+        assert!(!tree.root.contains_key(&'f')); // moved to 'z'
         assert!(tree.root.contains_key(&'v'));
         assert!(tree.root.contains_key(&'g'));
         // 'b' was the Buffer group, removed in the search-mode refactor and
@@ -1930,8 +2133,8 @@ mod tests {
     #[test]
     fn lookup_missing() {
         let tree = KeybindingTree::default();
-        assert!(tree.lookup(&['z']).is_none());
-        assert!(tree.lookup(&['t', 'z']).is_none());
+        assert!(tree.lookup(&['q']).is_none());
+        assert!(tree.lookup(&['t', 'q']).is_none());
     }
 
     #[test]
@@ -2596,7 +2799,7 @@ mod tests {
         let mut bindings = ShortcutBindings::default();
         bindings
             .bindings
-            .insert(alt_key('z'), InterceptAction::GroupPrefix(vec!['z']));
+            .insert(alt_key('z'), InterceptAction::GroupPrefix(vec!['q']));
         let tree = KeybindingTree::default();
         assert!(!bindings.validate_group_refs(&tree));
     }
@@ -2642,6 +2845,11 @@ mod tests {
         assert_eq!(humanize_command("PaneFocusLeft"), "focus left");
         assert_eq!(humanize_command("PaneMoveLeft"), "move left");
         assert_eq!(humanize_command("PaneToggleZoom"), "toggle zoom");
+        assert_eq!(humanize_command("PaneToggleZoomFloat"), "toggle zoom float");
+        assert_eq!(
+            humanize_command("PaneToggleZoomFullscreen"),
+            "toggle zoom fullscreen"
+        );
         assert_eq!(humanize_command("TabNext"), "next tab");
         assert_eq!(humanize_command("TabNew"), "new tab");
         assert_eq!(humanize_command("TabGoto 0"), "tab 1");

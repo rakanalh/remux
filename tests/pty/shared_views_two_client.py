@@ -25,6 +25,7 @@ MARK_B = "BBBB_bravo"
 def env_for():
     return {
         **os.environ,
+        "HOME": f"{RUN}/home",
         "XDG_RUNTIME_DIR": f"{RUN}/run",
         "XDG_STATE_HOME": f"{RUN}/state",
         "XDG_DATA_HOME": f"{RUN}/data",
@@ -39,7 +40,7 @@ def env_for():
 
 def start_server():
     shutil.rmtree(RUN, ignore_errors=True)
-    for s in ("run", "state", "data", "config"):
+    for s in ("run", "state", "data", "config", "home"):
         os.makedirs(f"{RUN}/{s}", exist_ok=True)
     p = subprocess.Popen(
         [BIN, "server"], env=env_for(),
@@ -196,7 +197,7 @@ def main():
                 fail("(c) B did not repaint with the added cell")
 
             # (d) A toggles zoom; B MIRRORS (only the focused cell remains).
-            a.prefix(b"f", 0.8)        # Prefix+f zoom
+            a.prefix(b"z", 0.8)        # Prefix+z zoom
             b.pump(1.0)
             if VERBOSE:
                 b.dump("B after A zoom")
@@ -208,7 +209,7 @@ def main():
                 fail("(d) B did not mirror the zoom (should show one cell)")
 
             # A un-zooms; B shows both again.
-            a.prefix(b"f", 0.8)
+            a.prefix(b"z", 0.8)
             b.pump(1.0)
             both = b.has(MARK_A) and b.has(MARK_B)
             print("[d.unzoom] B mirrors un-zoom (both cells):", both)
@@ -220,7 +221,7 @@ def main():
             # (not MARK_A). Pure text-presence witness; no attribute reads.
             a.prefix(b"pl", 0.7)       # Prefix p l: focus right -> MARK_B cell
             b.pump(0.8)
-            a.prefix(b"f", 0.8)        # zoom the (now) focused cell
+            a.prefix(b"z", 0.8)        # zoom the (now) focused cell
             b.pump(1.0)
             if VERBOSE:
                 b.dump("B after A focus-right + zoom")
@@ -229,7 +230,7 @@ def main():
             print(f"[d.focus] B mirrors focus move (zooms MARK_B): A_vis={fa} B_vis={fb}")
             if not focus_mirrored:
                 fail("(d) B did not mirror the focus move")
-            a.prefix(b"f", 0.8)        # un-zoom for the layout step
+            a.prefix(b"z", 0.8)        # un-zoom for the layout step
             b.pump(0.8)
 
             # (d) LAYOUT mirror: capture B's right-aligned status-bar layout token,

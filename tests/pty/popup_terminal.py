@@ -12,9 +12,15 @@ survives it all:
   5. `Ctrl-a p o` (the "pane -> popup" chord) toggles it too.
   6. The client stays alive throughout, and no panic lands in the logs.
 
+The client places the popup itself, so a second group of cases runs with a
+34-column left sidebar and checks the geometry the design fixes (see
+docs/sessions/popup-positions-design.md): a float centred on the whole window
+OVER the sidebar, the open-edge drawers, live config reload, the runtime resize
+keys, and one popup per tab.
+
 Run: python3 tests/pty/popup_terminal.py
 """
-import re, sys, time
+import os, re, sys, time
 from pty_harness import Tui, PREFIX
 
 RUNDIR = "/tmp/rmxpop/pty"
@@ -52,13 +58,17 @@ def boxes_in(rows_text, cols):
     return found
 
 
-def main():
-    fails = []
-
+def make_check(fails):
     def check(ok, msg):
         print(("  PASS  " if ok else "  FAIL  ") + msg)
         if not ok:
             fails.append(msg)
+    return check
+
+
+def no_sidebar_case():
+    fails = []
+    check = make_check(fails)
 
     tui = Tui(RUNDIR, cols=COLS, rows=ROWS)
     tui.start()
@@ -168,10 +178,663 @@ def main():
     check("panic" not in logs.lower(), "no panic in client.log / server.log")
 
     tui.kill()
-    print(f"\n{'FAILED: ' + str(len(fails)) if fails else 'ALL PASS'}")
-    for f in fails:
+    return fails
+
+
+# ---------------------------------------------------------------------------
+# With a left sidebar: the client places the popup
+# ---------------------------------------------------------------------------
+
+SB_COLS, SB_ROWS = 160, 48
+SIDEBAR_W = 34
+SIDEBAR = """
+[[sidebar]]
+edge = "left"
+size = 34
+visible = true
+  [[sidebar.panel]]
+  plugin = "agents"
+  [[sidebar.panel]]
+  plugin = "sessions"
+"""
+
+
+def cfg(position=None, wpct=None, hpct=None):
+    """The sidebar config, with the popup keys when given."""
+    keys = []
+    if position:
+        keys.append(f'popup_position = "{position}"')
+    if wpct:
+        keys.append(f"popup_width_pct = {wpct}")
+    if hpct:
+        keys.append(f"popup_height_pct = {hpct}")
+    head = "[appearance]\n" + "\n".join(keys) + "\n" if keys else ""
+    return head + SIDEBAR
+
+
+def start(rundir, config):
+    tui = Tui(rundir, cols=SB_COLS, rows=SB_ROWS, config=config)
+    tui.start()
+    tui.pump(1.6)
+    return tui
+
+
+def write_config(tui, body):
+    with open(f"{tui.rundir}/config/remux/config.toml", "w") as fh:
+        fh.write(body)
+
+
+def wait_for_reload(tui, baseline, timeout=12.0):
+    """Wait for the client to say it reloaded, rather than sleeping a fixed
+    time, so a slow save does not turn into a vacuous pass."""
+    end = time.time() + timeout
+    while time.time() < end:
+        tui.pump(0.3)
+        if tui.log("client").count("client: config reloaded") > baseline:
+            tui.pump(1.0)
+            return True
+    return False
+
+
+def corner_cols(row, glyph):
+    return [x for x, ch in enumerate(row) if ch == glyph]
+
+
+def float_over_sidebar_case():
+    print("\n== float over a left sidebar ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_float", cfg())
+    try:
+        before = list(tui.rows_text())
+        check(before[0][0] == "\u256d" and before[5][SIDEBAR_W - 1] == "\u2502",
+              "the sidebar is framed at the left")
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        rows = list(tui.rows_text())
+        # Box (16, 5, 128, 37), not (47, ...): it is centred on the WHOLE
+        # window, over the sidebar.
+        check(rows[5][16] == "\u256d" and rows[5][143] == "\u256e",
+              f"top corners at x=16 and x=143 (row 5: {rows[5][10:20]!r}...)")
+        check(rows[41][16] == "\u2570" and rows[41][143] == "\u256f",
+              "bottom corners at y=41")
+        check(16 < SIDEBAR_W, "the box overlaps the sidebar's columns")
+        check(all(rows[y][:16] == before[y][:16] for y in range(SB_ROWS)),
+              "sidebar text in columns 0..16 stays visible while the popup is up")
+        check(any("popup" in r for r in rows), "the popup's title is drawn")
+        cx, cy = tui.screen.cursor.x, tui.screen.cursor.y
+        check(17 <= cx <= 142 and 6 <= cy <= 40,
+              f"the cursor ({cx},{cy}) is inside the popup interior")
+        tui.send(b"echo SB_FLOAT_MARK\r")
+        tui.pump(1.2)
+        rows = list(tui.rows_text())
+        hits = [(y, r.index("SB_FLOAT_MARK")) for y, r in enumerate(rows)
+                if "SB_FLOAT_MARK" in r]
+        check(bool(hits) and all(6 <= y <= 40 and x >= 17 for y, x in hits),
+              f"typed text lands in the box ({hits})")
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        after = list(tui.rows_text())
+        check(all(after[y][:SIDEBAR_W] == before[y][:SIDEBAR_W]
+                  for y in range(SB_ROWS)),
+              "the sidebar is restored after the popup closes")
+        check(after[5][16] != "\u256d", "the box is gone")
+        check(tui.alive(), "the client is alive")
+        logs = tui.log("client") + tui.log("server")
+        check("panic" not in logs.lower(), "no panic in the logs")
+    finally:
+        tui.kill()
+    return fails
+
+
+def left_case():
+    print("\n== popup_position = left ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_left", cfg("left"))
+    try:
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        rows = list(tui.rows_text())
+        # Box (34, 0, 100, 47): right of the sidebar, no left border column.
+        check(rows[0][133] == "\u256e" and rows[46][133] == "\u256f",
+              f"right corners at x=133 (row 0: {rows[0][128:137]!r})")
+        check(all(rows[y][133] == "\u2502" for y in range(1, 46)),
+              "the right border runs down the box")
+        # The title chip sits at the start of the top edge, so the rule's end
+        # is read on the bottom row.
+        check(rows[46][SIDEBAR_W] == "\u2500" and rows[0][SIDEBAR_W] != "\u256d",
+              "the edges run to the box boundary with no corner")
+        check(all(rows[y][SIDEBAR_W] != "\u2502" for y in range(1, 46)),
+              "no left border column")
+        check("popup" in rows[0], "the title is on the top row")
+        check(rows[0][SIDEBAR_W - 1] == "\u256e" or rows[0][SIDEBAR_W - 1] == "\u2502"
+              or rows[1][SIDEBAR_W - 1] == "\u2502",
+              "the sidebar frame is intact beside it")
+        cx, cy = tui.screen.cursor.x, tui.screen.cursor.y
+        check(SIDEBAR_W <= cx <= 132 and 1 <= cy <= 45,
+              f"the cursor ({cx},{cy}) is inside the popup interior")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def top_case():
+    print("\n== popup_position = top ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_top", cfg("top"))
+    try:
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        rows = list(tui.rows_text())
+        # Box (0, 0, 160, 37): covers the sidebar's columns, open at the top.
+        check(rows[0][0] == "\u2502" and rows[0][159] == "\u2502",
+              f"row 0 starts with the side borders, not a corner ({rows[0][:3]!r})")
+        check("\u256d" not in rows[0] and "\u256e" not in rows[0],
+              "no top border row")
+        check(rows[36][0] == "\u2570" and rows[36][159] == "\u256f",
+              "the bottom corners close the box at y=36")
+        check("popup" in rows[36], "the title is on the bottom row")
+        check(rows[37][0] == "\u256d" or rows[37][SIDEBAR_W - 1] == "\u2502",
+              "the sidebar shows again below the box")
+        cx, cy = tui.screen.cursor.x, tui.screen.cursor.y
+        check(1 <= cx <= 158 and 0 <= cy <= 35,
+              f"the cursor ({cx},{cy}) is inside the popup interior")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def top_right_corner(row, start=0):
+    for x in range(start, len(row)):
+        if row[x] == "\u256e":
+            return x
+    return -1
+
+
+def live_reload_case():
+    print("\n== live config reload moves an open popup ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_reload", cfg())
+    try:
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(list(tui.rows_text())[5][16] == "\u256d", "the float is open")
+        baseline = tui.log("client").count("client: config reloaded")
+        write_config(tui, cfg("left", wpct=50))
+        check(wait_for_reload(tui, baseline), "the client logged the reload")
+        rows = list(tui.rows_text())
+        # Left, 50% of the 126-column content: box (34, 0, 63, 47).
+        check(rows[0][96] == "\u256e" and rows[46][96] == "\u256f",
+              f"the box moved to the left drawer (row 0: {rows[0][90:100]!r})")
+        check(rows[5][16] != "\u256d", "the old float is gone")
+        check(rows[46][SIDEBAR_W] == "\u2500", "and it is open on the left")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def runtime_resize_case():
+    print("\n== the runtime resize keys widen a left drawer ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_resize", cfg("left", wpct=50))
+    try:
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        before = top_right_corner(list(tui.rows_text())[0], SIDEBAR_W)
+        check(before == 96, f"the drawer's right corner is at column 96 before ({before})")
+        # Ctrl-a p R l: the sticky resize group, one step to the right.
+        tui.prefix(b"pR", 0.8)
+        tui.send(b"l", 1.2)
+        tui.send(b"\x1b", 1.0)
+        after = top_right_corner(list(tui.rows_text())[0], SIDEBAR_W)
+        check(after > before, f"the drawer is wider after ({before} -> {after})")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def per_tab_case():
+    print("\n== one popup per tab ==")
+    fails = []
+    check = make_check(fails)
+    marker_dir = "/tmp/rmxpop/tab2dir"
+    os.makedirs(marker_dir, exist_ok=True)
+    tui = start("/tmp/rmxpop/sb_tabs", cfg())
+    try:
+        # Tab 1: open the popup and type a marker.
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        tui.send(b"echo TAB1_POPUP_MARK\r")
+        tui.pump(1.2)
+        check(tui.has("TAB1_POPUP_MARK"), "tab 1's popup shows its marker")
+
+        # Tab 2: a new tab does not show tab 1's popup.
+        tui.prefix(b"tn", 1.8)
+        check(not tui.has("TAB1_POPUP_MARK"),
+              "tab 2 does not show tab 1's popup")
+        tui.send(f"cd {marker_dir}\r".encode())
+        tui.pump(1.0)
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(list(tui.rows_text())[5][16] == "\u256d", "tab 2's own popup opens")
+        tui.send(b"pwd\r")
+        tui.pump(1.2)
+        rows = list(tui.rows_text())
+        # A path on its own line inside the popup, not the typed command or a
+        # prompt (which carries the `$`).
+        check(any("/tmp/rmxpop/tab2dir" in r[17:143] and "$" not in r[17:143]
+                  for r in rows[6:41]),
+              "the popup starts in the directory tab 2's pane is in")
+
+        # Back to tab 1: its popup is still up, with its marker.
+        tui.prefix(b"t1", 1.8)
+        check(tui.has("TAB1_POPUP_MARK"),
+              "back on tab 1 its popup is still open with its marker")
+        check(list(tui.rows_text())[5][16] == "\u256d", "and it is drawn as a box")
+
+        # Close tab 2: the client survives.
+        tui.prefix(b"t2", 1.8)
+        tui.prefix(b"tx", 1.8)
+        check(tui.alive(), "the client survives closing a tab with a popup")
+        logs = tui.log("client") + tui.log("server")
+        check("panic" not in logs.lower(), "no panic in the logs")
+        tui.prefix(b"t1", 1.5)
+        check(tui.alive(), "and still after returning to tab 1")
+    finally:
+        tui.kill()
+    return fails
+
+
+# The user's own popup keys (not defaults): every one is a show/hide toggle.
+POPUP_KEYS = """[keybindings.command]
+"Alt-p" = "PopupToggle"
+"Alt--" = "PopupToggle bottom"
+"Alt-\\\\" = "PopupToggle right"
+"""
+ALT_MINUS = b"\x1b-"
+ALT_BACKSLASH = b"\x1b\\"
+
+
+def bottom_open(rows):
+    """The bottom drawer, (0, 10, 160, 37): its top-left corner at (0, 10)."""
+    return rows[10][0] == "\u256d"
+
+
+def right_open(rows):
+    """The right drawer, (60, 0, 100, 47): its top-left corner at (60, 0)."""
+    return rows[0][60] == "\u256d"
+
+
+def toggle_position_case():
+    print("\n== a popup key opens where it says and any popup key closes ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_keys", POPUP_KEYS + cfg())
+    try:
+        tui.send(ALT_MINUS)
+        tui.pump(1.8)
+        rows = list(tui.rows_text())
+        check(bottom_open(rows), "Alt-- opens the popup at the bottom")
+        check(not right_open(rows), "and not on the right")
+        tui.send(ALT_BACKSLASH)
+        tui.pump(1.8)
+        rows = list(tui.rows_text())
+        check(not bottom_open(rows) and not right_open(rows),
+              "Alt-\\ while it is open closes it rather than moving it")
+        tui.send(ALT_BACKSLASH)
+        tui.pump(1.8)
+        rows = list(tui.rows_text())
+        check(right_open(rows), "Alt-\\ opens it on the right")
+        check(not bottom_open(rows), "and not at the bottom")
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        rows = list(tui.rows_text())
+        check(not bottom_open(rows) and not right_open(rows),
+              "Alt-p while it is open closes it")
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(list(tui.rows_text())[5][16] == "\u256d",
+              "Alt-p opens it at the configured float")
+        check(tui.alive(), "the client is alive")
+        logs = tui.log("client") + tui.log("server")
+        check("panic" not in logs.lower(), "no panic in the logs")
+    finally:
+        tui.kill()
+    return fails
+
+
+SIZED_KEYS = """[keybindings.command]
+"Alt-p" = "PopupToggle float 80"
+"Alt-o" = "PopupToggle"
+"""
+ALT_O = b"\x1bo"
+
+
+def sized_float_case():
+    print("\n== a size on the popup key replaces the config percentages ==")
+    fails = []
+    check = make_check(fails)
+    # popup_width_pct = popup_height_pct = 45 is what a plain open uses.
+    tui = start("/tmp/rmxpop/sb_sized", SIZED_KEYS + cfg(wpct=45, hpct=45))
+    try:
+        # 80% of 160 columns and of 47 rows (the window minus the status row),
+        # centred on the whole window.
+        sized = {"x": 16, "y": 5, "width": 128, "height": 37}
+        # 45% of the same, centred.
+        plain = {"x": 44, "y": 13, "width": 72, "height": 21}
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        found = boxes_in(list(tui.rows_text()), SB_COLS)
+        check(sized in found, f"Alt-p (float 80) opens an 80% float; boxes: {found}")
+        check(plain not in found, "and not the configured 45%")
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(sized not in boxes_in(list(tui.rows_text()), SB_COLS),
+              "Alt-p while it is open closes it")
+        tui.send(ALT_O)
+        tui.pump(1.8)
+        found = boxes_in(list(tui.rows_text()), SB_COLS)
+        check(plain in found, f"a plain key opens the configured 45% float; boxes: {found}")
+        check(sized not in found, "and not the 80% one")
+        check(tui.alive(), "the client is alive")
+        logs = tui.log("client") + tui.log("server")
+        check("panic" not in logs.lower(), "no panic in the logs")
+    finally:
+        tui.kill()
+    return fails
+
+
+def tab_switch_no_resize_case():
+    print("\n== a tab switch does not resize a popup opened at a named position ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_noresize", POPUP_KEYS + cfg())
+
+    def popup_resizes():
+        return tui.log("server").count("resize_session_popups: popup pane_id=")
+
+    try:
+        tui.send(ALT_BACKSLASH)
+        tui.pump(1.8)
+        check(right_open(list(tui.rows_text())), "tab 1's popup opens on the right")
+        before = popup_resizes()
+        tui.prefix(b"tn", 1.8)
+        tui.prefix(b"t1", 1.8)
+        check(right_open(list(tui.rows_text())), "back on tab 1 it is still on the right")
+        after = popup_resizes()
+        check(after == before,
+              f"no popup PTY resize across the switch ({before} -> {after})")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def output_at(tui, needle):
+    """`(x, y)` of `needle` on screen. Markers are printed as `FOC$((40+n))`,
+    so the output text never appears in the typed command."""
+    for y, row in enumerate(tui.rows_text()):
+        x = row.find(needle)
+        if x >= 0:
+            return (x, y)
+    return None
+
+
+def focus_return_case():
+    print("\n== closing the popup returns input to the pane focused before it ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_focus", POPUP_KEYS + cfg())
+    try:
+        # Three panes; the newest is focused. Alt-h moves to another one.
+        tui.prefix(b"pv", 1.8)
+        tui.prefix(b"pv", 1.8)
+        tui.send(b"\x1bh", 0.8)
+        tui.send(b"echo FOC$((40+2))\r")
+        tui.pump(1.0)
+        home = output_at(tui, "FOC42")
+        check(home is not None, f"the focused pane printed its marker at {home}")
+        for n, (label, key) in enumerate([("Alt-p", ALT_P),
+                                          ("PopupToggle right", ALT_BACKSLASH)]):
+            tui.send(key)
+            tui.pump(1.8)
+            rows = list(tui.rows_text())
+            check(rows[5][16] == "\u256d" or right_open(rows), f"{label} opens the popup")
+            tui.send(key)
+            tui.pump(1.8)
+            marker = f"FOC{43 + n}"
+            tui.send(f"echo FOC$((40+{3 + n}))\r".encode())
+            tui.pump(1.0)
+            at = output_at(tui, marker)
+            rows = list(tui.rows_text())
+            # The same column with no pane divider between them: the same pane,
+            # not one stacked below it.
+            same_pane = (at is not None and home is not None and at[0] == home[0]
+                         and at[1] > home[1]
+                         and all(rows[y][home[0]] != "\u2500"
+                                 for y in range(home[1], at[1])))
+            check(same_pane,
+                  f"after {label} closes, typing lands in that pane ({at} below {home})")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def sgr_click(col, row):
+    """A left press and release at 0-based `(col, row)`; SGR is 1-based."""
+    return (f"\x1b[<0;{col + 1};{row + 1}M".encode()
+            + f"\x1b[<0;{col + 1};{row + 1}m".encode())
+
+
+def popup_open(tui):
+    return list(tui.rows_text())[5][16] == "\u256d"
+
+
+def dismiss_case():
+    print("\n== a click outside the box, or Alt-hjkl, closes the popup and acts ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_dismiss", cfg())
+    try:
+        # Three panes, newest on the right; Alt-h makes the middle one current.
+        tui.prefix(b"pv", 1.8)
+        tui.prefix(b"pv", 1.8)
+        tui.send(b"\x1bh", 0.8)
+        tui.send(b"echo DIS$((40+2))\r")
+        tui.pump(1.0)
+        home = output_at(tui, "DIS42")
+        check(home is not None, f"the middle pane printed its marker at {home}")
+
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "Alt-p opens the popup")
+        # Row 2 is above the float (it starts at row 5) and inside the left pane.
+        tui.send(sgr_click(40, 2), 1.5)
+        check(not popup_open(tui), "a click on the left pane closes the popup")
+        tui.send(b"echo DIS$((40+3))\r")
+        tui.pump(1.0)
+        at = output_at(tui, "DIS43")
+        check(not popup_open(tui) and at is not None and home is not None
+              and at[0] < home[0],
+              f"and the click focused it: typing lands left of the middle pane ({at} vs {home})")
+
+        # Alt-l returns to the middle pane; from there the popup is opened.
+        tui.send(b"\x1bl", 0.8)
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "the popup opens again")
+        tui.send(b"\x1bl", 1.5)
+        check(not popup_open(tui), "Alt-l closes the popup")
+        tui.send(b"echo DIS$((40+4))\r")
+        tui.pump(1.0)
+        at = output_at(tui, "DIS44")
+        check(not popup_open(tui) and at is not None and home is not None
+              and at[0] > home[0],
+              f"and moves focus to the right neighbour ({at} vs {home})")
+
+        # Nothing to the right: the popup still closes, and focus stays.
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "the popup opens on the right pane")
+        tui.send(b"\x1bl", 1.5)
+        check(not popup_open(tui), "Alt-l with no right neighbour closes the popup")
+        tui.send(b"echo DIS$((40+5))\r")
+        tui.pump(1.0)
+        again = output_at(tui, "DIS45")
+        check(again is not None and at is not None and again[0] == at[0],
+              f"and keeps the pane ({again} vs {at})")
+
+        # A sidebar answers its own press; the popup closes for it too.
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "the popup opens before a sidebar press")
+        tui.send(sgr_click(5, 10), 1.5)
+        check(not popup_open(tui), "a click on the sidebar closes the popup")
+
+        # The sidebar's own frame and the bar's tail past the server bar are
+        # answered by the client too; each closes the popup. A press on the
+        # content first takes the keyboard back from the sidebar.
+        for label, (cx, cy) in [("the sidebar's frame", (SIDEBAR_W - 1, 2)),
+                                ("the bar's tail", (SB_COLS - 1, SB_ROWS - 1))]:
+            tui.send(sgr_click(130, 2), 0.8)
+            tui.send(ALT_P)
+            tui.pump(1.8)
+            check(popup_open(tui), f"the popup opens before a press on {label}")
+            tui.send(sgr_click(cx, cy), 1.5)
+            check(not popup_open(tui), f"a press on {label} closes the popup")
+
+        # A press on the popup's frame is swallowed. The sidebar holds the
+        # keyboard after its press, so a press on the content takes it back.
+        tui.send(sgr_click(130, 2), 0.8)
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "the popup opens before a frame press")
+        tui.send(sgr_click(16, 20), 1.0)
+        check(popup_open(tui), "a click on the popup's frame leaves it open")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def tab_click_case():
+    print("\n== a click on a tab switches tabs and leaves the popup of the tab left ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_tabclick", cfg())
+    try:
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        tui.send(b"echo TABCLICK_MARK\r")
+        tui.pump(1.0)
+        tui.prefix(b"tn", 1.8)
+        tui.prefix(b"t1", 1.8)
+        check(popup_open(tui) and tui.has("TABCLICK_MARK"),
+              "tab 1's popup is up with its marker")
+        # The sidebar is shown, so the client draws the bar on the last row.
+        bar = list(tui.rows_text())[SB_ROWS - 1]
+        x = bar.find("Tab 2")
+        check(x >= 0, f"tab 2's label is on the bar ({bar.strip()!r})")
+        tui.send(sgr_click(x + 1, SB_ROWS - 1), 1.8)
+        check(not popup_open(tui) and not tui.has("TABCLICK_MARK"),
+              "the click switched to tab 2, which has no popup")
+        tui.prefix(b"t1", 1.8)
+        check(popup_open(tui) and tui.has("TABCLICK_MARK"),
+              "back on tab 1 its popup is still up")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def focus_key_sidebar_case():
+    print("\n== a focus key with the popup up never enters a sidebar ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_focuskey", cfg())
+    try:
+        tui.send(b"echo EDGE$((40+1))\r")
+        tui.pump(1.0)
+        home = output_at(tui, "EDGE41")
+        check(home is not None and home[0] >= SIDEBAR_W,
+              f"the pane is right of the sidebar ({home})")
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "the popup opens")
+        tui.send(b"\x1bh", 1.5)
+        check(not popup_open(tui), "Alt-h at the left edge closes the popup")
+        tui.send(b"echo EDGE$((40+2))\r")
+        tui.pump(1.0)
+        at = output_at(tui, "EDGE42")
+        check(at is not None and home is not None and at[0] == home[0],
+              f"and the keyboard is still in the pane, not the sidebar ({at})")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def popup_line_with(tui, needle):
+    """Whether a line of the float's interior holds `needle` as output: not the
+    typed command or a prompt, which carry the `$`."""
+    rows = list(tui.rows_text())
+    return any(needle in r[17:143] and "$" not in r[17:143] for r in rows[6:41])
+
+
+def in_tab_cwd_case():
+    print("\n== the first popup in a tab opens in the focused pane's directory ==")
+    fails = []
+    check = make_check(fails)
+    dir_a, dir_b = "/tmp/rmxpop/cwdA", "/tmp/rmxpop/cwdB"
+    for d in (dir_a, dir_b):
+        os.makedirs(d, exist_ok=True)
+    tui = start("/tmp/rmxpop/sb_cwd", cfg())
+    try:
+        tui.send(f"cd {dir_a}\r".encode())
+        tui.pump(0.8)
+        # Split: the new pane starts in dir A too, so move it to dir B.
+        tui.prefix(b"pv", 1.8)
+        tui.send(f"cd {dir_b}\r".encode())
+        tui.pump(0.8)
+        # Focus away and back, so pane 2 is focused by a focus key and not
+        # merely because it is the newest pane.
+        tui.send(b"\x1bh", 0.8)
+        tui.send(b"\x1bl", 0.8)
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(list(tui.rows_text())[5][16] == "\u256d", "the popup opens")
+        tui.send(b"pwd\r")
+        tui.pump(1.2)
+        check(popup_line_with(tui, dir_b),
+              "the popup starts in the focused pane's directory (dir B)")
+        check(not popup_line_with(tui, dir_a), "not in the first pane's (dir A)")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def main():
+    all_fails = []
+    for case in (no_sidebar_case, float_over_sidebar_case, left_case, top_case,
+                 live_reload_case, runtime_resize_case, per_tab_case,
+                 in_tab_cwd_case, toggle_position_case, focus_return_case,
+                 tab_switch_no_resize_case, sized_float_case, dismiss_case,
+                 tab_click_case, focus_key_sidebar_case):
+        all_fails += [f"{case.__name__}: {f}" for f in case()]
+    print(f"\n{'FAILED: ' + str(len(all_fails)) if all_fails else 'ALL PASS'}")
+    for f in all_fails:
         print("  - " + f)
-    return 1 if fails else 0
+    return 1 if all_fails else 0
 
 
 if __name__ == "__main__":

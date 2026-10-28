@@ -10,7 +10,7 @@ layouts give such a pane while other panes still exist in that direction:
      sidebar.
   2  Monocle, right sidebar, focus on pane 1: Alt+l focuses pane 2, then the
      sidebar.
-  3  Bsp with pane 2 zoomed (Prefix f), left sidebar: Alt+h focuses pane 1
+  3  Bsp with pane 2 zoomed (Prefix z), left sidebar: Alt+h focuses pane 1
      (the zoom follows it), then the sidebar.
 
 Which pane has focus is read from the shell inside it. Each pane printed a
@@ -143,7 +143,7 @@ def monocle_right(t):
 
 
 def zoom_left(t):
-    t.prefix(b"f", 1.0)
+    t.prefix(b"z", 1.0)
     expect_pane(t, "two", "start", "zoomed")
     t.send(ALT_H, 1.0)
     expect_pane(t, "one", "first", "Alt+h from zoomed pane 2")

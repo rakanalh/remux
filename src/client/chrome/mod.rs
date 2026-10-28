@@ -14,10 +14,11 @@ use anyhow::Result;
 // `MIN_CONTENT_COLS`/`MIN_CONTENT_ROWS` are deliberately NOT re-exported: this
 // is a binary crate, so a `pub use` nothing outside `geometry` imports trips
 // `unused_imports` under `-D warnings`.
+use geometry::{bar_hit, collapse_button, collapse_glyph, expand_glyph, strip_chip};
 pub use geometry::{
-    bar_rects, content_point, content_rect, effective_sizes, frame_size_inset, pane_area,
-    panel_rects, past_the_server_bar, sidebar_frame, status_bar_rect, PanelGeom, SidebarEdge,
-    SidebarGeom,
+    bar_rects, content_point, content_rect, effective_sizes, frame_for, inset_for, pane_area,
+    panel_rects, past_the_server_bar, status_bar_rect, BarHit, PanelGeom, SidebarEdge, SidebarGeom,
+    SidebarStyle,
 };
 
 use crate::client::renderer::Renderer;
@@ -28,6 +29,22 @@ use crate::config::theme::CompositorTheme;
 use crate::config::{BorderStyle, StatusBarPosition};
 use crate::protocol::RenderCell;
 use crate::server::layout::{FocusDirection, Rect};
+
+/// Where a pointer position belongs, in the order the client routes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerTarget {
+    /// Not on any sidebar: the server's content.
+    Content,
+    /// Inside a laid-out panel.
+    Panel { sidebar: usize, panel: usize },
+    /// A cell of an expanded sidebar's collapse chip. Wins over the panel the
+    /// chip is drawn inside.
+    Button(usize),
+    /// A cell of a collapsed sidebar's strip.
+    Strip(usize),
+    /// The rest of a sidebar: its frame or divider. Belongs to no panel.
+    Frame(usize),
+}
 
 /// One plugin panel plus its layout weight.
 pub struct Panel {
@@ -40,6 +57,9 @@ pub struct Sidebar {
     pub edge: SidebarEdge,
     pub size: u16,
     pub visible: bool,
+    pub style: SidebarStyle,
+    /// Whether hiding leaves a one-cell strip. See [`SidebarGeom::is_strip`].
+    pub collapse_to_strip: bool,
     pub panels: Vec<Panel>,
     /// Which panel takes keys when this sidebar is focused. Written by the
     /// navigation task (Task 7); tracked here from the start so focus survives
@@ -115,6 +135,8 @@ impl Chrome {
                 edge: sc.edge,
                 size: sc.size,
                 visible: sc.visible,
+                style: sc.style,
+                collapse_to_strip: sc.collapse_to_strip,
                 panels,
                 focused_panel: 0,
             });
@@ -147,6 +169,8 @@ impl Chrome {
                 edge: s.edge,
                 size: s.size,
                 visible: s.visible,
+                style: s.style,
+                collapse_to_strip: s.collapse_to_strip,
                 panels: s
                     .panels
                     .iter()
@@ -207,6 +231,69 @@ impl Chrome {
             .into_iter()
             .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
             .map(|(i, _)| i)
+    }
+
+    /// What the sidebar bar under a screen point is: an expanded sidebar's
+    /// collapse button or the rest of its frame, or a collapsed sidebar's strip.
+    pub fn bar_hit(
+        &self,
+        term_cols: u16,
+        term_rows: u16,
+        x: u16,
+        y: u16,
+    ) -> Option<(usize, BarHit)> {
+        bar_hit(
+            &self.geoms(),
+            term_cols,
+            term_rows,
+            &self.border_style,
+            x,
+            y,
+        )
+    }
+
+    /// Where the pointer at `(x, y)` goes.
+    ///
+    /// The collapse chip is asked first. It is drawn over cells inside a
+    /// panel's rect, so a panel-first lookup would hand the click to the panel
+    /// and the chip would never collapse anything. A chip or strip cell is never
+    /// a panel's.
+    pub fn pointer_target(&self, term_cols: u16, term_rows: u16, x: u16, y: u16) -> PointerTarget {
+        match self.bar_hit(term_cols, term_rows, x, y) {
+            Some((i, BarHit::Button)) => return PointerTarget::Button(i),
+            Some((i, BarHit::Strip)) => return PointerTarget::Strip(i),
+            _ => {}
+        }
+        let in_rect = |r: &Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        if let Some((sidebar, panel, _)) = self
+            .panel_rects(term_cols, term_rows)
+            .into_iter()
+            .find(|(_, _, r)| in_rect(r))
+        {
+            return PointerTarget::Panel { sidebar, panel };
+        }
+        match self.sidebar_at(term_cols, term_rows, x, y) {
+            Some(i) => PointerTarget::Frame(i),
+            None => PointerTarget::Content,
+        }
+    }
+
+    /// The edge a left press at `(x, y)` collapses or expands: the sidebar whose
+    /// chip or strip is there, and nothing for any other position.
+    ///
+    /// Position only, so the client can ask it before it asks anything else
+    /// about a mouse event, whatever owns the screen (a live view included).
+    pub fn collapse_press(
+        &self,
+        term_cols: u16,
+        term_rows: u16,
+        x: u16,
+        y: u16,
+    ) -> Option<SidebarEdge> {
+        match self.pointer_target(term_cols, term_rows, x, y) {
+            PointerTarget::Button(i) | PointerTarget::Strip(i) => Some(self.sidebars[i].edge),
+            _ => None,
+        }
     }
 
     /// The row the client draws the status bar on, or `None` while the
@@ -276,6 +363,21 @@ impl Chrome {
     ) -> Result<()> {
         let rects = self.panel_rects(term_cols, term_rows);
         for (si, bar) in self.bar_rects(term_cols, term_rows) {
+            if !self.sidebars[si].visible {
+                let sb = &self.sidebars[si];
+                let chip = strip_chip(sb.edge, bar).map(|c| {
+                    let local = Rect {
+                        x: c.x - bar.x,
+                        y: c.y - bar.y,
+                        ..c
+                    };
+                    (local, expand_glyph(sb.edge))
+                });
+                let mut grid = blank_grid(bar.width, bar.height, theme.border_bg());
+                frame::draw_strip(&mut grid, chip, theme);
+                renderer.paint_panel(bar, &grid)?;
+                continue;
+            }
             let mine: Vec<Rect> = rects
                 .iter()
                 .filter(|(s, _, _)| *s == si)
@@ -292,7 +394,12 @@ impl Chrome {
                 // this is what the pre-frame code did too (it painted nothing).
                 continue;
             }
-            let f = sidebar_frame(&self.border_style, self.sidebars[si].edge, bar);
+            let f = frame_for(
+                self.sidebars[si].style,
+                &self.border_style,
+                self.sidebars[si].edge,
+                bar,
+            );
             let render_panel = |pi: usize, r: Rect| {
                 let focused = self.focus
                     == ChromeFocus::Sidebar {
@@ -328,14 +435,19 @@ impl Chrome {
                 .collect();
             let active =
                 matches!(self.focus, ChromeFocus::Sidebar { sidebar, .. } if sidebar == si);
-            frame::draw_sidebar_frame(
-                &mut grid,
-                &self.border_style,
-                self.sidebars[si].edge,
-                active,
-                &rules,
-                theme,
-            );
+            match self.sidebars[si].style {
+                SidebarStyle::Boxed => frame::draw_sidebar_frame(
+                    &mut grid,
+                    &self.border_style,
+                    self.sidebars[si].edge,
+                    active,
+                    &rules,
+                    theme,
+                ),
+                SidebarStyle::Flat => {
+                    frame::draw_flat_frame(&mut grid, self.sidebars[si].edge, &rules, theme)
+                }
+            }
             for (pi, r) in panels.iter().copied().zip(mine.iter().copied()) {
                 let cells = render_panel(pi, r);
                 let ox = r.x.saturating_sub(bar.x) as usize;
@@ -351,6 +463,30 @@ impl Chrome {
                         *slot = cell.clone();
                     }
                 }
+            }
+            let sb = &self.sidebars[si];
+            if let Some(b) = collapse_button(sb.style, &self.border_style, sb.edge, bar) {
+                let local = Rect {
+                    x: b.x - bar.x,
+                    y: b.y - bar.y,
+                    ..b
+                };
+                let on_active_bar = panels.iter().zip(mine.iter()).any(|(&pi, r)| {
+                    self.focus
+                        == ChromeFocus::Sidebar {
+                            sidebar: si,
+                            panel: pi,
+                        }
+                        && r.y == b.y
+                        && (r.x..r.x + r.width).contains(&b.x)
+                });
+                frame::draw_chip(
+                    &mut grid,
+                    local,
+                    collapse_glyph(sb.edge),
+                    on_active_bar,
+                    theme,
+                );
             }
             renderer.paint_panel(bar, &grid)?;
         }
@@ -401,6 +537,14 @@ impl Chrome {
         };
 
         if !matches!(self.border_style, BorderStyle::ZellijStyle) {
+            return Ok(());
+        }
+        // While the popup layer is up, `focused_pane_rect` is the popup's
+        // interior, and the box's frame is drawn by the client already in the
+        // focused colour. The front buffer never holds that frame, only what is
+        // under the box, so the ring check below can only ever match a stale
+        // pane border hidden by the box.
+        if renderer.popup_rect().is_some() {
             return Ok(());
         }
         let Some(pane) = focused_pane_rect else {
@@ -616,7 +760,7 @@ impl Chrome {
         self.sidebars
             .iter()
             .enumerate()
-            .find(|(i, s)| s.edge == edge && sizes[*i] > 0)
+            .find(|(i, s)| s.edge == edge && s.visible && sizes[*i] > 0)
             .map(|(i, _)| i)
     }
 }
@@ -804,21 +948,24 @@ impl Chrome {
         // grant less -- it clamps against the content minimum and knows nothing
         // about frames -- which is exactly why the unframed degrade path in
         // `paint` has to keep working.
-        frame_size_inset(&self.border_style, self.sidebars[i].edge)
-            + self.sidebars[i]
-                .panels
-                .iter()
-                .map(|p| {
-                    let (min_cols, min_rows) = p.plugin.min_size();
-                    if vertical {
-                        min_cols
-                    } else {
-                        min_rows
-                    }
-                })
-                .max()
-                .unwrap_or(1)
-                .max(1)
+        inset_for(
+            self.sidebars[i].style,
+            &self.border_style,
+            self.sidebars[i].edge,
+        ) + self.sidebars[i]
+            .panels
+            .iter()
+            .map(|p| {
+                let (min_cols, min_rows) = p.plugin.min_size();
+                if vertical {
+                    min_cols
+                } else {
+                    min_rows
+                }
+            })
+            .max()
+            .unwrap_or(1)
+            .max(1)
     }
 
     /// Re-target a directional resize at the focused sidebar. Returns `true` if
@@ -1120,30 +1267,24 @@ pub fn intercept_focus(
             let Some(si) = chrome.sidebar_on(edge, term_cols, term_rows) else {
                 return false;
             };
-            // Enter the panel nearest the departing pane along the stack axis.
             let rects = chrome.panel_rects(term_cols, term_rows);
-            let mine: Vec<_> = rects.iter().filter(|(s, _, _)| *s == si).collect();
-            let Some(&&(_, fallback, _)) = mine.first() else {
+            let mine: Vec<usize> = rects
+                .iter()
+                .filter(|(s, _, _)| *s == si)
+                .map(|(_, p, _)| *p)
+                .collect();
+            let Some(&first) = mine.first() else {
                 // The sidebar takes space but every panel was dropped for being
                 // below its minimum: there is nothing to focus. Forward.
                 return false;
             };
-            let pi = match edge {
-                SidebarEdge::Left | SidebarEdge::Right => {
-                    let center = content.y + rect.y + rect.height / 2;
-                    mine.iter()
-                        .find(|(_, _, r)| center >= r.y && center < r.y + r.height)
-                        .map(|(_, p, _)| *p)
-                        .unwrap_or(fallback)
-                }
-                SidebarEdge::Bottom => {
-                    let center = content.x + rect.x + rect.width / 2;
-                    mine.iter()
-                        .find(|(_, _, r)| center >= r.x && center < r.x + r.width)
-                        .map(|(_, p, _)| *p)
-                        .unwrap_or(fallback)
-                }
-            };
+            // Return to the panel the user last left, as `focus_edge` does, and
+            // fall back to the first one. Picking by the departing pane's
+            // position instead makes the landing panel depend on the pane
+            // layout: a full-height pane always lands on whichever panel spans
+            // the middle row, never on the remembered one.
+            let want = chrome.sidebars[si].focused_panel;
+            let pi = if mine.contains(&want) { want } else { first };
             chrome.focus = ChromeFocus::Sidebar {
                 sidebar: si,
                 panel: pi,
@@ -1166,6 +1307,8 @@ mod focus_tests {
             edge,
             size,
             visible: true,
+            style: Default::default(),
+            collapse_to_strip: false,
             panel: vec![PanelConfig {
                 editor: None,
                 command: None,
@@ -1182,6 +1325,8 @@ mod focus_tests {
             edge: SidebarEdge::Left,
             size: 30,
             visible: true,
+            style: Default::default(),
+            collapse_to_strip: false,
             panel: vec![PanelConfig {
                 editor: None,
                 command: None,
@@ -1231,6 +1376,8 @@ mod focus_tests {
             edge,
             size,
             visible: true,
+            style: Default::default(),
+            collapse_to_strip: false,
             panel: (0..n)
                 .map(|_| PanelConfig {
                     editor: None,
@@ -1240,6 +1387,90 @@ mod focus_tests {
                 })
                 .collect(),
         }])
+    }
+
+    /// The cell the renderer holds at the centre of the collapse chip after a
+    /// `paint` of the first sidebar.
+    fn painted_chip_glyph(c: &Chrome, theme: &CompositorTheme) -> RenderCell {
+        let (cols, rows) = (60, 20);
+        let mut renderer = Renderer::new(cols, rows);
+        c.paint(&mut renderer, cols, rows, theme, None).unwrap();
+        let (_, bar) = c.bar_rects(cols, rows)[0];
+        let chip = collapse_button(
+            c.sidebars[0].style,
+            &c.border_style,
+            c.sidebars[0].edge,
+            bar,
+        )
+        .expect("a chip");
+        renderer.front_buffer()[chip.y as usize][(chip.x + chip.width / 2) as usize].clone()
+    }
+
+    fn styled_chrome(edge: SidebarEdge, style: SidebarStyle, size: u16) -> Chrome {
+        let mut c = chrome_with_panels(edge, size, 2);
+        c.sidebars[0].style = style;
+        c
+    }
+
+    fn focus_panel(c: &mut Chrome, panel: usize) {
+        c.focus = ChromeFocus::Sidebar { sidebar: 0, panel };
+    }
+
+    #[test]
+    fn the_chip_inverts_only_when_the_focused_panel_owns_its_header_row() {
+        let theme = CompositorTheme::default();
+        let mut c = chrome_with_panels(SidebarEdge::Bottom, 6, 2);
+
+        c.focus = ChromeFocus::Content;
+        let idle = painted_chip_glyph(&c, &theme);
+        assert_eq!(idle.bg, theme.sidebar_button_bg);
+
+        // The chip sits at the stack's far end, over the LAST panel's header.
+        focus_panel(&mut c, 0);
+        let elsewhere = painted_chip_glyph(&c, &theme);
+        assert_eq!(
+            elsewhere.bg, theme.sidebar_button_bg,
+            "another panel's focus"
+        );
+
+        focus_panel(&mut c, 1);
+        let on_bar = painted_chip_glyph(&c, &theme);
+        assert_eq!(on_bar.bg, theme.sidebar_header_active_fg);
+        assert_eq!(on_bar.fg, theme.sidebar_header_active_bg);
+        assert_ne!(on_bar.bg, theme.sidebar_header_active_bg);
+    }
+
+    /// On a left or right sidebar the chip is on the last row, never over a
+    /// header, even though both stacked panels share its columns.
+    #[test]
+    fn a_side_sidebars_chip_is_never_inverted() {
+        let theme = CompositorTheme::default();
+        for edge in [SidebarEdge::Left, SidebarEdge::Right] {
+            for style in [SidebarStyle::Boxed, SidebarStyle::Flat] {
+                let mut c = styled_chrome(edge, style, 30);
+                for panel in 0..2 {
+                    focus_panel(&mut c, panel);
+                    let chip = painted_chip_glyph(&c, &theme);
+                    assert_eq!(
+                        chip.bg, theme.sidebar_button_bg,
+                        "{edge:?} {style:?} panel {panel}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_flat_bottom_sidebars_chip_inverts_on_the_last_panel_only() {
+        let theme = CompositorTheme::default();
+        let mut c = styled_chrome(SidebarEdge::Bottom, SidebarStyle::Flat, 6);
+        focus_panel(&mut c, 0);
+        assert_eq!(painted_chip_glyph(&c, &theme).bg, theme.sidebar_button_bg);
+        focus_panel(&mut c, 1);
+        assert_eq!(
+            painted_chip_glyph(&c, &theme).bg,
+            theme.sidebar_header_active_fg
+        );
     }
 
     #[test]
@@ -1316,6 +1547,8 @@ mod focus_tests {
                 edge: SidebarEdge::Left,
                 size: 30,
                 visible: true,
+                style: Default::default(),
+                collapse_to_strip: false,
                 panel: vec![
                     PanelConfig {
                         editor: None,
@@ -1335,6 +1568,8 @@ mod focus_tests {
                 edge: SidebarEdge::Right,
                 size: 20,
                 visible: true,
+                style: Default::default(),
+                collapse_to_strip: false,
                 panel: vec![PanelConfig {
                     editor: None,
                     command: None,
@@ -1489,26 +1724,79 @@ mod focus_tests {
         ));
     }
 
-    #[test]
-    fn a_pane_entering_a_stacked_sidebar_lands_on_the_panel_beside_it() {
-        // Two stacked panels over 30 rows: panel 0 is rows 0..15, panel 1 is
-        // 15..30. A pane in the LOWER half of the content must enter panel 1.
-        let mut c = chrome_with_panels(SidebarEdge::Left, 30, 2);
-        let lower = PaneRect {
-            x: 1,
-            y: 16,
-            width: 68,
-            height: 12,
-            ..Default::default()
-        };
+    fn enter_left(c: &mut Chrome, pane: &PaneRect) {
         assert!(intercept_focus(
-            &mut c,
+            c,
             FocusDirection::Left,
-            Some(&lower),
+            Some(pane),
             100,
             30,
             &StatusBarPosition::Bottom
         ));
+    }
+
+    #[test]
+    fn entering_a_stacked_sidebar_lands_on_the_first_panel_by_default() {
+        // Panel 1 spans the lower half, beside both of these panes.
+        let mut c = chrome_with_panels(SidebarEdge::Left, 30, 2);
+        for pane in [
+            PaneRect {
+                x: 1,
+                y: 1,
+                width: 68,
+                height: 27,
+                ..Default::default()
+            },
+            PaneRect {
+                x: 1,
+                y: 16,
+                width: 68,
+                height: 12,
+                ..Default::default()
+            },
+        ] {
+            enter_left(&mut c, &pane);
+            assert_eq!(
+                c.focus,
+                ChromeFocus::Sidebar {
+                    sidebar: 0,
+                    panel: 0
+                }
+            );
+            c.leave_sidebar();
+        }
+    }
+
+    #[test]
+    fn entering_a_stacked_sidebar_returns_to_the_panel_last_left() {
+        let mut c = chrome_with_panels(SidebarEdge::Left, 30, 2);
+        let top = PaneRect {
+            x: 1,
+            y: 1,
+            width: 68,
+            height: 12,
+            ..Default::default()
+        };
+        enter_left(&mut c, &top);
+        assert!(intercept_focus(
+            &mut c,
+            FocusDirection::Down,
+            None,
+            100,
+            30,
+            &StatusBarPosition::Bottom
+        ));
+        assert!(intercept_focus(
+            &mut c,
+            FocusDirection::Right,
+            None,
+            100,
+            30,
+            &StatusBarPosition::Bottom
+        ));
+        assert_eq!(c.focus, ChromeFocus::Content);
+
+        enter_left(&mut c, &top);
         assert_eq!(
             c.focus,
             ChromeFocus::Sidebar {
@@ -1565,6 +1853,8 @@ mod focus_tests {
             edge: SidebarEdge::Left,
             size: 30,
             visible: true,
+            style: Default::default(),
+            collapse_to_strip: false,
             panel: vec![
                 PanelConfig {
                     editor: None,
@@ -1855,6 +2145,8 @@ mod focus_tests {
             edge: SidebarEdge::Left,
             size: 30,
             visible: true,
+            style: Default::default(),
+            collapse_to_strip: false,
             panel: vec![
                 PanelConfig {
                     editor: None,
@@ -1952,6 +2244,8 @@ mod resize_tests {
             edge,
             size,
             visible: true,
+            style: Default::default(),
+            collapse_to_strip: false,
             panel: weights
                 .iter()
                 .map(|w| PanelConfig {
@@ -2128,6 +2422,8 @@ mod resize_tests {
             edge,
             size,
             visible: true,
+            style: Default::default(),
+            collapse_to_strip: false,
             panel: (0..panels)
                 .map(|_| PanelConfig {
                     editor: None,
@@ -2146,6 +2442,8 @@ mod resize_tests {
             edge,
             size,
             visible: true,
+            style: Default::default(),
+            collapse_to_strip: false,
             panel: weights
                 .iter()
                 .map(|w| PanelConfig {
@@ -2370,5 +2668,261 @@ mod resize_tests {
         let mut c = focused(SidebarEdge::Left, 30, &[1]);
         assert!(!intercept_resize(&mut c, Right, 5, 20, 30));
         assert_eq!(c.focus, ChromeFocus::Content);
+    }
+
+    fn flat(mut cfg: SidebarConfig) -> SidebarConfig {
+        cfg.style = SidebarStyle::Flat;
+        cfg
+    }
+
+    #[test]
+    fn a_flat_sidebars_divider_belongs_to_no_panel_and_its_panels_start_at_the_edge() {
+        let c = Chrome::from_config(&[flat(bar(SidebarEdge::Left, 30, 1))]);
+        let rects = c.panel_rects(100, 30);
+        assert_eq!(rects.len(), 1);
+        let r = rects[0].2;
+        assert_eq!((r.x, r.y, r.width), (0, 0, 29));
+        // The divider column is inside the sidebar and inside no panel, so a
+        // click on it is swallowed instead of reaching a pane.
+        assert_eq!(c.sidebar_at(100, 30, 29, 5), Some(0));
+        assert!(!rects
+            .iter()
+            .any(|(_, _, r)| 29 >= r.x && 29 < r.x + r.width));
+        // The boxed default still insets by the frame.
+        let boxed = Chrome::from_config(&[bar(SidebarEdge::Left, 30, 1)]);
+        assert_eq!(boxed.panel_rects(100, 30)[0].2.x, 1);
+    }
+
+    #[test]
+    fn a_panel_built_from_config_draws_the_shared_header() {
+        let theme = CompositorTheme::default();
+        let mut cfg = bar(SidebarEdge::Left, 30, 1);
+        cfg.panel[0].plugin = "agents".into();
+        let c = Chrome::from_config(&[cfg]);
+        let grid = c.sidebars[0].panels[0].plugin.render(28, 6, false, &theme);
+        let header: String = grid[0].iter().map(|cell| cell.c).collect();
+        assert_eq!(header.trim_end(), " agents");
+    }
+
+    fn strippable(edge: SidebarEdge) -> SidebarConfig {
+        SidebarConfig {
+            collapse_to_strip: true,
+            ..bar(edge, 30, 1)
+        }
+    }
+
+    /// The state a toggle leaves behind, as what the client persists and what
+    /// the server is told.
+    fn observable(c: &Chrome) -> (crate::client::sidebar_state::SidebarState, Rect) {
+        (
+            crate::client::sidebar_state::SidebarState::from_chrome(c),
+            c.content_rect(100, 30),
+        )
+    }
+
+    #[test]
+    fn the_button_and_the_keyboard_collapse_to_the_same_state() {
+        let mut by_mouse = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        let mut by_key = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        let bar = by_mouse.bar_rects(100, 30)[0].1;
+        let b = collapse_button(
+            by_mouse.sidebars[0].style,
+            &by_mouse.border_style,
+            SidebarEdge::Left,
+            bar,
+        )
+        .expect("an expanded sidebar has a button");
+        let (si, hit) = by_mouse.bar_hit(100, 30, b.x, b.y).expect("on the bar");
+        assert_eq!(hit, BarHit::Button);
+        by_mouse.toggle_edge(by_mouse.sidebars[si].edge);
+        by_key.toggle_edge(SidebarEdge::Left);
+        assert_eq!(observable(&by_mouse), observable(&by_key));
+        // Collapsed: a strip, with the panes given the rest.
+        assert_eq!(by_mouse.content_rect(100, 30).x, 1);
+        assert!(by_mouse.panel_rects(100, 30).is_empty());
+
+        // Any cell of the strip expands it again, by either route.
+        let (si, hit) = by_mouse.bar_hit(100, 30, 0, 3).expect("the strip");
+        assert_eq!(hit, BarHit::Strip);
+        by_mouse.toggle_edge(by_mouse.sidebars[si].edge);
+        by_key.toggle_edge(SidebarEdge::Left);
+        assert_eq!(observable(&by_mouse), observable(&by_key));
+        assert_eq!(by_mouse.content_rect(100, 30).x, 30);
+    }
+
+    #[test]
+    fn collapsing_the_focused_sidebar_returns_the_keyboard_to_the_content() {
+        let mut c = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        assert!(c.focus_edge(SidebarEdge::Left, 100, 30));
+        c.toggle_edge(SidebarEdge::Left);
+        assert_eq!(c.focus, ChromeFocus::Content);
+        assert_eq!(c.focused_panel(100, 30), None);
+    }
+
+    #[test]
+    fn a_strip_takes_no_focus_until_focus_edge_expands_it() {
+        let mut c = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        c.toggle_edge(SidebarEdge::Left);
+        assert_eq!(c.sidebar_on(SidebarEdge::Left, 100, 30), None);
+        assert!(c.focus_edge(SidebarEdge::Left, 100, 30));
+        assert!(c.sidebars[0].visible, "focusing a strip expands it");
+        assert_eq!(c.sidebar_on(SidebarEdge::Left, 100, 30), Some(0));
+    }
+
+    #[test]
+    fn without_collapse_to_strip_the_button_hides_the_sidebar_fully() {
+        let mut c = Chrome::from_config(&[bar(SidebarEdge::Left, 30, 1)]);
+        let bar_rect = c.bar_rects(100, 30)[0].1;
+        let b = collapse_button(
+            c.sidebars[0].style,
+            &c.border_style,
+            SidebarEdge::Left,
+            bar_rect,
+        )
+        .expect("the button is shown either way");
+        assert_eq!(
+            c.bar_hit(100, 30, b.x, b.y).map(|(_, h)| h),
+            Some(BarHit::Button)
+        );
+        c.toggle_edge(SidebarEdge::Left);
+        assert!(c.bar_rects(100, 30).is_empty());
+        assert_eq!(c.content_rect(100, 30).x, 0);
+        assert_eq!(c.bar_hit(100, 30, 0, 3), None);
+    }
+
+    #[test]
+    fn a_sidebar_configured_hidden_starts_as_a_strip() {
+        let mut cfg = strippable(SidebarEdge::Right);
+        cfg.visible = false;
+        let c = Chrome::from_config(&[cfg]);
+        assert_eq!(c.bar_rects(100, 30)[0].1.width, 1);
+        assert_eq!(
+            c.bar_hit(100, 30, 99, 4).map(|(_, h)| h),
+            Some(BarHit::Strip)
+        );
+    }
+
+    #[test]
+    fn a_collapsed_sidebar_comes_back_as_a_strip_after_a_restart() {
+        use crate::client::sidebar_state::{apply, load_from, save_to, SidebarState};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sidebar.json");
+        let mut c = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        c.toggle_edge(SidebarEdge::Left);
+        save_to(&path, &SidebarState::from_chrome(&c));
+
+        let mut fresh = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        assert_eq!(fresh.bar_rects(100, 30)[0].1.width, 30);
+        apply(&mut fresh, &load_from(&path));
+        assert_eq!(fresh.bar_rects(100, 30)[0].1.width, 1);
+        // A state file written before this key existed has the same shape.
+        let old = SidebarState::from_json(
+            r#"{"bars":[{"edge":"left","visible":false,"size":30,"weights":[1]}]}"#,
+        );
+        let mut legacy = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        apply(&mut legacy, &old);
+        assert_eq!(legacy.bar_rects(100, 30)[0].1.width, 1);
+    }
+
+    #[test]
+    fn the_chip_cells_route_to_the_button_and_their_neighbour_to_the_panel() {
+        let (tc, tr) = (100, 40);
+        for style in [SidebarStyle::Boxed, SidebarStyle::Flat] {
+            for edge in [SidebarEdge::Left, SidebarEdge::Right, SidebarEdge::Bottom] {
+                let size = if edge == SidebarEdge::Bottom { 8 } else { 30 };
+                let mut cfg = bar(edge, size, 1);
+                cfg.style = style;
+                let c = Chrome::from_config(&[cfg]);
+                let bar_rect = c.bar_rects(tc, tr)[0].1;
+                let chip = collapse_button(style, &c.border_style, edge, bar_rect).expect("a chip");
+                assert_eq!(chip.width, 3, "{style:?} {edge:?}");
+                // The chip lies inside the panel's rect: only the routing order
+                // keeps the click from the panel.
+                let panel = c.panel_rects(tc, tr)[0].2;
+                assert!(chip.x >= panel.x && chip.x + chip.width <= panel.x + panel.width);
+                for dx in 0..chip.width {
+                    assert_eq!(
+                        c.pointer_target(tc, tr, chip.x + dx, chip.y),
+                        PointerTarget::Button(0),
+                        "{style:?} {edge:?} chip cell {dx}"
+                    );
+                }
+                let beside = if edge == SidebarEdge::Right {
+                    chip.x + chip.width
+                } else {
+                    chip.x - 1
+                };
+                assert_eq!(
+                    c.pointer_target(tc, tr, beside, chip.y),
+                    PointerTarget::Panel {
+                        sidebar: 0,
+                        panel: 0
+                    },
+                    "{style:?} {edge:?} next to the chip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_strip_cell_routes_to_expand_and_content_stays_content() {
+        let (tc, tr) = (100, 40);
+        let mut cfg = strippable(SidebarEdge::Left);
+        cfg.visible = false;
+        let c = Chrome::from_config(&[cfg]);
+        let strip = c.bar_rects(tc, tr)[0].1;
+        for y in strip.y..strip.y + strip.height {
+            assert_eq!(
+                c.pointer_target(tc, tr, strip.x, y),
+                PointerTarget::Strip(0)
+            );
+        }
+        assert_eq!(c.pointer_target(tc, tr, 5, 5), PointerTarget::Content);
+    }
+
+    #[test]
+    fn the_frame_belongs_to_no_panel() {
+        let (tc, tr) = (100, 40);
+        let mut cfg = bar(SidebarEdge::Left, 30, 1);
+        cfg.style = SidebarStyle::Flat;
+        let c = Chrome::from_config(&[cfg]);
+        assert_eq!(c.pointer_target(tc, tr, 29, 3), PointerTarget::Frame(0));
+    }
+
+    #[test]
+    fn only_a_chip_or_a_strip_collapses_on_a_press() {
+        let (tc, tr) = (100, 40);
+        let mut cfg = strippable(SidebarEdge::Left);
+        cfg.style = SidebarStyle::Flat;
+        let mut c = Chrome::from_config(&[cfg]);
+        let bar_rect = c.bar_rects(tc, tr)[0].1;
+        let chip = collapse_button(
+            SidebarStyle::Flat,
+            &c.border_style,
+            SidebarEdge::Left,
+            bar_rect,
+        )
+        .unwrap();
+        assert_eq!(
+            c.collapse_press(tc, tr, chip.x + 1, chip.y),
+            Some(SidebarEdge::Left)
+        );
+        assert_eq!(
+            c.collapse_press(tc, tr, chip.x - 1, chip.y),
+            None,
+            "a panel cell"
+        );
+        assert_eq!(
+            c.collapse_press(tc, tr, bar_rect.width - 1, 2),
+            None,
+            "the divider"
+        );
+        assert_eq!(c.collapse_press(tc, tr, 60, 5), None, "content");
+        c.toggle_edge(SidebarEdge::Left);
+        assert_eq!(
+            c.collapse_press(tc, tr, 0, 7),
+            Some(SidebarEdge::Left),
+            "the strip"
+        );
     }
 }

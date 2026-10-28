@@ -343,6 +343,9 @@ pub enum InputAction {
     Execute(RemuxCommand),
     /// Execute an action chain (multiple commands in sequence).
     ExecuteChain(Vec<RemuxCommand>),
+    /// Send a command to the named connection, which need not be the
+    /// foreground one. A context-menu rename of a sidebar row ends here.
+    ExecuteOn { conn: ConnId, command: RemuxCommand },
     /// The input mode changed.
     ModeChanged(Mode),
     /// Show the which-key popup for a group.
@@ -616,6 +619,14 @@ pub struct InputHandler {
     pub tab_picker: Option<TabPickerOverlay>,
     /// Whether we are waiting for scrollback content to open in an editor.
     pub pending_editor_open: bool,
+    /// The right-click context menu, while it is open. The main loop routes
+    /// its keys and clicks before any other consumer, so no handler here reads
+    /// it; it lives on the handler so the overlay relay finds it.
+    pub context_menu: Option<crate::client::context_menu::ContextMenu>,
+    /// What the open rename prompt renames when it was opened from a context
+    /// menu, which names its target. `None` for a prompt opened by a key, which
+    /// renames the focused entity.
+    pub rename_explicit: Option<crate::client::context_menu::RenameFor>,
 }
 
 /// Inline text input overlay state used for rename operations.
@@ -1723,7 +1734,24 @@ impl InputHandler {
             view_picker: None,
             tab_picker: None,
             pending_editor_open: false,
+            context_menu: None,
+            rename_explicit: None,
         }
+    }
+
+    /// The current keybinding for `action`, as shown in the context menu: a
+    /// modifier shortcut if one runs it, else the leader and the key path of
+    /// the first leaf that does.
+    pub fn binding_hint(&self, action: &str) -> Option<String> {
+        if let Some(shortcut) = self.shortcut_bindings.notation_for(action) {
+            return Some(shortcut);
+        }
+        let path = self.keybinding_tree.path_for(action)?;
+        let leader = crate::config::keybindings::format_key_notation(
+            &crate::config::keybindings::NormalizedKeyEvent::from(&self.leader_key),
+        );
+        let keys: Vec<String> = path.iter().map(char::to_string).collect();
+        Some(format!("{leader} {}", keys.join(" ")))
     }
 
     /// Create a new `InputHandler` with defaults (Ctrl-a as leader, default
@@ -2212,6 +2240,7 @@ impl InputHandler {
                 // Prompt for a name via the rename overlay; the confirm maps to
                 // InputAction::NewView(name), handled in the main loop.
                 self.mode = Mode::Normal;
+                self.rename_explicit = None;
                 self.rename_overlay = Some(RenameOverlay {
                     buffer: String::new(),
                     cursor: 0,
@@ -2229,6 +2258,7 @@ impl InputHandler {
                 // InputAction::ViewRename(name), applied to the active view in the
                 // main loop.
                 self.mode = Mode::Normal;
+                self.rename_explicit = None;
                 self.rename_overlay = Some(RenameOverlay {
                     buffer: String::new(),
                     cursor: 0,
@@ -2356,6 +2386,7 @@ impl InputHandler {
                         }
                         RemuxCommand::PaneRename(_) => {
                             // Activate rename overlay instead of executing directly.
+                            self.rename_explicit = None;
                             self.rename_overlay = Some(RenameOverlay {
                                 buffer: String::new(),
                                 cursor: 0,
@@ -2365,6 +2396,7 @@ impl InputHandler {
                         }
                         RemuxCommand::TabRename(_) => {
                             // Activate rename overlay instead of executing directly.
+                            self.rename_explicit = None;
                             self.rename_overlay = Some(RenameOverlay {
                                 buffer: String::new(),
                                 cursor: 0,
@@ -2374,6 +2406,7 @@ impl InputHandler {
                         }
                         RemuxCommand::SessionRename(_) => {
                             // Activate rename overlay instead of executing directly.
+                            self.rename_explicit = None;
                             self.rename_overlay = Some(RenameOverlay {
                                 buffer: String::new(),
                                 cursor: 0,
@@ -2383,6 +2416,7 @@ impl InputHandler {
                         }
                         RemuxCommand::SessionNew { .. } => {
                             // Activate rename overlay to prompt for session name.
+                            self.rename_explicit = None;
                             self.rename_overlay = Some(RenameOverlay {
                                 buffer: String::new(),
                                 cursor: 0,
@@ -3460,6 +3494,7 @@ impl InputHandler {
             KeyCode::Esc => {
                 // Cancel rename, close overlay.
                 self.rename_overlay = None;
+                self.rename_explicit = None;
                 // Return to Normal after cancelling.
                 self.mode = Mode::Normal;
                 InputAction::ModeChanged(Mode::Normal)
@@ -3470,6 +3505,12 @@ impl InputHandler {
                 let target = overlay.target.clone();
                 self.rename_overlay = None;
                 self.mode = Mode::Normal;
+                if let Some(explicit) = self.rename_explicit.take() {
+                    return match explicit.command(name) {
+                        (None, command) => InputAction::Execute(command),
+                        (Some(conn), command) => InputAction::ExecuteOn { conn, command },
+                    };
+                }
                 match target {
                     RenameTarget::NewSession => InputAction::NewSession(name),
                     RenameTarget::NewView => InputAction::NewView(name),
@@ -3736,6 +3777,31 @@ mod tests {
         make_key(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    #[test]
+    fn a_keybinding_rename_forgets_a_menu_target_left_over() {
+        let mut handler = InputHandler::with_defaults();
+        handler.rename_explicit = Some(crate::client::context_menu::RenameFor::Pane(3));
+        handler.handle_key(ctrl_key('a'));
+        handler.handle_key(make_key(KeyCode::Char('p'), KeyModifiers::NONE));
+        handler.handle_key(make_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(handler.rename_overlay.is_some(), "the prompt opened");
+        assert_eq!(handler.rename_explicit, None);
+    }
+
+    #[test]
+    fn a_binding_hint_prefers_a_shortcut_then_spells_out_the_leader_path() {
+        let handler = InputHandler::with_defaults();
+        assert_eq!(
+            handler.binding_hint("PaneToggleZoom").as_deref(),
+            Some("Alt-z")
+        );
+        assert_eq!(
+            handler.binding_hint("PaneClose").as_deref(),
+            Some("Ctrl-a p x")
+        );
+        assert_eq!(handler.binding_hint("PaneToggleZoomFloat"), None);
+    }
+
     /// Build a handler with `Alt-p` registered as a group-prefix shortcut.
     ///
     /// `Alt-p` is no longer a default shortcut, so tests that exercise the
@@ -3949,7 +4015,7 @@ mod tests {
 
         // An unbound key aborts the chord back to Normal (rather than staying
         // in Command mode and swallowing the next keypress).
-        let action = handler.handle_key(char_key('z'));
+        let action = handler.handle_key(char_key('q'));
         assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
         assert_eq!(handler.mode, Mode::Normal);
         assert!(handler.keybinding_state.is_at_root());
@@ -3967,8 +4033,8 @@ mod tests {
         assert_eq!(handler.mode, Mode::Command);
         assert!(matches!(action, InputAction::ShowWhichKey { .. }));
 
-        // Press 'z', which has no binding at root -- should abort back to Normal.
-        let action = handler.handle_key(char_key('z'));
+        // Press 'q', which has no binding at root -- should abort back to Normal.
+        let action = handler.handle_key(char_key('q'));
         assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
         assert_eq!(handler.mode, Mode::Normal);
 
@@ -5099,9 +5165,9 @@ mod tests {
     fn reload_keybindings_swaps_tree_and_leader() {
         let mut handler = InputHandler::with_defaults();
 
-        // Default tree has no 'z' binding at root, and the default leader is
+        // Default tree has no 'q' binding at root, and the default leader is
         // Ctrl-a.
-        assert!(handler.keybinding_tree.lookup(&['z']).is_none());
+        assert!(handler.keybinding_tree.lookup(&['q']).is_none());
         let ctrl_a = ctrl_key('a');
         assert!(matches!(
             handler.handle_key(ctrl_a),
@@ -5111,10 +5177,10 @@ mod tests {
         handler.mode = Mode::Normal;
         handler.keybinding_state.reset();
 
-        // Build a distinct tree that binds 'z' at root and a new leader (Ctrl-b).
+        // Build a distinct tree that binds 'q' at root and a new leader (Ctrl-b).
         let mut root = std::collections::HashMap::new();
         root.insert(
-            'z',
+            'q',
             KeyNode::Leaf {
                 label: "new tab".to_string(),
                 action: vec!["TabNew".to_string(), "EnterNormal".to_string()],
@@ -5130,8 +5196,8 @@ mod tests {
             SessionManagerBindings::default(),
         );
 
-        // The tree actually changed: 'z' now resolves at root.
-        assert!(handler.keybinding_tree.lookup(&['z']).is_some());
+        // The tree actually changed: 'q' now resolves at root.
+        assert!(handler.keybinding_tree.lookup(&['q']).is_some());
 
         // The old leader (Ctrl-a) no longer enters Command mode; it is a normal
         // keystroke forwarded to the PTY.
@@ -6317,6 +6383,7 @@ mod tests {
             cwd: None,
             name: None,
             unread: 0,
+            focused: false,
         }
     }
 

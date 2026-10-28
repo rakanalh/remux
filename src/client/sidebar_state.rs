@@ -328,6 +328,8 @@ mod tests {
             edge: SidebarEdge::Left,
             size: 30,
             visible: true,
+            style: Default::default(),
+            collapse_to_strip: false,
             panel: vec![
                 PanelConfig {
                     editor: None,
@@ -445,6 +447,8 @@ mod tests {
             edge: SidebarEdge::Left,
             size,
             visible,
+            style: Default::default(),
+            collapse_to_strip: false,
             panel: weights
                 .iter()
                 .map(|w| PanelConfig {
@@ -748,6 +752,8 @@ mod tests {
             edge: SidebarEdge::Left,
             size: 30,
             visible: true,
+            style: Default::default(),
+            collapse_to_strip: false,
             panel: vec![PanelConfig {
                 editor: None,
                 command: None,

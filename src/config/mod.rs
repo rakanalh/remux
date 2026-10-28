@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod keybindings;
 pub mod messaging;
+pub mod notifications;
 pub mod pane_title;
 pub mod sidebar;
 pub mod theme;
@@ -12,7 +13,8 @@ use serde::{Deserialize, Serialize};
 // Config root
 // ---------------------------------------------------------------------------
 
-/// Top-level Remux configuration, loaded from `~/.config/remux/config.toml`.
+/// Top-level Remux configuration, loaded from the config file
+/// ([`crate::paths::config_file`]).
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -39,6 +41,13 @@ pub struct Config {
     /// which owns every mailbox.
     #[serde(default)]
     pub messaging: messaging::MessagingConfig,
+    /// Desktop notifications for agents. Read by the CLIENT, which sends them.
+    #[serde(default)]
+    pub notifications: notifications::NotificationsConfig,
+    /// How `PaneToggleZoom` zooms a pane. Read by the SERVER, which owns every
+    /// tab's zoom and sizes the zoomed pane's PTY.
+    #[serde(default)]
+    pub zoom: ZoomConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -193,12 +202,18 @@ pub struct AppearanceConfig {
     pub theme: theme::ThemeConfig,
     /// Placement style for the which-key hint popup.
     pub which_key_position: WhichKeyPosition,
-    /// Width of the popup terminal as a percentage of the session's content
-    /// area. Clamped to `POPUP_MIN_PCT..=POPUP_MAX_PCT` (20..=100) when a
-    /// session is created, and adjustable at runtime with the resize commands.
+    /// Where the popup terminal sits; see [`PopupPosition`]. Applied by the
+    /// client, which hot-reloads it.
+    pub popup_position: PopupPosition,
+    /// Width of the popup terminal as a percentage of the window (`float`) or
+    /// of the content area (`left`, `right`). Ignored by `top` and `bottom`,
+    /// which span the window. Clamped to `POPUP_MIN_PCT..=POPUP_MAX_PCT`
+    /// (20..=100).
     pub popup_width_pct: u8,
-    /// Height of the popup terminal as a percentage of the session's content
-    /// area. Clamped like `popup_width_pct`.
+    /// Height of the popup terminal as a percentage of the window rows minus
+    /// the status bar row (`float`, `top`, `bottom`). Ignored by `left` and
+    /// `right`, which run the full content height. Clamped like
+    /// `popup_width_pct`.
     pub popup_height_pct: u8,
     /// The template a pane is named by; see [`pane_title`]. `None` names a
     /// pane by its settled window title, else its foreground command.
@@ -213,10 +228,214 @@ impl Default for AppearanceConfig {
             default_layout: DefaultLayout::default(),
             theme: theme::ThemeConfig::default(),
             which_key_position: WhichKeyPosition::default(),
+            popup_position: PopupPosition::default(),
             popup_width_pct: 80,
             popup_height_pct: 80,
             pane_title: None,
         }
+    }
+}
+
+/// Where the popup terminal is drawn.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PopupPosition {
+    /// A fully framed box centered on the whole window, over every sidebar.
+    #[default]
+    Float,
+    /// A drawer docked to the left edge of the content area.
+    Left,
+    /// A drawer docked to the right edge of the content area.
+    Right,
+    /// A drawer docked to the top of the window, over the sidebars.
+    Top,
+    /// A drawer docked above the status bar row, over the sidebars.
+    Bottom,
+}
+
+impl PopupPosition {
+    /// The position a `popup_position` value or a `PopupToggle` argument
+    /// names, in the config's own spelling.
+    pub fn parse(name: &str) -> Option<Self> {
+        use serde::de::value::{Error, StrDeserializer};
+        Self::deserialize(StrDeserializer::<Error>::new(name)).ok()
+    }
+}
+
+/// A popup's size in percent, as a `PopupToggle` key gives it. An axis left
+/// `None` uses the configured percentage.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub struct PopupSize {
+    pub width: Option<u8>,
+    pub height: Option<u8>,
+}
+
+/// Where a `PopupToggle` key opens the popup, and how big.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub struct PopupPlacement {
+    pub position: PopupPosition,
+    pub size: Option<PopupSize>,
+}
+
+impl From<PopupPosition> for PopupPlacement {
+    fn from(position: PopupPosition) -> Self {
+        PopupPlacement {
+            position,
+            size: None,
+        }
+    }
+}
+
+impl PopupPlacement {
+    /// The placement a `PopupToggle` key's arguments name: `None` for no
+    /// arguments, else a position and an optional size in percent.
+    ///
+    /// A float takes `N` (both axes) or `WxH`. A docked position takes one
+    /// number, for the axis it sizes (`left` and `right` the width, `top` and
+    /// `bottom` the height), because the other axis is not used and a second
+    /// number would be silently ignored. Each number is clamped to the range
+    /// of `popup_width_pct` and `popup_height_pct`.
+    ///
+    /// The error is the end of the sentence "action 'PopupToggle' has ...".
+    pub fn from_args(args: &[String]) -> Result<Option<Self>, String> {
+        let Some(first) = args.first() else {
+            return Ok(None);
+        };
+        let Some(position) = PopupPosition::parse(first) else {
+            return Err(
+                if first.split('x').all(|part| parse_percent(part).is_some()) {
+                    format!("a size '{first}' that needs a position before it")
+                } else {
+                    format!(
+                    "an invalid position '{first}' (expected float, left, right, top or bottom)"
+                )
+                },
+            );
+        };
+        let Some(text) = args.get(1) else {
+            return Ok(Some(position.into()));
+        };
+        if let Some(extra) = args.get(2) {
+            return Err(format!("an unexpected argument '{extra}' after the size"));
+        }
+        let invalid = || {
+            format!("an invalid size '{text}' (expected a percentage such as 80, or WxH such as 80x60 for a float)")
+        };
+        let size = match (text.split_once('x'), position) {
+            (None, PopupPosition::Float) => {
+                let pct = parse_percent(text).ok_or_else(invalid)?;
+                PopupSize {
+                    width: Some(pct),
+                    height: Some(pct),
+                }
+            }
+            (None, docked) => {
+                let pct = Some(parse_percent(text).ok_or_else(invalid)?);
+                match docked {
+                    PopupPosition::Left | PopupPosition::Right => PopupSize {
+                        width: pct,
+                        height: None,
+                    },
+                    _ => PopupSize {
+                        width: None,
+                        height: pct,
+                    },
+                }
+            }
+            (Some((w, h)), PopupPosition::Float) => PopupSize {
+                width: Some(parse_percent(w).ok_or_else(invalid)?),
+                height: Some(parse_percent(h).ok_or_else(invalid)?),
+            },
+            (Some((w, h)), docked) => {
+                // Name the axis in the message only for a well-formed WxH.
+                if parse_percent(w).is_none() || parse_percent(h).is_none() {
+                    return Err(invalid());
+                }
+                let axis = match docked {
+                    PopupPosition::Left | PopupPosition::Right => "width",
+                    _ => "height",
+                };
+                return Err(format!(
+                    "a size '{text}' for '{first}' that takes one number, the {axis}"
+                ));
+            }
+        };
+        Ok(Some(PopupPlacement {
+            position,
+            size: Some(size),
+        }))
+    }
+}
+
+/// A percentage of digits only, clamped to the popup range. A number too big
+/// for `u32` is a run of digits and clamps like any other large one.
+fn parse_percent(text: &str) -> Option<u8> {
+    use crate::server::layout::{POPUP_MAX_PCT, POPUP_MIN_PCT};
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pct = text.parse::<u32>().unwrap_or(u32::MAX);
+    Some(pct.clamp(POPUP_MIN_PCT as u32, POPUP_MAX_PCT as u32) as u8)
+}
+
+// ---------------------------------------------------------------------------
+// Zoom
+// ---------------------------------------------------------------------------
+
+/// How a zoomed pane is shown.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ZoomMode {
+    /// The pane fills the tab's whole area and the rest of the layout is hidden.
+    #[default]
+    Fullscreen,
+    /// The pane is a framed, centred box drawn over a layout that keeps its
+    /// shape.
+    Float,
+}
+
+/// The `[zoom]` section.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct ZoomConfig {
+    /// What `PaneToggleZoom` does. `PaneToggleZoomFloat` is always a float.
+    pub mode: ZoomMode,
+    /// Width of a float zoom as a percentage of the area the tab's layout
+    /// fills. Clamped to `POPUP_MIN_PCT..=POPUP_MAX_PCT`, like the popup's.
+    #[serde(deserialize_with = "clamped_percent")]
+    pub width: u8,
+    /// Height of a float zoom, as `width` is.
+    #[serde(deserialize_with = "clamped_percent")]
+    pub height: u8,
+}
+
+/// An integer percentage of any size, clamped to the popup's range, so a
+/// `width = 500` or `height = 0` is a clamped value and not a config that
+/// fails to load.
+fn clamped_percent<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use crate::server::layout::{POPUP_MAX_PCT, POPUP_MIN_PCT};
+    let pct = i64::deserialize(deserializer)?;
+    Ok(pct.clamp(POPUP_MIN_PCT as i64, POPUP_MAX_PCT as i64) as u8)
+}
+
+impl Default for ZoomConfig {
+    fn default() -> Self {
+        Self {
+            mode: ZoomMode::default(),
+            width: 90,
+            height: 90,
+        }
+    }
+}
+
+impl ZoomConfig {
+    /// `(width_pct, height_pct)` in the form [`crate::server::layout::popup_rect`]
+    /// takes.
+    pub fn float_pct(&self) -> (u8, u8) {
+        (self.width, self.height)
     }
 }
 
@@ -375,6 +594,8 @@ impl Default for Config {
             agents: agents::AgentsConfig::default(),
             layouts: crate::server::layout::EnabledLayouts::default(),
             messaging: messaging::MessagingConfig::default(),
+            notifications: notifications::NotificationsConfig::default(),
+            zoom: ZoomConfig::default(),
         }
     }
 }
@@ -384,7 +605,7 @@ impl Default for Config {
 // ---------------------------------------------------------------------------
 
 impl Config {
-    /// Load the configuration from `~/.config/remux/config.toml`.
+    /// Load the configuration from the config file ([`crate::paths::config_file`]).
     ///
     /// If the file does not exist, returns the default configuration.
     /// If the file exists but contains invalid TOML, returns an error.
@@ -774,11 +995,192 @@ mod tests {
             default_layout: _,
             theme: _,
             which_key_position: _,
+            popup_position: _,
             popup_width_pct: _,
             popup_height_pct: _,
             pane_title: _,
         } = &appearance;
         assert_eq!(*border_style, BorderStyle::ZellijStyle);
+    }
+
+    #[test]
+    fn zoom_defaults_to_a_fullscreen_zoom_with_a_90_by_90_float() {
+        let zoom = Config::default().zoom;
+        assert_eq!(zoom.mode, ZoomMode::Fullscreen);
+        assert_eq!(zoom.float_pct(), (90, 90));
+    }
+
+    #[test]
+    fn zoom_section_parses_mode_and_size() {
+        let config: Config =
+            toml::from_str("[zoom]\nmode = \"float\"\nwidth = 70\nheight = 60\n").unwrap();
+        assert_eq!(config.zoom.mode, ZoomMode::Float);
+        assert_eq!(config.zoom.float_pct(), (70, 60));
+    }
+
+    #[test]
+    fn zoom_section_keeps_the_defaults_it_does_not_name() {
+        let config: Config = toml::from_str("[zoom]\nmode = \"float\"\n").unwrap();
+        assert_eq!(config.zoom.float_pct(), (90, 90));
+        let config: Config = toml::from_str("[zoom]\nwidth = 50\n").unwrap();
+        assert_eq!(config.zoom.mode, ZoomMode::Fullscreen);
+        assert_eq!(config.zoom.float_pct(), (50, 90));
+    }
+
+    #[test]
+    fn zoom_size_clamps_instead_of_failing_the_config() {
+        for (given, want) in [
+            (0, 20),
+            (19, 20),
+            (20, 20),
+            (100, 100),
+            (101, 100),
+            (500, 100),
+            (-5, 20),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[zoom]\nwidth = {given}\nheight = {given}\n"))
+                    .unwrap_or_else(|e| panic!("{given}: {e}"));
+            assert_eq!(config.zoom.float_pct(), (want, want), "{given}");
+        }
+        assert!(toml::from_str::<Config>("[zoom]\nwidth = \"wide\"\n").is_err());
+    }
+
+    #[test]
+    fn zoom_mode_rejects_an_unknown_spelling() {
+        assert!(toml::from_str::<Config>("[zoom]\nmode = \"Float\"\n").is_err());
+    }
+
+    #[test]
+    fn popup_position_defaults_to_float() {
+        assert_eq!(
+            Config::default().appearance.popup_position,
+            PopupPosition::Float
+        );
+    }
+
+    #[test]
+    fn popup_position_parses_every_value() {
+        for (value, want) in [
+            ("float", PopupPosition::Float),
+            ("left", PopupPosition::Left),
+            ("right", PopupPosition::Right),
+            ("top", PopupPosition::Top),
+            ("bottom", PopupPosition::Bottom),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[appearance]\npopup_position = \"{value}\"\n")).unwrap();
+            assert_eq!(config.appearance.popup_position, want, "{value}");
+        }
+    }
+
+    #[test]
+    fn popup_position_parse_agrees_with_the_config_spelling() {
+        use PopupPosition::*;
+        for position in [Float, Left, Right, Top, Bottom] {
+            let json = serde_json::to_string(&position).unwrap();
+            let name = json.trim_matches('"');
+            assert_eq!(PopupPosition::parse(name), Some(position), "{name}");
+        }
+        assert_eq!(PopupPosition::parse("sideways"), None);
+        assert_eq!(
+            PopupPosition::parse("Float"),
+            None,
+            "the spelling is snake_case"
+        );
+    }
+
+    fn args(text: &str) -> Vec<String> {
+        text.split_whitespace().map(str::to_string).collect()
+    }
+
+    fn placement(position: PopupPosition, width: Option<u8>, height: Option<u8>) -> PopupPlacement {
+        PopupPlacement {
+            position,
+            size: Some(PopupSize { width, height }),
+        }
+    }
+
+    #[test]
+    fn popup_toggle_args_name_a_position_and_an_optional_size() {
+        use PopupPosition::*;
+        let ok = |text: &str| PopupPlacement::from_args(&args(text));
+        assert_eq!(ok(""), Ok(None));
+        assert_eq!(ok("right"), Ok(Some(Right.into())));
+        assert_eq!(
+            ok("float 80"),
+            Ok(Some(placement(Float, Some(80), Some(80))))
+        );
+        assert_eq!(
+            ok("float 80x60"),
+            Ok(Some(placement(Float, Some(80), Some(60))))
+        );
+        assert_eq!(ok("right 40"), Ok(Some(placement(Right, Some(40), None))));
+        assert_eq!(ok("left 40"), Ok(Some(placement(Left, Some(40), None))));
+        assert_eq!(ok("bottom 30"), Ok(Some(placement(Bottom, None, Some(30)))));
+        assert_eq!(ok("top 30"), Ok(Some(placement(Top, None, Some(30)))));
+    }
+
+    #[test]
+    fn a_popup_size_is_clamped_to_the_config_range() {
+        use PopupPosition::*;
+        let ok = |text: &str| PopupPlacement::from_args(&args(text));
+        assert_eq!(
+            ok("float 5"),
+            Ok(Some(placement(Float, Some(20), Some(20))))
+        );
+        assert_eq!(
+            ok("float 0"),
+            Ok(Some(placement(Float, Some(20), Some(20))))
+        );
+        assert_eq!(
+            ok("float 250x10"),
+            Ok(Some(placement(Float, Some(100), Some(20))))
+        );
+        assert_eq!(
+            ok("right 1000"),
+            Ok(Some(placement(Right, Some(100), None)))
+        );
+        assert_eq!(
+            ok("float 99999999999"),
+            Ok(Some(placement(Float, Some(100), Some(100)))),
+            "a number too big for a machine word still clamps"
+        );
+    }
+
+    #[test]
+    fn a_bad_popup_toggle_argument_is_a_named_error() {
+        let err = |text: &str| PopupPlacement::from_args(&args(text)).unwrap_err();
+        for (text, want) in [
+            ("sideways", "invalid position 'sideways'"),
+            ("80", "size '80' that needs a position before it"),
+            ("80x60", "size '80x60' that needs a position before it"),
+            ("float wide", "invalid size 'wide'"),
+            ("float 80x", "invalid size '80x'"),
+            ("float x60", "invalid size 'x60'"),
+            ("float 80x60x40", "invalid size '80x60x40'"),
+            ("float -5", "invalid size '-5'"),
+            ("float 8.5", "invalid size '8.5'"),
+            ("float 80%", "invalid size '80%'"),
+            (
+                "right 80x60",
+                "size '80x60' for 'right' that takes one number, the width",
+            ),
+            (
+                "bottom 80x60",
+                "size '80x60' for 'bottom' that takes one number, the height",
+            ),
+            ("float 80 60", "unexpected argument '60'"),
+        ] {
+            let message = err(text);
+            assert!(message.contains(want), "{text:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn popup_position_rejects_an_unknown_value() {
+        let err = toml::from_str::<Config>("[appearance]\npopup_position = \"middle\"\n");
+        assert!(err.is_err());
     }
 
     #[test]

@@ -3390,6 +3390,115 @@ mod tests {
         }
     }
 
+    /// A float zoom changes both axes at once, unlike a fullscreen zoom of a
+    /// full-width pane. Lines are short enough that no resize here wraps them,
+    /// so any line that goes missing was dropped, not reflowed.
+    fn float_round_trip_keeps_every_line(slot: (u16, u16), float: (u16, u16)) {
+        let mut s = Screen::new(slot.0, slot.1, 2000);
+        for i in 0..60 {
+            s.process_output(format!("early {i}\r\n").as_bytes());
+        }
+        s.resize(float.0, float.1); // float zoom
+        for i in 0..30 {
+            s.process_output(format!("floated {i}\r\n").as_bytes());
+        }
+        let total_before = s.total_lines();
+        s.resize(slot.0, slot.1); // snap back
+
+        assert_eq!(
+            s.total_lines(),
+            total_before,
+            "{slot:?} -> {float:?} -> {slot:?}: lines may move between grid and scrollback, never vanish"
+        );
+        let lines = all_lines(&s);
+        for i in 0..30 {
+            let want = format!("floated {i}");
+            assert!(
+                lines.contains(&want),
+                "{want:?} was deleted by the snap-back; kept {lines:?}"
+            );
+        }
+        for i in 0..60 {
+            let want = format!("early {i}");
+            assert!(lines.contains(&want), "{want:?} lost from the history");
+        }
+        assert!(
+            all_lines(&s)[s.scrollback.len()..].contains(&"floated 29".to_string()),
+            "the newest line must still be on the screen after the snap-back"
+        );
+    }
+
+    #[test]
+    fn float_zoom_of_a_narrow_pane_into_a_wider_shorter_box_and_back_keeps_every_line() {
+        float_round_trip_keeps_every_line((33, 27), (88, 24));
+    }
+
+    #[test]
+    fn float_zoom_of_a_big_pane_into_a_smaller_box_and_back_keeps_every_line() {
+        float_round_trip_keeps_every_line((98, 27), (88, 24));
+    }
+
+    #[test]
+    fn float_zoom_of_a_short_pane_into_a_taller_narrower_box_and_back_keeps_every_line() {
+        float_round_trip_keeps_every_line((100, 12), (60, 30));
+    }
+
+    #[test]
+    fn float_zoom_cycles_keep_growing_the_scrollback() {
+        let mut s = Screen::new(33, 27, 5000);
+        for i in 0..60 {
+            s.process_output(format!("early {i}\r\n").as_bytes());
+        }
+        for cycle in 0..3 {
+            let before = s.max_scroll_offset();
+            s.resize(88, 24);
+            for i in 0..30 {
+                s.process_output(format!("cycle {cycle} line {i}\r\n").as_bytes());
+            }
+            s.resize(33, 27);
+            assert_eq!(
+                s.max_scroll_offset(),
+                before + 30,
+                "cycle {cycle}: 30 lines of output must add 30 scrollable lines"
+            );
+        }
+    }
+
+    #[test]
+    fn float_zoom_round_trip_with_a_full_screen_app_up_keeps_the_primary_screens_lines() {
+        for (slot, float) in [((33u16, 27u16), (88u16, 24u16)), ((98, 27), (88, 24))] {
+            let mut s = Screen::new(slot.0, slot.1, 2000);
+            for i in 0..100 {
+                s.process_output(format!("primary {i}\r\n").as_bytes());
+            }
+            let total_before = s.total_lines();
+
+            s.process_output(b"\x1b[?1049h");
+            s.resize(float.0, float.1); // float the pane while the app is up
+            for i in 0..10 {
+                s.process_output(format!("app {i}\r\n").as_bytes());
+            }
+            s.resize(slot.0, slot.1); // snap back while the app is still up
+            s.process_output(b"\x1b[?1049l");
+
+            // The parked primary screen pads with blank rows when it grows back
+            // instead of pulling history down, so the count may rise but must
+            // never fall.
+            assert!(
+                s.total_lines() >= total_before,
+                "{slot:?} -> {float:?}: the round trip must not consume primary lines"
+            );
+            let lines = all_lines(&s);
+            for i in 0..100 {
+                let want = format!("primary {i}");
+                assert!(
+                    lines.contains(&want),
+                    "{want:?} lost to the float round trip"
+                );
+            }
+        }
+    }
+
     #[test]
     fn resize_while_alt_active_keeps_the_primary_screens_bottom_rows() {
         // A pane resized while a full-screen application is up (zoom, split, a

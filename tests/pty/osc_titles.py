@@ -7,9 +7,10 @@ A real PTY, because all three are composited by the CLIENT. A stand-in
 itself the way Claude Code does, `✳ <task>`, so the settle window, the glyph
 strip and the live push are all exercised.
 
-  1  before the title, the panel row is today's `claude main/0`
-  2  after it, the row is the title alone, with the `✳` stripped, and the pane
-     border shows the same name
+  1  before the title, the panel row is two lines: `session · tab`, then the
+     agent's command
+  2  after it, the first line is the title alone, with the `✳` stripped, the
+     second line is still the command, and the pane border shows the same name
   3  the Alt+a switcher shows the same label
   4  a View cell over the agent pane is labelled with the title, followed by its
      location
@@ -22,7 +23,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import Tui, sm_compose_view  # noqa: E402
+from pty_harness import Tui, install_agent_standin, sm_compose_view  # noqa: E402
 
 RUN = "/tmp/rmx-osctp"
 BINDIR = "/tmp/rmx-osctp-bin"
@@ -66,6 +67,20 @@ def content_text(t):
     return [r[SIDEBAR_W:] for r in t.rows_text()]
 
 
+def panel_lines(t):
+    """The sidebar's text rows, with the frame glyphs and padding stripped."""
+    return [r.strip(" \u2502") for r in sidebar_text(t)]
+
+
+def agent_row_at(t, needle):
+    """(first line, second line) of the agents row whose first line has `needle`."""
+    lines = panel_lines(t)
+    for i, line in enumerate(lines[:-1]):
+        if line.startswith(("\u25cf", "\u25cb")) and needle in line:
+            return line, lines[i + 1]
+    return None
+
+
 def in_sidebar(t, needle):
     return any(needle in r for r in sidebar_text(t))
 
@@ -76,10 +91,7 @@ def in_content(t, needle):
 
 def write_agent():
     os.makedirs(BINDIR, exist_ok=True)
-    p = f"{BINDIR}/claude"
-    with open(p, "w") as f:
-        f.write(AGENT)
-    os.chmod(p, 0o755)
+    install_agent_standin(BINDIR, "claude", AGENT)
 
 
 def start(config, rundir):
@@ -101,11 +113,16 @@ def run_default():
     t = start(SIDEBAR, RUN)
     try:
         t.send("claude\r", 1.2)
-        check("1 the untitled row is `claude main/0`",
-              wait_for(t, lambda: in_sidebar(t, "claude main/0"), 2.0), t)
+        check("1 the untitled row is `session \u00b7 tab` over the command",
+              wait_for(t, lambda: (agent_row_at(t, "main \u00b7 ") or ("", ""))[1]
+                       == "claude", 2.0), t)
         check("2 the row becomes the title",
               wait_for(t, lambda: in_sidebar(t, TITLE), 5.0), t)
-        check("2 the row is the title alone", not in_sidebar(t, "claude main/0"), t)
+        check("2 the first line is the title alone",
+              (agent_row_at(t, TITLE) or ("", ""))[0][1:].strip() == TITLE
+              and not in_sidebar(t, "main \u00b7 "), t)
+        check("2 the second line is still the command",
+              (agent_row_at(t, TITLE) or ("", ""))[1] == "claude", t)
         check("2 the spinner glyph is stripped", not in_sidebar(t, "✳"), t)
         check("2 the pane border shows the title", in_content(t, TITLE), t)
 

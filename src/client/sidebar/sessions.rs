@@ -25,10 +25,13 @@ use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
-use super::nav::{self, NavKey, HEADER_ROWS};
-use super::{blank_grid, draw_text, PluginAction, PluginEvent, SidebarPlugin};
+#[cfg(test)]
+use super::nav::LIST_HEADER_ROWS;
+use super::nav::{self, ListLayout, NavKey};
+use super::{blank_grid, draw_text_with, PluginAction, PluginEvent, SidebarPlugin};
+use crate::client::context_menu::{MenuAction, MenuItem, RenameFor};
 use crate::client::registry::{ConnId, RemoteState};
-use crate::client::tree_model::{ConnTrees, NodeType, TreeModel};
+use crate::client::tree_model::{ConnTrees, JumpTarget, NodeType, TreeModel};
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
 
@@ -55,6 +58,10 @@ impl SessionsPlugin {
             model: TreeModel::new(),
             last_top: Cell::new(0),
         }
+    }
+
+    fn layout(&self) -> ListLayout {
+        ListLayout::new(1)
     }
 
     /// Push `trees` into the model: roster first (it is what makes server rows
@@ -88,6 +95,20 @@ impl SessionsPlugin {
                 Vec::new(),
             );
         }
+    }
+
+    /// The id of tab `tab_index` of `session` on `conn`, from the tree the panel
+    /// holds.
+    fn tab_id(&self, conn: &ConnId, session: &str, tab_index: usize) -> Option<u64> {
+        let (_, trees) = self.trees.iter().find(|(id, _)| id == conn)?;
+        trees
+            .unfiled
+            .iter()
+            .chain(trees.folders.iter().flat_map(|f| f.sessions.iter()))
+            .find(|s| s.name == session)?
+            .tabs
+            .get(tab_index)
+            .map(|t| t.id)
     }
 
     /// Whether the selected node has children to show or hide.
@@ -126,7 +147,7 @@ impl SidebarPlugin for SessionsPlugin {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        (12, 3)
+        (12, self.layout().header_rows as u16 + 2)
     }
 
     fn wants_session_tree(&self) -> bool {
@@ -145,17 +166,18 @@ impl SidebarPlugin for SessionsPlugin {
         if grid.is_empty() {
             return grid;
         }
-        nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
+        let layout = self.layout();
+        nav::draw_header(&mut grid, self.title(), focused, theme);
 
-        let top = nav::scroll_offset(self.model.selected, rows);
+        let top = nav::scroll_offset_in(layout, self.model.selected, rows);
         self.last_top.set(top);
-        for i in 0..(rows as usize).saturating_sub(HEADER_ROWS) {
+        for i in 0..layout.visible(rows) {
             let Some(row) = self.model.rows.get(top + i) else {
                 break;
             };
-            let y = (HEADER_ROWS + i) as u16;
+            let y = layout.row_of(i);
             let selected = top + i == self.model.selected;
-            let (fg, row_bg) = nav::row_colors(theme, focused, selected, &bg);
+            let (fg, row_bg, bold) = nav::row_colors(theme, focused, selected, &bg);
             if selected {
                 nav::fill_row(&mut grid, y, cols, &fg, &row_bg);
             }
@@ -175,7 +197,7 @@ impl SidebarPlugin for SessionsPlugin {
                 current,
                 row.display_name
             );
-            draw_text(&mut grid, 0, y, &text, fg, row_bg);
+            draw_text_with(&mut grid, layout.pad(), y, &text, fg, row_bg, bold);
         }
         grid
     }
@@ -221,7 +243,8 @@ impl SidebarPlugin for SessionsPlugin {
         if !nav::is_select_click(kind) {
             return PluginAction::None;
         }
-        let hit = nav::hit_test(
+        let hit = nav::hit_test_in(
+            self.layout(),
             y,
             self.last_top.get(),
             self.model.selected,
@@ -234,6 +257,84 @@ impl SidebarPlugin for SessionsPlugin {
             nav::HitOutcome::Ignore => PluginAction::None,
             nav::HitOutcome::Moved => PluginAction::Redraw,
             nav::HitOutcome::Activate => self.activate(),
+        }
+    }
+
+    fn context_menu(&mut self, _x: u16, y: u16) -> Vec<MenuItem> {
+        let hit = nav::hit_test_in(
+            self.layout(),
+            y,
+            self.last_top.get(),
+            self.model.selected,
+            self.model.rows.len(),
+        );
+        if nav::pick_row(hit, &mut self.model.selected).is_none() {
+            return Vec::new();
+        }
+        let Some(row) = self.model.selected_row() else {
+            return Vec::new();
+        };
+        match row.node_type.clone() {
+            NodeType::Session { server, name } => {
+                let target = JumpTarget::Session {
+                    conn: server.clone(),
+                    session: name.clone(),
+                };
+                vec![
+                    MenuItem::new("Switch", MenuAction::Jump(target)).hint(Some("Enter".into())),
+                    MenuItem::new(
+                        "Rename",
+                        MenuAction::Rename(RenameFor::Session {
+                            conn: server.clone(),
+                            name: name.clone(),
+                        }),
+                    ),
+                    MenuItem::new(
+                        "Kill session",
+                        MenuAction::KillSession { conn: server, name },
+                    )
+                    .confirm(),
+                ]
+            }
+            NodeType::Tab {
+                server,
+                session,
+                tab_index,
+            } => {
+                let target = JumpTarget::Tab {
+                    conn: server.clone(),
+                    session: session.clone(),
+                    tab_index,
+                };
+                let mut items =
+                    vec![MenuItem::new("Switch", MenuAction::Jump(target))
+                        .hint(Some("Enter".into()))];
+                // The id is read now, so a tab moved before a row is chosen is
+                // still the one renamed or closed.
+                if let Some(tab_id) = self.tab_id(&server, &session, tab_index) {
+                    items.push(MenuItem::new(
+                        "Rename",
+                        MenuAction::Rename(RenameFor::SessionTab {
+                            conn: server.clone(),
+                            session: session.clone(),
+                            tab_id,
+                        }),
+                    ));
+                    items.push(
+                        MenuItem::new(
+                            "Close tab",
+                            MenuAction::CloseTab {
+                                conn: server,
+                                session,
+                                tab_id,
+                            },
+                        )
+                        .confirm(),
+                    );
+                }
+                items
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -413,7 +514,7 @@ mod tests {
         let mut p = SessionsPlugin::new();
         p.on_event(&local_tree());
         let rows = painted(&p, 24, 8);
-        assert_eq!(rows[0], "Sessions");
+        assert_eq!(rows[0], " sessions");
         assert!(
             rows.iter().any(|r| r.contains("local")),
             "no local server row: {rows:?}"
@@ -605,14 +706,14 @@ mod tests {
         p.on_event(&local_tree());
         let open = painted(&p, 24, 12);
         assert!(
-            open.iter().any(|r| r.starts_with("\u{25BC} local")),
+            open.iter().any(|r| r.starts_with(" \u{25BC} local")),
             "an expanded server is not marked open: {open:?}"
         );
         select(&mut p, "local");
         p.on_key(key(KeyCode::Char('h')));
         let shut = painted(&p, 24, 12);
         assert!(
-            shut.iter().any(|r| r.starts_with("\u{25B6} local")),
+            shut.iter().any(|r| r.starts_with(" \u{25B6} local")),
             "a collapsed server is not marked shut: {shut:?}"
         );
     }
@@ -667,11 +768,14 @@ mod tests {
         let theme = CompositorTheme::default();
         let focused = p.render(24, 6, true, &theme);
         let idle = p.render(24, 6, false, &theme);
-        assert_eq!(focused[1][0].bg, theme.tab_active_bg);
-        assert_eq!(focused[1][0].fg, theme.tab_active_fg);
-        assert_eq!(idle[1][0].bg, theme.tab_inactive_bg);
+        assert_eq!(focused[2][0].bg, theme.sidebar_selection_bg);
+        assert_eq!(focused[2][1].fg, theme.sidebar_name_selected_fg);
+        assert!(focused[2][1].bold);
+        // Unfocused, the band stays and the name loses its bright colour.
+        assert_eq!(idle[2][0].bg, theme.sidebar_selection_bg);
+        assert_eq!(idle[2][1].fg, theme.status_bar_fg);
         assert_ne!(
-            focused[2][0].bg, theme.tab_active_bg,
+            focused[3][0].bg, theme.sidebar_selection_bg,
             "an unselected row is highlighted too"
         );
     }
@@ -688,7 +792,7 @@ mod tests {
             .iter()
             .position(|r| r.display_name == "alpha")
             .unwrap();
-        let y = (alpha + HEADER_ROWS) as u16;
+        let y = (alpha + LIST_HEADER_ROWS) as u16;
         let down = MouseEventKind::Down(MouseButton::Left);
         assert_eq!(p.on_mouse(0, y, down), PluginAction::Redraw);
         assert_eq!(p.model.selected, alpha);
@@ -699,6 +803,79 @@ mod tests {
                 session: "alpha".to_string(),
             })
         );
+    }
+
+    fn menu_at(p: &mut SessionsPlugin, label: &str) -> Vec<MenuItem> {
+        let idx = p
+            .model
+            .rows
+            .iter()
+            .position(|r| r.display_name == label)
+            .unwrap();
+        p.context_menu(0, (idx + LIST_HEADER_ROWS) as u16)
+    }
+
+    #[test]
+    fn a_session_row_offers_switch_rename_and_a_confirmed_kill() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let _ = painted(&p, 24, 12);
+        let items = menu_at(&mut p, "alpha");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Switch", "Rename", "Kill session"]);
+        let target = JumpTarget::Session {
+            conn: ConnId::Local,
+            session: "alpha".to_string(),
+        };
+        assert_eq!(items[0].action, MenuAction::Jump(target));
+        assert_eq!(
+            items[1].action,
+            MenuAction::Rename(RenameFor::Session {
+                conn: ConnId::Local,
+                name: "alpha".to_string()
+            })
+        );
+        assert_eq!(
+            items[2].action,
+            MenuAction::KillSession {
+                conn: ConnId::Local,
+                name: "alpha".to_string()
+            }
+        );
+        assert!(items[2].confirm && !items[0].confirm);
+        assert_eq!(p.model.selected_row().unwrap().display_name, "alpha");
+    }
+
+    #[test]
+    fn a_tab_row_offers_switch_rename_and_a_confirmed_close() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let _ = painted(&p, 24, 12);
+        let items = menu_at(&mut p, "editor");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Switch", "Rename", "Close tab"]);
+        assert!(matches!(
+            items[2].action,
+            MenuAction::CloseTab { tab_id: 1, .. }
+        ));
+        assert_eq!(
+            items[1].action,
+            MenuAction::Rename(RenameFor::SessionTab {
+                conn: ConnId::Local,
+                session: "alpha".to_string(),
+                tab_id: 1
+            })
+        );
+        assert!(items[2].confirm);
+    }
+
+    #[test]
+    fn the_header_and_the_rows_below_the_list_have_no_menu() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let _ = painted(&p, 24, 12);
+        assert!(p.context_menu(0, 0).is_empty());
+        assert!(p.context_menu(0, 200).is_empty());
     }
 
     #[test]
@@ -718,10 +895,10 @@ mod tests {
         select(&mut p, "editor");
         p.on_key(key(KeyCode::Char('l')));
         p.on_key(key(KeyCode::Char('G')));
-        // A 3-row panel shows the header plus the last two tree rows.
-        let _ = painted(&p, 24, 3);
+        // A 4-row panel shows the two-row header plus the last two tree rows.
+        let _ = painted(&p, 24, 4);
         let down = MouseEventKind::Down(MouseButton::Left);
-        p.on_mouse(0, 1, down);
+        p.on_mouse(0, 2, down);
         assert_eq!(
             p.model.selected,
             p.model.rows.len() - 2,
@@ -806,5 +983,59 @@ mod tests {
             .unwrap()
             .wants_session_tree()
         );
+    }
+
+    #[test]
+    fn the_tree_has_a_lowercase_header_a_blank_row_and_one_column_of_padding() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let out = painted(&p, 24, 8);
+        assert_eq!(out[0], " sessions");
+        assert_eq!(out[1], "");
+        assert!(out[2].starts_with(" \u{25BC}"), "{out:?}");
+    }
+
+    #[test]
+    fn the_band_spans_the_row_and_a_click_resolves_below_the_two_row_header() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let theme = CompositorTheme::default();
+        let grid = p.render(24, 8, true, &theme);
+        assert!(grid[2].iter().all(|c| c.bg == theme.sidebar_selection_bg));
+        assert!(grid[3].iter().all(|c| c.bg != theme.sidebar_selection_bg));
+        let down = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(p.on_mouse(0, 1, down), PluginAction::None, "the blank row");
+        assert_eq!(p.on_mouse(0, 3, down), PluginAction::Redraw);
+        assert_eq!(p.model.selected, 1);
+    }
+
+    #[test]
+    fn the_header_takes_the_active_colour_only_while_the_panel_has_focus() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let theme = CompositorTheme::default();
+        assert_eq!(
+            p.render(24, 6, true, &theme)[0][1].fg,
+            theme.sidebar_header_active_fg
+        );
+        assert_eq!(
+            p.render(24, 6, false, &theme)[0][1].fg,
+            theme.sidebar_dim_fg
+        );
+    }
+
+    #[test]
+    fn the_header_is_a_bar_whose_colours_follow_focus() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let theme = CompositorTheme::default();
+        for focused in [false, true] {
+            let grid = p.render(24, 6, focused, &theme);
+            nav::assert_header_bar(&grid, focused, &theme);
+            assert!(
+                grid[2].iter().all(|c| c.bg == theme.sidebar_selection_bg),
+                "the selection band keeps its own colour (focused={focused})"
+            );
+        }
     }
 }

@@ -24,6 +24,7 @@ use crate::client::input::{
     AgentSwitchOverlay, FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget,
     SessionSwitchOverlay, SidebarIntent, TabPickerOverlay, TabPickerTree,
 };
+use crate::client::popup::{HeldLayer, PopupBox, PopupState};
 use crate::client::registry::{ConnId, ConnectionManager, Incoming, RemoteState};
 use crate::client::renderer::Renderer;
 use crate::client::session_manager::{NodeType, SessionManagerAction};
@@ -1033,12 +1034,16 @@ async fn client_event_loop(
 /// streaming `RenderDiff`s into a socket nobody drains (backpressure).
 async fn switch_to_server(
     mgr: &mut ConnectionManager,
+    renderer: &mut Renderer,
     target: &ConnId,
     content: crate::server::layout::Rect,
 ) -> Result<()> {
     if mgr.is_foreground(target) {
         return Ok(());
     }
+    // The popup layer belongs to the server being left. The first frame of the
+    // new foreground brings its own, and repaints what the box covered.
+    renderer.clear_popup();
     // Ensure a remote target is connected before handing off (it usually already
     // is, from expanding its node, but be safe).
     if let ConnId::Remote(name) = target {
@@ -1171,26 +1176,6 @@ fn content_rect_now(chrome: &crate::client::chrome::Chrome) -> Result<crate::ser
     Ok(chrome.content_rect(c, r))
 }
 
-/// Which panel, if any, a screen coordinate falls inside.
-///
-/// `term_cols`/`term_rows` must come from [`Renderer::size`], not from a fresh
-/// `terminal::size()`: panels are laid out against the front buffer, and
-/// between a SIGWINCH and the `Resize` event the two disagree -- a hit test run
-/// against the new size would resolve against rects that are not on screen yet.
-fn panel_at(
-    chrome: &crate::client::chrome::Chrome,
-    term_cols: u16,
-    term_rows: u16,
-    x: u16,
-    y: u16,
-) -> Option<(usize, usize)> {
-    chrome
-        .panel_rects(term_cols, term_rows)
-        .into_iter()
-        .find(|(_, _, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-        .map(|(si, pi, _)| (si, pi))
-}
-
 /// Which region a mouse gesture belongs to.
 ///
 /// A press claims a region and every event up to the matching release stays
@@ -1203,7 +1188,13 @@ fn panel_at(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MouseGrab {
     Content,
-    Panel { sidebar: usize, panel: usize },
+    Panel {
+        sidebar: usize,
+        panel: usize,
+    },
+    /// The interior of the popup box. A drag that began there keeps feeding the
+    /// popup and is clamped into its interior, never into the content rect.
+    Popup,
 }
 
 /// The focus direction a `PaneFocus*` command asks for, if it is one.
@@ -1337,7 +1328,7 @@ async fn switch_to_target(
     // renderer at it before the target server is told what size to composite.
     let content = content_rect_now(chrome)?;
     sync_content_rect(renderer, chrome, &content);
-    switch_to_server(mgr, &server, content).await?;
+    switch_to_server(mgr, renderer, &server, content).await?;
     // The server's handle_command ignores commands from a client with no
     // attached session, so a remote switch must attach first (a harmless
     // re-attach for local). Attaching alone is what a session-level jump is.
@@ -1465,6 +1456,22 @@ fn focused_pane<'a>(
         .and_then(active_tab_focused_pane)
 }
 
+/// `focus`, the pane the foreground server's session tree last named, if it
+/// still says where the user is.
+///
+/// It is only refreshed by a tree push from the foreground server, so it goes
+/// stale in three ways: the tree is unsubscribed, the connection drops (the
+/// reconcile then forgets it, so both read as "not in `subscribed`"), or another
+/// server comes to the foreground. A stale focus would suppress notifications
+/// for a pane the user is no longer looking at.
+fn current_tree_focus(
+    focus: Option<(ConnId, crate::protocol::PaneId)>,
+    subscribed: &std::collections::HashSet<ConnId>,
+    is_foreground: impl Fn(&ConnId) -> bool,
+) -> Option<(ConnId, crate::protocol::PaneId)> {
+    focus.filter(|(conn, _)| subscribed.contains(conn) && is_foreground(conn))
+}
+
 /// A session's active tab's focused pane. `None` when no tab is marked active
 /// (an older peer) or the active tab marks no focused pane.
 fn active_tab_focused_pane(
@@ -1555,6 +1562,195 @@ async fn reconcile_push_subscription(
     subscribed.retain(|id| live.contains(id));
 }
 
+/// What a sidebar change needs to repaint, borrowed from the client loop.
+struct SidebarApply<'a> {
+    renderer: &'a mut Renderer,
+    chrome: &'a mut crate::client::chrome::Chrome,
+    mgr: &'a mut ConnectionManager,
+    views: &'a mut [crate::client::view::ClientView],
+    active_view: Option<usize>,
+    input: &'a InputHandler,
+    whichkey: &'a mut WhichKeyPopup,
+    theme: &'a crate::config::theme::Theme,
+    compositor_theme: &'a crate::config::theme::CompositorTheme,
+    view_border_style: &'a crate::config::BorderStyle,
+    which_key_position: &'a crate::config::WhichKeyPosition,
+    viewport_top: usize,
+    focused_pane_rect: Option<&'a crate::protocol::PaneRect>,
+    /// The cursor the shell last reported: `(x, y, visible)`.
+    cursor: (u16, u16, bool),
+}
+
+/// Apply a sidebar intent and bring the screen, the server's `Resize`, the
+/// persisted state and any live view into agreement with it.
+///
+/// The one path for the keyboard (`Prefix b ...`) and the mouse (the collapse
+/// chip and a collapsed strip), so both leave identical state, a live view
+/// included.
+async fn apply_sidebar_intent(ctx: SidebarApply<'_>, intent: SidebarIntent) -> Result<()> {
+    let SidebarApply {
+        renderer,
+        chrome,
+        mgr,
+        views,
+        active_view,
+        input,
+        whichkey,
+        theme,
+        compositor_theme,
+        view_border_style,
+        which_key_position,
+        viewport_top,
+        focused_pane_rect,
+        cursor: (last_cursor_x, last_cursor_y, last_cursor_visible),
+    } = ctx;
+    let (tc, tr) = renderer.size();
+    // Tear the which-key popup down HERE -- before
+    // the refusal gate below can `continue`, and
+    // unconditionally, the way every other
+    // client-action arm does it.
+    //
+    // This arm used to have no `whichkey` teardown
+    // at all and lean on a side effect: a toggle
+    // that moves the content rect sends a `Resize`,
+    // the server answers with a `FullRender`, and
+    // the full repaint incidentally erased the
+    // popup. Every intent that changes NOTHING --
+    // a toggle for an edge with no sidebar
+    // configured, a cycle with no sidebars, a focus
+    // refused because a view owns the keyboard --
+    // repainted nothing (`Chrome::paint` over zero
+    // panel rects emits zero bytes) and stranded
+    // the popup on screen forever, while the mode
+    // reset underneath it fed the next keystroke
+    // straight to the shell.
+    let tore_down_popup = whichkey.visible;
+    if tore_down_popup {
+        whichkey.hide();
+        renderer.clear_overlay(tc, tr)?;
+    }
+    // FOCUS intents are refused while a view is live.
+    // A panel CAN hold the keyboard there -- a
+    // directional key deliberately hands it one --
+    // so this is a deliberate scope choice, not a
+    // technical impossibility: these name an EDGE
+    // with no regard for where the user is, so
+    // `Prefix b H` would pull them out of a cell
+    // they never left. Lifting it is a decision
+    // about behaviour, not a bug to fix.
+    // TOGGLE is honoured: the view is
+    // composited into the content rect now, and the
+    // panels it would show or hide are on screen next
+    // to it, so a toggle that did nothing would read as
+    // a dropped keypress. Logged either way, because a
+    // no-op that leaves no trace reads as one too.
+    if active_view.is_some() && !matches!(intent, SidebarIntent::Toggle(_)) {
+        log::debug!("sidebar: ignoring {intent:?} -- a view owns the keyboard");
+        // Nothing else runs, so the popup teardown
+        // above needs its own repaint: `paint_view`
+        // is what puts the view's cells and its
+        // cursor back after `clear_overlay`.
+        if tore_down_popup {
+            if let Some(av) = active_view {
+                paint_view(
+                    &mut *renderer,
+                    chrome,
+                    &views[av],
+                    input,
+                    whichkey,
+                    theme,
+                    compositor_theme,
+                    view_border_style,
+                    which_key_position,
+                    viewport_top,
+                    focused_pane_rect,
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    let before = chrome.content_rect(tc, tr);
+    // Snapshot of everything that OUTLIVES this
+    // client, so the save below fires on a real
+    // change and only on a real change. Comparing
+    // state rather than naming the intents keeps
+    // this correct for `Focus` (which opens a hidden
+    // sidebar) and for the resize/weight commands a
+    // later phase adds, and keeps a no-op toggle --
+    // including every toggle with no sidebar
+    // configured -- from writing a file at all.
+    let persisted_before = crate::client::sidebar_state::SidebarState::from_chrome(chrome);
+    match intent {
+        SidebarIntent::Toggle(edge) => {
+            chrome.toggle_edge(edge);
+        }
+        SidebarIntent::Focus(edge) => {
+            chrome.focus_edge(edge, tc, tr);
+        }
+        SidebarIntent::Cycle => chrome.cycle_focus(tc, tr),
+    }
+    if crate::client::sidebar_state::SidebarState::from_chrome(chrome) != persisted_before {
+        crate::client::sidebar_state::save(chrome);
+    }
+    // Showing or hiding a sidebar moves the content
+    // rect, which is the server's whole world: the
+    // origin and the `Resize` must travel together
+    // (see `sync_content_rect`). Focus/cycle leave
+    // the geometry alone, so nothing is sent.
+    let content = chrome.content_rect(tc, tr);
+    if content != before {
+        sync_content_rect(&mut *renderer, chrome, &content);
+        mgr.send_foreground(ClientMessage::Resize {
+            cols: content.width,
+            rows: content.height,
+        })
+        .await?;
+    }
+    match active_view {
+        // A live view owns the screen: its cells just
+        // changed size with the content rect, so
+        // re-demand their panes and recomposite -- the
+        // same pair the SIGWINCH path runs, for the
+        // same reason. `paint_view` paints the panels.
+        Some(av) => {
+            subscribe_view_cells(mgr, chrome, renderer, &mut views[av], view_border_style).await?;
+            paint_view(
+                &mut *renderer,
+                chrome,
+                &views[av],
+                input,
+                whichkey,
+                theme,
+                compositor_theme,
+                view_border_style,
+                which_key_position,
+                viewport_top,
+                focused_pane_rect,
+            )?;
+        }
+        None => {
+            chrome.paint(
+                renderer,
+                tc,
+                tr,
+                compositor_theme,
+                focused_pane_rect.filter(|_| active_view.is_none()),
+            )?;
+            // `clear_overlay` replays the front
+            // buffer with the cursor hidden, and
+            // only `paint_panel` puts it back --
+            // so with no panel on screen (which is
+            // exactly the no-op case above) the
+            // shell would be left with no cursor.
+            if tore_down_popup {
+                renderer.restore_cursor(last_cursor_x, last_cursor_y, last_cursor_visible)?;
+            }
+            renderer.flush()?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_plugin_action(
     action: crate::client::sidebar::PluginAction,
@@ -1617,6 +1813,197 @@ async fn handle_plugin_action(
     Ok(())
 }
 
+/// Open the rename prompt for `what`. Enter applies the name to that entity, not
+/// to whatever is focused by then.
+async fn open_rename_prompt(
+    what: crate::client::context_menu::RenameFor,
+    input: &mut InputHandler,
+    renderer: &mut Renderer,
+    mgr: &mut ConnectionManager,
+) -> Result<()> {
+    let (target, label) = match &what {
+        crate::client::context_menu::RenameFor::Pane(_) => (RenameTarget::Pane, "Pane"),
+        crate::client::context_menu::RenameFor::Tab(_)
+        | crate::client::context_menu::RenameFor::SessionTab { .. } => (RenameTarget::Tab, "Tab"),
+        crate::client::context_menu::RenameFor::Session { .. } => {
+            (RenameTarget::Session, "Session")
+        }
+    };
+    debug_assert_eq!(label, what.label());
+    input.rename_overlay = Some(crate::client::input::RenameOverlay {
+        buffer: String::new(),
+        cursor: 0,
+        target,
+    });
+    input.rename_explicit = Some(what);
+    let (c, r) = crossterm::terminal::size()?;
+    renderer.render_rename_popup("", label, c, r)?;
+    renderer.flush()?;
+    mgr.send_foreground(ClientMessage::ModeChanged {
+        mode: "COMMAND".to_string(),
+    })
+    .await
+}
+
+/// Run the action of a chosen context-menu row.
+#[allow(clippy::too_many_arguments)]
+async fn run_menu_action(
+    action: crate::client::context_menu::MenuAction,
+    input: &mut InputHandler,
+    chrome: &mut crate::client::chrome::Chrome,
+    mgr: &mut ConnectionManager,
+    renderer: &mut Renderer,
+    theme: &crate::config::theme::CompositorTheme,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
+    views: &[crate::client::view::ClientView],
+    active_view: &mut Option<usize>,
+    active_view_id: &mut Option<ViewId>,
+    mouse_grab: &mut Option<MouseGrab>,
+    last_local_session: &mut Option<String>,
+    current_attached: &mut Option<(ConnId, String)>,
+    previous_attached: &mut Option<(ConnId, String)>,
+) -> Result<()> {
+    use crate::client::context_menu::MenuAction;
+    use crate::client::sidebar::PluginAction;
+    log::debug!("context menu: run {action:?}");
+    match action {
+        MenuAction::Command(cmd) => {
+            mgr.send_foreground(ClientMessage::Command(cmd)).await?;
+        }
+        MenuAction::Rename(what) => open_rename_prompt(what, input, renderer, mgr).await?,
+        MenuAction::Jump(target) => {
+            handle_plugin_action(
+                PluginAction::JumpTo(target),
+                chrome,
+                mgr,
+                renderer,
+                theme,
+                focused_pane_rect,
+                views,
+                active_view,
+                active_view_id,
+                mouse_grab,
+                last_local_session,
+                current_attached,
+                previous_attached,
+            )
+            .await?;
+        }
+        MenuAction::JumpThen(target, then) => {
+            handle_plugin_action(
+                PluginAction::JumpTo(target),
+                chrome,
+                mgr,
+                renderer,
+                theme,
+                focused_pane_rect,
+                views,
+                active_view,
+                active_view_id,
+                mouse_grab,
+                last_local_session,
+                current_attached,
+                previous_attached,
+            )
+            .await?;
+            match *then {
+                MenuAction::Command(cmd) => {
+                    mgr.send_foreground(ClientMessage::Command(cmd)).await?;
+                }
+                other => log::warn!("context menu: no action follows a jump for {other:?}"),
+            }
+        }
+        MenuAction::KillSession { conn, name } => {
+            mgr.send(&conn, ClientMessage::KillSession { name }).await?;
+            mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+        }
+        MenuAction::CloseTab {
+            conn,
+            session,
+            tab_id,
+        } => {
+            mgr.send(
+                &conn,
+                ClientMessage::Command(RemuxCommand::TabCloseById { session, tab_id }),
+            )
+            .await?;
+            mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+        }
+        MenuAction::ClosePane {
+            conn,
+            session,
+            pane_id,
+        } => {
+            mgr.send(
+                &conn,
+                ClientMessage::Command(RemuxCommand::PaneCloseById { session, pane_id }),
+            )
+            .await?;
+            mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+        }
+        MenuAction::Request(request) => {
+            dispatch_plugin_request(0, 0, request, mgr).await;
+            // As the panel's own Enter does: the user asked for the file to be
+            // open, and the keys must reach the editor, not the panel.
+            handle_plugin_action(
+                PluginAction::Leave,
+                chrome,
+                mgr,
+                renderer,
+                theme,
+                focused_pane_rect,
+                views,
+                active_view,
+                active_view_id,
+                mouse_grab,
+                last_local_session,
+                current_attached,
+                previous_attached,
+            )
+            .await?;
+        }
+        MenuAction::CopyText(text) => {
+            if let Err(e) = copy_to_clipboard(&text) {
+                log::error!("Failed to copy to clipboard: {e}");
+            }
+        }
+        MenuAction::Cancel => {}
+    }
+    Ok(())
+}
+
+/// Repaint the screen under the context menu and lay the overlays back on, the
+/// menu last. Used when the highlight moves or the menu closes, since both
+/// leave cells of the old frame on screen.
+#[allow(clippy::too_many_arguments)]
+fn repaint_overlays(
+    renderer: &mut Renderer,
+    input: &InputHandler,
+    whichkey: &WhichKeyPopup,
+    theme: &crate::config::theme::Theme,
+    which_key_position: &crate::config::WhichKeyPosition,
+    viewport_top: usize,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
+    cursor: (u16, u16, bool),
+) -> Result<()> {
+    let (c, r) = crossterm::terminal::size()?;
+    renderer.clear_overlay(c, r)?;
+    relay_overlays(
+        renderer,
+        input,
+        whichkey,
+        theme,
+        which_key_position,
+        viewport_top,
+        focused_pane_rect,
+        c,
+        r,
+    )?;
+    renderer.restore_cursor(cursor.0, cursor.1, cursor.2)?;
+    renderer.flush()?;
+    Ok(())
+}
+
 /// Point the renderer at `content`.
 ///
 /// The origin and the content size are ONE piece of state and must always be
@@ -1647,6 +2034,406 @@ fn sync_content_rect(
         content.height - u16::from(owned && content.height > 0),
     );
     renderer.set_status_row_owned(owned);
+}
+
+/// The key a session's runtime popup resize is kept under: the server and the
+/// session on it, so two servers' sessions of the same name do not share one.
+fn popup_key(attached: &Option<(ConnId, String)>) -> String {
+    match attached {
+        Some((conn, name)) => format!("{conn:?}/{name}"),
+        None => String::new(),
+    }
+}
+
+/// Follow the rename of session `old` to `new` on server `conn`: in the
+/// attached and the last session, in the local session a fallback re-attaches
+/// to, and in the popup state kept under the name.
+///
+/// The attachment is otherwise only set by a switch, so without this every
+/// popup lookup that starts from it would use the old name while the frames use
+/// the new one, and the two would place different boxes. A fallback to the old
+/// local name would attach to a session that no longer exists under it.
+fn apply_session_rename(
+    conn: &ConnId,
+    old: &str,
+    new: &str,
+    current: &mut Option<(ConnId, String)>,
+    previous: &mut Option<(ConnId, String)>,
+    last_local: &mut Option<String>,
+    popup: &mut PopupState,
+) {
+    let old_key = popup_key(&Some((conn.clone(), old.to_string())));
+    let new_key = popup_key(&Some((conn.clone(), new.to_string())));
+    popup.rename_session(&old_key, &new_key);
+    for (c, name) in [current, previous].into_iter().flatten() {
+        if c == conn && name == old {
+            *name = new.to_string();
+        }
+    }
+    if matches!(conn, ConnId::Local) && last_local.as_deref() == Some(old) {
+        *last_local = Some(new.to_string());
+    }
+}
+
+/// The session a server frame belongs to, as `(server, session)`.
+///
+/// Usually the attached one, but not always: the attachment changes when the
+/// `Attach` is sent, so a frame the server sent for the session being left can
+/// still arrive after it. Its popup bookkeeping (which popups are alive, which
+/// one is on screen) is that session's, and filing it under the new one would
+/// drop the new session's records. A frame with no status bar description, from
+/// a server too old to send one, is taken as the attached session's.
+fn frame_attached(
+    current: &Option<(ConnId, String)>,
+    status: Option<&crate::server::compositor::StatusInfo>,
+) -> Option<(ConnId, String)> {
+    match (current, status) {
+        (Some((conn, _)), Some(status)) => Some((conn.clone(), status.session_name.clone())),
+        _ => current.clone(),
+    }
+}
+
+/// The popup box for the foreground session, in the terminal as the renderer
+/// sees it. The size is the renderer's, not a fresh `terminal::size()`, for the
+/// reason `Renderer::size` gives.
+fn popup_box_now(
+    popup: &PopupState,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &Renderer,
+    attached: &Option<(ConnId, String)>,
+) -> PopupBox {
+    let (tc, tr) = renderer.size();
+    popup.popup_box(&popup_key(attached), (tc, tr), chrome.content_rect(tc, tr))
+}
+
+/// What a popup layer changes about what the client knows of the focused pane
+/// and the cursor: both belong to the layer while it is up.
+struct PopupFocus {
+    /// Window-absolute `(x, y, visible, style)`.
+    cursor: (u16, u16, bool, u8),
+    /// The shared interior placed at the box's interior, window-absolute.
+    focused_pane_rect: crate::protocol::PaneRect,
+}
+
+/// Bring the popup box in line with a frame's `popup`: compose the box, show it
+/// and start masking it.
+///
+/// Called FIRST in the frame arms, before the frame is painted, so the frame
+/// skips the cells the box covers. `None` drops the box, and the frame that
+/// follows repaints what it covered.
+fn sync_popup(
+    layer: Option<Box<crate::protocol::PopupCells>>,
+    popup: &mut PopupState,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &mut Renderer,
+    attached: &Option<(ConnId, String)>,
+    theme: &crate::config::theme::CompositorTheme,
+) -> Result<Option<PopupFocus>> {
+    let key = popup_key(attached);
+    let Some(frame) = layer else {
+        renderer.clear_popup();
+        popup.bind_layer(&key, None);
+        return Ok(None);
+    };
+    // Before the box is placed: which popup this is decides where it goes.
+    popup.bind_layer(&key, Some(frame.pane_id));
+    let placed = popup_box_now(popup, chrome, renderer, attached);
+    // A frame that leaves the layer as it was, for a box that has not moved,
+    // can only have moved the cursor: the box on screen is already right.
+    let unchanged =
+        frame.cells.is_none() && frame.changes.is_empty() && renderer.popup_box() == Some(placed);
+    let Some(held) = HeldLayer::from_frame(renderer.take_held_layer(), &frame) else {
+        // Without a held layer no later diff applies either, so ask for the
+        // full one rather than show nothing until the box next moves.
+        renderer.clear_popup();
+        popup.bind_layer(&key, None);
+        popup.reannounce();
+        return Ok(None);
+    };
+    let interior = placed.interior;
+    let cursor = (
+        interior.x + held.cursor_x.min(interior.width.saturating_sub(1)),
+        interior.y + held.cursor_y.min(interior.height.saturating_sub(1)),
+        held.cursor_visible,
+        held.cursor_style,
+    );
+    let focused_pane_rect = crate::protocol::PaneRect {
+        x: interior.x,
+        y: interior.y,
+        width: held.cols.min(interior.width),
+        height: held.rows.min(interior.height),
+        neighbors: crate::protocol::FocusNeighbors::default(),
+    };
+    if unchanged {
+        renderer.set_popup_cursor(cursor);
+    } else {
+        let cells = crate::client::popup::compose_box(&placed, Some(&held), theme);
+        renderer.set_popup(placed.rect, cells, cursor);
+    }
+    renderer.set_held_layer(held, placed);
+    Ok(Some(PopupFocus {
+        cursor,
+        focused_pane_rect,
+    }))
+}
+
+/// Tell the foreground server the popup interior this client wants, when it has
+/// not been told for the current box.
+async fn send_popup_size(
+    mgr: &mut ConnectionManager,
+    popup: &mut PopupState,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &Renderer,
+    attached: &Option<(ConnId, String)>,
+) -> Result<()> {
+    let conn = mgr.foreground().clone();
+    if let Some((cols, rows)) = popup_size_to_send(popup, chrome, renderer, attached, &conn) {
+        mgr.send_foreground(ClientMessage::PopupSize { cols, rows })
+            .await?;
+    }
+    Ok(())
+}
+
+/// The body of [`send_popup_size`] without the send: the interior to announce
+/// to `conn`, if any.
+fn popup_size_to_send(
+    popup: &mut PopupState,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &Renderer,
+    attached: &Option<(ConnId, String)>,
+    conn: &ConnId,
+) -> Option<(u16, u16)> {
+    let placed = popup_box_now(popup, chrome, renderer, attached);
+    let size = popup.announce(conn, &placed);
+    if let Some((cols, rows)) = size {
+        log::debug!(
+            "popup: PopupSize {cols}x{rows} for the box at {:?}",
+            placed.rect
+        );
+    }
+    size
+}
+
+/// What a command is to [`prepare_popup_toggle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupToggleStep {
+    /// Not a `PopupToggle`: forward it as it is.
+    NotAToggle,
+    /// A `PopupToggle` that must not reach the server.
+    Swallow,
+    /// A `PopupToggle`, stripped of its position and size, to forward.
+    Forward,
+}
+
+/// Ready a `PopupToggle` for the foreground server, which learns neither the
+/// position nor the size.
+/// Returns `true` when the command must not be sent.
+///
+/// The placement the key named is recorded here instead, and when the toggle
+/// opens the popup the box it opens is announced FIRST, so the server spawns
+/// or shows the popup at that size rather than resizing it a frame later. A
+/// visible popup is closed by any popup key, so then nothing is announced.
+async fn prepare_popup_toggle(
+    cmd: &mut RemuxCommand,
+    mgr: &mut ConnectionManager,
+    popup: &mut PopupState,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &Renderer,
+    attached: &Option<(ConnId, String)>,
+    view_active: bool,
+) -> Result<bool> {
+    let step = plan_popup_toggle(cmd, popup, renderer, attached, view_active);
+    if step == PopupToggleStep::Forward && popup.is_opening() {
+        send_popup_size(mgr, popup, chrome, renderer, attached).await?;
+    }
+    Ok(step == PopupToggleStep::Swallow)
+}
+
+/// The decision [`prepare_popup_toggle`] acts on, and the state it records.
+///
+/// - While a View is up, a popup key is swallowed. The View owns the screen and
+///   shows no popup, so the client cannot tell an open from a close, and a
+///   recorded open would place whichever popup next appears.
+/// - A popup on screen, or one whose open is still waiting for its first
+///   layer, counts as visible, so a second key pressed before that layer
+///   closes it rather than recording a second open.
+fn plan_popup_toggle(
+    cmd: &mut RemuxCommand,
+    popup: &mut PopupState,
+    renderer: &Renderer,
+    attached: &Option<(ConnId, String)>,
+    view_active: bool,
+) -> PopupToggleStep {
+    let RemuxCommand::PopupToggle(placement) = cmd else {
+        return PopupToggleStep::NotAToggle;
+    };
+    if view_active {
+        log::debug!("popup: toggle placement={placement:?} ignored while a View is up");
+        return PopupToggleStep::Swallow;
+    }
+    let visible = renderer.popup_box().is_some() || popup.is_opening();
+    log::debug!("popup: toggle placement={placement:?} visible={visible}");
+    popup.toggle(&popup_key(attached), *placement, visible);
+    *placement = None;
+    PopupToggleStep::Forward
+}
+
+/// Where a mouse event lands relative to the popup box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupPointer {
+    /// In the popup's terminal, as interior-local coordinates.
+    Interior(u16, u16),
+    /// On the frame: it belongs to the popup and does nothing.
+    Frame,
+}
+
+/// Where `mouse` lands relative to the popup box, or `None` when the popup has
+/// no claim on it.
+///
+/// The box is over everything, so a press or a wheel step inside it is the
+/// popup's whichever sidebar or pane lies beneath. A drag or release follows
+/// the grab its press made: one that began in the interior keeps feeding the
+/// popup and is clamped into the interior, and one that began elsewhere is not
+/// the popup's even when it crosses the box. With no press behind it, motion
+/// over the box is swallowed.
+fn popup_pointer(
+    popup: &PopupBox,
+    grab: Option<MouseGrab>,
+    mouse: &crossterm::event::MouseEvent,
+) -> Option<PopupPointer> {
+    let inside = |r: &crate::server::layout::Rect| {
+        mouse.column >= r.x
+            && mouse.column < r.x + r.width
+            && mouse.row >= r.y
+            && mouse.row < r.y + r.height
+    };
+    let interior = popup.interior;
+    let local = || {
+        let x = mouse
+            .column
+            .clamp(interior.x, interior.x + interior.width.saturating_sub(1));
+        let y = mouse
+            .row
+            .clamp(interior.y, interior.y + interior.height.saturating_sub(1));
+        PopupPointer::Interior(x - interior.x, y - interior.y)
+    };
+    match mouse.kind {
+        MouseEventKind::Drag(_) | MouseEventKind::Up(_) => match grab {
+            Some(MouseGrab::Popup) => Some(local()),
+            Some(_) => None,
+            None => inside(&popup.rect).then_some(PopupPointer::Frame),
+        },
+        _ if inside(&interior) => Some(local()),
+        _ if inside(&popup.rect) => Some(PopupPointer::Frame),
+        _ => None,
+    }
+}
+
+/// [`popup_pointer`] against the box on screen, `on_screen`, while `wanted` is
+/// the box the client now asks the server for.
+///
+/// The two differ between a change that moves the box (a config reload, a
+/// runtime resize) and the server's answer, which is what replaces the box on
+/// screen. Until then an event the visible box claims is swallowed: its
+/// interior no longer matches the size the client asked for, and letting it
+/// fall through would hand it to whatever lies beneath the box.
+fn popup_hit(
+    on_screen: Option<PopupBox>,
+    wanted: &PopupBox,
+    grab: Option<MouseGrab>,
+    mouse: &crossterm::event::MouseEvent,
+) -> Option<PopupPointer> {
+    let on_screen = on_screen?;
+    let hit = popup_pointer(&on_screen, grab, mouse)?;
+    if on_screen != *wanted {
+        return Some(PopupPointer::Frame);
+    }
+    Some(hit)
+}
+
+/// Whether `mouse` dismisses the popup: a left press the popup has no claim on,
+/// with a popup box on screen or an open still waiting for its first layer.
+///
+/// Only a press does. The wheel acts on what is under the pointer, so the popup
+/// stays, and a drag or release belongs to the press that began it.
+///
+/// A dismissing press also cancels a pending open. The server hides the popup
+/// the press finds, one the user may not have seen yet, so the open this client
+/// is waiting on will not happen, and the next popup key must open a popup, not
+/// read as a close of one.
+fn dismisses_popup(
+    popup: &mut PopupState,
+    popup_on_screen: bool,
+    pointer: Option<PopupPointer>,
+    mouse: &crossterm::event::MouseEvent,
+) -> bool {
+    let up = popup_on_screen || popup.is_opening();
+    let dismisses =
+        up && pointer.is_none() && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+    if dismisses {
+        popup.cancel_opening();
+    }
+    dismisses
+}
+
+/// The message that closes the popup for a press the client answers itself
+/// (a sidebar, its frame or collapse chip, the bar's tail), so the press has no
+/// server message of its own to carry the close. A press the server gets closes
+/// the popup there instead, in the handler that acts on the press.
+///
+/// A `PopupToggle` would flip the popup, and the client's view of it lags the
+/// server's by a frame: sent after another client's close, or after this
+/// client's own earlier close, it would open the popup again. A press at
+/// `(u16::MAX, u16::MAX)` hits no pane, tab or stack label, so the server only
+/// runs the popup's dismissal, which hides and never opens. It also clears the
+/// client's content selection, as a press anywhere else in the content does.
+fn popup_dismiss_message() -> ClientMessage {
+    ClientMessage::MouseClick {
+        x: u16::MAX,
+        y: u16::MAX,
+        pane_id: None,
+        release: false,
+        popup: false,
+    }
+}
+
+async fn dismiss_popup(mgr: &mut ConnectionManager) -> Result<()> {
+    log::debug!("popup: closing for a press outside the box");
+    mgr.send_foreground(popup_dismiss_message()).await
+}
+
+/// Resize the popup instead of the layout, when a popup is up and the keyboard
+/// is in the content. Returns `true` when the command was consumed.
+///
+/// A `Resize*` while the popup is visible adjusts the popup on the axis its
+/// position uses; the other axis is ignored and logged. It never reaches the
+/// server, which keeps the layout from being resized underneath the popup. The
+/// new box is announced by the next [`send_popup_size`].
+fn intercept_popup_resize(
+    cmd: &RemuxCommand,
+    popup: &mut PopupState,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &Renderer,
+    attached: &Option<(ConnId, String)>,
+) -> bool {
+    use crate::server::layout::FocusDirection;
+    if renderer.popup_rect().is_none()
+        || !matches!(chrome.focus, crate::client::chrome::ChromeFocus::Content)
+    {
+        return false;
+    }
+    let Some((dir, amount)) = resize_of(cmd) else {
+        return false;
+    };
+    let amount = amount as i16;
+    let (dw, dh) = match dir {
+        FocusDirection::Left => (-amount, 0),
+        FocusDirection::Right => (amount, 0),
+        FocusDirection::Up => (0, -amount),
+        FocusDirection::Down => (0, amount),
+    };
+    popup.resize(&popup_key(attached), dw, dh);
+    true
 }
 
 /// Paint the server's status bar across the terminal's last row, when the
@@ -1783,6 +2570,10 @@ fn relay_overlays(
     else if whichkey.visible {
         let commands = whichkey.render(cols, rows, theme, which_key_position.clone());
         renderer.render_whichkey_overlay(&commands)?;
+    }
+    // The context menu goes last: it is over everything, the popup included.
+    if let Some(ref menu) = input.context_menu {
+        renderer.render_whichkey_overlay(&menu.render(theme))?;
     }
     Ok(())
 }
@@ -2573,7 +3364,9 @@ async fn send_to_focused_cell(
 ///   re-subscribe the view's cells to the content rect that moved
 ///   (`handle_chrome_resize` cannot: it repaints with `chrome.paint`).
 /// - `PaneMove{Left,Right,Up,Down}` -> `ViewMoveCell { dir }`.
-/// - `PaneToggleZoom` -> `ViewToggleZoom`.
+/// - `PaneToggleZoom`, `PaneToggleZoomFullscreen` and `PaneToggleZoomFloat` ->
+///   `ViewToggleZoom`. A view has one zoom, the focused cell filling the view,
+///   so a float request falls back to it.
 /// - `SetMaster` -> `ViewSetMaster` (Master layout + promote the focused cell).
 /// - `PaneClose` -> eject the focused cell: `ViewRemoveCell { cell_id }` (the
 ///   real pane is untouched; the resync unsubscribes it).
@@ -2840,7 +3633,9 @@ async fn handle_view_command(
             repaint!();
             Ok(true)
         }
-        RemuxCommand::PaneToggleZoom => {
+        RemuxCommand::PaneToggleZoom
+        | RemuxCommand::PaneToggleZoomFullscreen
+        | RemuxCommand::PaneToggleZoomFloat => {
             hide_whichkey!();
             if !views[av].cells.is_empty() {
                 mgr.send(
@@ -3042,6 +3837,12 @@ async fn run_client_loop(
     // back.
     let mut prev_sidebar_cfg = config.sidebar.clone();
     let mut which_key_position = config.appearance.which_key_position.clone();
+    // Where the popup terminal sits, and how the user has resized it. The
+    // client places the popup itself; the server only sizes its PTY to what is
+    // announced with `PopupSize`.
+    let mut popup = PopupState::from_config(config);
+    // Whether the last frame the foreground session sent holds a float zoom.
+    let mut float_zoom = false;
     // Border style used to frame a VIEW's cells. This is client-local, and has
     // to be: `Session::border_style` is PER-SESSION server state, while a view's
     // cells alias panes across several sessions and machines at once, so there
@@ -3241,6 +4042,79 @@ async fn run_client_loop(
     // with the list already on screen when a panel keeps it subscribed.
     let mut agent_roster = crate::client::sidebar::agents::AgentRoster::new();
     agent_roster.set_pane_title(pane_title.clone());
+    // Desktop notifications, fed by the same agent lists. While enabled they
+    // keep the push subscribed on every connection, panel or no panel.
+    let mut notifier =
+        crate::client::notify::AgentNotifier::new(config.notifications.clone(), pane_title.clone());
+    // The pane the foreground server's session tree last named as focused.
+    // Only updated while something subscribes to the tree, and dropped by
+    // `current_tree_focus` once it no longer describes the screen.
+    let mut tree_focus: Option<(ConnId, crate::protocol::PaneId)> = None;
+
+    // Whether the right button went down on something that got the press, so
+    // its release is forwarded and a release with no such press is not.
+    let mut right_down = false;
+    // What a key or a click did to the open context menu: repaint, close, or
+    // close and run the chosen row. A macro because it reads a dozen of this
+    // loop's locals, which a function would take as a dozen parameters.
+    macro_rules! apply_menu_outcome {
+        ($outcome:expr) => {{
+            use crate::client::context_menu::MenuOutcome;
+            let outcome: MenuOutcome = $outcome;
+            let chosen = match outcome {
+                MenuOutcome::Ignored => None,
+                MenuOutcome::Redraw => {
+                    repaint_overlays(
+                        &mut renderer,
+                        &input,
+                        &whichkey,
+                        &theme,
+                        &which_key_position,
+                        viewport_top,
+                        focused_pane_rect.as_ref(),
+                        (last_cursor_x, last_cursor_y, last_cursor_visible),
+                    )?;
+                    None
+                }
+                MenuOutcome::Close | MenuOutcome::Run(_) => {
+                    input.context_menu = None;
+                    repaint_overlays(
+                        &mut renderer,
+                        &input,
+                        &whichkey,
+                        &theme,
+                        &which_key_position,
+                        viewport_top,
+                        focused_pane_rect.as_ref(),
+                        (last_cursor_x, last_cursor_y, last_cursor_visible),
+                    )?;
+                    match outcome {
+                        MenuOutcome::Run(action) => Some(action),
+                        _ => None,
+                    }
+                }
+            };
+            if let Some(action) = chosen {
+                run_menu_action(
+                    action,
+                    &mut input,
+                    &mut chrome,
+                    mgr,
+                    &mut renderer,
+                    &compositor_theme,
+                    focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
+                    &views,
+                    &mut active_view,
+                    &mut active_view_id,
+                    &mut mouse_grab,
+                    &mut last_local_session,
+                    &mut current_attached,
+                    &mut previous_attached,
+                )
+                .await?;
+            }
+        }};
+    }
 
     loop {
         // Lay the panels out and act on what they ask for, before anything can
@@ -3253,6 +4127,12 @@ async fn run_client_loop(
                 dispatch_plugin_request(si, pi, req, mgr).await;
             }
         }
+        // Announce the popup interior the foreground server should size its
+        // popup PTYs to. Done here, once per pass, because everything that
+        // moves the box -- an attach or a server switch, a terminal or sidebar
+        // resize, a config reload, a runtime popup resize -- ends its handling
+        // and comes back to this point, and an unchanged box sends nothing.
+        send_popup_size(mgr, &mut popup, &chrome, &renderer, &current_attached).await?;
         reconcile_push_subscription(
             wants_session_tree,
             &mut tree_subscribed,
@@ -3261,9 +4141,11 @@ async fn run_client_loop(
             "the session tree",
         )
         .await;
-        // The agents panel and an open agent switcher each need the push; the
-        // server keeps ONE flag per client, so the client decides for both.
-        let agent_push_wanted = wants_agents || input.agent_switch.is_some();
+        // The agents panel, an open agent switcher and desktop notifications
+        // each need the push; the server keeps ONE flag per client, so the
+        // client decides for all three.
+        let agent_push_wanted =
+            wants_agents || input.agent_switch.is_some() || notifier.config().enabled;
         reconcile_push_subscription(
             agent_push_wanted,
             &mut agents_subscribed,
@@ -3273,9 +4155,10 @@ async fn run_client_loop(
         )
         .await;
         if !agent_push_wanted && !agents_subscribed.is_empty() {
-            // The switcher closed and no panel wants the list. Unsubscribing
-            // here, never at the close itself, is what keeps a panel's
-            // subscription alive: this runs only when neither wants it.
+            // The switcher closed, and neither a panel nor notifications want
+            // the list. Unsubscribing here, never at the close itself, is what
+            // keeps the others' subscription alive: this runs only when none of
+            // them wants it.
             for id in &agents_subscribed {
                 log::debug!("agents: unsubscribing from the agent list on {id:?}");
                 if let Err(e) = mgr.send(id, ClientMessage::UnsubscribeAgents).await {
@@ -3287,6 +4170,26 @@ async fn run_client_loop(
         // The held lists are only current while subscribed, so a connection
         // that is not must not seed the next switcher with a stale list.
         agent_roster.retain(|id| agents_subscribed.contains(id));
+        // A connection that stopped pushing is forgotten without an `exited`
+        // for each of its agents, and its next list is a fresh baseline.
+        notifier.retain(|id| agents_subscribed.contains(id));
+        tree_focus = current_tree_focus(tree_focus, &tree_subscribed, |id| mgr.is_foreground(id));
+        // In a view the focused cell is what the user is looking at, and it is
+        // not the focused pane of any session, so the server's flag cannot
+        // know about it.
+        notifier.set_local_focus(match active_view {
+            Some(av) => views
+                .get(av)
+                .and_then(|v| v.cells.get(v.focused))
+                .map(|c| (c.conn.clone(), c.pane_id)),
+            None => tree_focus.clone(),
+        });
+        for n in notifier.tick(std::time::Instant::now()) {
+            crate::client::notify::deliver(&n, notifier.config());
+        }
+        let notify_wait = notifier
+            .next_deadline()
+            .map(|due| due.saturating_duration_since(std::time::Instant::now()));
         // How long until some VISIBLE panel wants ticking, computed fresh each
         // pass. `None` -- no sidebar, none visible, or no panel that polls --
         // disables the timer branch below entirely, so a client with no such
@@ -3307,12 +4210,23 @@ async fn run_client_loop(
             // reach. Requests it produces are dispatched there, and their
             // answers repaint through the ordinary server-message arms.
             _ = tokio::time::sleep(panel_poll.unwrap_or_default()), if panel_poll.is_some() => {}
+            // A notification waiting out its settle window. The tick at the
+            // top of the loop fires it.
+            _ = tokio::time::sleep(notify_wait.unwrap_or_default()), if notify_wait.is_some() => {}
             // Keyboard events
             event = event_stream.next() => {
                 match event {
                     Some(Ok(crossterm::event::Event::Key(key)))
                         if key.kind == KeyEventKind::Press =>
                     {
+                        // An open context menu is modal and owns every key. It
+                        // sits ahead of the sidebar key gate below, which would
+                        // otherwise hand j/k/Enter/Esc to a focused panel.
+                        if let Some(menu) = input.context_menu.as_mut() {
+                            let outcome = menu.key(key);
+                            apply_menu_outcome!(outcome);
+                            continue;
+                        }
                         // A focused sidebar owns the keyboard, except for the
                         // prefix (which keeps command mode reachable), directional
                         // focus (handled by `intercept_focus` on the way out), the
@@ -3347,8 +4261,9 @@ async fn run_client_loop(
                         // re-subscribing the view's cells.
                         //
                         // Panels are laid out against the front buffer, so the
-                        // sizes come from `Renderer::size` -- see `panel_at` for
-                        // the SIGWINCH window a fresh `terminal::size()` reopens.
+                        // sizes come from `Renderer::size` -- see
+                        // `Chrome::pointer_target` for the SIGWINCH window a
+                        // fresh `terminal::size()` reopens.
                         if input.mode == Mode::Normal && !input.has_overlay() {
                             let (tc, tr) = renderer.size();
                             match chrome.focused_panel(tc, tr) {
@@ -3490,7 +4405,7 @@ async fn run_client_loop(
                                     mgr.send_foreground(ClientMessage::Input { data }).await?;
                                 }
                             }
-                            InputAction::Execute(cmd) => {
+                            InputAction::Execute(mut cmd) => {
                                 log::debug!("input: Execute cmd={:?}", cmd);
                                 // Border style is a display preference honored by
                                 // BOTH renderers: flip the client-local view style
@@ -3562,7 +4477,9 @@ async fn run_client_loop(
                                     if crate::client::chrome::intercept_focus(
                                         &mut chrome,
                                         dir,
-                                        focused_pane_rect.as_ref(),
+                                        // The popup layer owns the rect while it
+                                        // is up, and it is not a pane's edge.
+                                        focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()),
                                         tc,
                                         tr,
                                         &config.appearance.status_bar_position,
@@ -3571,6 +4488,12 @@ async fn run_client_loop(
                                         renderer.flush()?;
                                         continue;
                                     }
+                                }
+                                // While the popup is up and the keyboard is in
+                                // the content, `Resize*` resizes the popup, on
+                                // the client; it never reaches the server.
+                                if intercept_popup_resize(&cmd, &mut popup, &chrome, &renderer, &current_attached) {
+                                    continue;
                                 }
                                 // A focused sidebar re-targets `Resize*` at
                                 // itself: its own size across the edge, its
@@ -3593,7 +4516,7 @@ async fn run_client_loop(
                                 // Handle SendKey: forward raw bytes to PTY.
                                 if let RemuxCommand::SendKey(ref bytes) = cmd {
                                     mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
-                                } else {
+                                } else if !prepare_popup_toggle(&mut cmd, mgr, &mut popup, &chrome, &renderer, &current_attached, active_view.is_some()).await? {
                                     mgr.send_foreground(ClientMessage::Command(cmd)).await?;
                                 }
                                 // Notify server of current mode if it changed.
@@ -3620,6 +4543,11 @@ async fn run_client_loop(
                                     }
                                 }
                             }
+                            InputAction::ExecuteOn { conn, command } => {
+                                log::debug!("input: ExecuteOn conn={conn:?} cmd={command:?}");
+                                mgr.send(&conn, ClientMessage::Command(command)).await?;
+                                mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+                            }
                             InputAction::ExecuteChain(cmds) => {
                                 log::debug!("input: ExecuteChain count={} cmds={:?}", cmds.len(), cmds);
                                 // Hide which-key popup when executing commands
@@ -3628,7 +4556,7 @@ async fn run_client_loop(
                                     renderer.clear_overlay(cols, rows)?;
                                     renderer.flush()?;
                                 }
-                                for cmd in cmds {
+                                for mut cmd in cmds {
                                     if matches!(cmd, RemuxCommand::SessionDetach) {
                                         return Ok(());
                                     }
@@ -3681,7 +4609,7 @@ async fn run_client_loop(
                                         if crate::client::chrome::intercept_focus(
                                             &mut chrome,
                                             dir,
-                                            focused_pane_rect.as_ref(),
+                                            focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()),
                                             tc,
                                             tr,
                                             &config.appearance.status_bar_position,
@@ -3690,6 +4618,11 @@ async fn run_client_loop(
                                             renderer.flush()?;
                                             continue;
                                         }
+                                    }
+                                    // Resizes the popup instead, exactly as in the
+                                    // single-command arm.
+                                    if intercept_popup_resize(&cmd, &mut popup, &chrome, &renderer, &current_attached) {
+                                        continue;
                                     }
                                     // Re-targeted at the sidebar exactly as in
                                     // the single-command arm; `continue` skips
@@ -3710,7 +4643,7 @@ async fn run_client_loop(
                                     }
                                     if let RemuxCommand::SendKey(ref bytes) = cmd {
                                         mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
-                                    } else {
+                                    } else if !prepare_popup_toggle(&mut cmd, mgr, &mut popup, &chrome, &renderer, &current_attached, active_view.is_some()).await? {
                                         mgr.send_foreground(ClientMessage::Command(cmd)).await?;
                                     }
                                 }
@@ -4004,7 +4937,7 @@ async fn run_client_loop(
                                 renderer.flush()?;
                             }
                             InputAction::ExecuteAndShowWhichKey {
-                                command,
+                                mut command,
                                 label,
                                 entries,
                                 shortcuts,
@@ -4062,7 +4995,7 @@ async fn run_client_loop(
                                         if crate::client::chrome::intercept_focus(
                                             &mut chrome,
                                             dir,
-                                            focused_pane_rect.as_ref(),
+                                            focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()),
                                             tc,
                                             tr,
                                             &config.appearance.status_bar_position,
@@ -4077,6 +5010,11 @@ async fn run_client_loop(
                                             consumed = true;
                                         }
                                     }
+                                }
+                                if !consumed {
+                                    // The popup resizes first, exactly as in
+                                    // the `Execute` arm.
+                                    consumed = intercept_popup_resize(&command, &mut popup, &chrome, &renderer, &current_attached);
                                 }
                                 if !consumed {
                                     // A focused sidebar re-targets `Resize*` at
@@ -4101,7 +5039,9 @@ async fn run_client_loop(
                                     // Not in a view: send to the foreground server.
                                     // These are never SessionDetach/SendKey and the
                                     // mode stays Command, so no ModeChanged is needed.
-                                    mgr.send_foreground(ClientMessage::Command(command)).await?;
+                                    if !prepare_popup_toggle(&mut command, mgr, &mut popup, &chrome, &renderer, &current_attached, active_view.is_some()).await? {
+                                        mgr.send_foreground(ClientMessage::Command(command)).await?;
+                                    }
                                 }
                                 // Keep the which-key popup open so the user can
                                 // keep resizing (re-shown over the repainted view
@@ -5106,7 +6046,7 @@ async fn run_client_loop(
                                 // what size to composite.
                                 let content = content_rect_now(&chrome)?;
                                 sync_content_rect(&mut renderer, &chrome, &content);
-                                switch_to_server(mgr, &server, content).await?;
+                                switch_to_server(mgr, &mut renderer, &server, content).await?;
                                 mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                 mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                 if server == ConnId::Local {
@@ -5145,7 +6085,7 @@ async fn run_client_loop(
                                     // what size to composite.
                                     let content = content_rect_now(&chrome)?;
                                     sync_content_rect(&mut renderer, &chrome, &content);
-                                    switch_to_server(mgr, &server, content).await?;
+                                    switch_to_server(mgr, &mut renderer, &server, content).await?;
                                     mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                     mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                     if server == ConnId::Local {
@@ -5694,167 +6634,159 @@ async fn run_client_loop(
                             }
                             InputAction::Sidebar(intent) => {
                                 log::debug!("input: Sidebar {intent:?}");
-                                let (tc, tr) = renderer.size();
-                                // Tear the which-key popup down HERE -- before
-                                // the refusal gate below can `continue`, and
-                                // unconditionally, the way every other
-                                // client-action arm does it.
-                                //
-                                // This arm used to have no `whichkey` teardown
-                                // at all and lean on a side effect: a toggle
-                                // that moves the content rect sends a `Resize`,
-                                // the server answers with a `FullRender`, and
-                                // the full repaint incidentally erased the
-                                // popup. Every intent that changes NOTHING --
-                                // a toggle for an edge with no sidebar
-                                // configured, a cycle with no sidebars, a focus
-                                // refused because a view owns the keyboard --
-                                // repainted nothing (`Chrome::paint` over zero
-                                // panel rects emits zero bytes) and stranded
-                                // the popup on screen forever, while the mode
-                                // reset underneath it fed the next keystroke
-                                // straight to the shell.
-                                let tore_down_popup = whichkey.visible;
-                                if tore_down_popup {
-                                    whichkey.hide();
-                                    renderer.clear_overlay(tc, tr)?;
-                                }
-                                // FOCUS intents are refused while a view is live.
-                                // A panel CAN hold the keyboard there -- a
-                                // directional key deliberately hands it one --
-                                // so this is a deliberate scope choice, not a
-                                // technical impossibility: these name an EDGE
-                                // with no regard for where the user is, so
-                                // `Prefix b H` would pull them out of a cell
-                                // they never left. Lifting it is a decision
-                                // about behaviour, not a bug to fix.
-                                // TOGGLE is honoured: the view is
-                                // composited into the content rect now, and the
-                                // panels it would show or hide are on screen next
-                                // to it, so a toggle that did nothing would read as
-                                // a dropped keypress. Logged either way, because a
-                                // no-op that leaves no trace reads as one too.
-                                if active_view.is_some()
-                                    && !matches!(intent, SidebarIntent::Toggle(_))
-                                {
-                                    log::debug!(
-                                        "sidebar: ignoring {intent:?} -- a view owns the keyboard"
-                                    );
-                                    // Nothing else runs, so the popup teardown
-                                    // above needs its own repaint: `paint_view`
-                                    // is what puts the view's cells and its
-                                    // cursor back after `clear_overlay`.
-                                    if tore_down_popup {
-                                        if let Some(av) = active_view {
-                                            paint_view(
-                                                &mut renderer,
-                                                &chrome,
-                                                &views[av],
-                                                &input,
-                                                &whichkey,
-                                                &theme,
-                                                &compositor_theme,
-                                                &view_border_style,
-                                                &which_key_position,
-                                                viewport_top,
-                                                focused_pane_rect.as_ref(),
-                                            )?;
-                                        }
-                                    }
-                                    continue;
-                                }
-                                let before = chrome.content_rect(tc, tr);
-                                // Snapshot of everything that OUTLIVES this
-                                // client, so the save below fires on a real
-                                // change and only on a real change. Comparing
-                                // state rather than naming the intents keeps
-                                // this correct for `Focus` (which opens a hidden
-                                // sidebar) and for the resize/weight commands a
-                                // later phase adds, and keeps a no-op toggle --
-                                // including every toggle with no sidebar
-                                // configured -- from writing a file at all.
-                                let persisted_before =
-                                    crate::client::sidebar_state::SidebarState::from_chrome(&chrome);
-                                match intent {
-                                    SidebarIntent::Toggle(edge) => {
-                                        chrome.toggle_edge(edge);
-                                    }
-                                    SidebarIntent::Focus(edge) => {
-                                        chrome.focus_edge(edge, tc, tr);
-                                    }
-                                    SidebarIntent::Cycle => chrome.cycle_focus(tc, tr),
-                                }
-                                if crate::client::sidebar_state::SidebarState::from_chrome(&chrome)
-                                    != persisted_before
-                                {
-                                    crate::client::sidebar_state::save(&chrome);
-                                }
-                                // Showing or hiding a sidebar moves the content
-                                // rect, which is the server's whole world: the
-                                // origin and the `Resize` must travel together
-                                // (see `sync_content_rect`). Focus/cycle leave
-                                // the geometry alone, so nothing is sent.
-                                let content = chrome.content_rect(tc, tr);
-                                if content != before {
-                                    sync_content_rect(&mut renderer, &chrome, &content);
-                                    mgr.send_foreground(ClientMessage::Resize {
-                                        cols: content.width,
-                                        rows: content.height,
-                                    })
-                                    .await?;
-                                }
-                                match active_view {
-                                    // A live view owns the screen: its cells just
-                                    // changed size with the content rect, so
-                                    // re-demand their panes and recomposite -- the
-                                    // same pair the SIGWINCH path runs, for the
-                                    // same reason. `paint_view` paints the panels.
-                                    Some(av) => {
-                                        subscribe_view_cells(
-                                            mgr,
-                                            &chrome,
-                                            &renderer,
-                                            &mut views[av],
-                                            &view_border_style,
-                                        )
-                                        .await?;
-                                        paint_view(
-                                            &mut renderer,
-                                            &chrome,
-                                            &views[av],
-                                            &input,
-                                            &whichkey,
-                                            &theme,
-                                            &compositor_theme,
-                                            &view_border_style,
-                                            &which_key_position,
-                                            viewport_top,
-                                            focused_pane_rect.as_ref(),
-                                        )?;
-                                    }
-                                    None => {
-                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
-                                        // `clear_overlay` replays the front
-                                        // buffer with the cursor hidden, and
-                                        // only `paint_panel` puts it back --
-                                        // so with no panel on screen (which is
-                                        // exactly the no-op case above) the
-                                        // shell would be left with no cursor.
-                                        if tore_down_popup {
-                                            renderer.restore_cursor(
-                                                last_cursor_x,
-                                                last_cursor_y,
-                                                last_cursor_visible,
-                                            )?;
-                                        }
-                                        renderer.flush()?;
-                                    }
-                                }
+                                apply_sidebar_intent(
+                                    SidebarApply {
+                                        renderer: &mut renderer,
+                                        chrome: &mut chrome,
+                                        mgr: &mut *mgr,
+                                        views: &mut views,
+                                        active_view,
+                                        input: &input,
+                                        whichkey: &mut whichkey,
+                                        theme: &theme,
+                                        compositor_theme: &compositor_theme,
+                                        view_border_style: &view_border_style,
+                                        which_key_position: &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect: focused_pane_rect.as_ref(),
+                                        cursor: (last_cursor_x, last_cursor_y, last_cursor_visible),
+                                    },
+                                    intent,
+                                )
+                                .await?;
                             }
                             InputAction::None => {}
                         }
                     }
                     Some(Ok(crossterm::event::Event::Mouse(mouse))) => {
+                        // An open context menu is over everything, the popup
+                        // included, so it is asked first. A press outside it
+                        // closes it and then acts as if the menu had not been
+                        // there, like a press outside the popup does; every
+                        // other event over or after the menu is its own.
+                        if let Some(menu) = input.context_menu.as_mut() {
+                            use crate::client::context_menu::MenuOutcome;
+                            match mouse.kind {
+                                MouseEventKind::Moved => {
+                                    let outcome = menu.hover(mouse.column, mouse.row);
+                                    apply_menu_outcome!(outcome);
+                                    continue;
+                                }
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    let outcome = menu.click(mouse.column, mouse.row);
+                                    let falls_through = outcome == MenuOutcome::Close;
+                                    apply_menu_outcome!(outcome);
+                                    if !falls_through {
+                                        continue;
+                                    }
+                                }
+                                MouseEventKind::Down(_) => {
+                                    if menu.contains(mouse.column, mouse.row) {
+                                        continue;
+                                    }
+                                    apply_menu_outcome!(MenuOutcome::Close);
+                                }
+                                _ => continue,
+                            }
+                        }
+                        // The popup box is over every sidebar and pane, so it is
+                        // asked before anything else. It is the renderer's box
+                        // that counts: until the next frame replaces it, that is
+                        // what is on screen.
+                        let popup_pointer = if active_view.is_none() && renderer.popup_box().is_some() {
+                            let wanted = popup_box_now(&popup, &chrome, &renderer, &current_attached);
+                            popup_hit(renderer.popup_box(), &wanted, mouse_grab, &mouse)
+                        } else {
+                            None
+                        };
+                        // A left press the popup has no claim on closes it. The
+                        // server does that itself for a press it is sent; the
+                        // sites below that answer a press on the client call
+                        // `dismiss_popup`.
+                        let popup_dismiss = active_view.is_none()
+                            && dismisses_popup(
+                                &mut popup,
+                                renderer.popup_box().is_some() || float_zoom,
+                                popup_pointer,
+                                &mouse,
+                            );
+                        // The frame swallows a press, the start of a drag and
+                        // the wheel, like a sidebar's frame does. A press on it
+                        // still takes the keyboard back from a sidebar.
+                        if popup_pointer == Some(PopupPointer::Frame) {
+                            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                                mouse_grab = None;
+                                if let crate::client::chrome::ChromeFocus::Sidebar { sidebar, panel } = chrome.focus {
+                                    chrome.sidebars[sidebar].focused_panel = panel;
+                                    chrome.focus = crate::client::chrome::ChromeFocus::Content;
+                                    let (tc, tr) = renderer.size();
+                                    chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref())?;
+                                    renderer.flush()?;
+                                }
+                            }
+                            // A release swallowed while the box on screen is
+                            // stale still ends the drag its press began.
+                            if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                                mouse_grab = None;
+                            }
+                            continue;
+                        }
+                        // Interior-local coordinates, for an event the popup's
+                        // terminal gets.
+                        let popup_local = match popup_pointer {
+                            Some(PopupPointer::Interior(x, y)) => Some((x, y)),
+                            _ => None,
+                        };
+                        // The collapse chip and a collapsed strip answer a left
+                        // press wherever the pointer is, a live view included:
+                        // they are painted over the panes and the view alike, so
+                        // this runs before either consumer is asked. The chip
+                        // lies inside a panel's rect, which is why the panel
+                        // lookup further down cannot be trusted to leave it
+                        // alone.
+                        {
+                            let (tc, tr) = renderer.size();
+                            if popup_local.is_none()
+                                && matches!(
+                                    mouse.kind,
+                                    MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                                )
+                            {
+                                if let Some(edge) =
+                                    chrome.collapse_press(tc, tr, mouse.column, mouse.row)
+                                {
+                                    mouse_grab = None;
+                                    if popup_dismiss {
+                                        dismiss_popup(mgr).await?;
+                                    }
+                                    apply_sidebar_intent(
+                                        SidebarApply {
+                                            renderer: &mut renderer,
+                                            chrome: &mut chrome,
+                                            mgr: &mut *mgr,
+                                            views: &mut views,
+                                            active_view,
+                                            input: &input,
+                                            whichkey: &mut whichkey,
+                                            theme: &theme,
+                                            compositor_theme: &compositor_theme,
+                                            view_border_style: &view_border_style,
+                                            which_key_position: &which_key_position,
+                                            viewport_top,
+                                            focused_pane_rect: focused_pane_rect.as_ref(),
+                                            cursor: (
+                                                last_cursor_x,
+                                                last_cursor_y,
+                                                last_cursor_visible,
+                                            ),
+                                        },
+                                        SidebarIntent::Toggle(edge),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            }
+                        }
                         // A live view owns the screen: mouse events target its
                         // cells, not the (masked) foreground session. Everything
                         // here is routed by CELL GEOMETRY and PANE IDENTITY --
@@ -5971,6 +6903,7 @@ async fn run_client_loop(
                                                 y: cy,
                                                 pane_id: Some(cell.pane_id),
                                                 release: false,
+                                                popup: false,
                                             },
                                         )
                                         .await?;
@@ -6006,6 +6939,7 @@ async fn run_client_loop(
                                                     end_y: ey,
                                                     is_final: true,
                                                     pane_id: Some(pane_id),
+                                                    popup: false,
                                                 },
                                             )
                                             .await?;
@@ -6028,6 +6962,7 @@ async fn run_client_loop(
                                                     y: ey,
                                                     pane_id: Some(pane_id),
                                                     release: true,
+                                                    popup: false,
                                                 },
                                             )
                                             .await?;
@@ -6132,6 +7067,7 @@ async fn run_client_loop(
                                                     end_y: ey,
                                                     is_final: false,
                                                     pane_id: Some(pane_id),
+                                                    popup: false,
                                                 },
                                             )
                                             .await?;
@@ -6159,28 +7095,51 @@ async fn run_client_loop(
                         // reopen the SIGWINCH-to-`Resize` window the buffer size
                         // exists to close.
                         let (tc, tr) = renderer.size();
-                        let at_pointer = match panel_at(&chrome, tc, tr, mouse.column, mouse.row) {
-                            Some((sidebar, panel)) => MouseGrab::Panel { sidebar, panel },
-                            None => MouseGrab::Content,
+                        let target = chrome.pointer_target(tc, tr, mouse.column, mouse.row);
+                        let at_pointer = match target {
+                            crate::client::chrome::PointerTarget::Panel { sidebar, panel } => {
+                                MouseGrab::Panel { sidebar, panel }
+                            }
+                            _ => MouseGrab::Content,
                         };
                         // The sidebar's FRAME is inside the sidebar and inside
                         // no panel: `panel_rects` returns interiors. An event
                         // there is swallowed, never translated into the content
                         // rect -- clamping a click on a border into the content
                         // would land it on a pane the user did not click, one
-                        // cell away from where they pressed.
+                        // cell away from where they pressed. The collapse chip
+                        // and a collapsed strip count as frame: the chip lies
+                        // inside a panel's rect, but `pointer_target` resolves
+                        // it first, so no panel ever sees it.
                         //
                         // Only routes derived from POSITION consult this. A
                         // gesture already grabbed by the content keeps its grab
                         // when the pointer crosses the frame, exactly as it does
                         // when it crosses a panel.
-                        let over_frame = matches!(at_pointer, MouseGrab::Content)
-                            && chrome.sidebar_at(tc, tr, mouse.column, mouse.row).is_some();
-                        let route = match mouse.kind {
+                        let over_frame = matches!(
+                            target,
+                            crate::client::chrome::PointerTarget::Frame(_)
+                                | crate::client::chrome::PointerTarget::Button(_)
+                                | crate::client::chrome::PointerTarget::Strip(_)
+                        );
+                        let route = if popup_local.is_some() {
+                            // The popup's terminal claims the gesture, however
+                            // many sidebars lie beneath the box.
+                            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                                mouse_grab = Some(MouseGrab::Popup);
+                            }
+                            MouseGrab::Popup
+                        } else { match mouse.kind {
                             // A press claims the region for the whole gesture.
                             MouseEventKind::Down(_) => {
                                 if over_frame {
                                     mouse_grab = None;
+                                    if popup_dismiss {
+                                        dismiss_popup(mgr).await?;
+                                    }
+                                    // The collapse chip and a collapsed strip were
+                                    // answered before any routing; what is left of
+                                    // the frame is swallowed.
                                     continue;
                                 }
                                 mouse_grab = Some(at_pointer);
@@ -6191,6 +7150,14 @@ async fn run_client_loop(
                             // press behind it falls back to position.
                             MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
                                 match mouse_grab {
+                                    // The popup went away mid-gesture. What is
+                                    // left of the drag means nothing to the
+                                    // content, and the server never saw its head.
+                                    Some(MouseGrab::Popup) => {
+                                        mouse_grab = None;
+                                        drag_start = None;
+                                        continue;
+                                    }
                                     Some(g) => g,
                                     None if over_frame => continue,
                                     None => at_pointer,
@@ -6200,7 +7167,7 @@ async fn run_client_loop(
                             // on whatever is under the pointer.
                             _ if over_frame => continue,
                             _ => at_pointer,
-                        };
+                        } };
                         if matches!(mouse.kind, MouseEventKind::Up(_)) {
                             mouse_grab = None;
                         }
@@ -6230,6 +7197,42 @@ async fn run_client_loop(
                                 .row
                                 .clamp(rect.y, rect.y + rect.height.saturating_sub(1))
                                 - rect.y;
+                            if popup_dismiss {
+                                dismiss_popup(mgr).await?;
+                            }
+                            // A right press opens the row's context menu
+                            // instead of reaching the plugin's `on_mouse`. It
+                            // takes the focus, as any press on a panel does.
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                                // A prompt, the session manager or a pending key
+                                // chord owns the screen; a menu opened over it
+                                // could not be answered.
+                                if input.mode != Mode::Normal || input.has_overlay() {
+                                    continue;
+                                }
+                                chrome.focus =
+                                    crate::client::chrome::ChromeFocus::Sidebar { sidebar, panel };
+                                let items = chrome.sidebars[sidebar].panels[panel]
+                                    .plugin
+                                    .context_menu(px, py);
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                input.context_menu = crate::client::context_menu::ContextMenu::open(
+                                    items,
+                                    (mouse.column, mouse.row),
+                                    (tc, tr),
+                                );
+                                repaint_overlays(
+                                    &mut renderer,
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                    (last_cursor_x, last_cursor_y, last_cursor_visible),
+                                )?;
+                                continue;
+                            }
                             let focus_before = chrome.focus;
                             // Only a press moves focus: the wheel and a drag
                             // that merely crosses a panel must not steal it.
@@ -6289,16 +7292,21 @@ async fn run_client_loop(
                         // `content_point` for the clamp and for a click on the
                         // client-drawn status bar.
                         let content = chrome.content_rect(tc, tr);
-                        let (cx, cy) = crate::client::chrome::content_point(
-                            content,
-                            tc,
-                            tr,
-                            mouse.column,
-                            mouse.row,
-                        );
+                        let (cx, cy) = popup_local.unwrap_or_else(|| {
+                            crate::client::chrome::content_point(
+                                content,
+                                tc,
+                                tr,
+                                mouse.column,
+                                mouse.row,
+                            )
+                        });
+                        // Every message below says whose coordinates they are.
+                        let popup_flag = popup_local.is_some();
                         match mouse.kind {
                             MouseEventKind::Down(MouseButton::Left)
-                                if crate::client::chrome::past_the_server_bar(
+                                if popup_local.is_none()
+                                    && crate::client::chrome::past_the_server_bar(
                                     content,
                                     tc,
                                     tr,
@@ -6311,6 +7319,9 @@ async fn run_client_loop(
                                 // column, inside the last tab when tabs fill it.
                                 // No press also means the release sends nothing.
                                 drag_start = None;
+                                if popup_dismiss {
+                                    dismiss_popup(mgr).await?;
+                                }
                             }
                             MouseEventKind::Down(MouseButton::Left) => {
                                 log::debug!("mouse: click at ({}, {})", cx, cy);
@@ -6322,6 +7333,7 @@ async fn run_client_loop(
                                         y: cy,
                                         pane_id: None,
                                         release: false,
+                                        popup: popup_flag,
                                     })
                                     .await?;
                             }
@@ -6338,6 +7350,7 @@ async fn run_client_loop(
                                                 end_y: cy,
                                                 is_final: false,
                                                 pane_id: None,
+                                                popup: popup_flag,
                                             })
                                             .await?;
                                         last_drag_send = now;
@@ -6356,6 +7369,7 @@ async fn run_client_loop(
                                                 end_y: cy,
                                                 is_final: true,
                                                 pane_id: None,
+                                                popup: popup_flag,
                                             })
                                             .await?;
                                     } else {
@@ -6371,6 +7385,7 @@ async fn run_client_loop(
                                                 y: cy,
                                                 pane_id: None,
                                                 release: true,
+                                                popup: popup_flag,
                                             })
                                             .await?;
                                     }
@@ -6397,6 +7412,7 @@ async fn run_client_loop(
                                         x: cx,
                                         y: cy,
                                         up: true,
+                                        popup: popup_flag,
                                     })
                                     .await?;
                                 }
@@ -6422,15 +7438,49 @@ async fn run_client_loop(
                                         x: cx,
                                         y: cy,
                                         up: false,
+                                        popup: popup_flag,
                                     })
                                     .await?;
                                 }
+                            }
+                            MouseEventKind::Down(MouseButton::Right)
+                                if popup_local.is_some()
+                                    || !crate::client::chrome::past_the_server_bar(
+                                        content,
+                                        tc,
+                                        tr,
+                                        mouse.column,
+                                        mouse.row,
+                                    ) =>
+                            {
+                                log::debug!("mouse: right press at ({cx}, {cy})");
+                                right_down = true;
+                                mgr.send_foreground(ClientMessage::RightClick {
+                                    x: cx,
+                                    y: cy,
+                                    release: false,
+                                    popup: popup_flag,
+                                })
+                                .await?;
+                            }
+                            MouseEventKind::Up(MouseButton::Right) if right_down => {
+                                right_down = false;
+                                mgr.send_foreground(ClientMessage::RightClick {
+                                    x: cx,
+                                    y: cy,
+                                    release: true,
+                                    popup: popup_flag,
+                                })
+                                .await?;
                             }
                             _ => {}
                         }
                     }
                     Some(Ok(crossterm::event::Event::Resize(new_cols, new_rows))) => {
                         log::debug!("resize: {}x{}", new_cols, new_rows);
+                        // The menu was placed for the old size, and the repaint
+                        // below would leave it half drawn.
+                        input.context_menu = None;
                         renderer.resize(new_cols, new_rows);
                         // `resize` reallocated the front buffer and reset the
                         // content size to the whole terminal, but deliberately
@@ -6472,6 +7522,11 @@ async fn run_client_loop(
                         }
                     }
                     Some(Ok(crossterm::event::Event::Paste(text))) => {
+                        // An open menu is modal: a paste is not for the pane
+                        // behind it.
+                        if input.context_menu.is_some() {
+                            continue;
+                        }
                         // Bracketed paste is a SEPARATE crossterm event, so it never
                         // passes the key routing above: without this guard a focused
                         // sidebar would have Ctrl-Shift-V typed into the shell behind
@@ -6635,10 +7690,24 @@ async fn run_client_loop(
                     continue;
                 }
                 match msg {
-                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status }) => {
+                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer, live_popups, float_zoom: frame_float_zoom }) => {
+                        float_zoom = frame_float_zoom;
                         log::debug!("srv: FullRender rows={} cols={} cursor=({},{}) visible={} viewport_top={} scroll_offset={}",
                             cells.len(), if cells.is_empty() { 0 } else { cells[0].len() }, cursor_x, cursor_y, cursor_visible, so, srv_so);
-                        focused_pane_rect = fpr;
+                        // The popup layer first, so the frame below skips the
+                        // cells the box covers. A View owns the screen, so it
+                        // shows no box.
+                        let frame_session = frame_attached(&current_attached, status.as_ref());
+                        popup.prune(&popup_key(&frame_session), &live_popups);
+                        let popup_frame = if active_view.is_none() {
+                            sync_popup(popup_layer, &mut popup, &chrome, &mut renderer, &frame_session, &compositor_theme)?
+                        } else {
+                            renderer.clear_popup();
+                            None
+                        };
+                        // While the layer is up it owns the focused pane rect
+                        // and the cursor: the server reports neither.
+                        focused_pane_rect = popup_frame.as_ref().map(|f| f.focused_pane_rect).or(fpr);
                         input.application_cursor_keys = ack;
                         input.bracketed_paste = bp;
                         scroll_offset = so;
@@ -6646,6 +7715,8 @@ async fn run_client_loop(
                         // keep the dedicated highlight coordinate in sync.
                         viewport_top = so;
                         is_scrolled = srv_so > 0;
+                        let (cursor_x, cursor_y, cursor_visible, cursor_style) =
+                            popup_frame.as_ref().map_or((cursor_x, cursor_y, cursor_visible, cursor_style), |f| f.cursor);
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         last_cursor_visible = cursor_visible;
@@ -6680,9 +7751,19 @@ async fn run_client_loop(
                             renderer.flush()?;
                         }
                     }
-                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status }) => {
+                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer, live_popups, float_zoom: frame_float_zoom }) => {
+                        float_zoom = frame_float_zoom;
                         log::debug!("srv: RenderDiff changes={} cursor=({},{}) viewport_top={} scroll_offset={}", changes.len(), cursor_x, cursor_y, so, srv_so);
-                        focused_pane_rect = fpr;
+                        // See the FullRender arm: the popup layer goes first.
+                        let frame_session = frame_attached(&current_attached, status.as_ref());
+                        popup.prune(&popup_key(&frame_session), &live_popups);
+                        let popup_frame = if active_view.is_none() {
+                            sync_popup(popup_layer, &mut popup, &chrome, &mut renderer, &frame_session, &compositor_theme)?
+                        } else {
+                            renderer.clear_popup();
+                            None
+                        };
+                        focused_pane_rect = popup_frame.as_ref().map(|f| f.focused_pane_rect).or(fpr);
                         input.application_cursor_keys = ack;
                         input.bracketed_paste = bp;
                         scroll_offset = so;
@@ -6690,6 +7771,8 @@ async fn run_client_loop(
                         // keep the dedicated highlight coordinate in sync.
                         viewport_top = so;
                         is_scrolled = srv_so > 0;
+                        let (cursor_x, cursor_y, cursor_visible, cursor_style) =
+                            popup_frame.as_ref().map_or((cursor_x, cursor_y, cursor_visible, cursor_style), |f| f.cursor);
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         last_cursor_visible = cursor_visible;
@@ -6788,7 +7871,7 @@ async fn run_client_loop(
                             renderer.clear_overlay(c, r)?;
                             renderer.flush()?;
                             let content = content_rect_now(&chrome)?;
-                            switch_to_server(mgr, &ConnId::Local, content).await?;
+                            switch_to_server(mgr, &mut renderer, &ConnId::Local, content).await?;
                             mgr.send(&ConnId::Local, ClientMessage::Attach {
                                 session_name: target.clone(),
                             }).await?;
@@ -6801,6 +7884,31 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::Error { message, .. }) => {
                         log::error!("Server error: {}", message);
+                    }
+                    Some(ServerMessage::ContextMenu { x, y, target }) => {
+                        // A modal prompt, a view or an open session manager owns
+                        // the screen; a menu opened over it could not be
+                        // answered.
+                        if active_view.is_none() && input.mode == Mode::Normal && !input.has_overlay() {
+                            let items = crate::client::context_menu::items_for(&target, &|action| {
+                                input.binding_hint(action)
+                            });
+                            let (tc, tr) = renderer.size();
+                            let content = chrome.content_rect(tc, tr);
+                            let anchor = (content.x.saturating_add(x), content.y.saturating_add(y));
+                            input.context_menu =
+                                crate::client::context_menu::ContextMenu::open(items, anchor, (tc, tr));
+                            repaint_overlays(
+                                &mut renderer,
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &which_key_position,
+                                viewport_top,
+                                focused_pane_rect.as_ref(),
+                                (last_cursor_x, last_cursor_y, last_cursor_visible),
+                            )?;
+                        }
                     }
                     Some(ServerMessage::CopyToClipboard { data }) => {
                         if let Err(e) = copy_to_clipboard(&data) {
@@ -6973,6 +8081,9 @@ async fn run_client_loop(
                             src, agents.len(), detection_supported
                         );
                         agent_roster.apply(&src, &agents, detection_supported);
+                        for n in notifier.observe(&src, &agents, std::time::Instant::now()) {
+                            crate::client::notify::deliver(&n, notifier.config());
+                        }
                         let switcher_open = input.agent_switch.is_some();
                         if let Some(sw) = input.agent_switch.as_mut() {
                             sw.apply_agents(&src, &agents, detection_supported);
@@ -7127,6 +8238,7 @@ async fn run_client_loop(
                                 // its row, and they must be talking about the
                                 // same pane.
                                 let focused = focused_pane(&folders, &unfiled);
+                                tree_focus = focused.map(|p| (src.clone(), p.id));
                                 chrome.broadcast(
                                     &crate::client::sidebar::PluginEvent::FocusedCwd {
                                         conn: src.clone(),
@@ -7359,6 +8471,9 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::Event(event)) => {
                         log::debug!("server event: src={:?} {:?}", src, event);
+                        if let crate::protocol::SessionEvent::SessionRenamed { old, new } = &event {
+                            apply_session_rename(&src, old, new, &mut current_attached, &mut previous_attached, &mut last_local_session, &mut popup);
+                        }
                         // A pane the SERVER reports dead is deliberately NOT
                         // foreground-scoped: a view cell can alias a pane on any
                         // connected server, and the whole point of the event is
@@ -7862,7 +8977,7 @@ async fn run_client_loop(
                 }
             }
             // Config hot-reload (rare, low-priority). Applies client-side
-            // settings live so edits to ~/.config/remux/config.toml don't
+            // settings live so edits to the config file don't
             // require a restart. The channel is kept open by `_cfg_keepalive`,
             // so `None` only appears on a genuine full teardown.
             maybe_cfg = cfg_rx.recv() => {
@@ -7908,9 +9023,17 @@ async fn run_client_loop(
                     // Update which-key placement so it changes live too.
                     which_key_position = new_config.appearance.which_key_position.clone();
                     pane_title = new_config.appearance.pane_title.clone();
+                    // The popup's position and size apply live. A changed key
+                    // drops every runtime resize. The box is announced by the
+                    // top of the loop, and the server's answer is the frame
+                    // that rebuilds the layer.
+                    popup.apply_config(&new_config);
                     mgr.set_look(Look::from_config(&new_config));
                     mgr.announce_look().await;
                     agent_roster.set_pane_title(pane_title.clone());
+                    notifier.set_pane_title(pane_title.clone());
+                    let notify_before = notifier.config().enabled;
+                    notifier.set_config(new_config.notifications.clone());
 
                     // Reconcile the remotes roster (update in place / add new /
                     // drop idle config-removed remotes).
@@ -8019,7 +9142,10 @@ async fn run_client_loop(
                     // The same for the agents push, for the same reasons.
                     let wanted_agents_before = wants_agents;
                     wants_agents = chrome.wants_agents();
-                    if wanted_agents_before && !wants_agents {
+                    let switcher_open = input.agent_switch.is_some();
+                    let push_before = wanted_agents_before || switcher_open || notify_before;
+                    let push_after = wants_agents || switcher_open || notifier.config().enabled;
+                    if push_before && !push_after {
                         for id in &agents_subscribed {
                             log::debug!("sidebar: unsubscribing from the agent list on {id:?}");
                             if let Err(e) = mgr.send(id, ClientMessage::UnsubscribeAgents).await {
@@ -8110,6 +9236,50 @@ mod tests {
     }
 
     use super::*;
+
+    mod tree_focus {
+        use super::super::current_tree_focus;
+        use crate::client::registry::ConnId;
+        use std::collections::HashSet;
+
+        fn far() -> ConnId {
+            ConnId::Remote("far".to_string())
+        }
+
+        fn subscribed(ids: &[ConnId]) -> HashSet<ConnId> {
+            ids.iter().cloned().collect()
+        }
+
+        #[test]
+        fn a_focus_on_the_subscribed_foreground_server_is_kept() {
+            let kept = current_tree_focus(
+                Some((far(), 3)),
+                &subscribed(&[ConnId::Local, far()]),
+                |c| *c == far(),
+            );
+            assert_eq!(kept, Some((far(), 3)));
+        }
+
+        #[test]
+        fn a_focus_is_dropped_when_the_tree_is_no_longer_subscribed() {
+            // Covers a dropped connection too: the reconcile forgets every
+            // connection that is not live.
+            let kept = current_tree_focus(Some((far(), 3)), &subscribed(&[ConnId::Local]), |c| {
+                *c == far()
+            });
+            assert_eq!(kept, None);
+        }
+
+        #[test]
+        fn a_focus_is_dropped_when_another_server_comes_to_the_foreground() {
+            let kept = current_tree_focus(
+                Some((far(), 3)),
+                &subscribed(&[ConnId::Local, far()]),
+                |c| *c == ConnId::Local,
+            );
+            assert_eq!(kept, None);
+        }
+    }
 
     fn local(name: &str) -> (ConnId, String) {
         (ConnId::Local, name.to_string())
@@ -8453,5 +9623,988 @@ mod tests {
 
         assert_eq!(current, Some(remote));
         assert_eq!(previous, Some(local("a")));
+    }
+
+    /// The popup box: a framed float at (16, 5), 128x37, interior (17, 6, 126, 35).
+    mod popup_client {
+        use super::super::*;
+        use crate::client::chrome::Chrome;
+        use crate::config::sidebar::SidebarConfig;
+        use crate::config::PopupPosition;
+        use crate::protocol::{CellChange, PopupCells, RenderCell};
+        use crate::server::layout::Rect;
+        use crossterm::event::{KeyModifiers, MouseEvent};
+
+        fn float_box() -> PopupBox {
+            crate::client::popup::popup_box(
+                PopupPosition::Float,
+                (80, 80),
+                (160, 48),
+                Rect {
+                    x: 34,
+                    y: 0,
+                    width: 126,
+                    height: 48,
+                },
+            )
+        }
+
+        fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+            MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }
+        }
+
+        fn down(column: u16, row: u16) -> MouseEvent {
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+        }
+
+        #[test]
+        fn a_press_inside_the_interior_is_interior_local() {
+            let b = float_box();
+            assert_eq!(
+                popup_pointer(&b, None, &down(17, 6)),
+                Some(PopupPointer::Interior(0, 0))
+            );
+            assert_eq!(
+                popup_pointer(&b, None, &down(20, 10)),
+                Some(PopupPointer::Interior(3, 4))
+            );
+        }
+
+        #[test]
+        fn the_box_claims_a_press_over_a_sidebar() {
+            // Column 20 is inside the 34-column sidebar and inside the float.
+            let b = float_box();
+            assert_eq!(
+                popup_pointer(&b, None, &down(20, 10)),
+                Some(PopupPointer::Interior(3, 4))
+            );
+        }
+
+        #[test]
+        fn a_press_on_the_frame_is_swallowed() {
+            let b = float_box();
+            for (x, y) in [(16, 5), (16, 20), (143, 20), (60, 5), (60, 41)] {
+                assert_eq!(
+                    popup_pointer(&b, None, &down(x, y)),
+                    Some(PopupPointer::Frame),
+                    "({x}, {y})"
+                );
+            }
+            assert_eq!(
+                popup_pointer(&b, None, &mouse(MouseEventKind::ScrollUp, 16, 20)),
+                Some(PopupPointer::Frame),
+                "the wheel too"
+            );
+        }
+
+        #[test]
+        fn outside_the_box_the_popup_has_no_claim() {
+            let b = float_box();
+            for (x, y) in [(15, 5), (144, 20), (60, 4), (60, 42), (0, 0)] {
+                assert_eq!(popup_pointer(&b, None, &down(x, y)), None, "({x}, {y})");
+            }
+        }
+
+        #[test]
+        fn the_wheel_in_the_interior_goes_to_the_popup() {
+            let b = float_box();
+            assert_eq!(
+                popup_pointer(&b, None, &mouse(MouseEventKind::ScrollDown, 30, 12)),
+                Some(PopupPointer::Interior(13, 6))
+            );
+        }
+
+        #[test]
+        fn a_drag_that_began_in_the_popup_clamps_into_the_interior() {
+            let b = float_box();
+            let drag = |x, y| mouse(MouseEventKind::Drag(MouseButton::Left), x, y);
+            let grab = Some(MouseGrab::Popup);
+            // Out over the sidebar, above and below the box.
+            assert_eq!(
+                popup_pointer(&b, grab, &drag(0, 0)),
+                Some(PopupPointer::Interior(0, 0))
+            );
+            assert_eq!(
+                popup_pointer(&b, grab, &drag(159, 47)),
+                Some(PopupPointer::Interior(125, 34))
+            );
+            assert_eq!(
+                popup_pointer(
+                    &b,
+                    grab,
+                    &mouse(MouseEventKind::Up(MouseButton::Left), 0, 0)
+                ),
+                Some(PopupPointer::Interior(0, 0)),
+                "the release too"
+            );
+        }
+
+        #[test]
+        fn a_drag_that_began_elsewhere_is_not_the_popups() {
+            let b = float_box();
+            let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 60, 20);
+            assert_eq!(popup_pointer(&b, Some(MouseGrab::Content), &drag), None);
+            assert_eq!(
+                popup_pointer(
+                    &b,
+                    Some(MouseGrab::Panel {
+                        sidebar: 0,
+                        panel: 0
+                    }),
+                    &drag
+                ),
+                None
+            );
+            // With no press behind it, motion over the box is swallowed.
+            assert_eq!(popup_pointer(&b, None, &drag), Some(PopupPointer::Frame));
+        }
+
+        fn layer(cols: u16, rows: u16, fill: char) -> Box<PopupCells> {
+            let cell = RenderCell {
+                c: fill,
+                ..RenderCell::default()
+            };
+            Box::new(PopupCells {
+                pane_id: 7,
+                cols,
+                rows,
+                cursor_x: 2,
+                cursor_y: 1,
+                cursor_visible: true,
+                cursor_style: 2,
+                cells: Some(vec![vec![cell; cols as usize]; rows as usize]),
+                changes: Vec::new(),
+            })
+        }
+
+        fn sidebar_chrome() -> Chrome {
+            let cfg: Vec<SidebarConfig> = toml::from_str::<crate::config::Config>(
+                "[[sidebar]]\nedge = \"left\"\nsize = 34\nvisible = true\n[[sidebar.panel]]\nplugin = \"sessions\"\n",
+            )
+            .expect("config")
+            .sidebar;
+            Chrome::from_config(&cfg)
+        }
+
+        fn setup() -> (
+            Renderer,
+            Chrome,
+            PopupState,
+            crate::config::theme::CompositorTheme,
+        ) {
+            (
+                Renderer::new(160, 48),
+                sidebar_chrome(),
+                PopupState::from_config(&Config::default()),
+                crate::config::theme::CompositorTheme::default(),
+            )
+        }
+
+        #[test]
+        fn a_layer_puts_the_box_over_the_sidebar_and_owns_cursor_and_pane_rect() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let frame = sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap()
+            .expect("a popup frame");
+            let rect = renderer.popup_rect().expect("the box is up");
+            assert_eq!(
+                rect,
+                Rect {
+                    x: 16,
+                    y: 5,
+                    width: 128,
+                    height: 37
+                },
+                "over the sidebar's columns"
+            );
+            // The cursor is the layer's, offset to the interior origin (17, 6).
+            assert_eq!(frame.cursor, (19, 7, true, 2));
+            // The pane rect is the SHARED interior, not the box's.
+            let r = frame.focused_pane_rect;
+            assert_eq!((r.x, r.y, r.width, r.height), (17, 6, 4, 2));
+            assert_eq!(renderer.rect_origin(), (0, 0));
+        }
+
+        #[test]
+        fn a_later_diff_is_applied_to_the_held_layer() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            let mut diff = layer(4, 2, 'x');
+            diff.cells = None;
+            diff.changes = vec![CellChange {
+                x: 1,
+                y: 0,
+                cell: RenderCell {
+                    c: 'q',
+                    ..RenderCell::default()
+                },
+            }];
+            sync_popup(
+                Some(diff),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert_eq!(renderer.held_layer().unwrap().cells[0][1].c, 'q');
+            assert_eq!(renderer.held_layer().unwrap().cells[0][0].c, 'x');
+        }
+
+        #[test]
+        fn a_frame_that_changes_nothing_in_the_layer_only_moves_the_cursor() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            let grid = renderer.popup_cells().unwrap().as_ptr();
+            let mut idle = layer(4, 2, 'x');
+            idle.cells = None;
+            idle.cursor_x = 3;
+            let frame = sync_popup(
+                Some(idle),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap()
+            .expect("still up");
+            assert_eq!(
+                renderer.popup_cells().unwrap().as_ptr(),
+                grid,
+                "the box grid is not rebuilt"
+            );
+            assert_eq!(frame.cursor, (20, 7, true, 2));
+            assert_eq!(renderer.held_layer().unwrap().cursor_x, 3);
+        }
+
+        #[test]
+        fn a_layer_opened_by_a_named_key_is_placed_where_the_key_said() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            popup.toggle(
+                &popup_key(&attached),
+                Some(PopupPosition::Right.into()),
+                false,
+            );
+            for _ in 0..2 {
+                sync_popup(
+                    Some(layer(4, 2, 'x')),
+                    &mut popup,
+                    &chrome,
+                    &mut renderer,
+                    &attached,
+                    &theme,
+                )
+                .unwrap();
+                assert_eq!(
+                    renderer.popup_box().map(|b| b.frame),
+                    Some(crate::client::popup::PopupFrame::OpenRight)
+                );
+            }
+            // Another tab's popup, opened plainly: the configured float.
+            let mut other = layer(4, 2, 'y');
+            other.pane_id = 9;
+            sync_popup(
+                Some(other),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert_eq!(
+                renderer.popup_box().map(|b| b.frame),
+                Some(crate::client::popup::PopupFrame::Full)
+            );
+            // Back on the first tab, its popup is still on the right.
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert_eq!(
+                renderer.popup_box().map(|b| b.frame),
+                Some(crate::client::popup::PopupFrame::OpenRight)
+            );
+            // Closed: the box stays the drawer, so the hidden popup keeps its
+            // size, and a plain reopen is the configured float.
+            popup.toggle(&popup_key(&attached), None, true);
+            sync_popup(None, &mut popup, &chrome, &mut renderer, &attached, &theme).unwrap();
+            assert_eq!(
+                popup_box_now(&popup, &chrome, &renderer, &attached).frame,
+                crate::client::popup::PopupFrame::OpenRight
+            );
+            popup.toggle(&popup_key(&attached), None, false);
+            assert_eq!(
+                popup_box_now(&popup, &chrome, &renderer, &attached).frame,
+                crate::client::popup::PopupFrame::Full
+            );
+        }
+
+        #[test]
+        fn a_tab_switch_away_from_a_named_popup_and_back_announces_nothing() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let conn = ConnId::Local;
+            // The first box the server hears of, at attach.
+            assert!(popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn).is_some());
+            // Tab 1: open on the right. The open announces the drawer.
+            popup.toggle(
+                &popup_key(&attached),
+                Some(PopupPosition::Right.into()),
+                false,
+            );
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn),
+                Some((99, 45))
+            );
+            sync_popup(
+                Some(layer(99, 45, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn),
+                None
+            );
+            // Tab 2 has no popup: its frames carry no layer. The box is still the
+            // right drawer, which the server already has.
+            sync_popup(None, &mut popup, &chrome, &mut renderer, &attached, &theme).unwrap();
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn),
+                None,
+                "no float is announced for a tab with no popup"
+            );
+            // Back on tab 1: the drawer, at the size it already has.
+            sync_popup(
+                Some(layer(99, 45, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn),
+                None
+            );
+        }
+
+        #[test]
+        fn a_terminal_resize_while_the_popup_is_hidden_still_announces_its_box() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let conn = ConnId::Local;
+            popup.toggle(
+                &popup_key(&attached),
+                Some(PopupPosition::Right.into()),
+                false,
+            );
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn),
+                Some((99, 45))
+            );
+            sync_popup(
+                Some(layer(99, 45, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            popup.toggle(&popup_key(&attached), None, true);
+            sync_popup(None, &mut popup, &chrome, &mut renderer, &attached, &theme).unwrap();
+            // The terminal grows while the popup is hidden. The server must hear
+            // the new want, or this client's old one keeps capping the size every
+            // other client's popup gets.
+            renderer.resize(200, 60);
+            let grown = popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn)
+                .expect("the new box is announced");
+            assert!(grown.0 > 99 && grown.1 > 45, "{grown:?}");
+            assert_eq!(
+                popup_box_now(&popup, &chrome, &renderer, &attached).frame,
+                crate::client::popup::PopupFrame::OpenRight,
+                "still the drawer it was last placed as"
+            );
+        }
+
+        fn status_of(session: &str) -> crate::server::compositor::StatusInfo {
+            crate::server::compositor::StatusInfo {
+                mode: "NORMAL".to_string(),
+                session_name: session.to_string(),
+                tabs: Vec::new(),
+                layout_mode: "bsp".to_string(),
+                search_info: None,
+            }
+        }
+
+        #[test]
+        fn a_stale_frame_from_the_session_left_leaves_the_new_sessions_records() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let main = Some((ConnId::Local, "main".to_string()));
+            let other = Some((ConnId::Local, "other".to_string()));
+            // "other" left a popup open on the right; then "main" opened one at
+            // the bottom.
+            popup.toggle(&popup_key(&other), Some(PopupPosition::Right.into()), false);
+            popup.bind_layer(&popup_key(&other), Some(9));
+            popup.toggle(&popup_key(&main), Some(PopupPosition::Bottom.into()), false);
+            popup.bind_layer(&popup_key(&main), Some(7));
+            // The user attaches to "other". A frame "main" queued before the
+            // switch arrives after it.
+            let current = other.clone();
+            let status = status_of("main");
+            let attached = frame_attached(&current, Some(&status));
+            assert_eq!(attached, main, "the frame is main's");
+            popup.prune(&popup_key(&attached), &[7]);
+            let mut stale = layer(4, 2, 'x');
+            stale.pane_id = 7;
+            sync_popup(
+                Some(stale),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            // other's frame, with its popup 9, still finds it on the right.
+            let status = status_of("other");
+            let attached = frame_attached(&current, Some(&status));
+            popup.prune(&popup_key(&attached), &[9]);
+            let mut own = layer(4, 2, 'y');
+            own.pane_id = 9;
+            sync_popup(
+                Some(own),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert_eq!(
+                renderer.popup_box().map(|b| b.frame),
+                Some(crate::client::popup::PopupFrame::OpenRight)
+            );
+            // A server too old to describe its bar sends no status: the frame
+            // is taken as the attached session's, as before.
+            assert_eq!(frame_attached(&current, None), current);
+        }
+
+        #[test]
+        fn switching_between_two_open_popups_at_different_positions_announces_each_box() {
+            // Accepted: one terminal size per session, so two tabs whose popups
+            // are open at different positions resize the popups on a switch.
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let conn = ConnId::Local;
+            let key = popup_key(&attached);
+            let send = |popup: &mut PopupState, renderer: &Renderer| {
+                popup_size_to_send(popup, &chrome, renderer, &attached, &conn)
+            };
+            let show = |popup: &mut PopupState, renderer: &mut Renderer, pane: u64| {
+                let mut l = layer(4, 2, 'x');
+                l.pane_id = pane;
+                sync_popup(Some(l), popup, &chrome, renderer, &attached, &theme).unwrap();
+            };
+            // Tab 1: a right drawer.
+            popup.toggle(&key, Some(PopupPosition::Right.into()), false);
+            let right = send(&mut popup, &renderer).expect("right announced");
+            show(&mut popup, &mut renderer, 7);
+            // Tab 2: no popup at first, then a bottom drawer.
+            sync_popup(None, &mut popup, &chrome, &mut renderer, &attached, &theme).unwrap();
+            assert_eq!(send(&mut popup, &renderer), None);
+            popup.toggle(&key, Some(PopupPosition::Bottom.into()), false);
+            let bottom = send(&mut popup, &renderer).expect("bottom announced");
+            assert_ne!(bottom, right);
+            show(&mut popup, &mut renderer, 9);
+            // Each switch between the two announces the box it shows.
+            show(&mut popup, &mut renderer, 7);
+            assert_eq!(send(&mut popup, &renderer), Some(right));
+            show(&mut popup, &mut renderer, 9);
+            assert_eq!(send(&mut popup, &renderer), Some(bottom));
+        }
+
+        #[test]
+        fn a_local_rename_renames_the_session_a_fallback_reattaches_to() {
+            let (_, _, mut popup, _) = setup();
+            let far = ConnId::Remote("far".to_string());
+            let mut current = Some((far.clone(), "work".to_string()));
+            let mut previous = None;
+            let mut last_local = Some("work".to_string());
+            // A session of the same name on a remote is not the local one.
+            apply_session_rename(
+                &far,
+                "work",
+                "play",
+                &mut current,
+                &mut previous,
+                &mut last_local,
+                &mut popup,
+            );
+            assert_eq!(last_local.as_deref(), Some("work"));
+            apply_session_rename(
+                &ConnId::Local,
+                "work",
+                "home",
+                &mut current,
+                &mut previous,
+                &mut last_local,
+                &mut popup,
+            );
+            assert_eq!(last_local.as_deref(), Some("home"));
+            assert_eq!(current, Some((far, "play".to_string())));
+        }
+
+        #[test]
+        fn renaming_the_attached_session_keeps_its_named_popup_where_it_is() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let mut current = Some((ConnId::Local, "main".to_string()));
+            let mut previous = Some((ConnId::Local, "old".to_string()));
+            let conn = ConnId::Local;
+            popup.toggle(
+                &popup_key(&current),
+                Some(PopupPosition::Right.into()),
+                false,
+            );
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &current, &conn),
+                Some((99, 45))
+            );
+            sync_popup(
+                Some(layer(99, 45, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &current,
+                &theme,
+            )
+            .unwrap();
+
+            let mut last_local = Some("main".to_string());
+            apply_session_rename(
+                &conn,
+                "main",
+                "work",
+                &mut current,
+                &mut previous,
+                &mut last_local,
+                &mut popup,
+            );
+            assert_eq!(current, Some((ConnId::Local, "work".to_string())));
+            assert_eq!(
+                previous,
+                Some((ConnId::Local, "old".to_string())),
+                "only the renamed one"
+            );
+
+            // The next frame names the new session.
+            let status = status_of("work");
+            let frame_session = frame_attached(&current, Some(&status));
+            assert_eq!(frame_session, current);
+            popup.prune(&popup_key(&frame_session), &[7]);
+            sync_popup(
+                Some(layer(99, 45, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &frame_session,
+                &theme,
+            )
+            .unwrap();
+            let wanted = popup_box_now(&popup, &chrome, &renderer, &current);
+            assert_eq!(
+                wanted.frame,
+                crate::client::popup::PopupFrame::OpenRight,
+                "the position survives"
+            );
+            assert_eq!(
+                renderer.popup_box(),
+                Some(wanted),
+                "placed and wanted agree"
+            );
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &current, &conn),
+                None,
+                "the announced box is the one already sent"
+            );
+            let inside = down(wanted.interior.x, wanted.interior.y);
+            assert_eq!(
+                popup_hit(renderer.popup_box(), &wanted, None, &inside),
+                Some(PopupPointer::Interior(0, 0)),
+                "the mouse reaches the popup"
+            );
+        }
+
+        #[test]
+        fn a_popup_key_inside_a_view_is_swallowed() {
+            let (renderer, chrome, mut popup, _) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let mut cmd = RemuxCommand::PopupToggle(Some(PopupPosition::Right.into()));
+            assert_eq!(
+                plan_popup_toggle(&mut cmd, &mut popup, &renderer, &attached, true),
+                PopupToggleStep::Swallow
+            );
+            assert!(!popup.is_opening(), "nothing is recorded as an open");
+            assert_eq!(
+                popup_box_now(&popup, &chrome, &renderer, &attached).frame,
+                crate::client::popup::PopupFrame::Full
+            );
+        }
+
+        #[test]
+        fn a_second_popup_key_before_the_first_layer_closes_it() {
+            let (renderer, chrome, mut popup, _) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let mut open = RemuxCommand::PopupToggle(Some(PopupPosition::Right.into()));
+            assert_eq!(
+                plan_popup_toggle(&mut open, &mut popup, &renderer, &attached, false),
+                PopupToggleStep::Forward
+            );
+            assert_eq!(
+                open,
+                RemuxCommand::PopupToggle(None),
+                "the server learns no position"
+            );
+            assert!(popup.is_opening());
+            let mut again = RemuxCommand::PopupToggle(Some(PopupPosition::Bottom.into()));
+            assert_eq!(
+                plan_popup_toggle(&mut again, &mut popup, &renderer, &attached, false),
+                PopupToggleStep::Forward
+            );
+            assert!(
+                !popup.is_opening(),
+                "the second key closes the popup being opened"
+            );
+            assert_eq!(
+                popup_box_now(&popup, &chrome, &renderer, &attached).frame,
+                crate::client::popup::PopupFrame::Full
+            );
+            let mut other = RemuxCommand::TabNew;
+            assert_eq!(
+                plan_popup_toggle(&mut other, &mut popup, &renderer, &attached, false),
+                PopupToggleStep::NotAToggle
+            );
+        }
+
+        #[test]
+        fn a_sized_popup_key_opens_at_its_size_and_the_server_learns_neither() {
+            let (renderer, chrome, mut popup, _) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let plain = popup_box_now(&popup, &chrome, &renderer, &attached);
+            let mut open = RemuxCommand::PopupToggle(Some(crate::config::PopupPlacement {
+                position: PopupPosition::Float,
+                size: Some(crate::config::PopupSize {
+                    width: Some(30),
+                    height: Some(30),
+                }),
+            }));
+            assert_eq!(
+                plan_popup_toggle(&mut open, &mut popup, &renderer, &attached, false),
+                PopupToggleStep::Forward
+            );
+            assert_eq!(open, RemuxCommand::PopupToggle(None));
+            let sized = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert_eq!(sized.frame, crate::client::popup::PopupFrame::Full);
+            assert!(
+                sized.rect.width < plain.rect.width && sized.rect.height < plain.rect.height,
+                "{sized:?} should be smaller than {plain:?}"
+            );
+        }
+
+        #[test]
+        fn no_layer_drops_the_box() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert!(
+                sync_popup(None, &mut popup, &chrome, &mut renderer, &attached, &theme)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(renderer.popup_rect(), None);
+            assert!(renderer.held_layer().is_none());
+        }
+
+        #[test]
+        fn a_diff_with_nothing_to_apply_it_to_drops_the_box_and_asks_again() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let placed = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert!(popup.announce(&ConnId::Local, &placed).is_some());
+            assert!(popup.announce(&ConnId::Local, &placed).is_none());
+            let mut diff = layer(4, 2, 'x');
+            diff.cells = None;
+            assert!(sync_popup(
+                Some(diff),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(renderer.popup_rect(), None);
+            // The next pass re-announces the box, and the server answers that
+            // with a full frame that carries the whole layer.
+            assert!(popup.announce(&ConnId::Local, &placed).is_some());
+        }
+
+        #[test]
+        fn switching_server_drops_the_layer() {
+            // `switch_to_server` clears the box before the new foreground is
+            // handed the screen.
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            renderer.clear_popup();
+            assert_eq!(renderer.popup_rect(), None);
+        }
+
+        #[test]
+        fn the_box_on_screen_is_hit_tested_and_swallows_until_the_wanted_one_replaces_it() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            assert_eq!(
+                popup_hit(renderer.popup_box(), &float_box(), None, &down(20, 10)),
+                None,
+                "no box on screen"
+            );
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            let shown = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert_eq!(renderer.popup_box(), Some(shown));
+            assert_eq!(
+                popup_hit(renderer.popup_box(), &shown, None, &down(20, 10)),
+                Some(PopupPointer::Interior(3, 4))
+            );
+
+            // A reload makes it a left drawer, before the server has answered
+            // the new size: the float is still what is on screen.
+            let mut config = Config::default();
+            config.appearance.popup_position = PopupPosition::Left;
+            assert!(popup.apply_config(&config));
+            let wanted = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert_ne!(wanted, shown);
+            // (20, 10) is over the sidebar, inside the float but outside the
+            // drawer: it must not reach the sidebar beneath the visible box.
+            assert_eq!(
+                popup_hit(renderer.popup_box(), &wanted, None, &down(20, 10)),
+                Some(PopupPointer::Frame)
+            );
+            // Outside the box on screen the popup has no claim.
+            assert_eq!(
+                popup_hit(renderer.popup_box(), &wanted, None, &down(150, 2)),
+                None
+            );
+            // A drag the popup grabbed is swallowed too, release included.
+            let up = mouse(MouseEventKind::Up(MouseButton::Left), 150, 2);
+            assert_eq!(
+                popup_hit(renderer.popup_box(), &wanted, Some(MouseGrab::Popup), &up),
+                Some(PopupPointer::Frame)
+            );
+        }
+
+        #[test]
+        fn only_a_left_press_outside_the_box_dismisses_the_popup() {
+            let b = float_box();
+            let pointer = |m: &MouseEvent| popup_pointer(&b, None, m);
+            let mut state = PopupState::from_config(&Config::default());
+            let outside = down(150, 2);
+            assert!(dismisses_popup(
+                &mut state,
+                true,
+                pointer(&outside),
+                &outside
+            ));
+
+            let interior = down(20, 10);
+            let frame = down(16, 5);
+            for m in [&interior, &frame] {
+                assert!(!dismisses_popup(&mut state, true, pointer(m), m), "{m:?}");
+            }
+
+            let right = mouse(MouseEventKind::Down(MouseButton::Right), 150, 2);
+            let wheel = mouse(MouseEventKind::ScrollUp, 150, 2);
+            let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 150, 2);
+            let up = mouse(MouseEventKind::Up(MouseButton::Left), 150, 2);
+            for m in [&right, &wheel, &drag, &up] {
+                assert!(!dismisses_popup(&mut state, true, pointer(m), m), "{m:?}");
+            }
+
+            assert!(
+                !dismisses_popup(&mut state, false, None, &outside),
+                "no popup on screen"
+            );
+        }
+
+        #[test]
+        fn a_press_before_the_first_layer_cancels_the_pending_open() {
+            let mut state = PopupState::from_config(&Config::default());
+            state.toggle("main", None, false);
+            assert!(state.is_opening());
+
+            // No box on screen yet, so the popup has no claim on the press.
+            let outside = down(150, 2);
+            assert!(dismisses_popup(&mut state, false, None, &outside));
+            assert!(!state.is_opening(), "the open the server cancelled");
+
+            // Without a pending open there is nothing to dismiss.
+            assert!(!dismisses_popup(&mut state, false, None, &outside));
+        }
+
+        #[test]
+        fn a_press_the_client_answers_closes_the_popup_without_toggling_it() {
+            match popup_dismiss_message() {
+                ClientMessage::MouseClick {
+                    x,
+                    y,
+                    pane_id,
+                    release,
+                    popup,
+                } => {
+                    assert_eq!((x, y), (u16::MAX, u16::MAX), "off every region");
+                    assert_eq!(pane_id, None);
+                    assert!(!release && !popup, "a plain press");
+                }
+                other => panic!("expected a press that only dismisses, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_resize_while_the_popup_is_up_resizes_the_popup_not_the_layout() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            // No popup up: the command is not the popup's.
+            assert!(!intercept_popup_resize(
+                &RemuxCommand::ResizeRight(5),
+                &mut popup,
+                &chrome,
+                &renderer,
+                &attached
+            ));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            let before = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert!(intercept_popup_resize(
+                &RemuxCommand::ResizeRight(5),
+                &mut popup,
+                &chrome,
+                &renderer,
+                &attached
+            ));
+            let after = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert!(after.rect.width > before.rect.width);
+            // Not a resize: left alone.
+            assert!(!intercept_popup_resize(
+                &RemuxCommand::PaneFocusLeft,
+                &mut popup,
+                &chrome,
+                &renderer,
+                &attached
+            ));
+        }
+
+        #[test]
+        fn a_drawer_consumes_a_resize_on_the_axis_it_ignores_without_changing() {
+            let (mut renderer, chrome, _, theme) = setup();
+            let mut config = Config::default();
+            config.appearance.popup_position = PopupPosition::Left;
+            let mut popup = PopupState::from_config(&config);
+            let attached = Some((ConnId::Local, "main".to_string()));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            let before = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert!(intercept_popup_resize(
+                &RemuxCommand::ResizeDown(5),
+                &mut popup,
+                &chrome,
+                &renderer,
+                &attached
+            ));
+            assert_eq!(popup_box_now(&popup, &chrome, &renderer, &attached), before);
+        }
     }
 }

@@ -55,13 +55,14 @@ size = 5
 
 def make_env(config: str) -> dict:
     shutil.rmtree(RUNDIR, ignore_errors=True)
-    for sub in ("run", "state", "data", "config"):
+    for sub in ("run", "state", "data", "config", "home"):
         os.makedirs(f"{RUNDIR}/{sub}", exist_ok=True)
     os.makedirs(f"{RUNDIR}/config/remux", exist_ok=True)
     with open(f"{RUNDIR}/config/remux/config.toml", "w") as fh:
         fh.write(config)
     env = dict(os.environ)
     env.update(
+        HOME=f"{RUNDIR}/home",
         XDG_RUNTIME_DIR=f"{RUNDIR}/run",
         XDG_STATE_HOME=f"{RUNDIR}/state",
         XDG_DATA_HOME=f"{RUNDIR}/data",
@@ -170,7 +171,7 @@ def test_left_sidebar_offsets_content():
     rows = screen.display
     # Assertion 1: the panel title occupies the sidebar.
     assert any(
-        "Placeholder" in r[:SIDEBAR_W] for r in rows
+        "placeholder" in r[:SIDEBAR_W] for r in rows
     ), "panel not painted:\n" + "\n".join(rows[:5])
 
     # Write a marker into the shell and confirm it lands right of the seam.
@@ -246,12 +247,12 @@ def test_all_three_edges_corner_ownership():
     # inside it starts one cell in. The bar rects are unchanged; only where the
     # panel content lands moved.
     assert rows[0][0] == "\u256d", f"left sidebar's box missing: {rows[0][:24]!r}"
-    assert rows[1][1:].startswith("Placeholder"), f"left panel missing: {rows[1][:24]!r}"
+    assert rows[1][1:].startswith(" placeholder"), f"left panel missing: {rows[1][:24]!r}"
     assert (
         rows[0][COLS - right_w] == "\u256d"
     ), f"right sidebar's box missing: {rows[0][COLS - right_w:]!r}"
     assert (
-        rows[1][COLS - right_w + 1 :].startswith("Placeholder")
+        rows[1][COLS - right_w + 1 :].startswith(" placeholder")
     ), f"right panel missing: {rows[1][COLS - right_w:]!r}"
 
     # The bottom sidebar occupies the 5 rows above the status bar, inset
@@ -274,7 +275,7 @@ def test_all_three_edges_corner_ownership():
     ), f"bottom sidebar claimed the right corner: {top!r}"
     band = rows[ROWS - 5]
     assert (
-        band.index("Placeholder") == left_w + 1
+        band.index("placeholder") == left_w + 2
     ), f"bottom panel not one cell inside the content origin: {band!r}"
 
     # And the content shrank vertically to make room: the panes end above the
@@ -330,7 +331,7 @@ def test_resize_keeps_the_right_sidebar():
     pump(1.5)
     rows = screen.display
     assert any(
-        "Placeholder" in r[COLS - 20 :] for r in rows
+        "placeholder" in r[COLS - 20 :] for r in rows
     ), f"right panel missing before resize:\n{rows[0]!r}"
 
     new_cols, new_rows = 90, 26
@@ -342,7 +343,7 @@ def test_resize_keeps_the_right_sidebar():
     rows = screen.display
 
     assert any(
-        "Placeholder" in r[new_cols - 20 :] for r in rows
+        "placeholder" in r[new_cols - 20 :] for r in rows
     ), "the resize blanked the right sidebar:\n" + "\n".join(rows[:4])
     hit = [r for r in rows if "AFTERRESIZE" in r]
     assert hit, "shell output never appeared after the resize"
@@ -380,7 +381,7 @@ def test_overlay_teardown_restores_the_sidebar():
     rows = screen.display
     assert not any("Session Manager" in r for r in rows), "overlay never closed"
     assert any(
-        "Placeholder" in r[:SIDEBAR_W] for r in rows
+        "placeholder" in r[:SIDEBAR_W] for r in rows
     ), "overlay teardown erased the sidebar:\n" + "\n".join(rows[:4])
     # `repaint_all` re-renders the whole front buffer with `show_cursor=false`
     # and must put `last_cursor` back afterwards; without that restore the next
@@ -469,12 +470,15 @@ def test_search_highlights_land_on_the_match():
         if y not in skip and str(screen.buffer[y][x].bg) != "default"
     ]
     assert highlighted, "search produced no highlights"
-    bad = [(x, y) for (x, y) in highlighted if x < SIDEBAR_W]
+    # The sidebar's collapse chip is chrome with a background of its own: three
+    # cells on the sidebar's last interior row, against the right edge's box.
+    chip = {(x, ROWS - 3) for x in range(SIDEBAR_W - 4, SIDEBAR_W - 1)}
+    bad = [(x, y) for (x, y) in highlighted if x < SIDEBAR_W and (x, y) not in chip]
     assert not bad, f"search highlighted sidebar columns: {bad[:8]}"
     off = [
         (x, y, screen.buffer[y][x].data)
         for (x, y) in highlighted
-        if screen.buffer[y][x].data not in set(needle)
+        if (x, y) not in chip and screen.buffer[y][x].data not in set(needle)
     ]
     assert not off, f"highlight is not sitting on the match: {off[:8]}"
 
@@ -522,7 +526,7 @@ def test_yank_copies_content_not_the_sidebar():
         f"the yank did not copy the shell line: {yanked!r} "
         "(a sidebar-relative read would copy the panel or blanks)"
     )
-    assert "Placeholder" not in yanked and "idle" not in yanked, (
+    assert "placeholder" not in yanked and "idle" not in yanked, (
         f"the yank copied the sidebar panel: {yanked!r}"
     )
 

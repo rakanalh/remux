@@ -82,9 +82,14 @@ auto_connect = true
 )
 
 # The regression baseline: a valid config with no `[[sidebar]]` at all.
+# Desktop notifications subscribe to the agent list with no panel at all, so
+# they are off here for 9 to show that the panels alone gate the subscription.
 CFG_NONE = """
 [appearance]
 border_style = "zellij_style"
+
+[notifications]
+enabled = false
 """
 
 FAILURES = []
@@ -103,6 +108,7 @@ def base_env(rundir, statedir, datadir, cfgdir):
     return {
         **os.environ,
         "PATH": f"{RUN}/bin:" + os.environ.get("PATH", ""),
+        "HOME": f"{RUN}/home",
         "XDG_RUNTIME_DIR": rundir,
         "XDG_STATE_HOME": statedir,
         "XDG_DATA_HOME": datadir,
@@ -146,7 +152,7 @@ def write_shim():
 def setup_dirs():
     shutil.rmtree(RUN, ignore_errors=True)
     for s in ("run", "run2", "state", "state2", "data", "data2", "bin",
-              "cfg", "cfg-remote", "cfg-plain", "cfg-none"):
+              "cfg", "cfg-remote", "cfg-plain", "cfg-none", "home"):
         os.makedirs(f"{RUN}/{s}", exist_ok=True)
     write_shim()
     write_config(f"{RUN}/cfg", CFG_SIDEBAR)
@@ -249,6 +255,10 @@ def spawn(env, cols=COLS, rows=ROWS):
 # INSIDE the bar, so the panel is the bar minus one cell on every side.
 FRAME = 1
 
+# The panel's header row plus the blank row under it: tree index 0 is panel
+# row 2.
+HEADER_ROWS = 2
+
 
 def panel_rows(screen):
     """The panel's INTERIOR rows, one string per PANEL row.
@@ -261,6 +271,10 @@ def panel_rows(screen):
         r[FRAME : SIDEBAR_W - FRAME].rstrip()
         for r in screen.display[FRAME : len(screen.display) - FRAME]
     ]
+
+
+def indent(row):
+    return len(row) - len(row.lstrip())
 
 
 def content_rows(screen):
@@ -279,15 +293,15 @@ def panel_row_of(screen, needle):
 def select_row(child, screen, pump, needle):
     """Move the panel selection onto the row containing `needle`.
 
-    Row `y` of a full-height left sidebar is tree index `y - 1` (row 0 is the
-    header), and `g` puts the selection on tree index 0, so the move is
-    unambiguous without reading the highlight back.
+    Row `y` of a full-height left sidebar is tree index `y - HEADER_ROWS`, and
+    `g` puts the selection on tree index 0, so the move is unambiguous without
+    reading the highlight back.
     """
     y = panel_row_of(screen, needle)
     assert y is not None, f"no panel row {needle!r} in {panel_rows(screen)}"
     child.send(b"g")
     pump(0.3)
-    for _ in range(y - 1):
+    for _ in range(y - HEADER_ROWS):
         child.send(b"j")
         pump(0.12)
     return y
@@ -373,7 +387,7 @@ def scenario_local():
 
     rows = panel_rows(screen)
     log("panel:", rows)
-    check("1 the panel headers itself", any(r.startswith("Sessions") for r in rows), rows)
+    check("1 the panel headers itself", any(r.strip() == "sessions" for r in rows), rows)
     check("1 the local server row is listed", any("local" in r for r in rows), rows)
     check("1 both sessions are listed",
           any("alpha" in r for r in rows) and any("beta" in r for r in rows), rows)
@@ -382,9 +396,10 @@ def scenario_local():
     alpha_y = panel_row_of(screen, "alpha")
     check("1 alpha's two tabs are listed under it (the session auto-expanded)",
           alpha_y is not None
-          and rows[alpha_y + 1].startswith("    ")
-          and rows[alpha_y + 2].startswith("    "), rows)
-    check("1 the server row is marked expanded", rows[1].startswith("\u25bc "), rows)
+          and indent(rows[alpha_y + 1]) > indent(rows[alpha_y])
+          and indent(rows[alpha_y + 2]) > indent(rows[alpha_y]), rows)
+    check("1 the server row is marked expanded",
+          rows[HEADER_ROWS].lstrip().startswith("\u25bc "), rows)
 
     # -- 7: a structural change nobody in this terminal asked for -------------
     w3 = Wire(SOCK1)
@@ -414,7 +429,7 @@ def scenario_local():
     assert y_alpha is not None, panel_rows(screen)
     child.send(b"g")
     pump(0.3)
-    for _ in range(y_alpha - 1):
+    for _ in range(y_alpha - HEADER_ROWS):
         child.send(b"j")
         pump(0.1)
     child.send(b"j")               # tab 0
@@ -435,7 +450,7 @@ def scenario_local():
     y_alpha = panel_row_of(screen, "alpha")
     child.send(b"g")
     pump(0.3)
-    for _ in range(y_alpha - 1):
+    for _ in range(y_alpha - HEADER_ROWS):
         child.send(b"j")
         pump(0.1)
     child.send(b"j")               # tab 0
@@ -489,7 +504,7 @@ def scenario_remote():
     assert y is not None, rows
     child.send(b"g")
     pump(0.3)
-    for _ in range(y - 1):
+    for _ in range(y - HEADER_ROWS):
         child.send(b"j")
         pump(0.1)
     child.send(b"j")               # the tab under mini1
@@ -543,12 +558,12 @@ def scenario_no_sidebar():
           "SubscribeSessionTree" not in server_log(),
           "the client subscribed with no sessions panel configured")
     # The agents panel's push is gated on its own flag, and the same way. With
-    # no sidebar at all, neither subscription may go out.
+    # no sidebar at all and notifications off, neither subscription may go out.
     check("9 no agents subscription is sent either",
           "SubscribeAgents" not in server_log(),
           "the client subscribed to the agent list with no agents panel configured")
     check("9 no panel is painted",
-          not any("Sessions" in r for r in screen.display),
+          not any("sessions" in r for r in screen.display),
           "a panel painted with no sidebar configured")
     check_no_panic(f"{RUN}/state")
     teardown(child)

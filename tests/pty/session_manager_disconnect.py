@@ -109,6 +109,7 @@ def base_env(rundir, statedir, datadir, cfgdir):
     return {
         **os.environ,
         "PATH": f"{RUN}/bin:" + os.environ.get("PATH", ""),
+        "HOME": f"{RUN}/home",
         "XDG_RUNTIME_DIR": rundir,
         "XDG_STATE_HOME": statedir,
         "XDG_DATA_HOME": datadir,
@@ -167,7 +168,7 @@ def dials():
 def setup_dirs():
     shutil.rmtree(RUN, ignore_errors=True)
     for s in ("run", "run2", "state", "state2", "data", "data2", "bin",
-              "cfg", "cfg-none"):
+              "cfg", "cfg-none", "home"):
         os.makedirs(f"{RUN}/{s}", exist_ok=True)
     write_shim()
     write_config(f"{RUN}/cfg",

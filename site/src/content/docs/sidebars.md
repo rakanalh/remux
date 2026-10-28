@@ -51,7 +51,9 @@ Reloading the config rebuilds the panels, so a `sessions` tree loses its expansi
 |---|---|---|---|
 | `edge` | yes | — | `"left"`, `"right"` or `"bottom"`. There is no `"top"`. An unknown edge is a config error. |
 | `size` | yes | — | Thickness: columns for `left`/`right`, rows for `bottom`. This is the starting size; you can resize at runtime. |
-| `visible` | no | `true` | Whether the sidebar starts open. Once you toggle or resize a sidebar, its saved state wins at startup (see [What is remembered](#what-is-remembered)). |
+| `visible` | no | `true` | Whether the sidebar starts open. `false` starts it collapsed to a [strip](#collapse-to-a-strip). Once you toggle or resize a sidebar, its saved state wins at startup (see [What is remembered](#what-is-remembered)). |
+| `style` | no | `"boxed"` | `"boxed"` frames the sidebar like the panes; `"flat"` draws one quiet divider column instead. Only the edge differs: see [Look](#look). An unknown value is a config error. |
+| `collapse_to_strip` | no | `true` | Whether collapsing leaves a one-cell strip behind. `false` hides the sidebar completely. See [Collapse to a strip](#collapse-to-a-strip). |
 
 **One sidebar per edge.** All three edges can be used at once, but a second `[[sidebar]]` on an edge that is already taken is dropped with a warning in the log. To show two things on one edge, give that sidebar two panels.
 
@@ -91,7 +93,16 @@ In the [session manager](/remux/sessions/) overlay, `Space` marks panes for a Vi
 
 ### agents
 
-Every pane running an AI coding agent, on every connected server, colour-coded by what it is doing: red needs your input, yellow is working, dim is idle. `j`/`k`/`g`/`G` move and `Enter` jumps to that pane, wherever it is. See [Agents](/remux/agents/) for how detection works and how to configure it.
+Every pane running an AI coding agent, on every connected server. Each agent takes two lines in every sidebar style:
+
+```
+● main · editor
+  claude · pi
+```
+
+The first line is the agent's name: `session · tab`, using the tab's name once the session tree has arrived (its index until then). A [`pane_title`](/remux/theme/#pane-titles) template, a name you gave the pane, or the pane's own window title replaces that. The second line, dim, is the command, followed by ` · host` for an agent on a remote. A filled `●` marks an agent that is working or needs your input, and a hollow `○` one that is idle; the colours are the same as everywhere else (red needs your input, yellow is working). The row of the pane you are in gets a full-width band across both lines.
+
+`j`/`k`/`g`/`G` move and `Enter` jumps to that pane, wherever it is. See [Agents](/remux/agents/) for how detection works and how to configure it.
 
 ![The agents panel docked beside the panes](../../assets/screenshots/sidebar-agents.png)
 
@@ -141,12 +152,16 @@ The `b` group under the prefix manages sidebars:
 
 | Keys | Action |
 |---|---|
-| `Ctrl-a b h` | Show or hide the left sidebar |
-| `Ctrl-a b l` | Show or hide the right sidebar |
-| `Ctrl-a b j` | Show or hide the bottom sidebar |
+| `Ctrl-a b h` | Collapse or expand the left sidebar |
+| `Ctrl-a b l` | Collapse or expand the right sidebar |
+| `Ctrl-a b j` | Collapse or expand the bottom sidebar |
 | `Ctrl-a b b` | Cycle focus through every visible panel, then back to the panes |
 
-You can also click a row to select it.
+Focusing a collapsed sidebar (`Alt-h`/`Alt-l`, or `Ctrl-a b b`) expands it.
+
+With the mouse, click a row to select it, click the collapse button to collapse a sidebar, and click a collapsed strip to expand it (see [Collapse to a strip](#collapse-to-a-strip)).
+
+A right click on a row of the `sessions`, `agents` or `files` panel selects it and opens a [context menu](/remux/keybindings/#context-menu) for that row: switch, rename or kill a session, switch, rename or close a tab, jump to, zoom or close an agent's pane, open a file in a split or copy a path. The `placeholder` panel and rows that have no action, such as a server or a pane row of the sessions panel, open no menu.
 
 :::tip
 There are no default keys that jump straight into a sidebar, but the actions exist. Bind them under `[keybindings.command.b]` if you want them:
@@ -159,6 +174,16 @@ J = "SidebarFocusBottom"
 ```
 :::
 
+## Collapse to a strip
+
+Every expanded sidebar carries a small button, a three-cell chip on the last row inside the sidebar, next to the divider or frame: ` ◀ ` on a left sidebar, ` ▶ ` on a right one and ` ▼ ` on the bottom one. Click it to collapse the sidebar.
+
+A collapsed sidebar does not vanish. It shrinks to a one-cell strip along its edge (one column, or one row for the bottom sidebar), filled and carrying a centred chip that points back the other way: `▶`, `◀` or `▲`. Click anywhere on the strip to expand the sidebar again. The strip is only chrome: it holds no panel and never takes the keyboard, and the panes get the rest of the terminal.
+
+The keyboard does the same. `Ctrl-a b h`/`l`/`j` collapse to the strip and expand from it, and focusing a collapsed sidebar expands it. Collapsing and expanding work the same inside a [View](/remux/views/).
+
+Set `collapse_to_strip = false` on a sidebar to go back to hiding it completely: the button then removes the sidebar and only the keyboard brings it back. Like any sidebar, a strip is dropped on a terminal too small to keep the minimum pane area.
+
 ## Resize
 
 While a panel has focus, the pane-resize keys (`Ctrl-a p R` then `h`/`j`/`k`/`l`) act on the sidebar instead:
@@ -168,11 +193,20 @@ While a panel has focus, the pane-resize keys (`Ctrl-a p R` then `h`/`j`/`k`/`l`
 
 ## What is remembered
 
-Each sidebar's visibility and size, and each panel's weight, are saved to `$XDG_STATE_HOME/remux/sidebar.json` (by default `~/.local/state/remux/sidebar.json`) and restored the next time you start. At startup the saved state wins: the `size` and `visible` in your config are only the defaults for a sidebar with no saved state yet. While Remux is running, a value you change in the config takes effect when you save; values you did not touch keep what you last set at runtime.
+Each sidebar's collapsed or expanded state, its size, and each panel's weight are saved to `$XDG_STATE_HOME/remux/sidebar.json` (by default `~/.local/state/remux/sidebar.json`) and restored the next time you start. At startup the saved state wins: the `size` and `visible` in your config are only the defaults for a sidebar with no saved state yet. While Remux is running, a value you change in the config takes effect when you save; values you did not touch keep what you last set at runtime.
 
-## Frames
+## Look
 
-A sidebar is framed in the same `border_style` as the panes beside it: a rounded box around the whole sidebar under `zellij_style`, or a single divider on the side facing the panes under `tmux_style`. Stacked panels are separated by a rule. The frame is drawn inside the sidebar's `size`, and under `zellij_style` it takes the active border colour while one of its panels has focus. `Ctrl-a g` reframes sidebars along with the panes. See [Theme](/remux/theme/).
+Every panel shares one look, whatever the plugin or style: a column of padding on the left, a lowercase bold header on a full-width bar followed by a blank row, and a full-width band behind the selected row. A rule separates stacked panels. The bar is dark (`sidebar_header_bg`) with a dim title; while its panel has the keyboard it becomes a solid blue bar (`sidebar_header_active_bg`) with a dark title (`sidebar_header_active_fg`).
+
+`style` changes only the edge against the panes:
+
+| `style` | Edge |
+|---|---|
+| `"boxed"` (default) | A frame in the same `border_style` as the panes: a rounded box under `zellij_style`, a single divider under `tmux_style`. |
+| `"flat"` | No frame, just one quiet divider column (row, for the bottom sidebar) in `sidebar_divider_fg`. |
+
+The frame or divider is drawn inside the sidebar's `size`. A boxed sidebar takes the active border colour under `zellij_style` while one of its panels has focus, and `Ctrl-a g` reframes boxed sidebars along with the panes. The colours are the `sidebar_*` roles in [Theme](/remux/theme/#colour-roles).
 
 ## Migrating from `browser`
 

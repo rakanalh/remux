@@ -556,7 +556,6 @@ mod tests {
                 None,
                 crate::config::BorderStyle::ZellijStyle,
                 Default::default(),
-                (80, 80),
             )
             .unwrap();
 
@@ -581,7 +580,6 @@ mod tests {
                 Some("work"),
                 crate::config::BorderStyle::ZellijStyle,
                 Default::default(),
-                (80, 80),
             )
             .unwrap();
         state.create_tab("s1", "tab2", Default::default()).unwrap();
@@ -593,6 +591,69 @@ mod tests {
         assert!(persisted.state.folders.contains_key("work"));
         let sess = persisted.state.sessions.get("s1").unwrap();
         assert_eq!(sess.tabs.len(), 2);
+    }
+
+    #[test]
+    fn a_float_zoom_comes_back_through_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut state = ServerState::new();
+        state
+            .create_session(
+                "floaty",
+                None,
+                crate::config::BorderStyle::ZellijStyle,
+                Default::default(),
+            )
+            .unwrap();
+        let tab = &mut state.sessions.get_mut("floaty").unwrap().tabs[0];
+        assert!(tab.toggle_zoom(crate::config::ZoomMode::Float));
+        let floated = tab.focused_pane;
+        let persisted = PersistedState::from_server(&state, &HashMap::new()).unwrap();
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        let mut loaded = load_state_from(&state_path, None).unwrap().unwrap();
+        let tab = &mut loaded.state.sessions.get_mut("floaty").unwrap().tabs[0];
+        tab.reconcile_pane_order();
+
+        assert_eq!(tab.float_zoomed(), Some(floated));
+        assert_eq!(tab.zoom_mode, crate::config::ZoomMode::Float);
+    }
+
+    #[test]
+    fn a_state_file_from_before_zoom_modes_loads_its_zoom_as_fullscreen() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut state = ServerState::new();
+        state
+            .create_session(
+                "old",
+                None,
+                crate::config::BorderStyle::ZellijStyle,
+                Default::default(),
+            )
+            .unwrap();
+        let tab = &mut state.sessions.get_mut("old").unwrap().tabs[0];
+        tab.zoomed_pane = Some(tab.focused_pane);
+        let persisted = PersistedState::from_server(&state, &HashMap::new()).unwrap();
+        let mut json: serde_json::Value = serde_json::to_value(&persisted).unwrap();
+        let tabs = json["state"]["sessions"]["old"]["tabs"]
+            .as_array_mut()
+            .unwrap();
+        for tab in tabs {
+            tab.as_object_mut().unwrap().remove("zoom_mode");
+        }
+        std::fs::write(&state_path, json.to_string()).unwrap();
+
+        let loaded = load_state_from(&state_path, None).unwrap().unwrap();
+        let tab = &loaded.state.sessions["old"].tabs[0];
+
+        assert!(tab.zoomed_pane.is_some());
+        assert_eq!(tab.float_zoomed(), None);
     }
 
     #[test]
@@ -608,7 +669,6 @@ mod tests {
                 None,
                 crate::config::BorderStyle::ZellijStyle,
                 Default::default(),
-                (80, 80),
             )
             .unwrap();
 
@@ -673,7 +733,6 @@ mod tests {
                 None,
                 crate::config::BorderStyle::ZellijStyle,
                 Default::default(),
-                (80, 80),
             )
             .unwrap();
         let persisted = PersistedState::from_server(&state, &HashMap::new()).unwrap();
