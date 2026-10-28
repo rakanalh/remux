@@ -20,7 +20,9 @@ interprocess = { version = "2.2", features = ["tokio"] }
 crossbeam = "0.8"
 cassowary = "0.3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order`: `remux integrate` rewrites a user's settings file, and
+# must keep their keys in the order they wrote them.
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 signal-hook = "0.3"
