@@ -97,9 +97,16 @@ impl RemuxClient {
         let (reader, writer) = stream.into_split();
         let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(reader);
         let mut writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(writer);
-        let server_version = handshake(&mut reader, &mut writer)
-            .await
-            .context("handshake with local server")?;
+        let server_version = handshake(&mut reader, &mut writer).await.map_err(|e| {
+            if e.is::<ProtocolSkew>() {
+                e.context(
+                    "the running server is from another remux build; `remux restart` \
+                     replaces it, saving and restoring its sessions",
+                )
+            } else {
+                e.context("handshake with local server")
+            }
+        })?;
         Ok(Self {
             reader,
             writer,
@@ -325,11 +332,11 @@ where
     );
 
     if welcome.protocol_version != PROTOCOL_VERSION {
-        anyhow::bail!(
-            "incompatible remux: remote protocol v{}, local v{} (remote remux {shown})",
-            welcome.protocol_version,
-            PROTOCOL_VERSION,
-        );
+        return Err(ProtocolSkew {
+            remote: welcome.protocol_version,
+            remote_version: shown,
+        }
+        .into());
     }
     Ok(welcome.remux_version.chars().take(STAMP_MAX).collect())
 }
@@ -337,6 +344,28 @@ where
 /// The most of a peer's build stamp that is kept or shown. A real stamp is a
 /// version and a short git hash, far shorter than this.
 const STAMP_MAX: usize = 64;
+
+/// The peer answered the handshake with another protocol version: a server is
+/// running, and it is not this build's. A type of its own so that a caller can
+/// tell it from "nothing is listening".
+#[derive(Debug)]
+pub struct ProtocolSkew {
+    pub remote: u32,
+    /// The peer's build stamp, already escaped and bounded for display.
+    pub remote_version: String,
+}
+
+impl std::fmt::Display for ProtocolSkew {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "incompatible remux: remote protocol v{}, local v{} (remote remux {})",
+            self.remote, PROTOCOL_VERSION, self.remote_version
+        )
+    }
+}
+
+impl std::error::Error for ProtocolSkew {}
 
 /// Produce a concise summary of a `ClientMessage` for debug logging.
 fn client_message_summary(msg: &ClientMessage) -> String {
@@ -554,9 +583,12 @@ mod tests {
             remux_version: "0.1.0+old".to_string(),
         })
         .await;
-        let err = result
-            .expect_err("a skewed peer must be rejected")
-            .to_string();
+        let err = result.expect_err("a skewed peer must be rejected");
+        assert!(
+            err.is::<ProtocolSkew>(),
+            "typed, so a caller can tell it apart"
+        );
+        let err = err.to_string();
         assert!(
             err.contains("incompatible remux") && err.contains("0.1.0+old"),
             "the rejection must name the peer it refused: {err}"

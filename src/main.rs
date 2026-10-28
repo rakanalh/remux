@@ -650,16 +650,27 @@ async fn ensure_server_running() -> Result<()> {
         sock.display()
     );
     if sock.exists() {
-        // Try connecting to verify the socket is live
-        match RemuxClient::connect().await {
+        // A bare connect, no handshake: whether a server is LISTENING is the
+        // only question here. Only "nothing is listening" makes the socket
+        // stale. A server that answers is left alone even when it speaks
+        // another protocol -- the handshake that follows reports that -- because
+        // unlinking its socket orphans a live server and every session in it.
+        match tokio::net::UnixStream::connect(&sock).await {
             Ok(_) => {
                 log::debug!("ensure_server_running: server already running");
                 return Ok(());
             }
-            Err(_) => {
-                // Stale socket file, remove it
-                log::debug!("ensure_server_running: stale socket detected, removing");
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                log::debug!("ensure_server_running: stale socket detected ({e}), removing");
                 let _ = std::fs::remove_file(&sock);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("connecting to {}", sock.display()));
             }
         }
     }
