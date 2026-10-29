@@ -190,6 +190,7 @@ sys.path.insert(0, HERE)
 from harness import BIN, PROTOCOL_VERSION, Client, Server, name_of  # noqa: E402
 import ssh_shim  # noqa: E402
 import fakeagent  # noqa: E402
+import relay_fds  # noqa: E402
 
 RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msgrem")
 SHIMDIR = RUNDIR + "-bin"
@@ -1683,6 +1684,11 @@ try:
     restart_b(B_CONFIG + "mailbox_max_messages = 2\n")
     cli_b.close()
     cli_b, (B2,) = setup_server(srv_b, 1)
+    # Every relay dial rewrites the listing, so one left by an earlier dial
+    # must not stand in for this one's.
+    for stale in (os.environ["RMX_SHIM_FDS"], os.environ["RMX_SHIM_FDS"] + ".err"):
+        if os.path.exists(stale):
+            os.remove(stale)
     burst = [threading.Thread(target=cli_spawn, args=(srv_a,)) for _ in range(16)]
     for t in burst:
         t.start()
@@ -1690,11 +1696,15 @@ try:
     code, out, err = send_from_a1(f"mini:%{B2}", "i1")
     for t in burst:
         t.join()
-    fds = open(os.environ["RMX_SHIM_FDS"]).read().splitlines() if os.path.exists(os.environ["RMX_SHIM_FDS"]) else []
-    extra = [ln for ln in fds if re.search(r" (\d+) -> ", ln) and int(re.search(r" (\d+) -> ", ln).group(1)) > 2
-             and "ssh" not in ln.split(" -> ")[-1]]
-    check(fds and not extra and not any(k in "\n".join(fds) for k in ("/dev/pts", "ptmx", "remux.sock", "state.json")),
-          f"1r the relay inherits only 0, 1 and 2 (extra {extra})")
+    lines = shim_lines("RMX_SHIM_FDS")
+    captured, extra, leaked = relay_fds.verdict(lines)
+    err_path = os.environ["RMX_SHIM_FDS"] + ".err"
+    capture_err = open(err_path).read().splitlines()[-3:] if os.path.exists(err_path) else []
+    check(captured, f"1r the shim's descriptors were captured and read: 0, 1 and 2 are listed "
+                    f"({len(lines)} lines, fds {sorted(fd for fd, _ in relay_fds.listed_fds(lines))}, "
+                    f"capture errors {capture_err})")
+    check(captured and not extra and not leaked,
+          f"1r the relay inherits only 0, 1 and 2 (extra {extra}, terminal or server files {leaked})")
 
     # --- 1i -----------------------------------------------------------------
     send_from_a1(f"mini:%{B2}", "i2")

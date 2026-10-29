@@ -38,6 +38,12 @@ plays the mode the harness chose in `$RMX_SHIM_MODE`:
 
 Before the relay, the shim lists its own open descriptors to `$RMX_SHIM_FDS`:
 the relay inherits exactly these, and decision 71 says they are 0, 1 and 2.
+The listing is written whole, by rename, and retried while empty: `lsof` on
+macOS has come back empty, and a harness reading an empty or half-written
+listing would find no leaked fd in it. Each redirect is on a child command,
+never on the shell itself, which would open a descriptor in the very table
+being listed. A capture that stays empty leaves no file and a line in
+`$RMX_SHIM_FDS.err`.
 
 Run as a program (`python3 ssh_shim.py skew|skewnasty|oldpeer|eatsend|mute|hostile|echo|stalepong|garbage|garbage-forever|proxy`) it
 is the far side of the link for the modes that need no real server.
@@ -57,7 +63,13 @@ SHIM = r"""#!/bin/sh
 echo "$$" >> "$RMX_SHIM_PIDS"; printf '%s\n' "$*" >> "$RMX_SHIM_ARGV"
 mode=$(cat "$RMX_SHIM_MODE" 2>/dev/null || echo relay)
 case "$mode" in
-  relay)   ls -l "/proc/$$/fd" > "$RMX_SHIM_FDS" 2>/dev/null || lsof -p "$$" > "$RMX_SHIM_FDS" 2>/dev/null
+  relay)   tries=0
+           while [ "$tries" -lt 10 ]; do
+             ls -l "/proc/$$/fd" > "$RMX_SHIM_FDS.$$" 2>/dev/null || lsof -n -P -p "$$" > "$RMX_SHIM_FDS.$$" 2>> "$RMX_SHIM_FDS.err"
+             [ -s "$RMX_SHIM_FDS.$$" ] && break
+             tries=$((tries + 1)); sleep 0.2
+           done
+           if [ -s "$RMX_SHIM_FDS.$$" ]; then mv -f "$RMX_SHIM_FDS.$$" "$RMX_SHIM_FDS"; else rm -f "$RMX_SHIM_FDS.$$"; echo "$$: empty after $tries tries" >> "$RMX_SHIM_FDS.err"; fi
            export XDG_RUNTIME_DIR="$RMX_B_RUN" XDG_STATE_HOME="$RMX_B_STATE" XDG_DATA_HOME="$RMX_B_DATA" XDG_CONFIG_HOME="$RMX_B_CONFIG"
            exec "$RMX_BIN" relay ;;
   prompt)  echo "Enter passphrase for key '/home/x/.ssh/id_ed25519':" >&2; exit 255 ;;
