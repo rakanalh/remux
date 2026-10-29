@@ -80,7 +80,7 @@ def main():
     os.chmod(f"{rofile}/remux/client.log", 0o400)
     before = os.stat(f"{rofile}/remux/client.log").st_ino
     rc, out, err = run(cli_env(rofile, f"{RUNDIR}/run-none"), "integrate", "claude-messaging", "--status")
-    check(rc == 0 and "Absent" in out and no_panic(rc, err),
+    check(rc == 0 and "Absent" in out and err == "" and no_panic(rc, err),
           f"2 a read-only client.log: --status answers (rc={rc}, out={out.strip()!r}, err={err.strip()[:200]!r})")
 
     # -- 3 ---------------------------------------------------------------------

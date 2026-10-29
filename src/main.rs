@@ -804,7 +804,7 @@ async fn ensure_server_running() -> Result<()> {
         });
     }
 
-    cmd.spawn().context("spawning server process")?;
+    let mut child = cmd.spawn().context("spawning server process")?;
 
     // Wait for the socket to appear
     for i in 0..50 {
@@ -814,11 +814,31 @@ async fn ensure_server_running() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(50)).await;
             return Ok(());
         }
+        // A server that cannot start exits at once. Saying so now, rather
+        // than at the end of the wait, is what lets a relay's cause reach a
+        // dialler whose own deadline is shorter than this wait. One that lost
+        // the bind to a server started at the same moment also exits, and
+        // that server's socket is the one to use.
+        if let (Ok(Some(status)), false) = (child.try_wait(), sock.exists()) {
+            log::debug!("ensure_server_running: the server exited ({status})");
+            anyhow::bail!(
+                "the server exited before its socket appeared at {} ({status}); see {} if it \
+                 exists: a server that cannot open its log exits without writing one",
+                sock.display(),
+                paths::state_home()
+                    .join("remux")
+                    .join("server.log")
+                    .display()
+            );
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     log::debug!("ensure_server_running: timed out waiting for socket");
-    anyhow::bail!("timed out waiting for server to start")
+    anyhow::bail!(
+        "timed out waiting for the server's socket at {}",
+        sock.display()
+    )
 }
 
 /// `remux integrate`. Run by a human, so a failure exits non-zero.
