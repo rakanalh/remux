@@ -91,12 +91,15 @@ def _write_frame(stream, obj):
 
 
 def main(mode):
+    stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
+    # The proxy starts a relay, and importing harness installs home_guard,
+    # which counts the HOME this process inherited as the real one. That HOME
+    # is the test server's throwaway, so the proxy runs before the import.
+    if mode == "proxy":
+        return _proxy(stdin, stdout)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from harness import PROTOCOL_VERSION  # noqa: E402
 
-    stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
-    if mode == "proxy":
-        return _proxy(stdin, stdout)
     if mode in ("garbage", "garbage-forever"):
         size = 10 * 1024 if mode == "garbage" else 1024 * 1024
         line = b"Permission \x1b[31mdenied\x1b[0m (publickey)" + b"\x1b" * 400 + b"\n"

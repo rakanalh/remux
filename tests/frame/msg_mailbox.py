@@ -567,7 +567,7 @@ try:
     check(code_of(r) == "no_such_target", f"3m %{X}, exited but unreaped, is no_such_target (got {r})")
 
     # --- 3n: popups --------------------------------------------------------
-    cli.send({"Command": "PopupToggle"})
+    cli.send({"Command": {"PopupToggle": None}})
     time.sleep(1.0)
     spawned = re.findall(r"spawn_pane pane_id=(\d+)", srv.log())
     popup = int(spawned[-1]) if spawned else None
@@ -583,7 +583,7 @@ try:
     r = wait_file(out_file)
     check(code_of(r) == "sender_unverified" and "a popup cannot" in r["Error"]["message"],
           f"3n a send from inside the popup is refused, and says why (got {r})")
-    cli.send({"Command": "PopupToggle"})
+    cli.send({"Command": {"PopupToggle": None}})
     time.sleep(0.5)
 
     # --- 3o: control characters -------------------------------------------

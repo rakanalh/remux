@@ -65,7 +65,7 @@ def check(cond, label):
 
 def env_for(name):
     base = f"{RUN}/{name}"
-    for d in ("run", "state", "data", "config"):
+    for d in ("run", "state", "data", "config", "home"):
         os.makedirs(f"{base}/{d}", exist_ok=True)
     return base, {
         **os.environ,
@@ -73,6 +73,7 @@ def env_for(name):
         "XDG_STATE_HOME": f"{base}/state",
         "XDG_DATA_HOME": f"{base}/data",
         "XDG_CONFIG_HOME": f"{base}/config",
+        "HOME": f"{base}/home",
         "SHELL": "/bin/sh",
         "ENV": "/dev/null",
         "TERM": "xterm-256color",

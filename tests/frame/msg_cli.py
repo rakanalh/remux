@@ -612,7 +612,8 @@ fake_env = {**{k: v for k, v in os.environ.items() if k not in ("REMUX_SESSION",
             "XDG_RUNTIME_DIR": fake_run,
             "XDG_STATE_HOME": f"{RUNDIR}-fake/state",
             "XDG_DATA_HOME": f"{RUNDIR}-fake/data",
-            "XDG_CONFIG_HOME": f"{RUNDIR}-fake/config"}
+            "XDG_CONFIG_HOME": f"{RUNDIR}-fake/config",
+            "HOME": f"{RUNDIR}-fake/home"}
 try:
     for fmt in ("text", "context", "json"):
         done = subprocess.run([BIN, "msg", "read", "--pane", "%4", "--format", fmt],

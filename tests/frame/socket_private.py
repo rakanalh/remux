@@ -45,13 +45,13 @@ def check(cond, label):
 
 def env_for(name, xdg_runtime=None):
     base = f"{RUNDIR}/{name}"
-    for d in ("tmp", "state", "data", "config"):
+    for d in ("tmp", "state", "data", "config", "home"):
         os.makedirs(f"{base}/{d}", exist_ok=True)
     env = {k: v for k, v in os.environ.items()
            if k not in ("XDG_RUNTIME_DIR", "REMUX_SESSION", "REMUX_PANE")}
     env.update(TMPDIR=f"{base}/tmp", XDG_STATE_HOME=f"{base}/state",
                XDG_DATA_HOME=f"{base}/data", XDG_CONFIG_HOME=f"{base}/config",
-               SHELL="/bin/sh", ENV="/dev/null", TERM="xterm-256color")
+               HOME=f"{base}/home", SHELL="/bin/sh", ENV="/dev/null", TERM="xterm-256color")
     if xdg_runtime:
         os.makedirs(xdg_runtime, mode=0o700, exist_ok=True)
         env["XDG_RUNTIME_DIR"] = xdg_runtime
