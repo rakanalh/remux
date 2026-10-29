@@ -1,6 +1,7 @@
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use anyhow::{Context, Result};
+#[cfg(not(target_os = "linux"))]
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::pty::Winsize;
 use nix::sys::signal::{self, Signal};
@@ -259,22 +260,7 @@ impl Pty {
             identity
         );
 
-        // Built BEFORE the fork. `CString::new` allocates, and the child of a
-        // fork in a multi-threaded process may only call async-signal-safe
-        // functions -- the allocator lock can be held by a thread that does not
-        // exist on this side of the fork. Everything below the fork just reads
-        // these.
-        let c_args: Vec<std::ffi::CString> = args
-            .iter()
-            .map(|a| std::ffi::CString::new(a.as_str()))
-            .collect::<std::result::Result<_, _>>()
-            .context("an argument for the pane's command contains a NUL byte")?;
-
-        // Formatted BEFORE the fork, for the same reason `c_args` is: `format!`
-        // allocates, and the child of a fork in a multi-threaded process may only
-        // call async-signal-safe functions. The child below just hands these two
-        // strings to `set_var`.
-        let identity_env = identity.map(|id| (id.session.to_string(), id.pane.to_string()));
+        let exec = ChildExec::prepare(command, args, cwd, identity)?;
 
         let winsize = Winsize {
             ws_row: rows,
@@ -308,153 +294,11 @@ impl Pty {
             }
         };
 
-        // SAFETY: We are about to fork. The child process will exec immediately,
-        // so we avoid calling any async-signal-unsafe functions beyond what is
-        // strictly necessary for setting up the terminal and executing the shell.
+        // SAFETY: the child runs `exec_child` alone, which makes only
+        // async-signal-safe calls on data `exec` prepared above and never
+        // returns. See `ChildExec` for why that matters.
         match unsafe { unistd::fork() }.context("fork failed")? {
-            ForkResult::Child => {
-                // -- Child process --
-                // Close master fd in child; we only need the slave side.
-                drop(master);
-
-                // Create a new session and set the slave as the controlling terminal.
-                unistd::setsid().expect("setsid failed");
-
-                // Set the slave as the controlling terminal via ioctl.
-                // SAFETY: TIOCSCTTY is a well-defined ioctl for setting the
-                // controlling terminal. The slave fd is valid.
-                unsafe {
-                    if libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
-                        libc::_exit(1);
-                    }
-                }
-
-                // Redirect stdin/stdout/stderr to the slave PTY.
-                unistd::dup2(slave.as_raw_fd(), libc::STDIN_FILENO).expect("dup2 stdin failed");
-                unistd::dup2(slave.as_raw_fd(), libc::STDOUT_FILENO).expect("dup2 stdout failed");
-                unistd::dup2(slave.as_raw_fd(), libc::STDERR_FILENO).expect("dup2 stderr failed");
-
-                // `dup2` clears `FD_CLOEXEC` on the descriptor it creates, so the
-                // three above are already exec-safe -- except when the slave
-                // ALREADY is one of 0, 1 or 2. `dup2(fd, fd)` returns without
-                // changing anything, so the flag set before the fork would survive
-                // and `exec` would close the pane's own terminal. Clearing it here
-                // keeps the pane's stdio working for whatever descriptor number
-                // `openpty` happened to return.
-                for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
-                    if fcntl(fd, FcntlArg::F_SETFD(FdFlag::empty())).is_err() {
-                        // SAFETY: async-signal-safe, and a pane without stdio
-                        // cannot run. Same handling as the TIOCSCTTY failure above.
-                        unsafe { libc::_exit(1) }
-                    }
-                }
-
-                // Close the original slave fd if it is not one of 0/1/2.
-                if slave.as_raw_fd() > 2 {
-                    drop(slave);
-                }
-
-                // Change to the requested working directory, falling back
-                // to $HOME if the directory does not exist.
-                if let Some(dir) = cwd {
-                    if std::env::set_current_dir(dir).is_err() {
-                        if let Ok(home) = std::env::var("HOME") {
-                            let _ = std::env::set_current_dir(home);
-                        }
-                    }
-                }
-
-                // Set TERM to match the escape sequences Remux generates.
-                std::env::set_var("TERM", "xterm-256color");
-
-                // Mark the environment so a `remux` launched inside this pane
-                // can detect it is nested and refuse (mirrors tmux's $TMUX and
-                // zellij's $ZELLIJ). Set here in the child, alongside TERM, so it
-                // is inherited by the pane's shell and its descendants.
-                std::env::set_var("REMUX", "1");
-
-                // Name the pane to whatever runs in it, mirroring tmux's
-                // $TMUX/$TMUX_PANE. `REMUX=1` only says "you are inside SOME
-                // remux"; these two say which, and that is the difference
-                // between a script knowing it is nested and a script being able
-                // to ask the server for a split.
-                //
-                // Left UNSET when there is no identity, rather than set to an
-                // empty string: `remux split` distinguishes "not in a pane" from
-                // "in a pane" by PRESENCE, and an empty value would read as a
-                // session whose name is "".
-                if let Some((session, pane)) = &identity_env {
-                    std::env::set_var("REMUX_SESSION", session);
-                    std::env::set_var("REMUX_PANE", pane);
-                }
-
-                // Determine which shell/command to execute.
-                let shell = match command {
-                    Some(cmd) => cmd.to_string(),
-                    None => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
-                };
-
-                let c_shell = std::ffi::CString::new(shell.as_str()).expect("CString::new failed");
-
-                // Spawn the shell as a LOGIN shell. By convention, a shell
-                // treats itself as a login shell when its argv[0] begins with a
-                // leading dash (e.g. "-zsh"). This is what tmux/screen and
-                // login(1) do, and it ensures login-only init files such as
-                // ~/.zprofile, ~/.zlogin and ~/.bash_profile are sourced.
-                // We still exec the real binary at `c_shell`, but present its
-                // argv[0] as "-<basename>".
-                //
-                // Only when there are no ARGUMENTS, though, and the two halves
-                // of that fail in opposite and equally quiet ways -- which is
-                // why this comment is here and must not be tidied away as
-                // restating the code:
-                //
-                // * a dash-prefixed `vim` is a program name `vim` does not
-                //   recognise, so the pane dies with an error nobody expects;
-                // * a shell WITHOUT the dash starts perfectly and silently
-                //   stops sourcing `~/.zprofile`, `~/.zlogin` and
-                //   `~/.bash_profile`. Nothing fails. The user's PATH is just
-                //   quietly different in remux than everywhere else, months
-                //   after anyone would connect that to this line.
-                let shell_basename = std::path::Path::new(&shell)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(shell.as_str());
-                let argv0 = if c_args.is_empty() {
-                    format!("-{shell_basename}")
-                } else {
-                    shell_basename.to_string()
-                };
-                let c_argv0 = std::ffi::CString::new(argv0.as_str()).expect("CString::new failed");
-
-                // exec the shell. On success this does not return; on failure
-                // say so on the terminal and leave immediately.
-                //
-                // Deliberately NOT a panic. This is a forked child, so unwinding
-                // runs the parent's hooks and atexit handlers in a process that
-                // shares its memory image -- and the panic message goes to the
-                // pane, where the user reads a Rust backtrace instead of the
-                // name of the program that could not be started. Reachable by
-                // ordinary config since the `files` sidebar plugin takes a
-                // user-supplied `command`: one typo in `command = "yazi"` used
-                // to paint a panic into the panel.
-                let mut argv: Vec<&std::ffi::CStr> = Vec::with_capacity(1 + c_args.len());
-                argv.push(&c_argv0);
-                argv.extend(c_args.iter().map(|a| a.as_c_str()));
-                let _ = unistd::execvp(&c_shell, &argv);
-                let err = std::io::Error::last_os_error();
-                let msg = format!("remux: cannot run {shell:?}: {err}\r\n");
-                // SAFETY: a plain `write` to fd 2, which is the PTY slave here.
-                // Async-signal-safe, which `println!` and unwinding are not.
-                unsafe {
-                    libc::write(
-                        libc::STDERR_FILENO,
-                        msg.as_ptr() as *const libc::c_void,
-                        msg.len(),
-                    );
-                    libc::_exit(127) // 127 = "command not found", as a shell reports it
-                }
-            }
+            ForkResult::Child => unsafe { exec_child(&exec, slave.as_raw_fd()) },
             ForkResult::Parent { child } => {
                 // -- Parent process --
                 // Close the slave side; we only communicate through the master.
@@ -614,6 +458,408 @@ impl Pty {
             _ => Ok(None),
         }
     }
+}
+
+/// Everything a pane's child needs between `fork` and `exec`, built in the
+/// parent.
+///
+/// The server is multi-threaded, and the child of a fork in a multi-threaded
+/// process may only make async-signal-safe calls until it execs: a lock that
+/// another thread held at the moment of the fork stays held for ever on the
+/// child's side, because the thread that would release it does not exist
+/// there. The locks in question are real and busy: std's environment lock,
+/// which every `env::var` and every `Command` spawn in the server takes, the
+/// allocator's and the logger's. A child that blocked on one never reached
+/// `exec`, ran on with the server's signal handlers, so SIGTERM did nothing,
+/// and held every descriptor the server had, its listening socket included,
+/// so the next server refused to start.
+///
+/// So the parent builds argv, the environment, the paths `execvp` would try,
+/// the working directory and every failure message here, and the child only
+/// reads them.
+///
+/// It holds raw pointers into its own strings, so it is not `Send`: build it
+/// on the thread that forks.
+struct ChildExec {
+    /// Where to `execve`, in order, as `execvp` searches: the command alone
+    /// when it names a path, else each `PATH` entry joined to it.
+    candidates: Vec<std::ffi::CString>,
+    _argv: Vec<std::ffi::CString>,
+    argv: Vec<*const libc::c_char>,
+    /// For a candidate that is not an executable format (`ENOEXEC`): the same
+    /// command run by `/bin/sh`, which is what `execvp` does with it.
+    sh: std::ffi::CString,
+    sh_argv: Vec<Vec<*const libc::c_char>>,
+    _envp: Vec<std::ffi::CString>,
+    envp: Vec<*const libc::c_char>,
+    /// `Some` when a working directory was asked for. Its inner `None` is one
+    /// that cannot be a C string, which fails like a directory that does not
+    /// exist: the child falls back to `home`.
+    cwd: Option<Option<std::ffi::CString>>,
+    home: Option<std::ffi::CString>,
+    /// Descriptors above stderr are closed below this when `close_range` is
+    /// not available.
+    fd_bound: libc::c_int,
+    failure_prefix: Vec<u8>,
+    failures: Vec<(i32, Vec<u8>)>,
+}
+
+impl ChildExec {
+    fn prepare(
+        command: Option<&str>,
+        args: &[String],
+        cwd: Option<&std::path::Path>,
+        identity: Option<PaneIdentity<'_>>,
+    ) -> Result<Self> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_args: Vec<CString> = args
+            .iter()
+            .map(|a| CString::new(a.as_str()))
+            .collect::<std::result::Result<_, _>>()
+            .context("an argument for the pane's command contains a NUL byte")?;
+
+        let shell = match command {
+            Some(cmd) => cmd.to_string(),
+            None => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+        };
+
+        // Spawn the shell as a LOGIN shell. By convention, a shell
+        // treats itself as a login shell when its argv[0] begins with a
+        // leading dash (e.g. "-zsh"). This is what tmux/screen and
+        // login(1) do, and it ensures login-only init files such as
+        // ~/.zprofile, ~/.zlogin and ~/.bash_profile are sourced.
+        // We still exec the real binary at the shell's path, but present its
+        // argv[0] as "-<basename>".
+        //
+        // Only when there are no ARGUMENTS, though, and the two halves
+        // of that fail in opposite and equally quiet ways -- which is
+        // why this comment is here and must not be tidied away as
+        // restating the code:
+        //
+        // * a dash-prefixed `vim` is a program name `vim` does not
+        //   recognise, so the pane dies with an error nobody expects;
+        // * a shell WITHOUT the dash starts perfectly and silently
+        //   stops sourcing `~/.zprofile`, `~/.zlogin` and
+        //   `~/.bash_profile`. Nothing fails. The user's PATH is just
+        //   quietly different in remux than everywhere else, months
+        //   after anyone would connect that to this line.
+        let shell_basename = std::path::Path::new(&shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(shell.as_str());
+        let argv0 = if c_args.is_empty() {
+            format!("-{shell_basename}")
+        } else {
+            shell_basename.to_string()
+        };
+        let mut argv_owned =
+            vec![CString::new(argv0).context("the pane's command contains a NUL byte")?];
+        argv_owned.extend(c_args);
+        let argv = nul_terminated(&argv_owned);
+
+        // `execvp`'s search, decided here: a name with a `/` is used as it
+        // is, anything else is tried in each `PATH` entry, an empty entry
+        // meaning the working directory, with the C library's default `PATH`
+        // when there is none.
+        let candidates: Vec<CString> = if shell.is_empty() || shell.contains('\0') {
+            Vec::new()
+        } else if shell.contains('/') {
+            vec![CString::new(shell.as_str()).context("the pane's command contains a NUL byte")?]
+        } else {
+            let path =
+                std::env::var_os("PATH").unwrap_or_else(|| std::ffi::OsString::from(DEFAULT_PATH));
+            path.as_bytes()
+                .split(|&b| b == b':')
+                .filter_map(|dir| {
+                    let mut full = dir.to_vec();
+                    if !full.is_empty() {
+                        full.push(b'/');
+                    }
+                    full.extend_from_slice(shell.as_bytes());
+                    CString::new(full).ok()
+                })
+                .collect()
+        };
+        let sh = CString::new("/bin/sh").context("building /bin/sh")?;
+        let sh_argv = candidates
+            .iter()
+            .map(|candidate| {
+                let mut v = vec![sh.as_ptr(), candidate.as_ptr()];
+                v.extend(argv_owned[1..].iter().map(|a| a.as_ptr()));
+                v.push(std::ptr::null());
+                v
+            })
+            .collect();
+
+        // The parent's environment with the pane's own variables set over it,
+        // exactly as the child used to `set_var` them: TERM to match the
+        // escape sequences Remux generates; REMUX=1 so a `remux` launched in
+        // the pane knows it is nested (tmux's $TMUX, zellij's $ZELLIJ); and
+        // REMUX_SESSION/REMUX_PANE, which say WHICH remux and are what lets a
+        // script ask the server for a split. Those two are left as inherited,
+        // not set to "", when there is no identity: `remux split` tells "not
+        // in a pane" from "in a pane" by their PRESENCE.
+        let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+        let mut set = |key: &str, value: &str| {
+            let value = std::ffi::OsString::from(value);
+            match vars.iter_mut().find(|(k, _)| k == key) {
+                Some((_, v)) => *v = value,
+                None => vars.push((key.into(), value)),
+            }
+        };
+        set("TERM", "xterm-256color");
+        set("REMUX", "1");
+        if let Some(id) = identity {
+            set("REMUX_SESSION", id.session);
+            set("REMUX_PANE", &id.pane.to_string());
+        }
+        let envp_owned: Vec<CString> = vars
+            .iter()
+            .filter_map(|(k, v)| {
+                let mut entry = k.as_bytes().to_vec();
+                entry.push(b'=');
+                entry.extend_from_slice(v.as_bytes());
+                CString::new(entry).ok()
+            })
+            .collect();
+        let envp = nul_terminated(&envp_owned);
+
+        // The requested directory, falling back to $HOME when it cannot be
+        // entered.
+        let cwd = cwd.map(|dir| CString::new(dir.as_os_str().as_bytes()).ok());
+        let home = std::env::var("HOME")
+            .ok()
+            .and_then(|h| CString::new(h).ok());
+
+        let fd_bound = {
+            // SAFETY: `getrlimit` only writes the struct it is given.
+            let mut lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let got = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0;
+            if got && lim.rlim_cur != libc::RLIM_INFINITY {
+                lim.rlim_cur.min(FD_BOUND_CAP as libc::rlim_t) as libc::c_int
+            } else {
+                FD_BOUND_CAP
+            }
+        };
+
+        // Deliberately NOT a panic when the exec fails. This is a forked
+        // child, so unwinding runs the parent's hooks in a process that shares
+        // its memory image, and the user would read a Rust backtrace in the
+        // pane instead of the name of the program that could not be started.
+        let failure_prefix = format!("remux: cannot run {shell:?}: ").into_bytes();
+        let failures = [
+            libc::ENOENT,
+            libc::EACCES,
+            libc::ENOEXEC,
+            libc::ENOTDIR,
+            libc::ELOOP,
+            libc::ENAMETOOLONG,
+            libc::E2BIG,
+            libc::ENOMEM,
+            libc::ETXTBSY,
+            libc::EISDIR,
+            libc::EPERM,
+            libc::EIO,
+            libc::EINVAL,
+        ]
+        .into_iter()
+        .map(|code| {
+            let mut msg = failure_prefix.clone();
+            msg.extend_from_slice(
+                std::io::Error::from_raw_os_error(code)
+                    .to_string()
+                    .as_bytes(),
+            );
+            msg.extend_from_slice(b"\r\n");
+            (code, msg)
+        })
+        .collect();
+
+        Ok(ChildExec {
+            candidates,
+            _argv: argv_owned,
+            argv,
+            sh,
+            sh_argv,
+            _envp: envp_owned,
+            envp,
+            cwd,
+            home,
+            fd_bound,
+            failure_prefix,
+            failures,
+        })
+    }
+}
+
+/// The C library's `PATH` when there is none, which `execvp` would search.
+#[cfg(target_os = "macos")]
+const DEFAULT_PATH: &str = "/usr/bin:/bin";
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_PATH: &str = "/bin:/usr/bin";
+
+/// The most descriptors the child closes one by one, when it cannot close
+/// them all at once. A descriptor numbered above it would survive into the
+/// pane. Descriptors are allocated lowest-free, so one gets that high only
+/// with that many open at once, or by a `dup2` to a high number, and remux
+/// does neither.
+const FD_BOUND_CAP: libc::c_int = 65536;
+
+/// `strings` as a NUL-terminated array of pointers into them, for `execve`.
+fn nul_terminated(strings: &[std::ffi::CString]) -> Vec<*const libc::c_char> {
+    let mut ptrs: Vec<_> = strings.iter().map(|s| s.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    ptrs
+}
+
+/// The pane's side of the fork: it makes the slave its controlling terminal
+/// and its stdio, drops everything else it inherited, and execs.
+///
+/// # Safety
+///
+/// Called only in the child of `fork`, with `slave` open. Every call in here
+/// is async-signal-safe and nothing allocates: see [`ChildExec`].
+unsafe fn exec_child(exec: &ChildExec, slave: std::os::fd::RawFd) -> ! {
+    if libc::setsid() == -1 || libc::ioctl(slave, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+        libc::_exit(1);
+    }
+    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // `dup2` clears `FD_CLOEXEC` on the descriptor it creates, except
+        // when the slave ALREADY is one of 0, 1 or 2: `dup2(fd, fd)` changes
+        // nothing, so the flag set before the fork would survive and `exec`
+        // would close the pane's own terminal. Clearing it keeps the pane's
+        // stdio working whatever number the slave was given.
+        if libc::dup2(slave, fd) == -1 || libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+            libc::_exit(1);
+        }
+    }
+    // Everything else the child inherited is the server's: its listening
+    // socket, its clients' sockets, other panes' masters. `FD_CLOEXEC` covers
+    // them only on a platform that sets it atomically, which macOS does not
+    // for an accepted socket.
+    close_from(3, exec.fd_bound);
+    // The server's handlers, and the signals it blocks, are the server's:
+    // `exec` resets a handler but keeps an ignored signal and the mask, and
+    // the program in the pane should start as a terminal's would.
+    reset_signals();
+
+    if let Some(dir) = &exec.cwd {
+        let entered = dir.as_ref().is_some_and(|d| libc::chdir(d.as_ptr()) == 0);
+        if !entered {
+            if let Some(home) = &exec.home {
+                libc::chdir(home.as_ptr());
+            }
+        }
+    }
+
+    // `execvp`'s rules, which it does not promise to follow without
+    // allocating: an error that says this candidate is not the program moves
+    // on to the next one, EACCES is remembered and wins over a later
+    // ENOENT, ENOEXEC runs the file with /bin/sh, and anything else ends
+    // the search.
+    let mut err = libc::ENOENT;
+    let mut denied = false;
+    let mut searched_all = true;
+    for (i, path) in exec.candidates.iter().enumerate() {
+        libc::execve(path.as_ptr(), exec.argv.as_ptr(), exec.envp.as_ptr());
+        err = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::ENOENT);
+        match err {
+            libc::ENOEXEC => {
+                libc::execve(
+                    exec.sh.as_ptr(),
+                    exec.sh_argv[i].as_ptr(),
+                    exec.envp.as_ptr(),
+                );
+                err = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::ENOENT);
+                searched_all = false;
+                break;
+            }
+            libc::EACCES => denied = true,
+            libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::ENODEV | libc::ETIMEDOUT => {}
+            _ => {
+                searched_all = false;
+                break;
+            }
+        }
+    }
+    if searched_all && denied {
+        err = libc::EACCES;
+    }
+    write_failure(exec, err);
+    libc::_exit(127) // 127 = "command not found", as a shell reports it
+}
+
+/// Close every descriptor from `low` up. Linux's `close_range` does it in one
+/// call; elsewhere, or on a kernel without it, one at a time below `bound`.
+unsafe fn close_from(low: libc::c_int, bound: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    if libc::syscall(
+        libc::SYS_close_range,
+        low as libc::c_uint,
+        libc::c_uint::MAX,
+        0,
+    ) == 0
+    {
+        return;
+    }
+    for fd in low..bound {
+        libc::close(fd);
+    }
+}
+
+/// Every signal back to its default action, and none blocked.
+unsafe fn reset_signals() {
+    #[cfg(target_os = "linux")]
+    const NSIG: libc::c_int = 65;
+    #[cfg(not(target_os = "linux"))]
+    const NSIG: libc::c_int = 32;
+    let mut action: libc::sigaction = std::mem::zeroed();
+    action.sa_sigaction = libc::SIG_DFL;
+    libc::sigemptyset(&mut action.sa_mask);
+    for sig in 1..NSIG {
+        if sig != libc::SIGKILL && sig != libc::SIGSTOP {
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
+    }
+    let mut none: libc::sigset_t = std::mem::zeroed();
+    libc::sigemptyset(&mut none);
+    libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+}
+
+/// The failure message for `err` on stderr, which is the pane here, from
+/// the ones `ChildExec` formatted, or its prefix and the bare error number.
+unsafe fn write_failure(exec: &ChildExec, err: i32) {
+    let write = |bytes: &[u8]| {
+        libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
+    };
+    if let Some((_, msg)) = exec.failures.iter().find(|(code, _)| *code == err) {
+        write(msg);
+        return;
+    }
+    let mut digits = [0u8; 12];
+    let mut at = digits.len();
+    let mut n = err.unsigned_abs();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    write(&exec.failure_prefix);
+    write(b"os error ");
+    write(&digits[at..]);
+    write(b"\r\n");
 }
 
 impl Drop for Pty {
@@ -1193,6 +1439,7 @@ pub fn start_writer(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedSende
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 
     /// A pipe whose kernel buffer is shrunk to one page and that nobody reads:
     /// a sink the writer really parks on, which a pty in raw mode is not (on
@@ -1278,6 +1525,184 @@ mod tests {
             .expect("the writer never reported");
         assert_eq!(answer, Ok(true));
         assert_eq!(drain(&read), 100);
+    }
+
+    /// A pane's child is forked from a server whose other threads read the
+    /// environment all the time (the savers' paths, `socket_path`, every
+    /// `Command` spawn). Each read holds std's environment lock, and a child
+    /// forked while one is held inherits the lock held by a thread that does
+    /// not exist on its side, so anything in the child that takes it waits
+    /// for ever, before `exec`, still holding every descriptor the server had.
+    #[test]
+    fn a_child_forked_while_other_threads_read_the_environment_reaches_exec() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::black_box(std::env::vars_os().count());
+                    }
+                })
+            })
+            .collect();
+        let mut stuck = None;
+        for attempt in 0..100 {
+            let pty = Pty::spawn(80, 24, Some("/bin/true"), &[], None, None)
+                .expect("failed to spawn PTY");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let exited = loop {
+                if pty.try_wait().expect("try_wait failed").is_some() {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+            if !exited {
+                stuck = Some(attempt);
+                let _ = signal::kill(pty.child_pid, Signal::SIGKILL);
+                let _ = nix::sys::wait::waitpid(pty.child_pid, None);
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert_eq!(
+            stuck, None,
+            "a child had not reached exec 5 s after its fork"
+        );
+    }
+
+    /// Run a pane to its end: everything it wrote to its terminal, and its
+    /// exit code, or `None` if it was still running after 10 s.
+    fn run_pane(
+        command: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+        identity: Option<PaneIdentity<'_>>,
+    ) -> (String, Option<i32>) {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let pty =
+            Pty::spawn(80, 24, Some(command), &args, cwd, identity).expect("failed to spawn PTY");
+        let master = pty.master_fd.as_raw_fd();
+        let flags = fcntl(master, FcntlArg::F_GETFL).expect("F_GETFL failed");
+        fcntl(
+            master,
+            FcntlArg::F_SETFL(
+                nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK,
+            ),
+        )
+        .expect("F_SETFL failed");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut status = None;
+        let mut drained_after_exit = 0;
+        while std::time::Instant::now() < deadline && drained_after_exit < 20 {
+            if let Ok(n) = nix::unistd::read(master, &mut buf) {
+                out.extend_from_slice(&buf[..n]);
+            }
+            if status.is_none() {
+                status = pty.try_wait().expect("try_wait failed");
+            } else {
+                drained_after_exit += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        (String::from_utf8_lossy(&out).into_owned(), status)
+    }
+
+    /// What a pane's program sees, now that the child no longer edits its
+    /// own environment: the environment and directory the parent prepared,
+    /// a PATH lookup for a bare command name, no signal left ignored, and
+    /// only its terminal open.
+    #[test]
+    fn a_pane_starts_with_its_variables_its_directory_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = "printf 'T=%s R=%s S=%s P=%s D=%s\\n' \"$TERM\" \"$REMUX\" \
+                      \"$REMUX_SESSION\" \"$REMUX_PANE\" \"$(pwd -P)\"; \
+                      grep '^SigIgn' /proc/self/status; ls /proc/self/fd | tr '\\n' ' '; echo";
+        let (out, status) = run_pane(
+            "sh",
+            &["-c", script],
+            Some(dir.path()),
+            Some(PaneIdentity {
+                session: "main",
+                pane: 7,
+            }),
+        );
+        assert_eq!(status, Some(0), "{out}");
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            out.contains(&format!(
+                "T=xterm-256color R=1 S=main P=7 D={}",
+                cwd.display()
+            )),
+            "{out}"
+        );
+        // A SIGPIPE the server ignores stayed ignored through `exec`, so a
+        // pane's `yes | head` ran on after `head` had gone.
+        if cfg!(target_os = "linux") {
+            assert!(out.contains("SigIgn:\t0000000000000000"), "{out}");
+            // `ls` sees its own directory handle besides the terminal.
+            let fds: Vec<&str> = out
+                .lines()
+                .last()
+                .unwrap_or("")
+                .split_whitespace()
+                .collect();
+            assert!(fds.len() <= 4, "only the terminal, and ls's own: {out}");
+        }
+    }
+
+    /// The child searches for the program itself rather than through
+    /// `execvp`: a command that is nowhere, by path or by name, says so in
+    /// the pane and exits 127, as a shell does.
+    #[test]
+    fn a_command_that_does_not_exist_is_named_in_the_pane() {
+        for command in ["/nonexistent/x", "no-such-cmd-xyz"] {
+            let (out, status) = run_pane(command, &[], None, None);
+            assert!(
+                out.contains(&format!(
+                    "remux: cannot run {command:?}: No such file or directory"
+                )),
+                "{command}: {out}"
+            );
+            assert_eq!(status, Some(127), "{command}: {out}");
+        }
+    }
+
+    /// An executable file in no format the kernel runs (ENOEXEC) is run by
+    /// /bin/sh with the file and the pane's arguments, as `execvp` does.
+    #[test]
+    fn a_script_without_a_shebang_is_run_by_sh_with_its_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("noshebang");
+        std::fs::write(&script, "printf 'ENOEXEC_RAN:%s\\n' \"$1\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (out, status) = run_pane(script.to_str().unwrap(), &["alpha"], None, None);
+        assert!(out.contains("ENOEXEC_RAN:alpha"), "{out}");
+        assert_eq!(status, Some(0), "{out}");
+    }
+
+    /// A file found but not executable is EACCES, reported as such.
+    #[test]
+    fn a_file_that_is_not_executable_is_refused_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain");
+        std::fs::write(&file, "echo never\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (out, status) = run_pane(file.to_str().unwrap(), &[], None, None);
+        assert!(out.contains("Permission denied"), "{out}");
+        assert_eq!(status, Some(127), "{out}");
     }
 
     #[test]
