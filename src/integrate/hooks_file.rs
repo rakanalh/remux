@@ -105,17 +105,46 @@ fn sh_unquote(word: &str) -> Option<String> {
     (sh_quote(&text) == word).then_some(text)
 }
 
-/// Whether `binary` lives in a cargo build directory: an ancestor named
-/// `target` that cargo made (it holds `.rustc_info.json` or `CACHEDIR.TAG`) or
-/// that sits beside a `Cargo.toml`. A hook pointing there runs whatever the
-/// next `cargo build` leaves, or nothing after a `cargo clean`.
+/// Whether `binary` lives in a cargo build directory: an ancestor that cargo
+/// marked as its target directory (it holds `.rustc_info.json`, or a
+/// `CACHEDIR.TAG` that cargo wrote), or one named `target` beside a
+/// `Cargo.toml`. The marks are what find a `CARGO_TARGET_DIR`, which can have
+/// any name. A hook pointing there runs whatever the next `cargo build`
+/// leaves, or nothing after a `cargo clean`. A directory that only looks like
+/// one costs no more than `--allow-dev-path`.
 pub fn is_dev_build(binary: &Path) -> bool {
     binary.ancestors().skip(1).any(|dir| {
-        dir.file_name().is_some_and(|n| n == "target")
-            && (dir.join(".rustc_info.json").exists()
-                || dir.join("CACHEDIR.TAG").exists()
-                || dir.parent().is_some_and(|p| p.join("Cargo.toml").exists()))
+        dir.join(".rustc_info.json").exists()
+            || cargo_cache_tag(dir)
+            || (dir.file_name().is_some_and(|n| n == "target")
+                && dir.parent().is_some_and(|p| p.join("Cargo.toml").exists()))
     })
+}
+
+/// Whether `dir` holds a cache directory tag that cargo wrote. Other tools
+/// write the same file into their own caches, and a binary installed under one
+/// of those is not a build output.
+///
+/// Every ancestor up to `/` is looked at, including ones another user can
+/// write, so the tag is opened without following a symlink or waiting on a
+/// FIFO, must be a regular file, and is read only as far as cargo's own tag
+/// goes. A planted FIFO or `/dev/zero` link then answers no instead of
+/// hanging or exhausting memory.
+fn cargo_cache_tag(dir: &Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join("CACHEDIR.TAG"))
+    else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let mut tag = String::new();
+    file.take(4096).read_to_string(&mut tag).is_ok() && tag.contains("created by cargo")
 }
 
 /// A Claude-shaped hooks file, and the hooks remux keeps in it.
@@ -405,6 +434,9 @@ impl HooksFile {
 
     /// A hook must not be baked onto a build directory by accident.
     pub fn check_binary(&self) -> Result<()> {
+        // Safety first: past it, every directory `is_dev_build` reads is this
+        // user's or root's and closed to others.
+        check_binary_safe(self.hooks.binary(), self.euid)?;
         anyhow::ensure!(
             self.allow_dev_path || !is_dev_build(self.hooks.binary()),
             "{} is a cargo build output; hooks pointing there break on the next \
@@ -412,7 +444,7 @@ impl HooksFile {
              binary's `integrate`, or pass --allow-dev-path to use this one anyway",
             self.hooks.binary().display()
         );
-        check_binary_safe(self.hooks.binary(), self.euid)
+        Ok(())
     }
 
     /// The file to read and write, resolved ONCE per operation: the settings
@@ -1223,6 +1255,98 @@ mod tests {
         assert!(format!("{err:#}").contains("does not exist"), "{err:#}");
         assert_eq!(std::fs::read_link(&link).unwrap(), gone);
         assert!(!gone.exists());
+    }
+
+    /// A `CARGO_TARGET_DIR` can have any name; cargo marks its root.
+    #[test]
+    fn a_build_under_a_cargo_target_dir_of_any_name_is_a_dev_build() {
+        let base = tempfile::tempdir().unwrap();
+        let tagged = base.path().join("build-out");
+        std::fs::create_dir_all(tagged.join("debug")).unwrap();
+        std::fs::write(
+            tagged.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n\
+             # This file is a cache directory tag created by cargo.\n",
+        )
+        .unwrap();
+        assert!(is_dev_build(&tagged.join("debug/remux")));
+
+        let info = base.path().join("ci-cache");
+        std::fs::create_dir_all(info.join("debug")).unwrap();
+        std::fs::write(info.join(".rustc_info.json"), "{}").unwrap();
+        assert!(is_dev_build(&info.join("debug/remux")));
+
+        let other = base.path().join("app-cache");
+        std::fs::create_dir_all(other.join("bin")).unwrap();
+        std::fs::write(
+            other.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        assert!(
+            !is_dev_build(&other.join("bin/remux")),
+            "another tool's cache tag is not cargo's"
+        );
+    }
+
+    /// `f` on another thread, or None when it has not answered in 2 s.
+    fn within_2s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2)).ok()
+    }
+
+    /// Another user who can write an ancestor can plant a FIFO there, which
+    /// a plain read would wait on for ever: the cache tag is never read
+    /// through one, and the binary's safety is decided before any tag is.
+    #[test]
+    fn a_fifo_named_cachedir_tag_neither_hangs_nor_delays_the_refusal() {
+        let base = tempfile::tempdir().unwrap();
+        let open = base.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        nix::unistd::mkfifo(&open.join("CACHEDIR.TAG"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let binary = open.join("remux");
+        std::fs::write(&binary, "").unwrap();
+
+        let probe = binary.clone();
+        let dev = within_2s(move || is_dev_build(&probe));
+        assert_eq!(dev, Some(false), "is_dev_build waited on the FIFO");
+
+        chmod(&open, 0o777);
+        let file = HooksFile::new(
+            base.path().join("home/.claude/settings.json"),
+            Hooks::new(&SET, binary),
+            false,
+            me(),
+        );
+        let refused = within_2s(move || file.check_binary().map_err(|e| format!("{e:#}")));
+        match refused {
+            Some(Err(why)) => assert!(why.contains("writable by others"), "{why}"),
+            other => panic!("expected the unsafe directory to be refused, got {other:?}"),
+        }
+
+        let tagged = base.path().join("tagged");
+        std::fs::create_dir(&tagged).unwrap();
+        std::fs::write(
+            tagged.join("CACHEDIR.TAG"),
+            "# This file is a cache directory tag created by cargo.\n",
+        )
+        .unwrap();
+        std::fs::write(tagged.join("remux"), "").unwrap();
+        chmod(&tagged, 0o777);
+        let file = HooksFile::new(
+            base.path().join("home/.claude/settings.json"),
+            Hooks::new(&SET, tagged.join("remux")),
+            false,
+            me(),
+        );
+        let why = format!("{:#}", file.check_binary().unwrap_err());
+        assert!(
+            why.contains("writable by others"),
+            "safety is decided before the tag is read: {why}"
+        );
     }
 
     #[test]

@@ -5,7 +5,8 @@ A real PTY, because the panel is painted by the CLIENT. The stand-in `claude`
 names ITSELF (its own process runs `remux agent name alpha`), so the name is
 set by the agent, not typed into a shell before it.
 
-  3a  the row reads "… @alpha" after the label, with no badge
+  3a  the row's detail line, under its name, reads "claude @alpha", with no
+      badge
   3b  two messages sent to alpha: within 3 s the row ends "*2", in the
       theme's bell colour, though no pane printed anything (AGENTS_DIRTY on
       mail, not on output). The sender is one python process held on a file
@@ -143,11 +144,11 @@ class Wire:
 
 
 def agent_row(screen):
-    """The panel row whose label is the stand-in's."""
-    for y in range(FRAME + 1, ROWS - FRAME):
-        text = screen.display[y][FRAME:SIDEBAR_W - FRAME]
-        if "claude" in text or "@" in text:
-            return y, text.rstrip()
+    """The stand-in's detail line, the second line of its row: the command,
+    the messaging name and the unread badge are all drawn there."""
+    for y in range(FRAME + 1, ROWS - FRAME - 1):
+        if screen.display[y][FRAME:SIDEBAR_W - FRAME].lstrip()[:1] in ("\u25cf", "\u25cb"):
+            return y + 1, screen.display[y + 1][FRAME:SIDEBAR_W - FRAME].rstrip()
     return None, ""
 
 
@@ -204,7 +205,7 @@ def main():
 
         # --- 3a -----------------------------------------------------------
         y, text = wait_row(pump, screen, lambda t: "@alpha" in t, timeout=5)
-        check("3a the row names the agent after its label, with no badge",
+        check("3a the detail line names the agent after its command, with no badge",
               "@alpha" in text and "*" not in text, text)
 
         # --- 3b -----------------------------------------------------------

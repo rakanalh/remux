@@ -72,7 +72,7 @@ impl AgentRow {
     /// A name the user gave the pane wins outright. Otherwise a `pane_title`
     /// template decides; with none, a titled agent is shown by its title alone
     /// and an untitled one by this command-and-location form.
-    fn display_name(&self) -> String {
+    pub fn display_name(&self) -> String {
         if let Some(custom) = &self.entry.custom_name {
             return custom.clone();
         }
@@ -110,7 +110,7 @@ impl AgentRow {
     /// tail.
     ///
     /// A name the user gave the pane, a `pane_title` template result or the
-    /// pane's own title is shown whole, as the switcher shows it. With
+    /// pane's own title is shown whole, as `display_name` gives it. With
     /// none of those, the location is the name: the session, then ` · ` and the
     /// tab's name, or its index when `tab_name` is not known (a tree not yet
     /// received). The command is left out because the second line carries it.

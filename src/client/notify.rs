@@ -334,7 +334,7 @@ impl AgentNotifier {
             kind,
             conn: conn.clone(),
             pane_id: pane,
-            title: format!("{} {}", fit(&row.label(), kind.verb()), kind.verb()),
+            title: format!("{} {}", fit(&row.display_name(), kind.verb()), kind.verb()),
             body: format!("{host}{} · tab {}", entry.session, entry.tab_index + 1),
         })
     }
@@ -740,6 +740,19 @@ mod tests {
             t0 + secs(1),
         );
         assert!(again.is_empty(), "still blocked is not a new event");
+    }
+
+    /// The title names the pane as it did before messaging: the panel's row
+    /// label gained the messaging name, the notification did not.
+    #[test]
+    fn the_title_leaves_out_the_messaging_name() {
+        let t0 = Instant::now();
+        let mut n = baselined(&ConnId::Local, &[agent(1, AgentState::Working)], t0);
+        let mut named = agent(1, AgentState::NeedsInput);
+        named.name = Some("alpha".to_string());
+        let fired = n.observe(&ConnId::Local, &[named], t0);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].title, "claude main/0 needs input");
     }
 
     #[test]
