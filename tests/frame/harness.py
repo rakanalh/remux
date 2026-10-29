@@ -137,8 +137,26 @@ def _alive(pid):
 
 _GUARDED = []
 
+# Every server process a `Server` started, by handle. The /proc scan above
+# finds nothing on macOS, so these are what teardown can always stop there:
+# a crash-and-restart leaves the earlier handle behind, and a run that dies
+# mid-case leaves the current one. A handle is our own unreaped child, so its
+# pid cannot have been reused.
+_STARTED = []
+
+
+def _reap_started():
+    for proc in _STARTED:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
 
 def _reap_all(*_):
+    _reap_started()
     for root in _GUARDED:
         reap_rundir(root)
 
@@ -228,6 +246,7 @@ class Server:
             [BIN, "server"], env=self.env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        _STARTED.append(self.proc)
         for _ in range(200):
             if os.path.exists(self.sock):
                 time.sleep(0.3)
@@ -264,6 +283,7 @@ class Server:
             [BIN, "server"], env=self.env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        _STARTED.append(self.proc)
         for _ in range(200):
             if os.path.exists(self.sock):
                 time.sleep(0.3)
