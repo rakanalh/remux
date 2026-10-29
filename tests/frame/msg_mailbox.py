@@ -111,6 +111,7 @@ Run: python3 tests/frame/msg_mailbox.py   (RMX_RUNDIR overrides the run dir)
 import os
 import re
 import json
+import shlex
 import shutil
 import socket
 import sys
@@ -118,6 +119,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Server, Client, name_of  # noqa: E402
+from portable import SETSID_F, SETSID_W  # noqa: E402
 
 RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msg")
 
@@ -408,7 +410,7 @@ try:
           f"(identity lines: {identity_lines()})")
 
     # --- 1d: a sender that left the pane's session ------------------------
-    reply = cli_spawn("SplitBelow", argv=["setsid", "-w", BIN, "ls"])
+    reply = cli_spawn("SplitBelow", argv=SETSID_W + [BIN, "ls"])
     check(name_of(reply) == "CliSpawned", f"1d pane D spawned (got {reply})")
     d = reply["CliSpawned"]["pane_id"] if name_of(reply) == "CliSpawned" else None
     line = log_has(rf"identity: client_id=\d+ peer=Some\(\d+\) pin=\w+ -> pane %{d} "
@@ -435,7 +437,7 @@ try:
     # from the pane, and `setsid` gives it a session of its own.
     reply = cli_spawn("SplitBelow", argv=[
         "/bin/sh", "-c",
-        f"( setsid /bin/sh -c 'sleep 0.5; exec {BIN} ls' & ); "
+        f"( {' '.join(shlex.quote(a) for a in SETSID_F)} /bin/sh -c 'sleep 0.5; exec {BIN} ls' & ); "
         "printf 'DF:%s\\n' forked; exec /bin/sh"])
     check(name_of(reply) == "CliSpawned", f"1f pane F spawned (got {reply})")
     rx = re.compile(r"identity: client_id=\d+ peer=Some\((\d+)\) pin=\w+ "

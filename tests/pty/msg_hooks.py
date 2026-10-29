@@ -92,6 +92,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "frame"))
 sys.path.insert(0, HERE)
 from harness import BIN, Client, Server, name_of  # noqa: E402
+from portable import SETSID_F  # noqa: E402
 import fakeclaude  # noqa: E402
 
 RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msghook")
@@ -495,7 +496,7 @@ try:
           f"(runs {len(got)}, A's box {box(A)})")
 
     # --- 1g2 ----------------------------------------------------------------
-    write_stop_hook(f"setsid -f sh -c \"{HOOK_COMMANDS['Stop']}\"")
+    write_stop_hook(" ".join(shlex.quote(a) for a in SETSID_F + ["/bin/sh", "-c", HOOK_COMMANDS["Stop"]]))
     send_from_a(f"%{B}", "seven")
     start = tell("stop")
     time.sleep(1.0)

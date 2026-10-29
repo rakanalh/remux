@@ -178,6 +178,7 @@ Run from the repo root: python3 tests/frame/msg_remote.py  (RMX_RUNDIR overrides
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -188,6 +189,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from harness import BIN, PROTOCOL_VERSION, Client, Server, name_of  # noqa: E402
+from portable import SETSID_F  # noqa: E402
 import ssh_shim  # noqa: E402
 import fakeagent  # noqa: E402
 import relay_fds  # noqa: E402
@@ -498,10 +500,10 @@ def peer_frames(frames, how="child", hold=0.0, pane=None, auto_ack=None):
     elif how == "pane":
         cli_spawn(srv_b, argv)
     elif how == "setsid-b1":
-        line = "setsid -f " + " ".join(f"'{a}'" for a in argv) + "\n"
+        line = " ".join(shlex.quote(a) for a in SETSID_F + argv) + "\n"
         cli_b.send({"InputToPane": {"pane_id": pane, "data": list(line.encode())}})
     elif how == "setsid":
-        subprocess.run(["setsid", "-f", *argv], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(SETSID_F + argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     end = time.time() + 12
     while time.time() < end and not os.path.exists(out_file):
         time.sleep(0.05)

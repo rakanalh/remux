@@ -43,7 +43,9 @@ control: a command run from one is already a process-group leader, so
 `setsid(1)` forks, its parent exits, and the child is reparented to init --
 unverifiable by design (§6.5 rulings 3-4). Under a `CliSpawn`'d `sh -c` there
 is no job control, the command is not a group leader, `setsid(1)` does not
-fork, and the case passes for the wrong reason: a surplus pass.
+fork, and the case passes for the wrong reason: a surplus pass. The cases
+run `tests/portable.py`'s stand-ins rather than `setsid(1)`, which macOS does
+not ship; they always fork, which is the interactive-shell shape.
 
 Every marker is ASSEMBLED by the shell (`"$(printf 'MSG:%s' one)"` typed,
 `MSG:one` searched for), so a marker is never on screen as the echo of the
@@ -54,6 +56,7 @@ Run: python3 tests/pty/msg_sender_identity.py   (RMX_RUNDIR overrides the run di
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -61,6 +64,9 @@ import time
 
 import pexpect
 import pyte
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from portable import SETSID_F, SETSID_W  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msgid")
@@ -72,13 +78,17 @@ CLIENT_LOG = f"{RUNDIR}/state/remux/client.log"
 FAILURES = []
 
 
+def shell_words(argv):
+    return " ".join(shlex.quote(a) for a in argv)
+
+
 def check(cond, label):
     print(("PASS  " if cond else "FAIL  ") + label)
     if not cond:
         FAILURES.append(label)
 
 
-for tool in ("setsid", "script", "nohup"):
+for tool in ("script", "nohup"):
     if shutil.which(tool) is None:
         sys.exit(f"msg_sender_identity: `{tool}` is not installed; the case needing it cannot run")
 
@@ -273,7 +283,7 @@ try:
     check(m is not None and str(m["from"]["Pane"]["pane_id"]) == A, f"9c a nohup'd background send is from %{A} (got {m and m['from']})")
 
     # --- 9d ---------------------------------------------------------------
-    code, out, err = run_in_pane(child, pump, f"""setsid -w {BIN} msg send %{B} "$(printf 'MSG:%s' three)" """)
+    code, out, err = run_in_pane(child, pump, f"""{shell_words(SETSID_W)} {BIN} msg send %{B} "$(printf 'MSG:%s' three)" """)
     m = arrived(env, B, "MSG:three")
     check(code == 0 and m is not None and str(m["from"]["Pane"]["pane_id"]) == A,
           f"9d a setsid -w send is from %{A} (exit {code}, err {err!r})")
@@ -281,7 +291,7 @@ try:
     check(line.endswith("by Walk { depth: 2 }"), f"9d ...attributed by the walk, two links up (got {line!r})")
 
     # --- 9e ---------------------------------------------------------------
-    type_line(child, pump, f"""setsid sh -c 'sleep 0.2; {BIN} msg send %{B} "$(printf "MSG:%s" four)"'""")
+    type_line(child, pump, f"""{shell_words(SETSID_F)} /bin/sh -c 'sleep 0.2; {BIN} msg send %{B} "$(printf "MSG:%s" four)"'""")
     check(wait_for(pump, screen, "sender_unverified", timeout=8.0),
           "9e the daemonized send is refused: the pane shows sender_unverified")
     time.sleep(3.0)

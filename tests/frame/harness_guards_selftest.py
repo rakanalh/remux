@@ -60,6 +60,12 @@ try:
     why = refused(shared)
     check(why is not None and "writable by others" in why, f"1 a 0777 BINDIR is refused ({why})")
 
+    # Ours and private, but inside a directory anyone could rename it out of.
+    inner = os.path.join(shared, "inner")
+    os.mkdir(inner, 0o700)
+    why = refused(inner)
+    check(why is not None and "ancestor" in why, f"1 a private BINDIR inside a 0777 one is refused ({why})")
+
     # What `os.makedirs` makes under a umask of 002.
     grouped = os.path.join(root, "grouped")
     os.mkdir(grouped)

@@ -1,10 +1,9 @@
 """A stand-in for Claude Code's hook runner, for the messaging hook harnesses.
 
-`install(path)` writes this file to `path` with `#!<this interpreter>` as its
-first line, and the harness installs it as a file NAMED `claude`: a direct
-interpreter shebang makes the process's `comm` the script's name, so the
-server detects the pane as running `claude` with no config, as it would the
-real one.
+`install(path)` makes `path` a compiled binary that runs this file as its
+child (`tests/standin.py`), and the harness installs it as a file NAMED
+`claude`, so the server detects the pane as running `claude` with no config,
+as it would the real one, on macOS as well as Linux.
 
 Run as `claude <control> <log> <fixtures dir> <remux binary>`. It reads the
 hook commands from `$HOME/.claude/settings.json` on every run, the way Claude
@@ -44,12 +43,25 @@ import time
 
 
 def install(path):
-    """Write the fake to `path` as an executable with a direct shebang."""
+    """Install the fake at `path`: a compiled wrapper running this file under
+    this interpreter, or a direct-shebang copy where Linux has no `cc`.
+
+    `standin` is imported here, not at the top, because the installed copy of
+    this file runs from the harness's BINDIR, where `tests/` is not on the
+    path."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import standin
+
+    script = path + ".py"
+
+    def shebang():
+        with open(path, "w") as f:
+            f.write(f"#!{sys.executable}\n{source}")
+        os.chmod(path, 0o755)
+
     with open(os.path.abspath(__file__)) as f:
         source = f.read()
-    with open(path, "w") as f:
-        f.write(f"#!{sys.executable}\n{source}")
-    os.chmod(path, 0o755)
+    standin.install_wrapper(path, [sys.executable, script], {script: source}, shebang)
 
 
 def main():

@@ -259,6 +259,8 @@ Run: python3 tests/frame/msg_submit.py   (RMX_RUNDIR overrides the run dir)
 import json
 import re
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -266,6 +268,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Server, Client, name_of  # noqa: E402
 import fakeagent  # noqa: E402
+import standin  # noqa: E402
+from portable import TIMEOUT  # noqa: E402
 
 RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msgsub")
 # Outside the run dir: `Server.start` wipes the run dir.
@@ -551,10 +555,13 @@ fakeagent.install(FAKEAGENT)
 # Named like the agent, so the server takes it for one, but it reads a LINE:
 # its terminal is line-buffered, which is what a shell, `read` or a password
 # prompt behind an agent's name looks like. Whatever it reads it writes out.
+# A compiled wrapper runs the script, so it is named `fakeagent` on macOS too.
 WRAPPER = f"{BINDIR}/wrap/fakeagent"
+WRAPPER_SH = WRAPPER + ".sh"
 os.makedirs(os.path.dirname(WRAPPER), exist_ok=True)
-with open(WRAPPER, "w") as f:
-    f.write("#!/bin/sh\nread x\nprintf '%s' \"$x\" > \"$1\"\nsleep 30\n")
+standin.install_wrapper(WRAPPER, ["/bin/sh", WRAPPER_SH],
+                        {WRAPPER_SH: "#!/bin/sh\nread x\nprintf '%s' \"$x\" > \"$1\"\nsleep 30\n"},
+                        lambda: shutil.copyfile(WRAPPER_SH, WRAPPER))
 os.chmod(WRAPPER, 0o755)
 
 srv = Server(RUNDIR)
@@ -1185,7 +1192,7 @@ try:
     in_file, out_file = f"{RUNDIR}/in-{n}.json", f"{RUNDIR}/out-{n}.json"
     with open(in_file, "w") as f:
         json.dump(send(F, "GUARD:detached", "Submit"), f)
-    line = f"timeout 0.5 python3 {WIRE_SEND} {srv.sock} {in_file} {out_file}\n"
+    line = " ".join(shlex.quote(a) for a in TIMEOUT + ["0.5", sys.executable, WIRE_SEND, srv.sock, in_file, out_file]) + "\n"
     cli.send({"InputToPane": {"pane_id": A, "data": list(line.encode())}})
     at = None
     end = time.time() + 10
@@ -2019,10 +2026,11 @@ try:
     r = wait_file(out, timeout=60)
     took = time.time() - t0
     stream = b"".join(c for _, c in raw_chunks(M_LOG))
-    check(submitted(r) and took < 15.0 and stream.count(b"\nl") == 1400
+    lines_read = stream.count(b"\nl")
+    check(submitted(r) and took < 15.0 and lines_read == 1400
           and re.search(rb"\nl1399" + TRAILER + re.escape(CLOSE), stream),
           f"3ak a 1,400-line body is Submitted in {took:.1f}s, every line of it read first "
-          f"({stream.count(b'\nl')} of 1400 lines; reply {r})")
+          f"({lines_read} of 1400 lines; reply {r})")
     start = len(raw_chunks(M_LOG))
     too_many = "\n".join(f"l{n:04d}" for n in range(1600))
     r_sub = type_send(A, send(M, too_many, "Submit"))
