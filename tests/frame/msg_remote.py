@@ -139,8 +139,8 @@ The return path (Task 2), after 1n, with A's default `inbound = "replies"`:
   4e  B forgets a link that stopped pinging; a reply meanwhile has no route;
       after A dials again the name is declared afresh
   4b  B's server killed: A's link goes down, and a later send dials anew
-  4j  a second dial declaring laptop is refused while the stopped first one
-      holds the name, and declared once it expires
+  4j  a second dial declaring laptop is refused while the first one holds
+      the name, and declared once that one is silenced and expires
   4k  one ping held 1.5 intervals: B expires the link and closes it, so the
       next send is delivered over a new link, not refused
   4l  a relay stopped until B expires its link (at most 2.5 intervals), then
@@ -1511,10 +1511,15 @@ try:
     code, out, err = send_from_a1(f"mini:%{B7}", "four-j0")
     set_mode("relay")
     b_mark = len(srv_b.log())
-    open(os.environ["RMX_SHIM_SWALLOW"], "w").close()
+    # The second dial goes while the first link still pings, so the name is
+    # held for as long as the dial takes. Swallowing first gave the dial only
+    # B's two-interval expiry to land in, which a slower machine missed.
     code, out, err = send_from_a1("mini-again:%" + str(B7), "four-j1")
     check(code == 1 and "route_unavailable" in err and "held by a live link" in err,
           f"4j a second dial declaring laptop while the first is held is refused (exit {code}, err {err!r})")
+    check("peer link laptop: expired" not in srv_b.log()[b_mark:],
+          "4j ...while the first link was still live on B")
+    open(os.environ["RMX_SHIM_SWALLOW"], "w").close()
     check(wait_b_log("peer link laptop: expired", b_mark), "4j ...the first is expired by B, not closed by A")
     code, out, err = send_from_a1("mini-again:%" + str(B7), "four-j2")
     check(code == 0 and "peer link laptop: declared" in srv_b.log()[b_mark:],
@@ -1846,8 +1851,16 @@ try:
           f"6e agent ls and an untargeted status stay local: no host, no dial (ssh {shim_calls()} vs {calls}, {len(rows)} rows)")
 
     # --- 6f -----------------------------------------------------------------
+    # 6e left the link down, so this wait dials first. The link is dropped
+    # only once B has the wait parked: a fixed sleep killed the relay
+    # mid-handshake on a slower machine, which is a different error.
+    parked = f"waits for %{BF3} to be NeedsInput"
+    waits = srv_b.log().count(parked)
     base = type_start(cli_a, A1, f"'{BIN}' agent wait mini:%{BF3} --state blocked --timeout 15")
-    time.sleep(1.5)
+    end = time.time() + 15
+    while time.time() < end and srv_b.log().count(parked) == waits:
+        time.sleep(0.05)
+    check(srv_b.log().count(parked) > waits, "6f B has the forwarded wait parked before the link is dropped")
     t0 = time.time()
     drop_link()
     code, out, err = type_wait(base, 20)
