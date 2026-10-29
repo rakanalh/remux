@@ -299,6 +299,17 @@ async fn run_cli_spawn(
     Ok(())
 }
 
+/// The log file at `path`, created with its directory.
+fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
 /// Route panics into the role's log file, in addition to stderr.
 ///
 /// `env_logger` only ever sees what goes through the `log` crate, and every
@@ -357,27 +368,37 @@ async fn main() -> Result<()> {
         Some(Commands::Relay) => "relay.log",
         _ => "client.log",
     };
-    let log_dir = paths::state_home().join("remux");
-    std::fs::create_dir_all(&log_dir).expect("failed to create log directory");
-    let log_path = log_dir.join(log_filename);
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .expect("failed to open log file");
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
-        .format_timestamp_millis()
-        .target(env_logger::Target::Pipe(Box::new(log_file)))
-        .init();
-
-    install_panic_logger();
-
+    let log_path = paths::state_home().join("remux").join(log_filename);
     let role = match cli.command {
         Some(Commands::Server) => "server",
         Some(Commands::Relay) => "relay",
         _ => "client",
     };
+    match open_log(&log_path) {
+        Ok(log_file) => env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Debug)
+            .format_timestamp_millis()
+            .target(env_logger::Target::Pipe(Box::new(log_file)))
+            .init(),
+        // The server and the relay run for days, and the server's log is the
+        // only record of attribution, refused peers and link events, so
+        // neither runs without its log.
+        Err(e) if role != "client" => {
+            eprintln!(
+                "remux {role}: cannot open its log {}: {e}",
+                log_path.display()
+            );
+            std::process::exit(1);
+        }
+        // A sandbox can leave the state directory read-only. A client then
+        // runs with no logger, which makes every `log` macro a no-op: stderr
+        // is not a substitute, because the CLI's stderr is part of its output
+        // to the hooks and scripts that run it.
+        Err(_) => {}
+    }
+
+    install_panic_logger();
+
     log::info!("remux starting as {role}, log={}", log_path.display());
 
     // Refuse to launch an interactive client inside an existing remux pane
