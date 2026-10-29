@@ -168,22 +168,27 @@ pub enum ConnDescriptor {
 /// press as a left click on an old server.
 ///
 /// 19 -> 20: agent messaging, developed as 17 -> 18 beside the popup and
-/// context-menu bumps and renumbered when the two lines merged. Adds
+/// context-menu bumps and renumbered when the two lines merged. So a
+/// messaging build from before the merge and a popup build from master both
+/// report 18 while speaking different protocols, and the handshake cannot
+/// tell them apart: every machine must be rebuilt from the merged branch, not
+/// only the ones that run messaging. Adds
 /// [`ClientMessage::MsgSend`] and [`ClientMessage::MsgRead`] with their replies [`ServerMessage::MsgSent`] and
 /// [`ServerMessage::MsgList`], [`ClientMessage::MsgAck`] with
 /// [`ServerMessage::MsgAcked`], [`ClientMessage::AgentName`] with
 /// [`ServerMessage::AgentNamed`], [`ClientMessage::AgentStatus`] with
 /// [`ServerMessage::AgentStatusList`], and the additive `code` on
 /// [`ServerMessage::Error`]. An old server cannot decode any of
-/// them and would drop the connection. Later on the same branch, before any
-/// release, `MsgSend` gained `defer`, `timeout_ms` and `wait`, and `MsgSent`
-/// gained `timed_out` and `final_state`, all `#[serde(default)]`, so an older
-/// 20 build and a newer one still decode each other, as do [`AgentEntry`]'s
-/// `name` and `unread`. [`ClientMessage::AgentWait`]
-/// and [`ServerMessage::AgentWaited`] were added at 20 the same way, with no
-/// bump: a 20 server built before them cannot decode an `AgentWait` and drops
-/// that connection, which is the skew 13 describes, and only the finished
-/// branch is released. Remote messaging extended 20 the same way:
+/// them and would drop the connection. Later on the same branch, while it
+/// was numbered 18 and before any release, `MsgSend` gained `defer`,
+/// `timeout_ms` and `wait`, and `MsgSent` gained `timed_out` and
+/// `final_state`, all `#[serde(default)]`, so an older build of that line and
+/// a newer one still decode each other, as do [`AgentEntry`]'s `name` and
+/// `unread`. [`ClientMessage::AgentWait`] and [`ServerMessage::AgentWaited`]
+/// were added the same way while it was 18, with no bump: a messaging server
+/// built before them cannot decode an `AgentWait` and drops that connection,
+/// which is the skew 13 describes. Every build that reports 20 has all of
+/// them. Remote messaging extended the line the same way, also at 18:
 /// [`ClientMessage::PeerLink`] and [`ClientMessage::Ping`] with
 /// [`ServerMessage::Pong`], [`ServerMessage::MsgInbound`] with
 /// [`ClientMessage::MsgInboundAck`], and `MsgSend`'s `origin` and `req`,

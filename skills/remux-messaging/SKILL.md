@@ -155,7 +155,7 @@ A state is `idle`, `working`, or waiting on its user. The table calls the last o
 
 A send prints one line and exits 0 when the message was stored, saying what happened to it, for example `sent #7 to %4 (alpha): typed into the pane; idle, answered after 3.2s`. A refusal prints `<code>: <message>` on stderr and exits 1. With `--json` it is `{"error":{"code":…,"message":…}}`. Exit 2 is a malformed invocation, and nothing was sent. When the line ends with advice (`do not send it again`, `clear it with Ctrl-U`), follow it.
 
-Under `auto`, a code from the agent's side (`agent_working`, `agent_blocked`, `human_typing` and the other "stored" codes below) is not an error: the send exits 0 and the line says `stored in its mailbox (<code>)`. Under `submit` the same code is an error, and the message is still stored.
+Under `auto`, a code from the agent's side (`agent_working`, `agent_blocked`, `human_typing` and the other "stored" codes below) is not an error: the send exits 0 and the line says `stored in its mailbox (<code>)`. Under `submit` the same code is an error, and the message is still stored. The exception is `agent_working` when the target's server is set to leave a working agent's mail in its mailbox, which is the default for every agent except Claude Code: the mailbox is where that server sends it, so `submit` also exits 0 with `stored in its mailbox (agent_working)`. Only a server set to refuse a working agent answers `agent_working` as an error.
 
 | Code | What happened | What you do |
 |---|---|---|
@@ -171,7 +171,7 @@ Under `auto`, a code from the agent's side (`agent_working`, `agent_blocked`, `h
 | `rate_limited` | Over 20 sends in 10 s from your pane. | Batch. |
 | `agent_not_ready` | The target is not an agent: a shell, an editor, or the agent exited. Stored. | Nothing was typed. Someone at that pane can read it. |
 | `agent_blocked` | The target is waiting on its user. Stored. | Leave it: a person is being asked something. |
-| `agent_working` | The target is mid-turn and takes no typed input while working. Stored. | Its hook hands it over when the turn ends. |
+| `agent_working` | The target is mid-turn and its server does not type into it while it works. Stored. An error under `submit` only where that server refuses a working agent. | Its hook hands it over when the turn ends. |
 | `human_typing` | A person typed into the target pane. Stored. | Leave it: the person's draft matters more. |
 | `pane_attended` | This server is configured not to type into a pane a person is looking at. Stored. | Use `--deliver mailbox`. |
 | `agent_did_not_read` | The agent did not read the probe, or stopped part-way through the body. Not submitted. Stored. | If it stopped part-way, what it read is in its input, unsent: do not send it again with `submit`, and its user should clear that input. |
@@ -251,11 +251,14 @@ The server attributes a send by finding the pane the sending process belongs to.
 
 | Harness | Linux | macOS |
 |---|---|---|
-| A plain shell in a pane | works (sid) | untested |
-| Claude Code, Bash tool, sandbox OFF | untested | untested |
-| Claude Code, Bash tool, sandbox ON | untested | untested |
-| Codex, shell tool | untested | untested |
+| A plain shell in a pane | works (sid) | works (walk) |
+| Claude Code, Bash tool, sandbox OFF | works (walk) | works (walk) |
+| Claude Code, Bash tool, sandbox ON | no connection: the socket is visible, but `connect()` is refused (EPERM); `sandbox.network.allowUnixSockets` does not change that | no connection, unless the user allows both writes to the remux state directory (`sandbox.filesystem.allowWrite`) and the remux socket (`sandbox.network.allowUnixSockets`); then works (walk) |
+| Codex, shell tool, sandbox OFF | works (walk) | works (walk) |
+| Codex, shell tool, sandbox ON | no connection: `connect()` is refused (EPERM) | not tested: every command stopped at the log-file crash that remux has since fixed |
 
-`works (sid)`: attributed in one lookup. `works (walk)`: attributed by walking parent processes. `no connection: <fix>`: the socket is not reachable from the sandbox. `misattributed: do not use`: mail would carry the wrong sender.
+`works (sid)`: attributed in one lookup. `works (walk)`: attributed by walking parent processes. `no connection`: the socket is not reachable from the sandbox. `misattributed: do not use`: mail would carry the wrong sender.
 
-If your sends are refused `sender_unverified` from inside a tool, tell your user rather than working around it. The workaround is to run the command outside the sandbox, and that is their decision.
+Tested with remux 8efe4e3, which still crashed on a read-only log directory, with Claude Code 2.1.312, and with Codex 0.157.1 on Linux and 0.165.0 on macOS, on Fedora with kernel 7.2 and on macOS 27.0.
+
+**Never disable your sandbox to reach remux.** If remux cannot connect, or your sends are refused `sender_unverified`, from inside a sandboxed tool, stop and tell your user. Do not turn the sandbox off, pass `dangerouslyDisableSandbox`, or edit sandbox settings yourself. Allowing the remux socket through a sandbox is the same decision as turning the sandbox off: anything that can reach the socket can run commands outside the sandbox with `remux split`, and type into other panes. That decision is your user's.

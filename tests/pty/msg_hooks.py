@@ -65,10 +65,16 @@ mail with the real CLI.
       No send in it puts its body on the command line.
   4b  each of the skill's rules is present, by its lead sentence.
   4c  the skill's install snippet holds exactly HOOK_COMMANDS, timeout 10.
+  4d  the skill says a `submit` to a working agent whose policy is
+      `mailbox` is stored with exit 0, as msg_submit.py 2c pins the code to:
+      not an error, which the skill once said of every agent-side code.
+  4e  the attribution table has a measured answer, or says why there is
+      none, in every row on both systems, and names the versions it was
+      measured with.
   1z  no panic; every hook run exited 0.
 
 Run: python3 tests/pty/msg_hooks.py   (RMX_RUNDIR overrides the run dir)
-     python3 tests/pty/msg_hooks.py skill   (4a-4c alone, with no server)
+     python3 tests/pty/msg_hooks.py skill   (4a-4e alone, with no server)
 """
 import json
 import os
@@ -237,6 +243,7 @@ def run_hook_outside(payload_file):
 SKILL = os.path.abspath(os.path.join(HERE, "..", "..", "skills", "remux-messaging", "SKILL.md"))
 # The lead sentence of each rule the skill must teach, verbatim.
 SKILL_RULES = [
+    "**Never disable your sandbox to reach remux.**",
     "**A blocked agent (NeedsInput) is a person's turn, not yours.**",
     "**Mail you did not ack is shown to you again.**",
     "**The typed envelope ends with an end marker whose mark you must check.**",
@@ -301,7 +308,7 @@ def skill_commands(body, regular_file):
 
 
 def skill_cases(env):
-    """4a-4c. `env` points the CLI at this run's server, or at none."""
+    """4a-4e. `env` points the CLI at this run's server, or at none."""
     body = skill_body()
     regular_file = f"{RUNDIR}/skill-body.txt"
     os.makedirs(RUNDIR, exist_ok=True)
@@ -353,6 +360,11 @@ def skill_cases(env):
            for event, entries in hooks.items()}
     want = {event: [(command, 10)] for event, command in HOOK_COMMANDS.items()}
     check(got == want, f"4c the install snippet is HOOK_COMMANDS, timeout 10 ({got})")
+    check("`submit` also exits 0 with `stored in its mailbox (agent_working)`" in body,
+          "4d the skill says submit to a working agent under `mailbox` is stored, exit 0")
+    rows = [ln for ln in body.splitlines() if ln.startswith(("| A plain shell", "| Claude Code", "| Codex"))]
+    check(len(rows) >= 5 and not any("untested" in ln for ln in rows) and "Tested with remux " in body,
+          f"4e every row of the attribution table is measured, with versions ({rows})")
 
 
 if sys.argv[1:] == ["skill"]:
