@@ -43,7 +43,8 @@ macOS has come back empty, and a harness reading an empty or half-written
 listing would find no leaked fd in it. Each redirect is on a child command,
 never on the shell itself, which would open a descriptor in the very table
 being listed. A capture that stays empty leaves no file and a line in
-`$RMX_SHIM_FDS.err`.
+`$RMX_SHIM_FDS.err`. macOS keeps `lsof` in /usr/sbin, which a PATH set for a
+harness run often leaves out, so that is where it is looked for then.
 
 Run as a program (`python3 ssh_shim.py skew|skewnasty|oldpeer|eatsend|mute|hostile|echo|stalepong|garbage|garbage-forever|proxy`) it
 is the far side of the link for the modes that need no real server.
@@ -63,9 +64,9 @@ SHIM = r"""#!/bin/sh
 echo "$$" >> "$RMX_SHIM_PIDS"; printf '%s\n' "$*" >> "$RMX_SHIM_ARGV"
 mode=$(cat "$RMX_SHIM_MODE" 2>/dev/null || echo relay)
 case "$mode" in
-  relay)   tries=0
+  relay)   tries=0 lsof=$(command -v lsof || echo /usr/sbin/lsof)
            while [ "$tries" -lt 10 ]; do
-             ls -l "/proc/$$/fd" > "$RMX_SHIM_FDS.$$" 2>/dev/null || lsof -n -P -p "$$" > "$RMX_SHIM_FDS.$$" 2>> "$RMX_SHIM_FDS.err"
+             ls -l "/proc/$$/fd" > "$RMX_SHIM_FDS.$$" 2>/dev/null || "$lsof" -n -P -p "$$" > "$RMX_SHIM_FDS.$$" 2>> "$RMX_SHIM_FDS.err"
              [ -s "$RMX_SHIM_FDS.$$" ] && break
              tries=$((tries + 1)); sleep 0.2
            done
