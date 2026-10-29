@@ -259,6 +259,8 @@ The server attributes a send by finding the pane the sending process belongs to.
 
 `works (sid)`: attributed in one lookup. `works (walk)`: attributed by walking parent processes. `no connection`: the socket is not reachable from the sandbox. `misattributed: do not use`: mail would carry the wrong sender.
 
+On macOS a sender is only ever found by walking its parent processes, so a send from a process that has left the pane's process tree, such as one backgrounded in a subshell (`( remux msg send … & )`), is refused `sender_unverified` ("not a descendant of any pane"), where Linux attributes the same send by its session. Run a send in the foreground, or directly from your tool call.
+
 Tested with remux 8efe4e3, which still crashed on a read-only log directory, with Claude Code 2.1.312, and with Codex 0.157.1 on Linux and 0.165.0 on macOS, on Fedora with kernel 7.2 and on macOS 27.0. The Linux sandbox-ON rows were measured again after that fix, with a remux build stamped dc0b8da-dirty (dc0b8da plus uncommitted changes).
 
 **Never disable your sandbox to reach remux.** If remux cannot connect, or your sends are refused `sender_unverified`, from inside a sandboxed tool, stop and tell your user. Do not turn the sandbox off, pass `dangerouslyDisableSandbox`, or edit sandbox settings yourself. Allowing the remux socket through a sandbox is the same decision as turning the sandbox off: anything that can reach the socket can run commands outside the sandbox with `remux split`, and type into other panes. That decision is your user's.

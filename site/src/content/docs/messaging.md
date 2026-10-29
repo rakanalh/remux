@@ -103,6 +103,8 @@ The hooks run the `remux` binary by its absolute path, so re-run the install aft
 
 The server attributes every message to the pane the **sending process** runs in, found from the process itself, never from anything the sender claims, `$REMUX_PANE` included. So a send must run inside a pane, and one that the server cannot place in a pane is refused `sender_unverified`.
 
+On macOS the server finds the pane only by walking up from the sending process to its parents, so a send from a process that has left the pane's process tree, such as one backgrounded in a subshell (`( remux msg send … & )`), is refused `sender_unverified`. Linux attributes the same send by its session. A send run in the foreground, or from an agent's own tool call, is fine on both.
+
 That proves which pane a message came from, and nothing more. A name is a label anyone in your user account can set, and any process of yours can act for any pane. The trust boundary is your user account, not the pane.
 
 ## Agents in a sandbox
