@@ -528,9 +528,9 @@ def main():
         req.drain(0.6)
 
         print("7. main's hidden popup")
-        cmd(req, "PopupToggle")
-        cmd(req, "PopupToggle")
-        popups = re.findall(r'PopupToggle session="main" spawned popup pane_id=(\d+)', srv.log())
+        cmd(req, {"PopupToggle": None})
+        cmd(req, {"PopupToggle": None})
+        popups = re.findall(r'PopupToggle session="main" tab=\d+ spawned popup pane_id=(\d+)', srv.log())
         check(len(popups) == 1, f"exactly one popup was spawned for main ({popups})")
         popup = int(popups[0]) if popups else None
         if popup is not None:

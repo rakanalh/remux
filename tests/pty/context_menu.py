@@ -23,10 +23,11 @@ import sys
 
 from pty_harness import Tui
 
-RUNDIR = "/private/tmp/claude-501/cm/run1"
-RUNDIR2 = "/private/tmp/claude-501/cm/run2"
-RUNDIR3 = "/private/tmp/claude-501/cm/run3"
-RUNDIR4 = "/private/tmp/claude-501/cm/run4"
+BASE = "/tmp/rmx-cm"
+RUNDIR = f"{BASE}/run1"
+RUNDIR2 = f"{BASE}/run2"
+RUNDIR3 = f"{BASE}/run3"
+RUNDIR4 = f"{BASE}/run4"
 SIDEBAR_CFG = """
 [[sidebar]]
 edge = "left"
@@ -172,7 +173,7 @@ def sidebar_files(fails):
     cfg = SIDEBAR_CFG.replace('"sessions"', '"files"')
     t = Tui(RUNDIR3, cols=COLS, rows=ROWS, config=cfg).start()
     try:
-        t.send("cd /private/tmp/claude-501/cm/run3/home && touch needle.txt && clear\r", 1.0)
+        t.send(f"cd {RUNDIR3}/home && touch needle.txt && clear\r", 1.0)
         t.pump(2.5)
         t.dump("G: the files sidebar")
         pos = where(t, "needle.txt")

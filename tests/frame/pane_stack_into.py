@@ -211,9 +211,9 @@ def main():
         open_three(cli, "popup")
         g = snapshot(cli)
         boxes_before = g.boxes()
-        cmd(cli, "PopupToggle")
+        cmd(cli, {"PopupToggle": None})
         cmd(cli, "PaneStackIntoLeft")
-        cmd(cli, "PopupToggle")
+        cmd(cli, {"PopupToggle": None})
         g = snapshot(cli)
         print(f"  [popup] after close: layout={g.layout_name()} boxes={g.boxes()}")
         check(g.boxes() == boxes_before,

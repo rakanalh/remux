@@ -67,13 +67,7 @@ def main():
         # The pane rows sit under their tab rows, so expand the remote's tab.
         child.send(b"\x1b2")
         pump(0.5)
-        y = h.panel_row_of(screen, "mini1")
-        assert y is not None, rows
-        child.send(b"g")
-        pump(0.3)
-        for _ in range(y - 1):
-            child.send(b"j")
-            pump(0.1)
+        h.select_row(child, screen, pump, "mini1")
         child.send(b"j")
         pump(0.2)
         child.send(b"l")

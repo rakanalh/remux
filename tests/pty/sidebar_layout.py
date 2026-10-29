@@ -449,6 +449,12 @@ def test_search_highlights_land_on_the_match():
     pump(1.5)
     child.send(f"echo {needle}\r".encode())
     pump(1.5)
+    # The sidebar paints chrome with backgrounds of its own, such as the panel
+    # title band. Only a cell whose background the search changed is a
+    # highlight.
+    bg_before = {
+        (x, y): str(screen.buffer[y][x].bg) for y in range(ROWS) for x in range(COLS)
+    }
     # Prefix (Ctrl-a) then `s s` enters search; type the needle and confirm.
     child.send(b"\x01ss")
     pump(0.8)
@@ -467,7 +473,9 @@ def test_search_highlights_land_on_the_match():
         (x, y)
         for y in range(ROWS)
         for x in range(COLS)
-        if y not in skip and str(screen.buffer[y][x].bg) != "default"
+        if y not in skip
+        and str(screen.buffer[y][x].bg) != "default"
+        and str(screen.buffer[y][x].bg) != bg_before[(x, y)]
     ]
     assert highlighted, "search produced no highlights"
     # The sidebar's collapse chip is chrome with a background of its own: three

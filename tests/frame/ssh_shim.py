@@ -44,6 +44,7 @@ is the far side of the link for the modes that need no real server.
 """
 import json
 import os
+import pwd
 import struct
 import sys
 
@@ -94,8 +95,12 @@ def main(mode):
     stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
     # The proxy starts a relay, and importing harness installs home_guard,
     # which counts the HOME this process inherited as the real one. That HOME
-    # is the test server's throwaway, so the proxy runs before the import.
+    # is the test server's throwaway, so the proxy runs before the import and
+    # checks the passwd home itself instead.
     if mode == "proxy":
+        home = os.environ.get("HOME", "")
+        if not home or os.path.realpath(home) == os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir):
+            sys.exit(f"ssh_shim proxy: refusing to start a relay with the real HOME {home!r}")
         return _proxy(stdin, stdout)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from harness import PROTOCOL_VERSION  # noqa: E402

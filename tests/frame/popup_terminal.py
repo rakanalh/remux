@@ -1,7 +1,7 @@
 """Popup terminal (frame harness): the whole feature, read off the composited
 grid the server actually sends.
 
-The popup is a per-SESSION floating pane drawn centered on top of the layout. It
+The popup is a per-TAB floating pane drawn centered on top of the layout. It
 is a real PTY but is deliberately in NO tab's `pane_order` and in no layout tree,
 so it must steal no space from the panes it covers.
 
@@ -11,9 +11,11 @@ Cases:
   2. Typing goes to the popup and NOT to the pane that had focus.
   3. Toggle off -> the frame returns to the plain layout AND focus is restored to
      the original pane (a second marker lands there).
-  4. Runtime resize (`ResizeLeft/Right/Up/Down`) changes the rect as expected,
-     and clamping holds at both extremes.
-  5. Tab switch while open -> the popup is still visible (per-session scope).
+  4. `ResizeLeft/Right/Up/Down` change neither the popup nor the layout under
+     it: a client that sent `PopupSize` sizes its popup itself, and this
+     harness's client sent none.
+  5. Tab switch while open -> the new tab has no popup, and switching back
+     shows the same popup with its history (per-tab scope).
   6. Popup shell exit -> the popup closes and the frame returns to plain layout.
   7. It stole no space: every surrounding pane's rect is IDENTICAL popup-open vs
      popup-closed.
@@ -189,7 +191,7 @@ def main():
 
     # -- 1. Toggle ON: a bordered box at the expected centered rect. --------
     print("\n[1] toggle on -> centered bordered box at the expected rect")
-    c.send({"Command": "PopupToggle"})
+    c.send({"Command": {"PopupToggle": None}})
     time.sleep(0.9)
     for m in c.drain(0.8):
         grid.apply(m)
@@ -213,27 +215,8 @@ def main():
     unoverlapped = [b for b in boxes_closed if not overlaps(b, exp)]
     check(all(b in boxes_open for b in unoverlapped),
           f"every non-overlapped layout box is unchanged ({len(unoverlapped)} checked)")
-    # At 80% the popup covers both panes' corners, so shrink it to the minimum
-    # (which covers no corner) and assert the layout boxes are STILL byte-identical
-    # -- direct evidence that the popup took no space from them.
-    for _ in range(8):
-        c.send({"Command": {"ResizeLeft": 20}})
-        c.send({"Command": {"ResizeUp": 20}})
-    time.sleep(1.4)
-    for m in c.drain(0.9):
-        grid.apply(m)
-    small = expected_popup_rect(COLS, ROWS, 20, 20)
-    boxes_small = boxes_in(grid)
-    check(small in boxes_small, f"popup shrunk to its minimum {small}")
-    check(all(b in boxes_small for b in boxes_closed),
-          f"BOTH layout boxes are still intact with the popup open: {boxes_closed} in {boxes_small}")
-    for _ in range(3):
-        c.send({"Command": {"ResizeRight": 20}})
-        c.send({"Command": {"ResizeDown": 20}})
-    time.sleep(1.2)
-    for m in c.drain(0.9):
-        grid.apply(m)
-    check(exp in boxes_in(grid), "popup restored to 80x80 for the remaining cases")
+    check(all(b in boxes_open for b in boxes_closed),
+          f"BOTH layout boxes are still intact with the popup open: {boxes_closed} in {boxes_open}")
     # The authoritative check: the server's own pane geometry is unchanged.
     tree_open = pane_rects_via_tree(c)
     c.drain(0.2)
@@ -272,19 +255,19 @@ def main():
     check(geometry == {"x": exp["x"] + 1, "y": exp["y"] + 1,
                        "width": exp["width"] - 2, "height": exp["height"] - 2},
           f"focused_pane_rect is the popup interior: {fpr}")
-    # The server refuses `PaneFocus*` while the popup is up, so it reports no
-    # neighbour in any direction.
+    # `PaneFocus*` closes the popup rather than moving inside it, so the popup
+    # reports no neighbour in any direction.
     check(fpr is not None and not any(fpr.get("neighbors", {}).values()),
           f"the popup reports no focus neighbours: {fpr}")
 
     # -- 8. Layout-mutating commands are no-ops while the popup is open. ----
-    print("\n[8] layout commands are no-ops while the popup is open")
+    print("\n[8] layout and resize commands are no-ops while the popup is open")
     snapshot = grid.text()
     for cmd in ["PaneSplitVertical", "PaneSplitHorizontal", "PaneNew",
                 "PaneMoveLeft", "PaneMoveRight", "PaneMoveUp", "PaneMoveDown",
-                "PaneFocusLeft", "PaneFocusRight", "PaneFocusUp", "PaneFocusDown",
                 "LayoutNext", "SetMaster", "PaneToggleZoom",
-                "PaneStackAdd", "PaneStackNext", "PaneStackPrev"]:
+                "PaneStackAdd", "PaneStackNext", "PaneStackPrev",
+                {"ResizeLeft": 10}, {"ResizeRight": 10}, {"ResizeUp": 10}, {"ResizeDown": 10}]:
         c.send({"Command": cmd})
     time.sleep(1.2)
     for m in c.drain(0.9):
@@ -296,59 +279,8 @@ def main():
     check(grid.text() == snapshot, "the frame is byte-identical after those commands")
     check(exp in boxes_in(grid), "the popup is still at its rect")
 
-    # -- 4. Runtime resize + clamping. -------------------------------------
-    print("\n[4] runtime resize changes the rect; clamping holds at extremes")
-    c.send({"Command": {"ResizeRight": 10}})
-    time.sleep(0.7)
-    for m in c.drain(0.7):
-        grid.apply(m)
-    exp90 = expected_popup_rect(COLS, ROWS, 90, 80)
-    got = boxes_in(grid)
-    check(exp90 in got, f"ResizeRight 10 -> {exp90} (got {got})")
-
-    c.send({"Command": {"ResizeDown": 10}})
-    time.sleep(0.7)
-    for m in c.drain(0.7):
-        grid.apply(m)
-    exp9090 = expected_popup_rect(COLS, ROWS, 90, 90)
-    check(exp9090 in boxes_in(grid), f"ResizeDown 10 -> {exp9090}")
-
-    # Clamp high: many grows must saturate at 100%.
-    for _ in range(6):
-        c.send({"Command": {"ResizeRight": 20}})
-        c.send({"Command": {"ResizeDown": 20}})
-    time.sleep(1.2)
-    for m in c.drain(0.8):
-        grid.apply(m)
-    expmax = expected_popup_rect(COLS, ROWS, 100, 100)
-    check(expmax in boxes_in(grid), f"clamped at max -> {expmax}")
-
-    # Clamp low: many shrinks must saturate at 20%.
-    for _ in range(8):
-        c.send({"Command": {"ResizeLeft": 20}})
-        c.send({"Command": {"ResizeUp": 20}})
-    time.sleep(1.4)
-    for m in c.drain(0.9):
-        grid.apply(m)
-    expmin = expected_popup_rect(COLS, ROWS, 20, 20)
-    got = boxes_in(grid)
-    check(expmin in got, f"clamped at min -> {expmin} (got {got})")
-    check(expmin["width"] - 2 >= 10 and expmin["height"] - 2 >= 3,
-          "the clamped popup still has a usable interior")
-
-    # Back to 80x80 for the remaining cases.
-    for _ in range(3):
-        c.send({"Command": {"ResizeRight": 20}})
-        c.send({"Command": {"ResizeDown": 20}})
-    time.sleep(1.0)
-    for m in c.drain(0.8):
-        grid.apply(m)
-    check(exp in boxes_in(grid), "restored to the 80x80 rect")
-
-    # -- 5. Tab switch while open -> still visible (per-session scope). -----
-    print("\n[5] tab switch while open -> the popup stays visible")
-    # A fresh marker: the extreme-resize case above scrolled the older one out of
-    # the popup's (deliberately tiny) screen, which is honest terminal behavior.
+    # -- 5. Tab switch while open -> the popup belongs to its tab. ----------
+    print("\n[5] tab switch while open -> the popup stays with its tab")
     c.send({"Input": {"data": list(b"echo PRE_TABSWITCH_MARK\n")}})
     time.sleep(0.9)
     for m in c.drain(0.8):
@@ -358,15 +290,15 @@ def main():
     time.sleep(1.0)
     for m in c.drain(0.9):
         grid.apply(m)
-    check(exp in boxes_in(grid), "the popup is still drawn on the new tab")
-    inside_newtab = grid.region_text(exp)
-    check("PRE_TABSWITCH_MARK" in inside_newtab,
-          "and it kept its history (same popup, same shell, across the tab switch)")
+    check(exp not in boxes_in(grid), "the new tab has no popup")
+    check("PRE_TABSWITCH_MARK" not in grid.text(), "and nothing of the first tab's popup shows")
     c.send({"Command": "TabPrev"})
     time.sleep(0.9)
     for m in c.drain(0.8):
         grid.apply(m)
-    check(exp in boxes_in(grid), "still drawn after switching back")
+    check(exp in boxes_in(grid), "switching back shows the popup again")
+    check("PRE_TABSWITCH_MARK" in grid.region_text(exp),
+          "and it kept its history (same popup, same shell, across the tab switch)")
     # Drop the scratch tab so later pane-set comparisons match `tree_before`.
     c.send({"Command": "TabNext"})
     time.sleep(0.6)
@@ -377,7 +309,7 @@ def main():
 
     # -- 3. Toggle OFF -> plain layout, focus restored to the original pane.
     print("\n[3] toggle off -> plain layout and focus restored")
-    c.send({"Command": "PopupToggle"})
+    c.send({"Command": {"PopupToggle": None}})
     time.sleep(0.9)
     for m in c.drain(0.8):
         grid.apply(m)
@@ -414,13 +346,13 @@ def main():
         grid.apply(m)
     zoom_boxes = boxes_in(grid)
     check(len(zoom_boxes) == 1, f"zoomed: a single full-area pane box {zoom_boxes}")
-    c.send({"Command": "PopupToggle"})
+    c.send({"Command": {"PopupToggle": None}})
     time.sleep(0.9)
     for m in c.drain(0.8):
         grid.apply(m)
     check(exp in boxes_in(grid), "the popup draws on top of the zoomed pane")
     check(zoom_boxes[0] in boxes_in(grid) or True, "zoomed pane box still present")
-    c.send({"Command": "PopupToggle"})
+    c.send({"Command": {"PopupToggle": None}})
     time.sleep(0.9)
     for m in c.drain(0.8):
         grid.apply(m)
@@ -436,7 +368,7 @@ def main():
     plain_before = boxes_in(grid)
     check(plain_before == boxes_closed,
           f"un-zoomed back to the plain 2-pane layout: {plain_before}")
-    c.send({"Command": "PopupToggle"})
+    c.send({"Command": {"PopupToggle": None}})
     time.sleep(0.9)
     for m in c.drain(0.8):
         grid.apply(m)
@@ -454,7 +386,7 @@ def main():
           f"the real pane set is untouched by the popup's whole lifecycle: {tree_end}")
 
     # State is cleaned up: a fresh toggle spawns a NEW popup that works.
-    c.send({"Command": "PopupToggle"})
+    c.send({"Command": {"PopupToggle": None}})
     time.sleep(1.0)
     for m in c.drain(0.9):
         grid.apply(m)
