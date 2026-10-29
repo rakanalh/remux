@@ -121,6 +121,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Server, Client, name_of  # noqa: E402
 from portable import SETSID_F, SETSID_W  # noqa: E402
 
+# macOS has no sid to attribute by: a pane's own process is found by the walk
+# instead, at a depth fixed by how it was started. Its pin is the socket's
+# audit token, and its script(1) is BSD's.
+MAC = sys.platform == "darwin"
+
+
+def by_own(depth):
+    """How the server attributes a process in a pane's own session, as
+    `(pattern, label)`: a regex fragment for the log, and the words for the
+    check's line."""
+    if MAC:
+        return rf"by Walk \{{ depth: {depth} \}}", f"by Walk {{ depth: {depth} }}"
+    return "by Sid", "by Sid"
+
+
 RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msg")
 
 failures = []
@@ -388,9 +403,10 @@ try:
     a = reply["CliSpawned"]["pane_id"] if name_of(reply) == "CliSpawned" else None
     ok, seen = pane_content(cli, a, "LS:done")
     check(ok, f"1a `remux ls` ran inside pane A to completion (saw {seen[-5:]})")
-    line = log_has(rf"identity: client_id=\d+ peer=Some\(\d+\) pin=\w+ -> pane %{a} by Sid$")
+    how, said = by_own(1)
+    line = log_has(rf"identity: client_id=\d+ peer=Some\(\d+\) pin=\w+ -> pane %{a} {how}$")
     check(line is not None,
-          f"1a the connection from inside pane A is attributed to %{a} by Sid "
+          f"1a the connection from inside pane A is attributed to %{a} {said} "
           f"(identity lines: {identity_lines()})")
 
     # --- 1b: the harness itself is in no pane of this server ---------------
@@ -404,9 +420,10 @@ try:
     reply = cli_spawn("SplitRight", argv=[BIN, "ls"])
     check(name_of(reply) == "CliSpawned", f"1c pane B spawned (got {reply})")
     b = reply["CliSpawned"]["pane_id"] if name_of(reply) == "CliSpawned" else None
-    line = log_has(rf"identity: client_id=\d+ peer=Some\(\d+\) pin=\w+ -> pane %{b} by Sid$")
+    how, said = by_own(0)
+    line = log_has(rf"identity: client_id=\d+ peer=Some\(\d+\) pin=\w+ -> pane %{b} {how}$")
     check(line is not None,
-          f"1c the pane's own `remux ls` is attributed to %{b} by Sid "
+          f"1c the pane's own `remux ls` is attributed to %{b} {said} "
           f"(identity lines: {identity_lines()})")
 
     # --- 1d: a sender that left the pane's session ------------------------
@@ -423,7 +440,8 @@ try:
     if shutil.which("script") is None:
         print("SKIP  1e `script` is not installed")
     else:
-        reply = cli_spawn("SplitRight", argv=["script", "-qec", f"{BIN} ls", "/dev/null"])
+        script = ["script", "-q", "/dev/null", BIN, "ls"] if MAC else ["script", "-qec", f"{BIN} ls", "/dev/null"]
+        reply = cli_spawn("SplitRight", argv=script)
         check(name_of(reply) == "CliSpawned", f"1e pane E spawned (got {reply})")
         e = reply["CliSpawned"]["pane_id"] if name_of(reply) == "CliSpawned" else None
         line = log_has(rf" INFO .*identity: client_id=\d+ peer=Some\(\d+\) pin=\w+ -> pane %{e} "
@@ -453,7 +471,7 @@ try:
           f"(identity lines: {identity_lines()})")
 
     # --- 1g: the pin in use -------------------------------------------------
-    want = "pidfd" if kernel_has_peer_pidfd() else "starttime"
+    want = "token" if MAC else "pidfd" if kernel_has_peer_pidfd() else "starttime"
     pins = set(re.findall(r"identity: client_id=\d+ peer=Some\(\d+\) pin=(\w+) ", srv.log()))
     check(pins == {want}, f"1g every connection is pinned by {want}, which this kernel offers (saw {pins})")
 
@@ -549,8 +567,11 @@ try:
 
     # --- 3j ---------------------------------------------------------------
     r = inherited_socket_send(send_to({"Pane": B}, "MSG:inherited"))
-    check(code_of(r) == "sender_unverified" and "exited before it was checked" in r["Error"]["message"],
-          f"3j an inherited socket whose connector exited is refused as exited (got {r})")
+    # macOS pins the socket's audit token, which names the exited connector,
+    # so it refuses for the walk finding no pane rather than for the exit.
+    why = "not a descendant of any pane" if MAC else "exited before it was checked"
+    check(code_of(r) == "sender_unverified" and why in r["Error"]["message"],
+          f"3j an inherited socket whose connector exited is refused: {why} (got {r})")
 
     # --- 3m ---------------------------------------------------------------
     # The program exits only once its tab is in the background, which is the
@@ -938,8 +959,9 @@ try:
     log = srv.log()
     check(re.search(rf"msg: id=1 from=%{A}\(-\) to=%{B} bytes=7 deliver=Auto -> mailbox", log) is not None,
           "3i the send is logged with its size")
-    check(re.search(rf"identity: client_id=\d+ MsgSend caller -> pane %{A} by Sid$", log, re.M) is not None,
-          "3i the send's attribution is logged, by Sid")
+    how, said = by_own(1)
+    check(re.search(rf"identity: client_id=\d+ MsgSend caller -> pane %{A} {how}$", log, re.M) is not None,
+          f"3i the send's attribution is logged, {said}")
     bodies = [b for b in ("MSG:one", "MSG:two", "MSG:leader", "MSG:outside", "MSG:inherited",
                           "MSG:to-popup", "MSG:from-popup", "MSG:paste", "MSG:forged",
                           "ACK:1", "CAP:1", "RATE:1", "GONE:1", "NAME:1", "WAIT:1")

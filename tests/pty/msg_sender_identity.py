@@ -275,7 +275,9 @@ try:
           f"9b MSG:one is from %{A} (lead), NOT from the %{B} the caller claimed (got {frm})")
     check(f"pane_hint=%{B} disagrees with attribution %{A}" in server_log(), "9b the server logs the disagreement")
     line = last_send_identity(A)
-    check(line.endswith("by Sid"), f"9b the identity line says by Sid (got {line!r})")
+    # macOS has no sid to attribute by; the walk finds the CLI's parent shell.
+    how = "by Walk { depth: 1 }" if sys.platform == "darwin" else "by Sid"
+    check(line.endswith(how), f"9b the identity line says {how} (got {line!r})")
 
     # --- 9c ---------------------------------------------------------------
     type_line(child, pump, f"""nohup {BIN} msg send %{B} "$(printf 'MSG:%s' two)" >/dev/null 2>&1 &""")
@@ -303,7 +305,11 @@ try:
           f"9e the server logs the refusal and the peer pid it could not place (refusals {refused})")
 
     # --- 9f ---------------------------------------------------------------
-    code, out, err = run_in_pane(child, pump, f"""script -qc '{BIN} msg send %{B} "$(printf "MSG:%s" five)"' /dev/null""")
+    if sys.platform == "darwin":
+        nested = f"""script -q /dev/null /bin/sh -c '{BIN} msg send %{B} "$(printf "MSG:%s" five)"'"""
+    else:
+        nested = f"""script -qc '{BIN} msg send %{B} "$(printf "MSG:%s" five)"' /dev/null"""
+    code, out, err = run_in_pane(child, pump, nested)
     m = arrived(env, B, "MSG:five")
     check(code == 0 and m is not None and str(m["from"]["Pane"]["pane_id"]) == A,
           f"9f a send inside script is from %{A} (exit {code}, err {err!r})")
@@ -322,10 +328,21 @@ try:
           f"9g an outside read is a peek and leaves every message Queued ({first} -> {second})")
 
     # --- SEC1 -------------------------------------------------------------
+    refused_before = len(re.findall(r"msg: sender unverified: client_id=\d+ not a descendant of any pane", server_log()))
     type_line(child, pump, f"""( {BIN} msg send %{B} "$(printf 'MSG:%s' sec1)" >/dev/null 2>&1 & )""")
     m = arrived(env, B, "MSG:sec1")
-    check(m is not None and str(m["from"]["Pane"]["pane_id"]) == A,
-          f"SEC1 a double-forked send without setsid is from %{A} (got {m and m['from']})")
+    if sys.platform == "darwin":
+        # A known macOS limitation: there is no sid to attribute by, and the
+        # reparented orphan's walk reaches init, so the send is refused.
+        # Failing closed is the accepted outcome; Linux credits it by Sid.
+        refused_after = len(re.findall(r"msg: sender unverified: client_id=\d+ not a descendant of any pane",
+                                        server_log()))
+        check(m is None and refused_after > refused_before,
+              f"SEC1 a double-forked send is refused on macOS, not a descendant of any pane, and nothing is stored "
+              f"(got {m and m['from']}, refusals {refused_before} -> {refused_after})")
+    else:
+        check(m is not None and str(m["from"]["Pane"]["pane_id"]) == A,
+              f"SEC1 a double-forked send without setsid is from %{A} (got {m and m['from']})")
 
     # --- SEC2 -------------------------------------------------------------
     code, out, err = run_in_pane(child, pump, f"""env -u REMUX_PANE -u REMUX_SESSION {BIN} msg send %{B} "$(printf 'MSG:%s' sec2)" """)
