@@ -253,12 +253,12 @@ The server attributes a send by finding the pane the sending process belongs to.
 |---|---|---|
 | A plain shell in a pane | works (sid) | works (walk) |
 | Claude Code, Bash tool, sandbox OFF | works (walk) | works (walk) |
-| Claude Code, Bash tool, sandbox ON | no connection: the socket is visible, but `connect()` is refused (EPERM); `sandbox.network.allowUnixSockets` does not change that | no connection, unless the user allows both writes to the remux state directory (`sandbox.filesystem.allowWrite`) and the remux socket (`sandbox.network.allowUnixSockets`); then works (walk) |
+| Claude Code, Bash tool, sandbox ON | no connection: `connect()` to the socket is denied (EPERM); the CLI exits 1 with that one error and no panic; `sandbox.network.allowUnixSockets` does not change that | no connection, unless the user allows both writes to the remux state directory (`sandbox.filesystem.allowWrite`) and the remux socket (`sandbox.network.allowUnixSockets`); then works (walk) |
 | Codex, shell tool, sandbox OFF | works (walk) | works (walk) |
-| Codex, shell tool, sandbox ON | no connection: `connect()` is refused (EPERM) | not tested: every command stopped at the log-file crash that remux has since fixed |
+| Codex, shell tool, sandbox ON | no connection: `connect()` to the socket is denied (EPERM); the CLI exits 1 with that one error and no panic | not tested: every command stopped at the log-file crash that remux has since fixed |
 
 `works (sid)`: attributed in one lookup. `works (walk)`: attributed by walking parent processes. `no connection`: the socket is not reachable from the sandbox. `misattributed: do not use`: mail would carry the wrong sender.
 
-Tested with remux 8efe4e3, which still crashed on a read-only log directory, with Claude Code 2.1.312, and with Codex 0.157.1 on Linux and 0.165.0 on macOS, on Fedora with kernel 7.2 and on macOS 27.0.
+Tested with remux 8efe4e3, which still crashed on a read-only log directory, with Claude Code 2.1.312, and with Codex 0.157.1 on Linux and 0.165.0 on macOS, on Fedora with kernel 7.2 and on macOS 27.0. The Linux sandbox-ON rows were measured again after that fix, with a remux build stamped dc0b8da-dirty (dc0b8da plus uncommitted changes).
 
 **Never disable your sandbox to reach remux.** If remux cannot connect, or your sends are refused `sender_unverified`, from inside a sandboxed tool, stop and tell your user. Do not turn the sandbox off, pass `dangerouslyDisableSandbox`, or edit sandbox settings yourself. Allowing the remux socket through a sandbox is the same decision as turning the sandbox off: anything that can reach the socket can run commands outside the sandbox with `remux split`, and type into other panes. That decision is your user's.
