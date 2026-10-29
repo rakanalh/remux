@@ -15956,7 +15956,8 @@ fn place_popup<'a>(
             y: interior.y,
             width: interior.width,
             height: interior.height,
-            // The server refuses `PaneFocus*` while the popup is up.
+            // `PaneFocus*` closes the popup rather than moving inside it, so
+            // the popup has no neighbour in any direction.
             neighbors: FocusNeighbors::default(),
         }),
         layer: None,
