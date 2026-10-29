@@ -21,6 +21,8 @@ Debug logging is always on; there is no `RUST_LOG` or verbosity switch to set. P
 tail -f ~/.local/state/remux/server.log
 ```
 
+When the log directory cannot be written, for example from inside an AI agent's sandboxed shell, CLI commands such as `remux msg send` still run, without a log and without saying so. The server and the relay do not: they exit at once with `cannot open its log` and the path.
+
 ## Where files live
 
 Every location honours its XDG variable first, when it is set to an absolute path.
