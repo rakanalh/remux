@@ -1,12 +1,14 @@
 """A stand-in agent for the submit harnesses: it records exactly what reaches
 its pane's input, and shows the screens a real agent would.
 
-`install(path)` writes this file to `path` with `#!<this interpreter>` as its
-first line. A DIRECT interpreter shebang is what makes the kernel name the
-process after the script: through `#!/usr/bin/env python3` the process is
-re-exec'd and its `comm` is `python3`, which no `[agents] commands` entry
-matches, and every submit is then refused `agent_not_ready` for a reason that
-looks like a server bug.
+`install(path)` makes `path` a compiled binary that runs this file under
+this interpreter as its child, and stays the process group's leader. The
+server names the agent after that leader, and no script can carry the name
+on both platforms: Linux names a direct-shebang script after the script, but
+macOS names a process after its EXECUTABLE (`proc_pidpath`), which for any
+script is the interpreter -- the Xcode `python3` re-execs itself as `Python`
+-- so no `[agents] commands` entry matches, and every submit is refused
+`agent_not_ready` for a reason that looks like a server bug.
 
 Run as `fakeagent <log> <control>`. The terminal is put in raw mode, so every
 byte the pane receives arrives unchanged, and each read becomes one line
@@ -72,9 +74,13 @@ its Enter, the moment a real agent takes a prompt up:
   ASK:       show the permission prompt 1 s after the Enter: a turn that
              ends in a question
 """
+import json
 import os
 import re
 import select
+import shutil
+import stat
+import subprocess
 import sys
 import time
 
@@ -120,8 +126,101 @@ def tell(ctl, log, command, timeout=5.0, settle=0.4):
     time.sleep(settle)
 
 
+# Forwards the signals sent to the leader's pid alone, so the python child
+# never outlives the wrapper that names it. One sent to the whole group, as a
+# pane's close does, reaches the child twice, which nothing here minds.
+_WRAPPER_C = r"""
+#include <errno.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static volatile pid_t child;
+
+static void forward(int sig) {
+    if (child > 0) kill(child, sig);
+}
+
+int main(int argc, char **argv) {
+    int fwd[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT};
+    for (unsigned i = 0; i < sizeof fwd / sizeof *fwd; i++) signal(fwd[i], forward);
+    char *args[argc + 2];
+    args[0] = PYTHON;
+    args[1] = SCRIPT;
+    for (int i = 1; i < argc; i++) args[i + 1] = argv[i];
+    args[argc + 1] = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        for (unsigned i = 0; i < sizeof fwd / sizeof *fwd; i++) signal(fwd[i], SIG_DFL);
+        execv(PYTHON, args);
+        _exit(127);
+    }
+    child = pid;
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (WIFEXITED(st)) return WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+    return 1;
+}
+"""
+
+
+def require_private_dir(path):
+    """Refuse a directory another user could write into, and close ours.
+
+    The harness BINDIRs sit at fixed `/tmp` paths and are made with
+    `exist_ok=True`, so one another local user created first is accepted
+    silently, and they could swap the source, the binary or the script
+    between install and the pane running it. A group-writable one of ours
+    is what a umask of 002 makes, so it is tightened to 0700 rather than
+    refused.
+    """
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise SystemExit(f"fakeagent: refusing {path}: not a real directory")
+    if st.st_uid != os.geteuid():
+        raise SystemExit(f"fakeagent: refusing {path}: owned by uid {st.st_uid}, not {os.geteuid()}")
+    if st.st_mode & 0o002:
+        raise SystemExit(f"fakeagent: refusing {path}: writable by others "
+                         f"({stat.S_IMODE(st.st_mode):o})")
+    os.chmod(path, 0o700)
+
+
 def install(path):
-    """Write the fakeagent to `path` as an executable with a direct shebang."""
+    """Install the fakeagent at `path`, named for detection on Linux and macOS.
+
+    Without a working `cc` it falls back to a direct-shebang script, which
+    only Linux detects, so on macOS that is an error rather than a harness
+    whose every agent case fails for no visible reason.
+    """
+    require_private_dir(os.path.dirname(os.path.abspath(path)))
+    # Nobody else can add a name here once the directory is closed, so
+    # removing what is there leaves no link planted before that for the
+    # writes below to follow.
+    for name in (path, path + ".c", path + ".py"):
+        try:
+            os.unlink(name)
+        except FileNotFoundError:
+            pass
+    script = path + ".py"
+    shutil.copyfile(os.path.abspath(__file__), script)
+    cc = shutil.which("cc")
+    error = "no `cc` on PATH"
+    if cc:
+        src = path + ".c"
+        with open(src, "w") as f:
+            f.write(_WRAPPER_C)
+        r = subprocess.run(
+            [cc, "-O1", f"-DPYTHON={json.dumps(sys.executable)}", f"-DSCRIPT={json.dumps(script)}",
+             "-o", path, src],
+            capture_output=True, text=True)
+        os.remove(src)
+        if r.returncode == 0:
+            return
+        error = f"`cc` failed: {r.stderr.strip()[:300]}"
+    if sys.platform == "darwin":
+        raise SystemExit(f"fakeagent: cannot build the stand-in ({error}); macOS needs it")
+    print(f"note: fakeagent is a script ({error}); detected on Linux only", file=sys.stderr)
     with open(os.path.abspath(__file__)) as f:
         source = f.read()
     with open(path, "w") as f:
