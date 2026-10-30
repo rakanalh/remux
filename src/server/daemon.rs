@@ -1060,7 +1060,7 @@ async fn forwarding_sender(
     peer: &Arc<identity::Peer>,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-) -> Result<(PaneId, String), ServerMessage> {
+) -> Result<(PaneId, String), Box<ServerMessage>> {
     let from = match attribute_frame_caller(peer, panes).await {
         Ok(found) => found,
         Err(why) => {
@@ -1068,10 +1068,10 @@ async fn forwarding_sender(
                 "msg: sender unverified: client_id={client_id} {}",
                 why.reason()
             );
-            return Err(ServerMessage::refused(
+            return Err(Box::new(ServerMessage::refused(
                 "sender_unverified",
                 format!("{}: {}", why.reason(), why.fix()),
-            ));
+            )));
         }
     };
     log_caller(client_id, "MsgSend", &from);
@@ -1084,14 +1084,17 @@ async fn forwarding_sender(
         )
     };
     if from_popup {
-        return Err(ServerMessage::refused("sender_unverified", POPUP_REFUSED));
+        return Err(Box::new(ServerMessage::refused(
+            "sender_unverified",
+            POPUP_REFUSED,
+        )));
     }
     match session {
         Some(session) => Ok((from.pane, session)),
-        None => Err(ServerMessage::refused(
+        None => Err(Box::new(ServerMessage::refused(
             "sender_unverified",
             format!("pane %{} is closing", from.pane),
-        )),
+        ))),
     }
 }
 
@@ -1135,7 +1138,7 @@ async fn reply_over_inbound(
     let (from_pane, session) =
         match forwarding_sender(client_id, msg.pane_hint, peer, state, panes).await {
             Ok(found) => found,
-            Err(refusal) => return Some(refusal),
+            Err(refusal) => return Some(*refusal),
         };
     let (minted, from_name) = {
         let mut store = store.lock().await;
@@ -1647,7 +1650,7 @@ async fn forward_send(
     let (from_pane, session) =
         match forwarding_sender(client_id, msg.pane_hint, peer, state, panes).await {
             Ok(found) => found,
-            Err(refusal) => return Some(refusal),
+            Err(refusal) => return Some(*refusal),
         };
     // A typed send parks this connection until the far server answers, as a
     // local one does: one at a time, and never beside a local one.
@@ -3972,23 +3975,23 @@ async fn mailbox_of(
     peer: &Arc<identity::Peer>,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-) -> Result<(PaneId, Option<PaneId>), ServerMessage> {
+) -> Result<(PaneId, Option<PaneId>), Box<ServerMessage>> {
     let caller = attribute_frame_caller(peer, panes).await;
     if let Ok(found) = &caller {
         log_caller(client_id, verb, found);
         log_hint(pane_hint, found.pane);
     }
     if let Some(refused) = unverified_refusal(&caller) {
-        return Err(refused);
+        return Err(Box::new(refused));
     }
     let pane = match (pane, &caller) {
         (Some(pane), _) => pane,
         (None, Ok(found)) => found.pane,
         (None, Err(why)) => {
-            return Err(ServerMessage::refused(
+            return Err(Box::new(ServerMessage::refused(
                 "not_in_pane",
                 format!("not in a pane ({}): pass --pane %N", why.reason()),
-            ))
+            )))
         }
     };
     check_addressable(pane, state, panes).await?;
@@ -4001,20 +4004,23 @@ async fn check_addressable(
     pane: PaneId,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-) -> Result<(), ServerMessage> {
+) -> Result<(), Box<ServerMessage>> {
     let live = live_panes(panes).await.contains(&pane);
     let (in_a_tab, popup) = {
         let st = state.lock().await;
         (st.locate_pane(pane).is_some(), st.is_popup(pane))
     };
     if popup {
-        return Err(ServerMessage::refused("no_such_target", POPUP_REFUSED));
+        return Err(Box::new(ServerMessage::refused(
+            "no_such_target",
+            POPUP_REFUSED,
+        )));
     }
     if !live || !in_a_tab {
-        return Err(ServerMessage::refused(
+        return Err(Box::new(ServerMessage::refused(
             "no_such_target",
             format!("no such target: %{pane}"),
-        ));
+        )));
     }
     Ok(())
 }
@@ -4056,7 +4062,7 @@ async fn handle_agent_name(
         }
     };
     if let Err(refused) = check_addressable(pane, state, panes).await {
-        return refused;
+        return *refused;
     }
     let named = store.lock().await.set_name(pane, request.name.as_deref());
     match named {
@@ -4084,29 +4090,35 @@ async fn resolve_target(
     address: &Address,
     live: &std::collections::HashSet<PaneId>,
     store: &Mutex<Messaging>,
-) -> Result<PaneId, ServerMessage> {
+) -> Result<PaneId, Box<ServerMessage>> {
     use crate::server::messaging::Refusal;
+    let refused =
+        |refusal: Refusal| Box::new(ServerMessage::refused(refusal.code(), refusal.message()));
     if let Some(host) = &address.host {
         if !valid_host(host) {
-            let refusal = Refusal::BadAddress(format!("bad host {}", loggable(host)));
-            return Err(ServerMessage::refused(refusal.code(), refusal.message()));
+            return Err(refused(Refusal::BadAddress(format!(
+                "bad host {}",
+                loggable(host)
+            ))));
         }
-        return Err(ServerMessage::refused(
+        return Err(Box::new(ServerMessage::refused(
             "bad_address",
             "a forwarded request must name a pane on this server",
-        ));
+        )));
     }
     if let Target::Name(name) = &address.target {
         if !valid_name(name) {
-            let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
-            return Err(ServerMessage::refused(refusal.code(), refusal.message()));
+            return Err(refused(Refusal::BadAddress(format!(
+                "bad name {}",
+                loggable(name)
+            ))));
         }
     }
     store
         .lock()
         .await
         .resolve(&address.target, |pane| live.contains(&pane))
-        .map_err(|refusal| ServerMessage::refused(refusal.code(), refusal.message()))
+        .map_err(refused)
 }
 
 /// `agent wait`: answer at once when `target`'s agent is already in `want`,
@@ -4130,7 +4142,7 @@ async fn handle_agent_wait(
     let live = live_panes(panes).await;
     let pane = match resolve_target(&target, &live, store).await {
         Ok(pane) => pane,
-        Err(refusal) => return Some(refusal),
+        Err(refusal) => return Some(*refusal),
     };
     let sample = sample_pane(pane, state, panes, config).await;
     if !sample.live {
@@ -4301,7 +4313,7 @@ async fn handle_agent_status(
         None => None,
         Some(address) => match resolve_target(address, &live, store).await {
             Ok(pane) => Some(pane),
-            Err(refusal) => return refusal,
+            Err(refusal) => return *refusal,
         },
     };
 
@@ -4429,7 +4441,7 @@ async fn handle_msg_read(
     .await
     {
         Ok(found) => found,
-        Err(refused) => return Some(refused),
+        Err(refused) => return Some(*refused),
     };
     let mark = caller == Some(pane) && !msg.peek;
     // Cloned before the store is locked: a waiter answers through it later.
@@ -4551,7 +4563,7 @@ async fn handle_msg_ack(
     .await
     {
         Ok(found) => found,
-        Err(refused) => return refused,
+        Err(refused) => return *refused,
     };
     let count = {
         let mut store = store.lock().await;
