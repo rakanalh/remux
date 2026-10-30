@@ -596,18 +596,18 @@ def scenario():
     # ...and the trap, one level up: a DIFFERENT directory whose path starts
     # with the home's text.
     keys(child, pump, "h")
-    ok = wait_until(pump, lambda: header(screen) == RUN)
+    ok = wait_until(pump, lambda: header_is(screen, RUN))
     check("13 the directory above home is not shortened at all", ok,
           header(screen))
     found = descend(child, pump, screen, "homework")
-    ok = wait_until(pump, lambda: header(screen) == NOT_HOME)
+    ok = wait_until(pump, lambda: header_is(screen, NOT_HOME))
     check("13 a sibling whose path merely STARTS with the home's is left "
           "alone, rather than becoming `~work`",
           found and ok, (found, header(screen), entry_rows(screen)))
 
     # Back where the other cases left it.
     keys(child, pump, "h")
-    wait_until(pump, lambda: header(screen) == RUN)
+    wait_until(pump, lambda: header_is(screen, RUN))
     descend(child, pump, screen, "home")
     wait_until(pump, lambda: header(screen) == "~")
     descend(child, pump, screen, "fixture")
@@ -619,6 +619,22 @@ def scenario():
     except Exception:
         pass
     wire.close()
+
+
+def header_is(screen, path):
+    """Whether the header shows `path` as the panel does: resolved, because a
+    pane's cwd is its physical path. That is `path` itself on Linux, unless the
+    run dir is under a symlink. On macOS `/tmp` resolves to `/private/tmp`,
+    which makes the path long enough for the panel to cut it from the left
+    behind a `…`. The kept tail must hold the last two whole components, so a
+    header cut down to a few characters does not match."""
+    shown, want = header(screen), os.path.realpath(path)
+    if shown == want:
+        return True
+    if sys.platform != "darwin" or not shown.startswith("…") or not want.endswith(shown[1:]):
+        return False
+    whole = shown[1:].partition("/")[2]
+    return whole.count("/") >= 1 and want.endswith("/" + whole)
 
 
 def stale_config_scenario():
