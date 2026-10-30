@@ -78,11 +78,14 @@ pub fn home_dir() -> Option<String> {
 /// kernel reports PHYSICALLY. A home that goes through a symlink, such as
 /// Fedora Silverblue's `/home` -> `/var/home`, would otherwise never prefix
 /// them. The verbatim fallback (a home that does not exist, or cannot be read)
-/// keeps the answer remux gave before.
+/// keeps the answer remux gave before. So does a resolved path that is not
+/// UTF-8 when `$HOME` itself is, because the wire cannot carry the first.
 fn resolved_home(home: Option<std::path::PathBuf>) -> Option<String> {
     let home = home?;
-    let home = std::fs::canonicalize(&home).unwrap_or(home);
-    home.to_str().map(str::to_string)
+    std::fs::canonicalize(&home)
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .or_else(|| home.to_str().map(str::to_string))
 }
 
 /// List `path`, sorted directories-first then by name.
@@ -443,5 +446,21 @@ mod tests {
             gone.to_str().map(str::to_string)
         );
         assert_eq!(resolved_home(None), None);
+    }
+
+    /// Linux only, because APFS refuses a file name that is not UTF-8.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_home_that_resolves_to_a_non_utf8_path_is_reported_as_spelled() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = Tmp::new("home-bytes");
+        let real = tmp.path().join(std::ffi::OsStr::from_bytes(b"real-\xff"));
+        std::fs::create_dir(&real).expect("real");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        assert_eq!(
+            resolved_home(Some(link.clone())),
+            link.to_str().map(str::to_string)
+        );
     }
 }
