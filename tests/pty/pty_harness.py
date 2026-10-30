@@ -356,12 +356,34 @@ def sm_title(t):
     raise AssertionError("session manager is not on screen")
 
 
+def sm_settled(t, read, timeout=4.0):
+    """`read(t)`, retried while it raises, for up to `timeout` seconds.
+
+    The client paints a server frame and then the overlay over it, so a screen
+    read between the two sees the popup half drawn or gone. On a slow machine
+    that window is wide enough to hit. A popup that is really missing, or a
+    tree that really has no single highlight, still raises after the timeout.
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            return read(t)
+        except AssertionError:
+            if time.time() >= deadline:
+                raise
+            t.pump(0.1)
+
+
 def sm_tree(t):
     """Every tree row the manager is currently painting, top to bottom.
 
     The popup is found by its title line, its columns by that line's corners --
     so this is immune to the popup moving or resizing with the terminal.
     """
+    return sm_settled(t, _sm_tree_once)
+
+
+def _sm_tree_once(t):
     rows = t.rows_text()
     title_y = None
     for i, r in enumerate(rows):
@@ -391,7 +413,11 @@ def sm_tree(t):
 
 def sm_selected(t):
     """The highlighted tree row. Raises unless exactly one row is highlighted."""
-    tree = sm_tree(t)
+    return sm_settled(t, _sm_selected_once)
+
+
+def _sm_selected_once(t):
+    tree = _sm_tree_once(t)
     hits = [r for r in tree if r.selected]
     if len(hits) != 1:
         raise AssertionError(
