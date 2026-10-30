@@ -19809,6 +19809,52 @@ mod popup_tests {
         rig.finish().await;
     }
 
+    /// Every `Rig` command saves `state.json`, because `Config::default()` has
+    /// `save_sessions = true`. The save must land in the test sandbox and never
+    /// in the data directory the environment names, which is the user's own.
+    ///
+    /// The user's file usually exists already, so the check is that its
+    /// identity is unchanged, not that it is absent. A save replaces it by a
+    /// rename, which gives it a new inode and mtime. A remux server the user is
+    /// running also saves to that file, so a save of its own inside this test's
+    /// window makes the test fail although no test wrote the file.
+    #[tokio::test]
+    async fn a_command_saves_the_session_state_into_the_test_sandbox() {
+        use std::os::unix::fs::MetadataExt;
+        let configured = std::env::var_os("XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(dirs::data_dir)
+            .expect("a data directory")
+            .join("remux")
+            .join("state.json");
+        let identity = || {
+            std::fs::symlink_metadata(&configured)
+                .ok()
+                .map(|m| (m.ino(), m.len(), m.modified().ok()))
+        };
+        let before = identity();
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        rig.command(RemuxCommand::SessionRename("sandboxed".to_string()))
+            .await;
+        assert!(
+            crate::paths::data_home()
+                .join("remux")
+                .join("state.json")
+                .exists(),
+            "the save ran"
+        );
+        assert_eq!(
+            identity(),
+            before,
+            "{} changed during the test: a test wrote it, unless a remux server \
+             you are running saved it at the same moment",
+            configured.display()
+        );
+        rig.finish().await;
+    }
+
     #[tokio::test]
     async fn a_session_rename_is_announced_to_every_client() {
         let dir = tempfile::tempdir().expect("dir");
