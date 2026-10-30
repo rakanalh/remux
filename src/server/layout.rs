@@ -414,6 +414,28 @@ impl LayoutMode {
         }
     }
 
+    /// Every automatic layout mode, in the order of [`LayoutMode::next`].
+    pub fn automatic_modes() -> [LayoutMode; 6] {
+        [
+            LayoutMode::Bsp(BspLayout),
+            LayoutMode::Master(MasterLayout::default()),
+            LayoutMode::Monocle(MonocleLayout),
+            LayoutMode::Grid(GridLayout),
+            LayoutMode::Columns(ColumnsLayout),
+            LayoutMode::Rows(RowsLayout),
+        ]
+    }
+
+    /// The mode whose [`LayoutMode::name`] is `name`, in its default state.
+    pub fn from_name(name: &str) -> Option<LayoutMode> {
+        if name == CustomLayout.name() {
+            return Some(LayoutMode::Custom(CustomLayout));
+        }
+        Self::automatic_modes()
+            .into_iter()
+            .find(|mode| mode.name() == name)
+    }
+
     fn cycle_index(&self) -> Option<usize> {
         match self {
             LayoutMode::Bsp(_) => Some(0),

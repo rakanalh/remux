@@ -1984,6 +1984,37 @@ async fn handle_client_message(
             }
             Ok(())
         }
+        ClientMessage::ListLayouts => {
+            // `clients` is released before `state` is taken, for the lock-order
+            // reason given in `RequestScrollbackInfo` below.
+            let session_name = {
+                let cls = clients.lock().await;
+                cls.get(&client_id).and_then(|c| c.session_name.clone())
+            };
+            let (layouts, current) = {
+                let st = state.lock().await;
+                session_name
+                    .as_deref()
+                    .and_then(|name| st.sessions.get(name))
+                    .and_then(|sess| sess.tabs.get(sess.active_tab))
+                    .map(|tab| {
+                        let restorable =
+                            saved_custom_is_restorable(&tab.saved_custom_layout, &tab.pane_order);
+                        (
+                            layout_choices(&tab.layout_mode, restorable, &config.layouts),
+                            tab.layout_mode.name().to_string(),
+                        )
+                    })
+                    .unwrap_or_default()
+            };
+            let cls = clients.lock().await;
+            if let Some(client) = cls.get(&client_id) {
+                let _ = client
+                    .tx
+                    .send(ServerMessage::LayoutList { layouts, current });
+            }
+            Ok(())
+        }
         ClientMessage::RequestScrollbackInfo => {
             // Take `clients` and RELEASE it before touching `state`. Holding it
             // across the `state` lock would be a `clients -> state` order, and
@@ -2944,6 +2975,7 @@ async fn handle_command(
                 | RemuxCommand::PaneMoveToTabTarget { .. }
                 | RemuxCommand::PaneToggleZoom
                 | RemuxCommand::LayoutNext
+                | RemuxCommand::LayoutSet(_)
                 | RemuxCommand::SetMaster => {
                     log::debug!("server: command {cmd:?} is a no-op while the popup is open");
                     return Ok(());
@@ -3793,36 +3825,42 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
-                // Snapshot the current custom arrangement *before* touching the
-                // tree, so the cycle can return to it later. Order matters: a
-                // rebuild below would otherwise overwrite `tab.layout`.
-                if matches!(tab.layout_mode, LayoutMode::Custom(_)) {
-                    tab.saved_custom_layout = Some(tab.layout.clone());
-                }
-                // Cycling the layout releases the zoom, for the same reason a
-                // new pane does: the tab is showing a different arrangement, and
-                // a zoom would hide all of it. Cleared *first*, so the
-                // `focus_pane` below can't carry a stale zoom into the restored
-                // tree -- and so the cycle can never park a live zoom in Monocle,
-                // the one mode that refuses to take one.
-                tab.zoomed_pane = None;
                 // The last enabled automatic mode returns to Custom only when
                 // the saved tree is still restorable (its pane set matches the
-                // live panes); otherwise the cycle stays automatic.
+                // live panes); otherwise the cycle stays automatic. Leaving
+                // Custom never returns to it, so this can be read before
+                // `switch_tab_layout` snapshots the current Custom tree.
                 let restorable =
                     saved_custom_is_restorable(&tab.saved_custom_layout, &tab.pane_order);
-                tab.layout_mode = next_layout_mode(&tab.layout_mode, restorable, &config.layouts);
-                log::debug!("server: LayoutNext new_mode={}", tab.layout_mode.name());
-                if tab.layout_mode.is_automatic() {
-                    tab.rebuild_if_automatic();
-                } else if let Some(saved) = tab.saved_custom_layout.clone() {
-                    // Custom: restore the remembered arrangement. Adopt its own
-                    // active-pane markers so the focused pane stays visible.
-                    // The live names replace the snapshot's, which predate any
-                    // rename made while the tab was automatic.
-                    tab.replace_layout(saved);
-                    if let Some(active) = tab.layout.active_pane() {
-                        tab.focus_pane(active);
+                let mode = next_layout_mode(&tab.layout_mode, restorable, &config.layouts);
+                log::debug!("server: LayoutNext new_mode={}", mode.name());
+                switch_tab_layout(tab, mode);
+            }
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::LayoutSet(ref name) => {
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                let restorable =
+                    saved_custom_is_restorable(&tab.saved_custom_layout, &tab.pane_order);
+                match resolve_layout_set(name, &tab.layout_mode, restorable, &config.layouts) {
+                    Ok(Some(mode)) => {
+                        log::debug!("server: LayoutSet new_mode={}", mode.name());
+                        switch_tab_layout(tab, mode);
+                    }
+                    Ok(None) => return Ok(()),
+                    Err(why) => {
+                        log::warn!("server: LayoutSet {name:?} refused: {why}");
+                        return Ok(());
                     }
                 }
             }
@@ -6100,6 +6138,83 @@ fn next_layout_mode(
         return LayoutMode::Custom(CustomLayout);
     }
     current.next_enabled(enabled)
+}
+
+/// Put `tab` in `mode`: the one path `LayoutNext` and `LayoutSet` share.
+fn switch_tab_layout(tab: &mut session::Tab, mode: LayoutMode) {
+    // Snapshot the current custom arrangement *before* touching the
+    // tree, so the cycle can return to it later. Order matters: a
+    // rebuild below would otherwise overwrite `tab.layout`.
+    if matches!(tab.layout_mode, LayoutMode::Custom(_)) {
+        tab.saved_custom_layout = Some(tab.layout.clone());
+    }
+    // Changing the layout releases the zoom, for the same reason a
+    // new pane does: the tab is showing a different arrangement, and
+    // a zoom would hide all of it. Cleared *first*, so the
+    // `focus_pane` below can't carry a stale zoom into the restored
+    // tree -- and so a switch can never park a live zoom in Monocle,
+    // the one mode that refuses to take one.
+    tab.zoomed_pane = None;
+    tab.layout_mode = mode;
+    if tab.layout_mode.is_automatic() {
+        tab.rebuild_if_automatic();
+    } else if let Some(saved) = tab.saved_custom_layout.clone() {
+        // Custom: restore the remembered arrangement. Adopt its own
+        // active-pane markers so the focused pane stays visible.
+        // The live names replace the snapshot's, which predate any
+        // rename made while the tab was automatic.
+        tab.replace_layout(saved);
+        if let Some(active) = tab.layout.active_pane() {
+            tab.focus_pane(active);
+        }
+    }
+}
+
+/// The layout names `LayoutSet` accepts for a tab in `current`, in cycle
+/// order: the automatic modes `enabled` allows, then `custom` when the tab
+/// is Custom or `has_saved_custom` says its remembered tree is restorable.
+///
+/// It is the list `LayoutNext` visits, so the switcher never offers a layout
+/// the cycle would skip.
+fn layout_choices(
+    current: &LayoutMode,
+    has_saved_custom: bool,
+    enabled: &EnabledLayouts,
+) -> Vec<String> {
+    let mut names: Vec<String> = LayoutMode::automatic_modes()
+        .iter()
+        .filter(|mode| enabled.allows(mode))
+        .map(|mode| mode.name().to_string())
+        .collect();
+    if has_saved_custom || !current.is_automatic() {
+        names.push(LayoutMode::Custom(CustomLayout).name().to_string());
+    }
+    names
+}
+
+/// Decide what `LayoutSet(name)` does to a tab in `current`: `Ok(Some(mode))`
+/// switches to `mode`, `Ok(None)` leaves the tab alone because it is already
+/// in that layout, and `Err` names why the request is refused.
+///
+/// Every refusal is a name [`layout_choices`] would not offer.
+fn resolve_layout_set(
+    name: &str,
+    current: &LayoutMode,
+    has_saved_custom: bool,
+    enabled: &EnabledLayouts,
+) -> Result<Option<LayoutMode>, &'static str> {
+    if name == current.name() {
+        return Ok(None);
+    }
+    let mode = LayoutMode::from_name(name).ok_or("unknown layout")?;
+    if mode.is_automatic() {
+        if !enabled.allows(&mode) {
+            return Err("disabled under [layouts]");
+        }
+    } else if !has_saved_custom {
+        return Err("no restorable custom layout");
+    }
+    Ok(Some(mode))
 }
 
 /// Return true if `saved` can be restored as the current custom layout, i.e.
@@ -10235,9 +10350,10 @@ async fn handle_resurrect_session(
 #[cfg(test)]
 mod tests {
     use super::{
-        arrow_report, button_report, compute_diff, group_member_name, merge_dormant_into,
-        mouse_route, next_layout_mode, saved_custom_is_restorable, take_dormant_session,
-        wheel_report, ButtonPhase, MouseGesture, MouseRoute, PaneNames, PanePlacement,
+        arrow_report, button_report, compute_diff, group_member_name, layout_choices,
+        merge_dormant_into, mouse_route, next_layout_mode, resolve_layout_set,
+        saved_custom_is_restorable, take_dormant_session, wheel_report, ButtonPhase, MouseGesture,
+        MouseRoute, PaneNames, PanePlacement,
     };
     use crate::protocol::RenderCell;
     use crate::screen::Screen;
@@ -10963,6 +11079,96 @@ mod tests {
             next_layout_mode(&LayoutMode::Custom(CustomLayout), true, &enabled),
             LayoutMode::Columns(_)
         ));
+    }
+
+    /// The switcher lists exactly what `LayoutNext` visits: walk the cycle from
+    /// Custom and compare.
+    #[test]
+    fn layout_choices_match_the_cycle() {
+        let no_grid = EnabledLayouts {
+            grid: false,
+            ..EnabledLayouts::default()
+        };
+        for enabled in [EnabledLayouts::default(), no_grid.clone()] {
+            let mut cycle = Vec::new();
+            let mut mode = next_layout_mode(&LayoutMode::Custom(CustomLayout), true, &enabled);
+            while mode.is_automatic() {
+                cycle.push(mode.name().to_string());
+                mode = next_layout_mode(&mode, true, &enabled);
+            }
+            cycle.push("custom".to_string());
+            assert_eq!(
+                layout_choices(&LayoutMode::Bsp(BspLayout), true, &enabled),
+                cycle
+            );
+        }
+        assert_eq!(
+            layout_choices(&LayoutMode::Bsp(BspLayout), false, &no_grid),
+            ["bsp", "master", "monocle", "columns", "rows"]
+        );
+    }
+
+    #[test]
+    fn layout_choices_list_custom_while_the_tab_is_custom() {
+        let names = layout_choices(
+            &LayoutMode::Custom(CustomLayout),
+            false,
+            &EnabledLayouts::default(),
+        );
+        assert_eq!(names.last().map(String::as_str), Some("custom"));
+    }
+
+    #[test]
+    fn layout_choices_with_everything_disabled_list_everything() {
+        let none = EnabledLayouts {
+            bsp: false,
+            master: false,
+            monocle: false,
+            grid: false,
+            columns: false,
+            rows: false,
+        };
+        assert_eq!(
+            layout_choices(&LayoutMode::Bsp(BspLayout), false, &none).len(),
+            6
+        );
+    }
+
+    #[test]
+    fn resolve_layout_set_refuses_what_the_switcher_would_not_offer() {
+        let no_grid = EnabledLayouts {
+            grid: false,
+            ..EnabledLayouts::default()
+        };
+        let bsp = LayoutMode::Bsp(BspLayout);
+        assert!(matches!(
+            resolve_layout_set("monocle", &bsp, false, &no_grid),
+            Ok(Some(LayoutMode::Monocle(_)))
+        ));
+        assert!(resolve_layout_set("grid", &bsp, false, &no_grid).is_err());
+        assert!(resolve_layout_set("spiral", &bsp, false, &no_grid).is_err());
+        assert!(resolve_layout_set("custom", &bsp, false, &no_grid).is_err());
+        assert!(matches!(
+            resolve_layout_set("custom", &bsp, true, &no_grid),
+            Ok(Some(LayoutMode::Custom(_)))
+        ));
+        assert!(matches!(
+            resolve_layout_set("bsp", &bsp, false, &no_grid),
+            Ok(None)
+        ));
+    }
+
+    /// Every name the switcher can list resolves back to the mode it names.
+    #[test]
+    fn every_listed_layout_name_resolves() {
+        for name in layout_choices(
+            &LayoutMode::Custom(CustomLayout),
+            true,
+            &EnabledLayouts::default(),
+        ) {
+            let mode = LayoutMode::from_name(&name).expect("listed name parses");
+            assert_eq!(mode.name(), name);
+        }
     }
 
     /// A two-pane custom stack whose traversal order differs from the caller's

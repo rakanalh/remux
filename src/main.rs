@@ -19,8 +19,8 @@ use futures::StreamExt;
 
 use crate::client::editor::copy_to_clipboard;
 use crate::client::input::{
-    AgentSwitchOverlay, FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget,
-    SessionSwitchOverlay, SidebarIntent, TabPickerOverlay, TabPickerTree,
+    AgentSwitchOverlay, FolderSelectOverlay, InputAction, InputHandler, LayoutSwitchOverlay, Mode,
+    RenameTarget, SessionSwitchOverlay, SidebarIntent, TabPickerOverlay, TabPickerTree,
 };
 use crate::client::registry::{ConnId, ConnectionManager, Incoming, RemoteState};
 use crate::client::renderer::Renderer;
@@ -1564,6 +1564,10 @@ fn relay_overlays(
         let (c, r) = crossterm::terminal::size()?;
         let draw_cmds = tp.render(c, r, theme);
         renderer.render_whichkey_overlay(&draw_cmds)?;
+    } else if let Some(ref ls) = input.layout_switch {
+        let (c, r) = crossterm::terminal::size()?;
+        let draw_cmds = ls.render(c, r, theme);
+        renderer.render_whichkey_overlay(&draw_cmds)?;
     }
     // Re-render view picker overlay on top if active
     else if let Some(ref vp) = input.view_picker {
@@ -2065,6 +2069,16 @@ async fn handle_connection_drop(
     // to offer.
     if input.tab_picker.as_ref().is_some_and(|tp| tp.conn() == src) {
         input.tab_picker = None;
+        input.mode = Mode::Normal;
+        let (tc, tr) = renderer.size();
+        renderer.clear_overlay(tc, tr)?;
+    }
+    if input
+        .layout_switch
+        .as_ref()
+        .is_some_and(|ls| ls.conn() == src)
+    {
+        input.layout_switch = None;
         input.mode = Mode::Normal;
         let (tc, tr) = renderer.size();
         renderer.clear_overlay(tc, tr)?;
@@ -5139,6 +5153,68 @@ async fn run_client_loop(
                                 renderer.flush()?;
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
+                            InputAction::LayoutSwitchOpen => {
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                if let Some(av) = active_view {
+                                    // A view cycles its own client-side layout
+                                    // (`ViewLayoutNext`), which no server list
+                                    // describes.
+                                    log::debug!("layout switcher: not opened, a view is displayed");
+                                    input.mode = Mode::Normal;
+                                    paint_view(
+                                        &mut renderer,
+                                        &chrome,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &view_border_style,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                    renderer.flush()?;
+                                    mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                } else {
+                                    let conn = mgr.foreground().clone();
+                                    mgr.send(&conn, ClientMessage::ListLayouts).await?;
+                                    let switcher = LayoutSwitchOverlay::new(conn);
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
+                                    renderer.render_whichkey_overlay(&switcher.render(c, r, &theme))?;
+                                    renderer.flush()?;
+                                    input.layout_switch = Some(switcher);
+                                    mgr.send_foreground(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
+                                }
+                            }
+                            InputAction::LayoutSwitchUpdate => {
+                                if let Some(ref ls) = input.layout_switch {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
+                                    renderer.render_whichkey_overlay(&ls.render(c, r, &theme))?;
+                                    renderer.flush()?;
+                                }
+                            }
+                            InputAction::LayoutSwitchConfirm { ref conn, ref name } => {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                renderer.flush()?;
+                                let cmd = ClientMessage::Command(RemuxCommand::LayoutSet(name.clone()));
+                                if let Err(e) = mgr.send(conn, cmd).await {
+                                    log::info!("layout switcher: LayoutSet not sent to {conn:?}: {e}");
+                                }
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                            }
+                            InputAction::LayoutSwitchClose => {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                renderer.flush()?;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                            }
                             InputAction::SessionSwitchClose => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
@@ -7291,6 +7367,19 @@ async fn run_client_loop(
                         // if it ever DOES arrive here, the log says so instead of
                         // the message vanishing into a catch-all.
                         log::debug!("srv: CliSpawned pane_id={pane_id} (unexpected here)");
+                    }
+                    Some(ServerMessage::LayoutList { layouts, current }) => {
+                        log::debug!(
+                            "srv: LayoutList src={src:?} layouts={layouts:?} current={current}"
+                        );
+                        if let Some(ls) = input.layout_switch.as_mut() {
+                            if ls.apply_from(&src, layouts, current) {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                renderer.render_whichkey_overlay(&ls.render(c, r, &theme))?;
+                                renderer.flush()?;
+                            }
+                        }
                     }
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {
                         log::debug!("srv: ScrollbackInfo total_lines={}", total_lines);

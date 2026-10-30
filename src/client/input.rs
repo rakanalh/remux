@@ -466,6 +466,15 @@ pub enum InputAction {
     },
     /// Tab picker closed without a move.
     TabPickerClose,
+    /// Open the layout switcher. The event loop builds the overlay, because it
+    /// knows which connection holds the active tab.
+    LayoutSwitchOpen,
+    /// Layout switcher updated (re-render needed).
+    LayoutSwitchUpdate,
+    /// Layout switcher confirmed: send `LayoutSet(name)` to `conn`.
+    LayoutSwitchConfirm { conn: ConnId, name: String },
+    /// Layout switcher closed without a change.
+    LayoutSwitchClose,
     // -- Views (client-only virtual tabs; never forwarded to the server) --
     /// Create a new empty view with the given name and activate it.
     NewView(String),
@@ -614,6 +623,8 @@ pub struct InputHandler {
     pub view_picker: Option<ViewPickerOverlay>,
     /// The tab picker for moving the focused pane, while it is open.
     pub tab_picker: Option<TabPickerOverlay>,
+    /// The layout switcher, while it is open.
+    pub layout_switch: Option<LayoutSwitchOverlay>,
     /// Whether we are waiting for scrollback content to open in an editor.
     pub pending_editor_open: bool,
 }
@@ -1510,6 +1521,86 @@ impl TabPickerOverlay {
     }
 }
 
+/// The layout switcher behind `LayoutQuickSwitch`: the layouts the active tab
+/// can switch to, with its current one marked.
+///
+/// The list comes from the server ([`crate::protocol::ServerMessage::LayoutList`]),
+/// because `[layouts]` is server config. Like [`TabPickerOverlay`], it is pinned
+/// to the connection that was in the foreground when it opened, so the list it
+/// shows and the `LayoutSet` it sends name the same server.
+#[derive(Debug)]
+pub struct LayoutSwitchOverlay {
+    conn: ConnId,
+    /// `None` until the server answers.
+    layouts: Option<Vec<String>>,
+    current: String,
+    nav: crate::client::sidebar::nav::NavList,
+}
+
+impl LayoutSwitchOverlay {
+    pub fn new(conn: ConnId) -> Self {
+        Self {
+            conn,
+            layouts: None,
+            current: String::new(),
+            nav: crate::client::sidebar::nav::NavList::new(),
+        }
+    }
+
+    pub fn conn(&self) -> &ConnId {
+        &self.conn
+    }
+
+    /// Take the server's list if `src` is the pinned connection, and start the
+    /// highlight on the current layout. Returns whether the list was taken.
+    pub fn apply_from(&mut self, src: &ConnId, layouts: Vec<String>, current: String) -> bool {
+        if *src != self.conn {
+            return false;
+        }
+        let start = layouts.iter().position(|l| *l == current).unwrap_or(0);
+        self.nav.set_selected(start);
+        self.layouts = Some(layouts);
+        self.current = current;
+        true
+    }
+
+    fn navigate(&mut self, cmd: crate::client::sidebar::nav::NavKey) {
+        let len = self.layouts.as_ref().map_or(0, Vec::len);
+        self.nav.apply(cmd, len);
+    }
+
+    /// The pinned connection and the highlighted layout name, if the list has
+    /// arrived and is not empty.
+    fn choice(&self) -> Option<(ConnId, String)> {
+        let name = self.layouts.as_ref()?.get(self.nav.selected())?;
+        Some((self.conn.clone(), name.clone()))
+    }
+
+    /// Render the layout switcher popup as draw commands.
+    pub fn render(
+        &self,
+        screen_cols: u16,
+        screen_rows: u16,
+        theme: &crate::config::theme::Theme,
+    ) -> Vec<crate::client::whichkey::DrawCommand> {
+        let rows: Vec<SwitchRow> = match &self.layouts {
+            None => vec![SwitchRow::item("  ...".to_string(), false)],
+            Some(layouts) if layouts.is_empty() => {
+                vec![SwitchRow::item("  no layouts".to_string(), false)]
+            }
+            Some(layouts) => layouts
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let marker = if *name == self.current { "* " } else { "  " };
+                    SwitchRow::item(format!("{marker}{name}"), i == self.nav.selected())
+                })
+                .collect(),
+        };
+        render_switch_popup(" Switch Layout ", &rows, screen_cols, screen_rows, theme)
+    }
+}
+
 /// One row of a quick-switch popup.
 #[derive(Debug, Clone)]
 pub enum SwitchRow {
@@ -1722,6 +1813,7 @@ impl InputHandler {
             agent_switch: None,
             view_picker: None,
             tab_picker: None,
+            layout_switch: None,
             pending_editor_open: false,
         }
     }
@@ -1791,6 +1883,9 @@ impl InputHandler {
 
         if self.tab_picker.is_some() {
             return self.handle_tab_picker_key(key);
+        }
+        if self.layout_switch.is_some() {
+            return self.handle_layout_switch_key(key);
         }
 
         // If the view picker overlay is active, capture keystrokes for it.
@@ -1949,6 +2044,7 @@ impl InputHandler {
             || self.agent_switch.is_some()
             || self.view_picker.is_some()
             || self.tab_picker.is_some()
+            || self.layout_switch.is_some()
     }
 
     /// Whether this key is a way into command mode: the configured leader, or a
@@ -2207,6 +2303,10 @@ impl InputHandler {
             ClientAction::PaneMoveToTab => {
                 self.mode = Mode::Command;
                 InputAction::TabPickerOpen
+            }
+            ClientAction::LayoutQuickSwitch => {
+                self.mode = Mode::Command;
+                InputAction::LayoutSwitchOpen
             }
             ClientAction::ViewNew => {
                 // Prompt for a name via the rename overlay; the confirm maps to
@@ -3393,6 +3493,43 @@ impl InputHandler {
                 Some(cmd) => {
                     overlay.navigate(cmd);
                     InputAction::TabPickerUpdate
+                }
+                None => InputAction::None,
+            },
+        }
+    }
+
+    /// Handle a keystroke while the layout switcher is open. A key the list has
+    /// no use for does nothing and never reaches the pane.
+    fn handle_layout_switch_key(&mut self, key: KeyEvent) -> InputAction {
+        let overlay = match self.layout_switch.as_mut() {
+            Some(o) => o,
+            None => return InputAction::None,
+        };
+        let close = |this: &mut Self, action: InputAction| {
+            this.layout_switch = None;
+            this.mode = Mode::Normal;
+            action
+        };
+        let confirm =
+            |this: &mut Self, overlay_choice: Option<(ConnId, String)>| match overlay_choice {
+                Some((conn, name)) => close(this, InputAction::LayoutSwitchConfirm { conn, name }),
+                None => close(this, InputAction::LayoutSwitchClose),
+            };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => close(self, InputAction::LayoutSwitchClose),
+            KeyCode::Char('l') => {
+                let choice = overlay.choice();
+                confirm(self, choice)
+            }
+            _ => match crate::client::sidebar::nav::nav_key(&key) {
+                Some(crate::client::sidebar::nav::NavKey::Activate) => {
+                    let choice = overlay.choice();
+                    confirm(self, choice)
+                }
+                Some(cmd) => {
+                    overlay.navigate(cmd);
+                    InputAction::LayoutSwitchUpdate
                 }
                 None => InputAction::None,
             },
@@ -6356,6 +6493,69 @@ mod tests {
         let action = handler.handle_key(make_key(KeyCode::Char('a'), KeyModifiers::ALT));
         assert_eq!(action, InputAction::AgentSwitchOpen);
         assert_eq!(handler.mode, Mode::Command);
+    }
+
+    /// `ESC L` as crossterm parses it: Alt and Shift on an uppercase `L`.
+    #[test]
+    fn alt_shift_l_opens_the_layout_switcher() {
+        let mut handler = InputHandler::with_defaults();
+        let action = handler.handle_key(make_key(
+            KeyCode::Char('L'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(action, InputAction::LayoutSwitchOpen);
+        assert_eq!(handler.mode, Mode::Command);
+    }
+
+    fn layout_switch_handler() -> InputHandler {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        let mut overlay = LayoutSwitchOverlay::new(ConnId::Local);
+        let names = ["bsp", "master", "monocle"].map(String::from).to_vec();
+        assert!(overlay.apply_from(&ConnId::Local, names, "master".to_string()));
+        handler.layout_switch = Some(overlay);
+        handler
+    }
+
+    #[test]
+    fn the_layout_switcher_starts_on_the_current_layout_and_sends_the_pick() {
+        let mut handler = layout_switch_handler();
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Char('j'), KeyModifiers::NONE)),
+            InputAction::LayoutSwitchUpdate
+        );
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::LayoutSwitchConfirm {
+                conn: ConnId::Local,
+                name: "monocle".to_string()
+            }
+        );
+        assert!(handler.layout_switch.is_none());
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn the_layout_switcher_ignores_another_connections_list() {
+        let mut overlay = LayoutSwitchOverlay::new(ConnId::Local);
+        assert!(!overlay.apply_from(
+            &ConnId::Remote("mini".to_string()),
+            vec!["grid".to_string()],
+            "grid".to_string()
+        ));
+        assert_eq!(overlay.choice(), None);
+    }
+
+    #[test]
+    fn enter_before_the_list_arrives_closes_the_layout_switcher() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        handler.layout_switch = Some(LayoutSwitchOverlay::new(ConnId::Local));
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::LayoutSwitchClose
+        );
+        assert!(handler.layout_switch.is_none());
     }
 
     #[test]

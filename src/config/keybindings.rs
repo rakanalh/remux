@@ -317,6 +317,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         ' ',
         leaf_chain("layout next", &["LayoutNext", "EnterNormal"]),
     );
+    root.insert('L', leaf("switch layout", "LayoutQuickSwitch"));
     root.insert(
         'f',
         leaf_chain("zoom pane", &["PaneToggleZoom", "EnterNormal"]),
@@ -812,13 +813,13 @@ impl Default for ShortcutBindings {
         bindings.insert(alt_key('k'), cmd("PaneFocusUp"));
         bindings.insert(alt_key('l'), cmd("PaneFocusRight"));
 
-        // Move panes directionally (Alt-Shift-h/j/k/l -> Alt-H/J/K/L). These
+        // Move panes directionally (Alt-Shift-h/j/k -> Alt-H/J/K). These
         // match `parse_key_notation("Alt-H")`, i.e. an uppercase char with the
-        // Alt modifier.
+        // Alt modifier. Alt-L is the layout switcher, so PaneMoveRight is
+        // reached through `Prefix p L`.
         bindings.insert(alt_key('H'), cmd("PaneMoveLeft"));
         bindings.insert(alt_key('J'), cmd("PaneMoveDown"));
         bindings.insert(alt_key('K'), cmd("PaneMoveUp"));
-        bindings.insert(alt_key('L'), cmd("PaneMoveRight"));
 
         // Tab navigation (Alt-, / Alt-.) and direct jumps (Alt-1..Alt-9).
         bindings.insert(alt_key(','), cmd("TabPrev"));
@@ -837,6 +838,7 @@ impl Default for ShortcutBindings {
         bindings.insert(alt_key('t'), cmd("TabNew"));
         bindings.insert(alt_key('s'), cmd("SessionQuickSwitch"));
         bindings.insert(alt_key('a'), cmd("AgentQuickSwitch"));
+        bindings.insert(alt_key('L'), cmd("LayoutQuickSwitch"));
         bindings.insert(alt_key('o'), cmd("SessionSwitchLast"));
         bindings.insert(alt_key('z'), cmd("PaneToggleZoom"));
         bindings.insert(alt_key('p'), cmd("PopupToggle"));
@@ -1157,6 +1159,7 @@ fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
             let name = args.first().map(|s| s.to_string()).unwrap_or_default();
             Some(RemuxCommand::PaneRename(name))
         }
+        "LayoutSet" => args.first().map(|s| RemuxCommand::LayoutSet(s.to_string())),
         // A destination/alias is a single token (no spaces), so `args.first()`
         // is correct here -- returns `None` when no argument is given.
         "RemoteConnect" => args.first().map(|s| RemuxCommand::RemoteConnect(s.clone())),
@@ -2437,6 +2440,22 @@ mod tests {
         }
     }
 
+    /// crossterm reports `ESC L` as `'L'` + `ALT | SHIFT` and the CSI-u
+    /// `CSI 108;4u` as `'l'` + `ALT | SHIFT`; both are Alt+Shift+L.
+    #[test]
+    fn alt_shift_l_opens_the_layout_switcher_in_every_encoding() {
+        let bindings = ShortcutBindings::default();
+        let want = Some(vec!["LayoutQuickSwitch".to_string()]);
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        assert_eq!(lookup_mods(&bindings, 'L', alt_shift), want);
+        assert_eq!(lookup_mods(&bindings, 'l', alt_shift), want);
+        assert_eq!(lookup_mods(&bindings, 'L', KeyModifiers::ALT), want);
+        assert_eq!(
+            lookup_mods(&bindings, 'l', KeyModifiers::ALT),
+            Some(vec!["PaneFocusRight".to_string()])
+        );
+    }
+
     #[test]
     fn alt_shift_h_reaches_pane_move_left_as_a_terminal_sends_it() {
         let bindings = ShortcutBindings::default();
@@ -2455,6 +2474,40 @@ mod tests {
             lookup_mods(&bindings, '1', KeyModifiers::ALT | KeyModifiers::SHIFT),
             None
         );
+    }
+
+    #[test]
+    fn pane_move_right_has_no_alt_default_but_keeps_its_prefix_binding() {
+        let bindings = ShortcutBindings::default();
+        assert!(!bindings
+            .entries()
+            .iter()
+            .any(|(_, label)| label == &humanize_command("PaneMoveRight")));
+        match KeybindingTree::default().lookup(&['p', 'L']) {
+            Some(KeyNode::Leaf { action, .. }) => {
+                assert!(action.contains(&"PaneMoveRight".to_string()))
+            }
+            other => panic!("expected the p L leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_l_opens_the_layout_switcher() {
+        match KeybindingTree::default().lookup(&['L']) {
+            Some(KeyNode::Leaf { action, .. }) => {
+                assert_eq!(action, &vec!["LayoutQuickSwitch".to_string()])
+            }
+            other => panic!("expected the L leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layout_set_takes_the_layout_name() {
+        assert_eq!(
+            parse_command("LayoutSet grid"),
+            Some(RemuxCommand::LayoutSet("grid".to_string()))
+        );
+        assert_eq!(parse_command("LayoutSet"), None);
     }
 
     #[test]
@@ -2952,6 +3005,7 @@ mod tests {
             ("CommandPaletteOpen", ClientAction::CommandPaletteOpen),
             ("SessionQuickSwitch", ClientAction::SessionQuickSwitch),
             ("AgentQuickSwitch", ClientAction::AgentQuickSwitch),
+            ("LayoutQuickSwitch", ClientAction::LayoutQuickSwitch),
             ("PaneMoveToTab", ClientAction::PaneMoveToTab),
             ("ViewNew", ClientAction::ViewNew),
             ("ViewAddPane", ClientAction::ViewAddPane),

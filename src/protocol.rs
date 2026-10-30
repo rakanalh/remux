@@ -129,7 +129,13 @@ pub enum ConnDescriptor {
 /// session from the caller's `REMUX_SESSION`, which is stale for a pane moved
 /// to another session. The failure is a new pane in the wrong session, not a
 /// dropped connection, so only the handshake can catch it.
-pub const PROTOCOL_VERSION: u32 = 17;
+///
+/// 17 -> 18: the layout switcher. Adds [`ClientMessage::ListLayouts`],
+/// [`ServerMessage::LayoutList`] and [`RemuxCommand::LayoutSet`]. An old
+/// server cannot decode the first or the last and would drop the connection.
+/// `feat/tab-move-keys` also branched from master at 17 and takes 18, so
+/// whichever of the two merges second takes the next free number.
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -339,6 +345,13 @@ pub enum ClientMessage {
     /// Stop receiving [`ServerMessage::AgentList`] pushes. A no-op for a client
     /// that never subscribed.
     UnsubscribeAgents,
+    /// Ask for the layouts the requester's active tab can switch to. Answered
+    /// with one [`ServerMessage::LayoutList`].
+    ///
+    /// The server answers because `[layouts]` is SERVER config: a client-side
+    /// list would offer a layout the server refuses, and on a remote it would
+    /// describe the wrong machine's config.
+    ListLayouts,
     /// How this client wants panes named: its `[appearance] pane_title`
     /// template, and the name it knows this server by.
     ///
@@ -811,6 +824,17 @@ pub enum ServerMessage {
         /// what keeps the addition off [`PROTOCOL_VERSION`].
         #[serde(default)]
         home: Option<String>,
+    },
+    /// Answer to [`ClientMessage::ListLayouts`]: the layout names
+    /// [`RemuxCommand::LayoutSet`] accepts for the requester's active tab, in
+    /// cycle order, and the name of the tab's layout now.
+    ///
+    /// `layouts` holds the automatic layouts `[layouts]` enables, then
+    /// `"custom"` when the tab is Custom or has a restorable Custom layout.
+    /// Both are empty when the requester has no session or no active tab.
+    LayoutList {
+        layouts: Vec<String>,
+        current: String,
     },
     /// The panes running an AI coding agent, pushed to every client subscribed
     /// with [`ClientMessage::SubscribeAgents`].
@@ -1342,6 +1366,10 @@ pub enum RemuxCommand {
     // -- Layout commands ------------------------------------------------------
     ToggleStyle,
     LayoutNext,
+    /// Switch the active tab to the named layout (`"bsp"`, `"master"`, ...,
+    /// `"custom"`). The server refuses a layout that `[layouts]` disables, and
+    /// `"custom"` when the tab has no restorable Custom layout.
+    LayoutSet(String),
     SetMaster,
 
     // -- System / mode commands ---------------------------------------------
@@ -1493,6 +1521,7 @@ impl RemuxCommand {
             | RemuxCommand::ResizeUp(_)
             | RemuxCommand::ResizeDown(_)
             | RemuxCommand::LayoutNext
+            | RemuxCommand::LayoutSet(_)
             | RemuxCommand::SetMaster
             // `SessionSwitch*` name a session too, but they ATTACH the
             // requester to it, so the screen they reshape is always the one it
@@ -1628,6 +1657,8 @@ pub enum ClientAction {
     /// Open the agent switcher overlay: every pane running an agent, on every
     /// connected server.
     AgentQuickSwitch,
+    /// Open the layout switcher overlay for the active tab.
+    LayoutQuickSwitch,
     /// Open the tab picker that moves the focused pane to another tab of its
     /// session, or to a new one.
     PaneMoveToTab,
@@ -1804,6 +1835,9 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("SessionSwitchLast").label("last session"),
             ActionSpec::server("ToggleStyle"),
             ActionSpec::server("LayoutNext").label("next layout"),
+            ActionSpec::server("LayoutSet")
+                .arg("<layout>", "grid")
+                .label("set layout"),
             ActionSpec::server("SetMaster").label("set master"),
             ActionSpec::server("EnterNormal"),
             ActionSpec::server("EnterCommandMode"),
@@ -1822,6 +1856,8 @@ pub fn action_specs() -> &'static [ActionSpec] {
                 .label("switch session"),
             ActionSpec::client("AgentQuickSwitch", ClientAction::AgentQuickSwitch)
                 .label("switch agent"),
+            ActionSpec::client("LayoutQuickSwitch", ClientAction::LayoutQuickSwitch)
+                .label("switch layout"),
             ActionSpec::client("PaneMoveToTab", ClientAction::PaneMoveToTab).label("move to tab"),
             ActionSpec::client("ViewNew", ClientAction::ViewNew).label("new view"),
             ActionSpec::client("ViewAddPane", ClientAction::ViewAddPane).label("add pane"),
@@ -2742,6 +2778,7 @@ mod tests {
             RemuxCommand::RemoteDisconnect(_) => Some("RemoteDisconnect"),
             RemuxCommand::ToggleStyle => Some("ToggleStyle"),
             RemuxCommand::LayoutNext => Some("LayoutNext"),
+            RemuxCommand::LayoutSet(_) => Some("LayoutSet"),
             RemuxCommand::SetMaster => Some("SetMaster"),
             RemuxCommand::EnterNormal => Some("EnterNormal"),
             RemuxCommand::EnterCommandMode => Some("EnterCommandMode"),

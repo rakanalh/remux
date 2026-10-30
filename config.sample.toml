@@ -132,7 +132,8 @@
 # LAYOUTS
 # -----------------------------------------------------------------------------
 # Which automatic layouts `LayoutNext` (Alt+Space / Ctrl-a Space) cycles
-# through, for tabs and Views alike. The order is fixed:
+# through, for tabs and Views alike, and which ones the layout switcher
+# (`LayoutQuickSwitch`, Alt+Shift+L / Ctrl-a L) offers. The order is fixed:
 # bsp -> master -> monocle -> grid -> columns -> rows. A missing key means
 # enabled. Custom is manual and always reachable by splitting.
 #
@@ -329,11 +330,10 @@
 # "Alt-j" = "PaneFocusDown"
 # "Alt-k" = "PaneFocusUp"
 # "Alt-l" = "PaneFocusRight"
-# Move panes directionally (Alt-Shift-h/j/k/l):
+# Move panes directionally (Alt-Shift-h/j/k; move right is Ctrl-a p L):
 # "Alt-H" = "PaneMoveLeft"
 # "Alt-J" = "PaneMoveDown"
 # "Alt-K" = "PaneMoveUp"
-# "Alt-L" = "PaneMoveRight"
 # Tab navigation and direct jumps:
 # "Alt-," = "TabPrev"
 # "Alt-." = "TabNext"
@@ -350,6 +350,7 @@
 # "Alt-t" = "TabNew"
 # "Alt-s" = "SessionQuickSwitch"
 # "Alt-a" = "AgentQuickSwitch"
+# "Alt-L" = "LayoutQuickSwitch"
 # "Alt-o" = "SessionSwitchLast"
 # "Alt-z" = "PaneToggleZoom"
 # "Alt-p" = "PopupToggle"
@@ -488,6 +489,7 @@
 #   v     = "EnterVisualMode"                — enter Visual (scrollback) mode
 #   g     = "ToggleStyle; EnterNormal"       — toggle border style
 #   Space = "LayoutNext; EnterNormal"        — cycle layout (key is a literal space)
+#   L     = "LayoutQuickSwitch"              — open the layout switcher
 #   f     = "PaneToggleZoom; EnterNormal"    — zoom the focused pane
 #   ":"   = "CommandPaletteOpen"             — open the command palette
 #   a     = "SendKey Ctrl-a; EnterNormal"    — send the prefix key to the terminal
@@ -656,6 +658,11 @@
 #   LayoutNext                      — Cycle the enabled automatic layouts (BSP -> Master
 #                                     -> Monocle -> Grid -> Columns -> Rows), then back
 #                                     to a remembered Custom arrangement
+#   LayoutSet <layout>              — Switch the active tab to a layout by name (bsp,
+#                                     master, monocle, grid, columns, rows, custom);
+#                                     refused when [layouts] disables it
+#   LayoutQuickSwitch               — Open the layout switcher (the layouts LayoutNext
+#                                     visits; Enter applies one)
 #   SetMaster                       — Set the focused pane as the master pane
 #
 # Remote commands:
