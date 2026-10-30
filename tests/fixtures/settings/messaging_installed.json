@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "'/opt/re'\\''mux/bin/remux' msg hook claude-stop || true",
+            "command": "'/remux-test-absent/re'\\''mux/bin/remux' msg hook claude-stop || true",
             "timeout": 10
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "'/opt/re'\\''mux/bin/remux' msg hook claude-prompt || true",
+            "command": "'/remux-test-absent/re'\\''mux/bin/remux' msg hook claude-prompt || true",
             "timeout": 10
           }
         ]

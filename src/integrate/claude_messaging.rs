@@ -258,8 +258,14 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
 
+    /// Absent, under a first component nobody creates, so `/` is the only
+    /// directory the install's binary check reads and the tests do not
+    /// depend on the host's other directories (GitHub's runner has a 777
+    /// `/opt`). See `hooks_file`'s test `hooks()`.
+    const BINARY: &str = "/remux-test-absent/remux/bin/remux";
+
     fn hooks() -> Hooks {
-        Hooks::new(&MESSAGING, PathBuf::from("/opt/remux/bin/remux"))
+        Hooks::new(&MESSAGING, PathBuf::from(BINARY))
     }
 
     /// The installed spelling is exactly what tests/pty/msg_hooks.py writes
@@ -269,11 +275,11 @@ mod tests {
         let h = hooks();
         assert_eq!(
             h.command("claude-stop"),
-            "'/opt/remux/bin/remux' msg hook claude-stop || true"
+            "'/remux-test-absent/remux/bin/remux' msg hook claude-stop || true"
         );
         assert_eq!(
             h.command("claude-prompt"),
-            "'/opt/remux/bin/remux' msg hook claude-prompt || true"
+            "'/remux-test-absent/remux/bin/remux' msg hook claude-prompt || true"
         );
         assert_eq!(MESSAGING.timeout_secs, 10);
     }
@@ -297,12 +303,7 @@ mod tests {
 
     /// The integration under a throwaway `home`, never the real `$HOME`.
     fn in_home(home: &Path) -> ClaudeMessaging {
-        ClaudeMessaging::new(
-            home,
-            PathBuf::from("/opt/remux/bin/remux"),
-            true,
-            effective_uid(),
-        )
+        ClaudeMessaging::new(home, PathBuf::from(BINARY), true, effective_uid())
     }
 
     fn skill_path(home: &Path) -> PathBuf {
@@ -334,7 +335,7 @@ mod tests {
         assert_eq!(mode(&skill), 0o644);
         match it.status().unwrap() {
             IntegrationStatus::Installed { runs } => assert!(
-                runs.contains("/opt/remux/bin/remux")
+                runs.contains(BINARY)
                     && runs.contains(&format!("the skill is at {}", skill.display())),
                 "{runs}"
             ),

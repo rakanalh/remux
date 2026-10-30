@@ -889,8 +889,14 @@ mod tests {
 
     /// A binary path with a quote in it, so every spelling test exercises the
     /// `sh` quoting too.
+    ///
+    /// It must not exist, and its first component must be a directory nobody
+    /// creates: then `/` is the only directory `check_binary_safe` reads on
+    /// the install path, and the tests do not depend on how the host has set
+    /// up any other directory. GitHub's ubuntu runner has a mode 777 `/opt`,
+    /// which a path under `/opt` failed on.
     fn hooks() -> Hooks {
-        Hooks::new(&SET, PathBuf::from("/opt/re'mux/bin/remux"))
+        Hooks::new(&SET, PathBuf::from("/remux-test-absent/re'mux/bin/remux"))
     }
 
     fn installed(text: &str) -> String {
@@ -921,11 +927,11 @@ mod tests {
         let h = hooks();
         assert_eq!(
             h.command("claude-stop"),
-            r"'/opt/re'\''mux/bin/remux' msg hook claude-stop || true"
+            r"'/remux-test-absent/re'\''mux/bin/remux' msg hook claude-stop || true"
         );
         assert_eq!(
             h.written_binary(&h.command("claude-prompt"), "claude-prompt"),
-            Some(PathBuf::from("/opt/re'mux/bin/remux"))
+            Some(PathBuf::from("/remux-test-absent/re'mux/bin/remux"))
         );
         assert_eq!(
             h.written_binary(&h.command("claude-prompt"), "claude-stop"),
