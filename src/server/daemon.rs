@@ -17243,6 +17243,11 @@ mod tests {
     async fn a_typing_task_that_panics_still_ends_its_panes_typing() {
         use crate::server::messaging::SubmitEntry;
         let pane = 9_000_001;
+        // The store is the process-wide one, and every `Rig` test closing its
+        // panes runs `reap_panes`, which removes the mail each closed pane
+        // SENT. Rig panes are numbered from 1, so a sender id in that range
+        // loses this test's entry whenever such a test finishes alongside it.
+        let sender = 9_000_002;
         let store = super::messaging();
         {
             let mut st = store.lock().await;
@@ -17252,7 +17257,7 @@ mod tests {
                 pane,
                 deliver: crate::protocol::Deliver::Submit,
                 body: String::new(),
-                from: crate::server::messaging::SubmitFrom::pane(1),
+                from: crate::server::messaging::SubmitFrom::pane(sender),
                 enqueued_at: std::time::Instant::now(),
                 defer: false,
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
