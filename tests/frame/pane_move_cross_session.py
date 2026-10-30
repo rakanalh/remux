@@ -155,6 +155,15 @@ def cmd(cli, c):
     return cli.drain(0.6)
 
 
+def quiet(cli, window=1.0, limit=6.0):
+    """Drain until `window` seconds pass with nothing new, or `limit` runs out."""
+    end = time.time() + limit
+    while cli.drain(window):
+        if time.time() >= end:
+            print(f"  note: still not quiet after {limit}s; a later check may see stale messages")
+            return
+
+
 def move(cli, tab_id, session):
     return cmd(cli, {"PaneMoveToTabTarget": {"tab_id": tab_id, "session": session}})
 
@@ -400,6 +409,12 @@ def main():
         print("1. B into another session's tab")
         g_main, _ = snapshot(by_main)
         g_other, _ = snapshot(by_other)
+        # `snapshot` re-sends the same size, and `Pty::resize` signals SIGWINCH
+        # even then. A shell that redraws its prompt on SIGWINCH (macOS bash
+        # 3.2 does) makes B push a `PaneContent` labelled `main` a moment
+        # later. It is drained here, so the check below sees only what the
+        # server sent after the move.
+        quiet(sub)
         got = move(req, other_tab1, "other")
         st = last_status(got)
         m1 = tree(req, "main")
