@@ -17239,15 +17239,18 @@ mod tests {
     use crate::server::session::ServerState;
     use std::collections::HashMap;
 
+    /// Pane ids for tests that use the process-wide `messaging()` store. Every
+    /// `Rig` test closing its panes runs `reap_panes` on that store, which
+    /// removes the mail each closed pane sent, and Rig panes are numbered
+    /// from one. An id in that range loses a test's entries whenever such a
+    /// test finishes alongside it, so these tests take their ids from here.
+    const TEST_ONLY_PANE_IDS_FROM: crate::protocol::PaneId = 9_000_000;
+
     #[tokio::test]
     async fn a_typing_task_that_panics_still_ends_its_panes_typing() {
         use crate::server::messaging::SubmitEntry;
-        let pane = 9_000_001;
-        // The store is the process-wide one, and every `Rig` test closing its
-        // panes runs `reap_panes`, which removes the mail each closed pane
-        // SENT. Rig panes are numbered from 1, so a sender id in that range
-        // loses this test's entry whenever such a test finishes alongside it.
-        let sender = 9_000_002;
+        let pane = TEST_ONLY_PANE_IDS_FROM + 1;
+        let sender = TEST_ONLY_PANE_IDS_FROM + 2;
         let store = super::messaging();
         {
             let mut st = store.lock().await;
