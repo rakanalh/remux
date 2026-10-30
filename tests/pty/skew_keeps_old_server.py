@@ -109,6 +109,8 @@ def read_frame(fd, timeout=5.0):
 
 def remux_pids(runtime_dir):
     """Every `remux server` process whose environment names `runtime_dir`."""
+    if sys.platform == "darwin":
+        return darwin_remux_pids(runtime_dir)
     pids = []
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
@@ -121,6 +123,23 @@ def remux_pids(runtime_dir):
         if len(cmd) >= 2 and cmd[1] == b"server" \
                 and f"XDG_RUNTIME_DIR={runtime_dir}".encode() in envb.split(b"\0"):
             pids.append(int(pid))
+    return pids
+
+
+def darwin_remux_pids(runtime_dir):
+    """`remux_pids` for macOS, which has no `/proc`.
+
+    `ps -E` appends a process's environment to its argv, so the second word
+    is argv[1] and the environment is among the words after it. The run dirs
+    here have no spaces, so splitting on whitespace is exact for them.
+    """
+    r = subprocess.run(["ps", "-axEww", "-o", "pid=,command="], capture_output=True, text=True)
+    want = f"XDG_RUNTIME_DIR={runtime_dir}"
+    pids = []
+    for line in r.stdout.splitlines():
+        words = line.split()
+        if len(words) >= 3 and words[2] == "server" and want in words[3:]:
+            pids.append(int(words[0]))
     return pids
 
 

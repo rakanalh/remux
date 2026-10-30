@@ -169,9 +169,16 @@ def main():
     os.chmod(f"{RUN}/run", 0o700)
     with open(f"{RUN}/cfg/remux/config.toml", "w") as f:
         f.write(CFG)
-    with open(f"{RUN}/bin/claude", "w") as f:
-        f.write(AGENT)
-    os.chmod(f"{RUN}/bin/claude", 0o755)
+    if sys.platform == "darwin":
+        # macOS names a script's process after its interpreter, so the stand-in
+        # runs under a compiled wrapper called `claude` (`tests/standin.py`).
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from pty_harness import install_agent_standin
+        install_agent_standin(f"{RUN}/bin", "claude", AGENT)
+    else:
+        with open(f"{RUN}/bin/claude", "w") as f:
+            f.write(AGENT)
+        os.chmod(f"{RUN}/bin/claude", 0o755)
 
     server = subprocess.Popen([BIN, "server"], env=env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(200):

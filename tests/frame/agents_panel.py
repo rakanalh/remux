@@ -103,7 +103,11 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from harness import Client, Server, name_of  # noqa: E402
+import standin  # noqa: E402
+
+DARWIN = sys.platform == "darwin"
 
 RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-agents")
 # The second server, run with the SHIPPED patterns (see cases 13-14).
@@ -113,6 +117,12 @@ RUNDIR2 = RUNDIR + "-shipped"
 # the pane would silently fall back to whatever real `claude` the developer
 # happens to have installed.
 BINDIR = RUNDIR + "-bin"
+if DARWIN:
+    # macOS reports a process's executable by its resolved path, and `/tmp`
+    # is a symlink there, so case 18 compares against the resolved form. Only
+    # the parent is resolved: a `BINDIR` that is itself a symlink must stay one,
+    # so that `write_bins` refuses it instead of clearing where it points.
+    BINDIR = os.path.join(os.path.realpath(os.path.dirname(BINDIR)), os.path.basename(BINDIR))
 WIRE_SEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wire_send.py")
 FAILURES = []
 
@@ -198,14 +208,24 @@ def check(cond, msg):
 
 
 def write_bins():
+    if DARWIN and os.path.islink(BINDIR):
+        raise SystemExit(f"{BINDIR} is a symlink; refusing to clear it")
     shutil.rmtree(BINDIR, ignore_errors=True)
     os.makedirs(BINDIR, exist_ok=True)
     for name, body in (("claude", AGENT), ("notanagent", NOT_AGENT)):
         p = f"{BINDIR}/{name}"
+        # The stand-in's `child` arm launches another stand-in by absolute
+        # path, so it has to be told where they live.
+        body = body.replace("@BINDIR@", BINDIR)
+        if DARWIN:
+            # macOS names a script's process after its interpreter, so the
+            # script runs under a compiled wrapper that carries the name and
+            # leads the foreground group (`tests/standin.py`). Without `cc`,
+            # `install_wrapper` exits on macOS before it would call the fallback.
+            standin.install_wrapper(p, ["/bin/sh", p + ".sh"], {p + ".sh": body}, lambda: None)
+            continue
         with open(p, "w") as f:
-            # The stand-in's `child` arm launches another stand-in by absolute
-            # path, so it has to be told where they live.
-            f.write(body.replace("@BINDIR@", BINDIR))
+            f.write(body)
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     real = shutil.which("sleep")
     if real is None:
@@ -219,6 +239,11 @@ def write_bins():
         raise SystemExit("cases 16-18 need `pgrep` to prove their processes are alive")
     for name in (VERSIONED, CHILD_AGENT, CHILD_NOT_AGENT):
         shutil.copy(real, f"{BINDIR}/{name}")
+        if DARWIN:
+            # A copy of a system binary fails Apple's signature check and is
+            # killed at exec, so it is signed again, ad hoc.
+            subprocess.run(["codesign", "--force", "-s", "-", f"{BINDIR}/{name}"],
+                           check=True, capture_output=True)
     os.environ["PATH"] = BINDIR + ":" + os.environ["PATH"]
 
 
@@ -322,7 +347,16 @@ def held(srv, name, requests, argv0=None, deaf=False):
     argv = ["python3"]
     if argv0 is not None:
         raw = "import tty; tty.setraw(0); " if deaf else ""
-        argv += ["-c", f"import os, sys; {raw}os.execv(sys.executable, [{argv0!r}] + sys.argv[1:])"]
+        exe = "sys.executable"
+        if DARWIN:
+            # A macOS `python3` is a stub that re-execs the framework's
+            # `Python.app` under that binary's own path, which drops the
+            # chosen argv[0]. Exec'ing the binary that is running, found with
+            # `proc_pidpath`, keeps it.
+            raw += ("import ctypes; b = ctypes.create_string_buffer(4096); "
+                    "ctypes.CDLL('/usr/lib/libproc.dylib').proc_pidpath(os.getpid(), b, 4096); ")
+            exe = "b.value.decode()"
+        argv += ["-c", f"import os, sys; {raw}os.execv({exe}, [{argv0!r}] + sys.argv[1:])"]
     argv += [WIRE_SEND, "--held", go, srv.sock, in_file, out_file]
     caller = Client(srv.sock)
     caller.hello()
@@ -383,12 +417,20 @@ def pids_matching(pattern):
     return [int(x) for x in r.stdout.split()]
 
 
+def ps_field(pid, field):
+    """One `ps` column for `pid`, for macOS, which has no `/proc`."""
+    r = subprocess.run(["ps", "-o", f"{field}=", "-p", str(pid)], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def proc_state(pid):
     """A process's scheduling state letter -- `T` while it is stopped.
 
     Read from the LAST `)` for the same reason the server does: `comm` is raw
     and may contain spaces and parentheses.
     """
+    if DARWIN:
+        return ps_field(pid, "stat")[:1] or None
     try:
         with open(f"/proc/{pid}/stat") as f:
             line = f.read()
@@ -399,12 +441,28 @@ def proc_state(pid):
 
 def proc_pgid(pid):
     """A process's process-group id, read the way the server reads it."""
+    if DARWIN:
+        pgid = ps_field(pid, "pgid")
+        return int(pgid) if pgid else None
     try:
         with open(f"/proc/{pid}/stat") as f:
             line = f.read()
     except OSError:
         return None
     return int(line[line.rindex(")") + 1 :].split()[2])
+
+
+def proc_exe(pid):
+    """macOS: a process's executable path, by the `proc_pidpath` the server uses.
+
+    Case 18 needs it because a compiled stand-in runs under the bare name the
+    shell found on PATH, so its argv does not contain `BINDIR`.
+    """
+    import ctypes
+
+    buf = ctypes.create_string_buffer(4096)
+    n = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidpath(int(pid), buf, len(buf))
+    return buf.value.decode("utf-8", "replace") if n > 0 else ""
 
 
 def proc_cmdline(pid):
@@ -876,7 +934,9 @@ def run(srv):
     # group leader's pid IS the pgid, so naming it is what identifies the group.
     child_pid = next(iter(started)) if started else None
     group_leader = proc_pgid(child_pid) if child_pid else None
-    leader_argv = proc_cmdline(group_leader) if group_leader else ""
+    leader_argv = ""
+    if group_leader:
+        leader_argv = proc_exe(group_leader) if DARWIN else proc_cmdline(group_leader)
     check(
         f"{BINDIR}/claude" in leader_argv,
         f"18 and the child shares the process group led by the stand-in agent "
