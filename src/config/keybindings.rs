@@ -488,16 +488,20 @@ impl NormalizedKeyEvent {
     /// keys reach the pane instead. A non-letter keeps its `SHIFT` bit because
     /// the shifted character of `'1'` depends on the keyboard layout.
     pub fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
-        match code {
-            KeyCode::Char(c) if modifiers.contains(KeyModifiers::SHIFT) && c.is_alphabetic() => {
-                let shifted = c.to_uppercase().next().unwrap_or(c);
-                Self {
-                    code: KeyCode::Char(shifted),
-                    modifiers: modifiers - KeyModifiers::SHIFT,
+        if let KeyCode::Char(c) = code {
+            if modifiers.contains(KeyModifiers::SHIFT) && c.is_alphabetic() {
+                // `ß` uppercases to `SS`; taking the first char would turn it
+                // into an `S` binding, so a multi-char uppercase is left alone.
+                let mut upper = c.to_uppercase();
+                if let (Some(shifted), None) = (upper.next(), upper.next()) {
+                    return Self {
+                        code: KeyCode::Char(shifted),
+                        modifiers: modifiers - KeyModifiers::SHIFT,
+                    };
                 }
             }
-            _ => Self { code, modifiers },
         }
+        Self { code, modifiers }
     }
 }
 
@@ -2473,6 +2477,22 @@ mod tests {
         assert_eq!(
             lookup_mods(&bindings, '1', KeyModifiers::ALT | KeyModifiers::SHIFT),
             None
+        );
+    }
+
+    #[test]
+    fn a_letter_with_a_multi_char_uppercase_is_not_read_as_its_first_char() {
+        let bindings = ShortcutBindings::default();
+        assert_eq!(
+            lookup_mods(&bindings, 'ß', KeyModifiers::ALT | KeyModifiers::SHIFT),
+            None
+        );
+        assert_eq!(
+            NormalizedKeyEvent::new(KeyCode::Char('ß'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+            NormalizedKeyEvent {
+                code: KeyCode::Char('ß'),
+                modifiers: KeyModifiers::ALT | KeyModifiers::SHIFT,
+            }
         );
     }
 
