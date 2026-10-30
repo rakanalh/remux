@@ -108,6 +108,10 @@ def main():
                                 stderr=subprocess.PIPE, env=env)
         proc.stdin.write(payload)
         proc.stdin.close()
+        # Python 3.12 and older, which includes the 3.9 macOS ships, flush
+        # `proc.stdin` in `communicate` below and raise ValueError on the
+        # closed file.
+        proc.stdin = None
         try:
             if always_kill:
                 time.sleep(kill_after_s)
