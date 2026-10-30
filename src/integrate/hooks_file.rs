@@ -357,6 +357,10 @@ fn resolve(path: &Path) -> Result<PathBuf> {
 /// resolves to are checked: a user who can write a link's directory can
 /// point the link at another binary, and the directories above the target
 /// hold the file that actually runs.
+///
+/// A path that does not exist is skipped, so the check means something only
+/// for a binary that exists, such as the canonical `current_exe` the install
+/// passes. Never use it to vet a path that is not there yet.
 pub fn check_binary_safe(binary: &Path, euid: u32) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     const FIX: &str = "install remux somewhere only you or root can write, and run that \
