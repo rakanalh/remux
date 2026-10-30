@@ -477,26 +477,38 @@ pub struct NormalizedKeyEvent {
 }
 
 impl NormalizedKeyEvent {
+    /// A letter's case is its Shift state, so a cased letter is stored as the
+    /// shifted character WITHOUT the `SHIFT` bit.
+    ///
+    /// Bindings are written as `Alt-L`, which parses to `'L'` + `ALT`, but
+    /// crossterm reports the `ESC L` a terminal sends for Alt+Shift+L as
+    /// `'L'` + `ALT | SHIFT`, and the CSI-u form `CSI 108;4u` as `'l'` +
+    /// `ALT | SHIFT`. Without this the exact-match lookup misses both, and the
+    /// keys reach the pane instead. A non-letter keeps its `SHIFT` bit because
+    /// the shifted character of `'1'` depends on the keyboard layout.
     pub fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
-        Self { code, modifiers }
+        match code {
+            KeyCode::Char(c) if modifiers.contains(KeyModifiers::SHIFT) && c.is_alphabetic() => {
+                let shifted = c.to_uppercase().next().unwrap_or(c);
+                Self {
+                    code: KeyCode::Char(shifted),
+                    modifiers: modifiers - KeyModifiers::SHIFT,
+                }
+            }
+            _ => Self { code, modifiers },
+        }
     }
 }
 
 impl From<&KeyEvent> for NormalizedKeyEvent {
     fn from(event: &KeyEvent) -> Self {
-        Self {
-            code: event.code,
-            modifiers: event.modifiers,
-        }
+        Self::new(event.code, event.modifiers)
     }
 }
 
 impl From<KeyEvent> for NormalizedKeyEvent {
     fn from(event: KeyEvent) -> Self {
-        Self {
-            code: event.code,
-            modifiers: event.modifiers,
-        }
+        Self::new(event.code, event.modifiers)
     }
 }
 
@@ -2406,6 +2418,43 @@ mod tests {
             InterceptAction::Command(cmds) => assert_eq!(cmds, &["PaneMoveLeft"]),
             other => panic!("expected Command(PaneMoveLeft) for Alt-H, got {other:?}"),
         }
+    }
+
+    fn lookup_mods(
+        bindings: &ShortcutBindings,
+        c: char,
+        mods: KeyModifiers,
+    ) -> Option<Vec<String>> {
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char(c),
+            mods,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        );
+        match bindings.lookup(&key)? {
+            InterceptAction::Command(cmds) => Some(cmds.clone()),
+            InterceptAction::GroupPrefix(_) => None,
+        }
+    }
+
+    #[test]
+    fn alt_shift_h_reaches_pane_move_left_as_a_terminal_sends_it() {
+        let bindings = ShortcutBindings::default();
+        assert_eq!(
+            lookup_mods(&bindings, 'H', KeyModifiers::ALT | KeyModifiers::SHIFT),
+            Some(vec!["PaneMoveLeft".to_string()])
+        );
+    }
+
+    /// The shifted character of a digit depends on the keyboard layout, so
+    /// Alt+Shift+1 must not be read as Alt-1.
+    #[test]
+    fn shift_on_a_non_letter_is_kept() {
+        let bindings = ShortcutBindings::default();
+        assert_eq!(
+            lookup_mods(&bindings, '1', KeyModifiers::ALT | KeyModifiers::SHIFT),
+            None
+        );
     }
 
     #[test]
