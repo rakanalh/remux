@@ -133,7 +133,7 @@
 # -----------------------------------------------------------------------------
 # Which automatic layouts `LayoutNext` (Alt+Space / Ctrl-a Space) cycles
 # through, for tabs and Views alike, and which ones the layout switcher
-# (`LayoutQuickSwitch`, Alt+Shift+L / Ctrl-a L) offers. The order is fixed:
+# (`LayoutQuickSwitch`, Alt-g / Ctrl-a L) offers. The order is fixed:
 # bsp -> master -> monocle -> grid -> columns -> rows. A missing key means
 # enabled. Custom is manual and always reachable by splitting.
 #
@@ -330,10 +330,11 @@
 # "Alt-j" = "PaneFocusDown"
 # "Alt-k" = "PaneFocusUp"
 # "Alt-l" = "PaneFocusRight"
-# Move panes directionally (Alt-Shift-h/j/k; move right is Ctrl-a p L):
+# Move panes directionally (Alt-Shift-h/j/k/l):
 # "Alt-H" = "PaneMoveLeft"
 # "Alt-J" = "PaneMoveDown"
 # "Alt-K" = "PaneMoveUp"
+# "Alt-L" = "PaneMoveRight"
 # Tab navigation and direct jumps:
 # "Alt-," = "TabPrev"
 # "Alt-." = "TabNext"
@@ -350,7 +351,7 @@
 # "Alt-t" = "TabNew"
 # "Alt-s" = "SessionQuickSwitch"
 # "Alt-a" = "AgentQuickSwitch"
-# "Alt-L" = "LayoutQuickSwitch"
+# "Alt-g" = "LayoutQuickSwitch"
 # "Alt-o" = "SessionSwitchLast"
 # "Alt-z" = "PaneToggleZoom"
 # "Alt-p" = "PopupToggle"

@@ -10,7 +10,7 @@ Every tab has a layout mode that decides where its panes go. Six are **automatic
 | Action | Keys |
 |---|---|
 | Next layout | `Alt-Space` or `Ctrl-a Space` |
-| Pick a layout from a list | `Alt-L` (`Alt+Shift+l`) or `Ctrl-a L` |
+| Pick a layout from a list | `Alt-g` or `Ctrl-a L` |
 | Promote the focused pane to master | `Alt-m` or `Ctrl-a p m` |
 
 The cycle runs **Bsp → Master → Monocle → Grid → Columns → Rows** and back to Bsp. If the tab was in Custom when you started cycling, Remux remembers that arrangement: after the last automatic layout the cycle returns to it instead of wrapping to Bsp. That only happens while the tab still has exactly the panes the arrangement was made for; open or close a pane in between and the cycle stays automatic.
@@ -65,7 +65,7 @@ The moment you arrange panes by hand, the tab switches to Custom and Remux stops
 
 - splitting a pane (`Ctrl-a p v`, `Ctrl-a p s`)
 - resizing (`Ctrl-a p R` then `h`/`j`/`k`/`l`)
-- moving a pane (`Alt-H`/`J`/`K`, `Ctrl-a p L`)
+- moving a pane (`Alt-H`/`J`/`K`/`L`)
 - stacking or unstacking a pane
 
 `Ctrl-a p n` is the exception: it opens a pane *placed by the current layout*, so an automatic tab stays automatic.
@@ -104,7 +104,7 @@ monocle = false
 
 | Action | Keys |
 |---|---|
-| Move the pane left / down / up | `Alt-H` / `Alt-J` / `Alt-K` |
+| Move the pane left / down / up / right | `Alt-H` / `Alt-J` / `Alt-K` / `Alt-L` |
 | The same, from the leader | `Ctrl-a p H` / `J` / `K` / `L` |
 
 A move swaps the focused pane with its neighbour in that direction; focus travels with the pane. If there is no neighbour, because the pane is already at that edge, the pane is lifted out and placed against that edge, taking half the tab along its full length while everything else shares the other half.
@@ -138,7 +138,7 @@ Unstacking only does something when the pane shares its stack with at least one 
 
 **Moving inside a stack.** The move keys understand stacks:
 
-- `Alt-H` / `Ctrl-a p L` move the pane one place along its stack. At the end of the stack, the next press takes it out into its own slot on that side.
+- `Alt-H` / `Alt-L` move the pane one place along its stack. At the end of the stack, the next press takes it out into its own slot on that side.
 - `Alt-J` / `Alt-K` take it out of the stack at once, into a new slot below or above.
 
 **Focus is stack-aware.** `Alt-h`/`j`/`k`/`l` step through the panes of a stack before crossing to the neighbouring slot.

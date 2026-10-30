@@ -34,7 +34,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Move to tab** — `Ctrl-a p t` opens a picker of every session on the pane's server, each with its tabs and a `+ new tab`, the pane's own session first; pick one and the focused pane moves there with its running program and scrollback intact, and focus follows it, into another session too. A tab left empty closes, and so does a session.
 - **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
 - **Resize** — grow/shrink the focused pane edge by a configurable amount.
-- **Seven layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views while enabled), **Columns** (every pane side by side, equal widths), **Rows** (every pane stacked, equal heights), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid → Columns → Rows, then back to a remembered Custom arrangement), or pick one directly from the **layout switcher** (`Alt-Shift-L` / `Ctrl-a L`), which lists exactly the layouts the cycle visits with the current one marked; turn any of them off under `[layouts]`.
+- **Seven layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views while enabled), **Columns** (every pane side by side, equal widths), **Rows** (every pane stacked, equal heights), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid → Columns → Rows, then back to a remembered Custom arrangement), or pick one directly from the **layout switcher** (`Alt-g` / `Ctrl-a L`), which lists exactly the layouts the cycle visits with the current one marked; turn any of them off under `[layouts]`.
 - **Popup terminal** — a scratch terminal that floats centered on top of the layout instead of occupying a slot in it. Toggle with `Alt-p` (or `Ctrl-a p o`); it keeps running while hidden, so it's the same terminal with the same history every time you pull it up. One per session — toggle it from any tab and it follows you. Sized as a percentage of the screen (`popup_width_pct` / `popup_height_pct`, default 80×80) and resizable while open with the pane-resize keys. It takes no space from the surrounding panes and is excluded from every layout operation, so `Alt-Space`, zoom, and pane move/swap can never pull it into the layout.
 - **Login-shell panes** — new panes spawn their shell as a login shell so your profile/rc files run as expected.
 - **Two rendering styles** — **Zellij style** (rounded box borders with pane names) and **Tmux style** (minimal dividers). Toggle live with `Ctrl-a g`.
@@ -440,13 +440,13 @@ There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h
 | Shortcut | Action |
 |----------|--------|
 | `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` | Focus pane left / down / up / right — and into or out of a sidebar on that edge |
-| `Alt-H` / `Alt-J` / `Alt-K` | Move (swap) pane left / down / up (move right is `Ctrl-a p L`) |
+| `Alt-H` / `Alt-J` / `Alt-K` / `Alt-L` | Move (swap) pane left / down / up / right |
 | `Alt-,` / `Alt-.` | Previous / next tab |
 | `Alt-1` … `Alt-9` | Jump to tab 1–9 |
 | `Alt-t` | New tab |
 | `Alt-s` | Quick session switcher (local + remote) |
 | `Alt-a` | Agent switcher (local + remote) |
-| `Alt-L` | Layout switcher (`Alt-Shift-l`) |
+| `Alt-g` | Layout switcher |
 | `Alt-o` | Last session (toggle) |
 | `Alt-z` | Toggle pane zoom |
 | `Alt-p` | Toggle the popup terminal |

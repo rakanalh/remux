@@ -215,13 +215,13 @@ The `SidebarFocus*` actions have no default key. `Alt-h/j/k/l` move into and out
 | Key | Action |
 |---|---|
 | `Alt-h` `Alt-j` `Alt-k` `Alt-l` | `PaneFocusLeft/Down/Up/Right` |
-| `Alt-H` `Alt-J` `Alt-K` | `PaneMoveLeft/Down/Up` |
+| `Alt-H` `Alt-J` `Alt-K` `Alt-L` | `PaneMoveLeft/Down/Up/Right` |
 | `Alt-,` / `Alt-.` | `TabPrev` / `TabNext` |
 | `Alt-1` … `Alt-9` | `TabGoto 0` … `TabGoto 8` |
 | `Alt-t` | `TabNew` |
 | `Alt-s` | `SessionQuickSwitch` |
 | `Alt-a` | `AgentQuickSwitch` |
-| `Alt-L` | `LayoutQuickSwitch` |
+| `Alt-g` | `LayoutQuickSwitch` |
 | `Alt-o` | `SessionSwitchLast` |
 | `Alt-z` | `PaneToggleZoom` |
 | `Alt-p` | `PopupToggle` |
