@@ -522,7 +522,12 @@ impl ChildExec {
 
         let shell = match command {
             Some(cmd) => cmd.to_string(),
+            #[cfg(not(test))]
             None => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+            // A unit test never runs the user's own shell, which would source
+            // the user's rc files. See `paths::sandbox::pane_env`.
+            #[cfg(test)]
+            None => "/bin/sh".to_string(),
         };
 
         // Spawn the shell as a LOGIN shell. By convention, a shell
@@ -602,6 +607,11 @@ impl ChildExec {
         // not set to "", when there is no identity: `remux split` tells "not
         // in a pane" from "in a pane" by their PRESENCE.
         let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+        // Under test the child starts from a short allow-list rather than the
+        // whole environment, so that no inherited variable can make its shell
+        // run the user's code. See `paths::sandbox::pane_inherits`.
+        #[cfg(test)]
+        vars.retain(|(k, _)| crate::paths::sandbox::pane_inherits(k));
         let mut set = |key: &str, value: &str| {
             let value = std::ffi::OsString::from(value);
             match vars.iter_mut().find(|(k, _)| k == key) {
@@ -614,6 +624,12 @@ impl ChildExec {
         if let Some(id) = identity {
             set("REMUX_SESSION", id.session);
             set("REMUX_PANE", &id.pane.to_string());
+        }
+        // Last, so that under test the sandbox values win over anything set
+        // above or inherited.
+        #[cfg(test)]
+        for (key, value) in crate::paths::sandbox::pane_env() {
+            set(key, &value);
         }
         let envp_owned: Vec<CString> = vars
             .iter()
@@ -629,9 +645,12 @@ impl ChildExec {
         // The requested directory, falling back to $HOME when it cannot be
         // entered.
         let cwd = cwd.map(|dir| CString::new(dir.as_os_str().as_bytes()).ok());
+        #[cfg(not(test))]
         let home = std::env::var("HOME")
             .ok()
             .and_then(|h| CString::new(h).ok());
+        #[cfg(test)]
+        let home = CString::new(crate::paths::sandbox::home().into_os_string().as_bytes()).ok();
 
         let fd_bound = {
             // SAFETY: `getrlimit` only writes the struct it is given.

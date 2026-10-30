@@ -124,7 +124,7 @@ pub fn config_file() -> Option<PathBuf> {
 /// integration test under `tests/*.rs` would link the normal build, skip this
 /// sandbox, and write to the user's directories again.
 #[cfg(test)]
-mod sandbox {
+pub(crate) mod sandbox {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -141,6 +141,68 @@ mod sandbox {
                 .keep()
         })
         .join(kind)
+    }
+
+    /// A sandbox directory that exists, for a variable a pane's programs use
+    /// as soon as they start: a shell whose `HOME` does not exist cannot
+    /// write its history, and `TMPDIR` must exist to be used at all.
+    fn made(kind: &str) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = dir(kind);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&path)
+            .expect("create a sandbox directory");
+        path
+    }
+
+    /// `HOME` for every process a unit test spawns in a pane.
+    pub(crate) fn home() -> PathBuf {
+        made("home")
+    }
+
+    /// Whether a pane spawned by a unit test inherits `key` from the test
+    /// process. Everything else is dropped.
+    ///
+    /// An allow-list, not a deny-list, because the variables that make a shell
+    /// run the user's code have no common name: `PROMPT_COMMAND`, `PS1` and
+    /// `PS4` command substitutions, exported `BASH_FUNC_*%%` functions, and
+    /// whatever the next shell reads. The kept ones only locate programs and
+    /// describe the terminal and locale.
+    pub(crate) fn pane_inherits(key: &std::ffi::OsStr) -> bool {
+        let key = key.to_string_lossy();
+        matches!(&*key, "PATH" | "TERM" | "LANG" | "USER" | "LOGNAME") || key.starts_with("LC_")
+    }
+
+    /// The variables a pane spawned by a unit test gets on top of what
+    /// [`pane_inherits`] keeps.
+    ///
+    /// A pane's shell is a login shell, so with the user's `HOME` it sources
+    /// the user's profile and rc files, and it appends the test's commands to
+    /// the user's history file when it exits. `HISTFILE` and `ZDOTDIR` are set
+    /// explicitly so that a shell never falls back to a default outside the
+    /// sandbox. `ENV` and `BASH_ENV` name the startup file `sh` and
+    /// non-interactive `bash` read. The XDG variables keep a `remux` or other
+    /// program run in a pane out of the user's directories, as
+    /// [`super::data_home`] does for this process, and `XDG_RUNTIME_DIR` in
+    /// particular keeps it away from the socket of the user's running server.
+    pub(crate) fn pane_env() -> Vec<(&'static str, String)> {
+        let home = home();
+        let text = |p: PathBuf| p.to_string_lossy().into_owned();
+        vec![
+            ("HOME", text(home.clone())),
+            ("ZDOTDIR", text(home.clone())),
+            ("HISTFILE", text(home.join(".sh_history"))),
+            ("SHELL", "/bin/sh".to_string()),
+            ("ENV", "/dev/null".to_string()),
+            ("BASH_ENV", "/dev/null".to_string()),
+            ("XDG_CONFIG_HOME", text(dir("config"))),
+            ("XDG_DATA_HOME", text(dir("data"))),
+            ("XDG_STATE_HOME", text(dir("state"))),
+            ("XDG_RUNTIME_DIR", text(made("run"))),
+            ("TMPDIR", text(made("tmp"))),
+        ]
     }
 }
 

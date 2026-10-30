@@ -19855,6 +19855,89 @@ mod popup_tests {
         rig.finish().await;
     }
 
+    /// A pane's shell inherits the test process's environment. With the
+    /// user's `HOME` it reads their rc files and appends this test's commands
+    /// to their real history file when it exits.
+    ///
+    /// The `where` file proves on every `/bin/sh` that the shell ran in the
+    /// sandbox: its `HOME`, its runtime directory (the user's server socket
+    /// lives in the real one) and its `TMPDIR`, and without a variable the
+    /// allow-list drops. The history check can only fail where `/bin/sh` keeps
+    /// history, which bash does (Fedora, macOS) and dash (Debian, Ubuntu)
+    /// never does.
+    #[tokio::test]
+    async fn a_pane_shell_runs_in_the_sandbox_and_leaves_the_users_history_alone() {
+        use std::os::unix::fs::MetadataExt;
+        // A name no other code reads, so setting it process-wide cannot change
+        // another test's outcome.
+        std::env::set_var("REMUX_TEST_PANE_LEAK", "leaked");
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+        let mut watched: Vec<std::path::PathBuf> =
+            [".bash_history", ".sh_history", ".zsh_history", ".history"]
+                .iter()
+                .map(|name| home.join(name))
+                .collect();
+        watched.extend(std::env::var_os("HISTFILE").map(std::path::PathBuf::from));
+        let identity = || {
+            watched
+                .iter()
+                .map(|p| {
+                    std::fs::symlink_metadata(p)
+                        .ok()
+                        .map(|m| (m.ino(), m.len(), m.modified().ok()))
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = identity();
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let pane = *rig.panes.lock().await.keys().next().expect("pane");
+        rig.panes.lock().await[&pane]
+            .pty
+            .write_input(
+                b"printf 'HOME:%s RUN:%s TMP:%s LEAK:%s' \"$HOME\" \"$XDG_RUNTIME_DIR\" \
+                  \"$TMPDIR\" \"${REMUX_TEST_PANE_LEAK-}\" > \"$HOME/where-sandbox-test\"\nexit\n",
+            )
+            .expect("write");
+        let mut exited = false;
+        for _ in 0..100 {
+            if rig.panes.lock().await[&pane]
+                .pty
+                .try_wait()
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        std::env::remove_var("REMUX_TEST_PANE_LEAK");
+        assert!(exited, "the pane's shell exited");
+        rig.finish().await;
+        let sandbox_home = crate::paths::sandbox::home();
+        let root = sandbox_home.parent().expect("sandbox root");
+        assert_eq!(
+            std::fs::read_to_string(sandbox_home.join("where-sandbox-test")).ok(),
+            Some(format!(
+                "HOME:{} RUN:{} TMP:{} LEAK:",
+                sandbox_home.display(),
+                root.join("run").display(),
+                root.join("tmp").display()
+            )),
+            "the pane's shell ran with the sandbox environment"
+        );
+        assert_eq!(
+            identity(),
+            before,
+            "a history file under {} changed during the test: a pane's shell \
+             wrote it, unless a shell you are running saved its history at the \
+             same moment",
+            home.display()
+        );
+    }
+
     #[tokio::test]
     async fn a_session_rename_is_announced_to_every_client() {
         let dir = tempfile::tempdir().expect("dir");
