@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""The layout switcher (Alt+Shift+L): list the active tab's layouts, apply one.
+"""The layout switcher (Alt-g), and Alt+Shift+H/J/K/L moving panes.
 
 A real PTY, because the switcher is a CLIENT overlay opened by a key the client
-decodes: the server only answers `ListLayouts` and applies `LayoutSet`.
+decodes: the server only answers `ListLayouts` and applies `LayoutSet`. The
+move keys are here too because they share the decoding fix: crossterm reports
+`ESC L` as `'L'` + Alt + Shift, and before `NormalizedKeyEvent` dropped that
+Shift, no Alt+Shift+letter shortcut ever fired.
 
 What it covers:
 
-  1  each byte sequence a terminal sends for Alt+Shift+L opens the switcher:
-     legacy `ESC L`, and the CSI-u forms `CSI 108;4u` (base key + Shift) and
-     `CSI 76;4u` (shifted key + Shift)
+  1  `ESC g` opens the switcher
   2  the list is the SERVER's `[layouts]`: `grid = false` leaves grid out, the
      other five automatic layouts are listed, and the current one is marked
   3  Enter applies the highlighted layout: the status bar's layout name, which
@@ -17,7 +18,12 @@ What it covers:
      never decides which layouts exist
   5  after a manual resize (which ejects the tab to Custom) and a switch away,
      `custom` is offered and restores
-  6  the client is alive and neither log has a panic
+  6  Alt+Shift+H/J/K/L move the focused pane, in every encoding a terminal
+     sends (legacy `ESC L`, CSI-u base key `CSI 108;4u`, CSI-u shifted key
+     `CSI 76;4u`), and none of them opens the switcher. The pane is tracked by
+     a marker its own shell printed (`printf 'P%s' B` typed, `PB` searched),
+     so the typed command cannot fake it
+  7  the client is alive and neither log has a panic
 
 Run from the repo root:
     python3 tests/pty/layout_selector.py [-v]
@@ -31,11 +37,17 @@ from pty_harness import PROTOCOL_VERSION, Tui  # noqa: E402
 RUN = "/tmp/rmx-lsel"
 VERBOSE = "-v" in sys.argv
 
-ENCODINGS = [
-    ("ESC L", b"\x1bL"),
-    ("CSI 108;4u", b"\x1b[108;4u"),
-    ("CSI 76;4u", b"\x1b[76;4u"),
-]
+OPEN = b"\x1bg"
+
+
+def encodings(letter):
+    """Every byte form of Alt+Shift+`letter`: legacy, CSI-u base, CSI-u shifted."""
+    return [
+        (f"ESC {letter.upper()}", b"\x1b" + letter.upper().encode()),
+        (f"CSI {ord(letter)};4u", f"\x1b[{ord(letter)};4u".encode()),
+        (f"CSI {ord(letter.upper())};4u", f"\x1b[{ord(letter.upper())};4u".encode()),
+    ]
+
 EXPECTED = ["bsp", "master", "monocle", "columns", "rows"]
 TITLE = "Switch Layout"
 
@@ -44,8 +56,9 @@ CONFIG = """
 grid = false
 
 [keybindings.command]
-"Alt-g" = "LayoutSet grid"
+"Alt-u" = "LayoutSet grid"
 "Alt-y" = "LayoutSet columns"
+"Alt-i" = "LayoutSet rows"
 "Alt-r" = "ResizeRight 3"
 """
 
@@ -93,16 +106,29 @@ def pick(t, name, items):
     t.send(b"\r", 1.0)
 
 
-def main():
-    print(f"layout_selector (protocol {PROTOCOL_VERSION})")
+def marker_pos(t, marker):
+    """(row, col) of every line-start occurrence of `marker` on screen.
+
+    `finditer`, because two panes share each screen row and the marker can sit
+    in either half.
+    """
+    import re
+    hits = []
+    for y, row in enumerate(t.rows_text()):
+        for m in re.finditer(re.escape(marker) + r"\b", row):
+            hits.append((y, m.start()))
+    return hits
+
+
+def switcher_section():
     t = Tui(RUN, config=CONFIG).start()
     try:
         current = status_layout(t)
         check("starts in bsp", current == "bsp", t.rows_text()[-1])
 
-        targets = ["monocle", "columns", "rows"]
-        for (label, seq), target in zip(ENCODINGS, targets):
-            t.send(seq, 1.0)
+        for target in ["monocle", "columns", "rows"]:
+            label = f"ESC g -> {target}"
+            t.send(OPEN, 1.0)
             items = popup_rows(t)
             if VERBOSE:
                 t.dump(label)
@@ -124,7 +150,7 @@ def main():
             check(f"{label}: status bar shows {target}", current == target,
                   t.rows_text()[-1])
 
-        t.send(b"\x1bg", 1.0)
+        t.send(b"\x1bu", 1.0)
         check("LayoutSet grid is refused by the server",
               status_layout(t) == current, t.rows_text()[-1])
         check("the refusal is logged", 'LayoutSet "grid" refused' in t.log("server"),
@@ -142,7 +168,7 @@ def main():
         current = status_layout(t)
         check("a manual resize ejects to custom", current == "custom",
               t.rows_text()[-1])
-        t.send(b"\x1bL", 1.0)
+        t.send(OPEN, 1.0)
         items = popup_rows(t) or []
         names = [i[2:] for i in items]
         check("custom is listed and marked while the tab is custom",
@@ -150,7 +176,7 @@ def main():
         pick(t, "bsp", items)
         check("switching away from custom", status_layout(t) == "bsp",
               t.rows_text()[-1])
-        t.send(b"\x1bL", 1.0)
+        t.send(OPEN, 1.0)
         items = popup_rows(t) or []
         names = [i[2:] for i in items]
         check("the remembered custom layout is still offered",
@@ -161,11 +187,90 @@ def main():
         check("client is alive", t.alive())
     finally:
         t.kill()
+    check_logs(t, "switcher")
 
+
+def move_section():
+    t = Tui(RUN, config=CONFIG).start()
+    try:
+        t.send(b"printf 'P%s\\n' A\r", 0.6)
+        t.prefix(b"pv", 1.2)
+        t.send(b"printf 'P%s\\n' B\r", 0.8)
+
+        def where():
+            a, b = marker_pos(t, "PA"), marker_pos(t, "PB")
+            if len(a) != 1 or len(b) != 1:
+                return None
+            return a[0], b[0]
+
+        start = where()
+        check("two panes, each with its marker", start is not None,
+              "\n".join(t.rows_text()))
+        if start is None:
+            return
+        check("the focused pane B starts right of A", start[1][1] > start[0][1], start)
+
+        # Each key is checked from a start the PREFIX tree set up (`Ctrl-a p
+        # L` etc.), which never goes through the shortcut lookup. A check that
+        # started from where the previous key left B would pass vacuously after
+        # that key failed to move it.
+        def setup(prefix_key, ok, what):
+            t.prefix(b"p" + prefix_key, 1.0)
+            pos = where()
+            if not (pos is not None and ok(pos)):
+                check(f"prefix p {prefix_key.decode()} puts B {what}", False, pos)
+
+        def left(p):
+            return p[1][1] < p[0][1]
+
+        def above(p):
+            return p[1][0] < p[0][0]
+
+        for (lh, h), (ll, l) in zip(encodings("h"), encodings("l")):
+            setup(b"L", lambda p: not left(p), "right of A")
+            t.send(h, 1.0)
+            pos = where()
+            check(f"{lh} moves B left of A", pos is not None and left(pos), pos)
+            setup(b"H", left, "left of A")
+            t.send(l, 1.0)
+            pos = where()
+            check(f"{ll} moves B right of A", pos is not None and pos[1][1] > pos[0][1],
+                  pos)
+            check(f"{ll} does not open the switcher", popup_rows(t) is None,
+                  "\n".join(t.rows_text()))
+
+        t.send(b"\x1bi", 1.2)
+        check("rows layout for the vertical moves", status_layout(t) == "rows",
+              t.rows_text()[-1])
+        for (lk, k), (lj, j) in zip(encodings("k"), encodings("j")):
+            setup(b"J", lambda p: not above(p), "below A")
+            t.send(k, 1.0)
+            pos = where()
+            check(f"{lk} moves B above A", pos is not None and above(pos), pos)
+            setup(b"K", above, "above A")
+            t.send(j, 1.0)
+            pos = where()
+            check(f"{lj} moves B below A", pos is not None and pos[1][0] > pos[0][0], pos)
+        if VERBOSE:
+            t.dump("after moves")
+        check("client is alive after the moves", t.alive())
+    finally:
+        t.kill()
+    check_logs(t, "moves")
+
+
+def check_logs(t, label):
     for which in ("client", "server"):
         body = t.log(which)
-        check(f"no panic in {which}.log", "panicked at" not in body, body[-1500:])
-        check(f"{which}.log is not empty", len(body) > 0)
+        check(f"{label}: no panic in {which}.log", "panicked at" not in body,
+              body[-1500:])
+        check(f"{label}: {which}.log is not empty", len(body) > 0)
+
+
+def main():
+    print(f"layout_selector (protocol {PROTOCOL_VERSION})")
+    switcher_section()
+    move_section()
 
     if FAILURES:
         print(f"\nFAILED: {len(FAILURES)}")

@@ -817,13 +817,13 @@ impl Default for ShortcutBindings {
         bindings.insert(alt_key('k'), cmd("PaneFocusUp"));
         bindings.insert(alt_key('l'), cmd("PaneFocusRight"));
 
-        // Move panes directionally (Alt-Shift-h/j/k -> Alt-H/J/K). These
+        // Move panes directionally (Alt-Shift-h/j/k/l -> Alt-H/J/K/L). These
         // match `parse_key_notation("Alt-H")`, i.e. an uppercase char with the
-        // Alt modifier. Alt-L is the layout switcher, so PaneMoveRight is
-        // reached through `Prefix p L`.
+        // Alt modifier.
         bindings.insert(alt_key('H'), cmd("PaneMoveLeft"));
         bindings.insert(alt_key('J'), cmd("PaneMoveDown"));
         bindings.insert(alt_key('K'), cmd("PaneMoveUp"));
+        bindings.insert(alt_key('L'), cmd("PaneMoveRight"));
 
         // Tab navigation (Alt-, / Alt-.) and direct jumps (Alt-1..Alt-9).
         bindings.insert(alt_key(','), cmd("TabPrev"));
@@ -842,7 +842,7 @@ impl Default for ShortcutBindings {
         bindings.insert(alt_key('t'), cmd("TabNew"));
         bindings.insert(alt_key('s'), cmd("SessionQuickSwitch"));
         bindings.insert(alt_key('a'), cmd("AgentQuickSwitch"));
-        bindings.insert(alt_key('L'), cmd("LayoutQuickSwitch"));
+        bindings.insert(alt_key('g'), cmd("LayoutQuickSwitch"));
         bindings.insert(alt_key('o'), cmd("SessionSwitchLast"));
         bindings.insert(alt_key('z'), cmd("PaneToggleZoom"));
         bindings.insert(alt_key('p'), cmd("PopupToggle"));
@@ -2444,16 +2444,28 @@ mod tests {
         }
     }
 
-    /// crossterm reports `ESC L` as `'L'` + `ALT | SHIFT` and the CSI-u
-    /// `CSI 108;4u` as `'l'` + `ALT | SHIFT`; both are Alt+Shift+L.
+    /// crossterm reports `ESC L` as `'L'` + `ALT | SHIFT`, the CSI-u
+    /// `CSI 108;4u` as `'l'` + `ALT | SHIFT`, and `CSI 76;4u` as `'L'` +
+    /// `ALT | SHIFT`. All of them are Alt+Shift+<letter>.
     #[test]
-    fn alt_shift_l_opens_the_layout_switcher_in_every_encoding() {
+    fn alt_shift_hjkl_reach_pane_move_in_every_encoding() {
         let bindings = ShortcutBindings::default();
-        let want = Some(vec!["LayoutQuickSwitch".to_string()]);
         let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
-        assert_eq!(lookup_mods(&bindings, 'L', alt_shift), want);
-        assert_eq!(lookup_mods(&bindings, 'l', alt_shift), want);
-        assert_eq!(lookup_mods(&bindings, 'L', KeyModifiers::ALT), want);
+        for (lower, upper, command) in [
+            ('h', 'H', "PaneMoveLeft"),
+            ('j', 'J', "PaneMoveDown"),
+            ('k', 'K', "PaneMoveUp"),
+            ('l', 'L', "PaneMoveRight"),
+        ] {
+            let want = Some(vec![command.to_string()]);
+            assert_eq!(lookup_mods(&bindings, upper, alt_shift), want, "{upper}");
+            assert_eq!(lookup_mods(&bindings, lower, alt_shift), want, "{lower}");
+            assert_eq!(
+                lookup_mods(&bindings, upper, KeyModifiers::ALT),
+                want,
+                "{upper}"
+            );
+        }
         assert_eq!(
             lookup_mods(&bindings, 'l', KeyModifiers::ALT),
             Some(vec!["PaneFocusRight".to_string()])
@@ -2461,11 +2473,20 @@ mod tests {
     }
 
     #[test]
-    fn alt_shift_h_reaches_pane_move_left_as_a_terminal_sends_it() {
-        let bindings = ShortcutBindings::default();
+    fn prefix_p_l_moves_the_pane_right() {
+        match KeybindingTree::default().lookup(&['p', 'L']) {
+            Some(KeyNode::Leaf { action, .. }) => {
+                assert!(action.contains(&"PaneMoveRight".to_string()))
+            }
+            other => panic!("expected the p L leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alt_g_opens_the_layout_switcher() {
         assert_eq!(
-            lookup_mods(&bindings, 'H', KeyModifiers::ALT | KeyModifiers::SHIFT),
-            Some(vec!["PaneMoveLeft".to_string()])
+            lookup_mods(&ShortcutBindings::default(), 'g', KeyModifiers::ALT),
+            Some(vec!["LayoutQuickSwitch".to_string()])
         );
     }
 
@@ -2494,21 +2515,6 @@ mod tests {
                 modifiers: KeyModifiers::ALT | KeyModifiers::SHIFT,
             }
         );
-    }
-
-    #[test]
-    fn pane_move_right_has_no_alt_default_but_keeps_its_prefix_binding() {
-        let bindings = ShortcutBindings::default();
-        assert!(!bindings
-            .entries()
-            .iter()
-            .any(|(_, label)| label == &humanize_command("PaneMoveRight")));
-        match KeybindingTree::default().lookup(&['p', 'L']) {
-            Some(KeyNode::Leaf { action, .. }) => {
-                assert!(action.contains(&"PaneMoveRight".to_string()))
-            }
-            other => panic!("expected the p L leaf, got {other:?}"),
-        }
     }
 
     #[test]

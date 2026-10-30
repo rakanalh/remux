@@ -6495,14 +6495,10 @@ mod tests {
         assert_eq!(handler.mode, Mode::Command);
     }
 
-    /// `ESC L` as crossterm parses it: Alt and Shift on an uppercase `L`.
     #[test]
-    fn alt_shift_l_opens_the_layout_switcher() {
+    fn alt_g_opens_the_layout_switcher() {
         let mut handler = InputHandler::with_defaults();
-        let action = handler.handle_key(make_key(
-            KeyCode::Char('L'),
-            KeyModifiers::ALT | KeyModifiers::SHIFT,
-        ));
+        let action = handler.handle_key(make_key(KeyCode::Char('g'), KeyModifiers::ALT));
         assert_eq!(action, InputAction::LayoutSwitchOpen);
         assert_eq!(handler.mode, Mode::Command);
     }

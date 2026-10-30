@@ -133,8 +133,6 @@ pub enum ConnDescriptor {
 /// 17 -> 18: the layout switcher. Adds [`ClientMessage::ListLayouts`],
 /// [`ServerMessage::LayoutList`] and [`RemuxCommand::LayoutSet`]. An old
 /// server cannot decode the first or the last and would drop the connection.
-/// `feat/tab-move-keys` also branched from master at 17 and takes 18, so
-/// whichever of the two merges second takes the next free number.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
