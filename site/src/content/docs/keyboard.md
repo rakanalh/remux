@@ -35,12 +35,13 @@ These work directly in Normal mode, with no prefix.
 | Action | Keys |
 |---|---|
 | Focus left / down / up / right (also into and out of a sidebar) | `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` |
-| Move the pane left / down / up / right | `Alt-H` / `Alt-J` / `Alt-K` / `Alt-L` |
+| Move the pane left / down / up | `Alt-H` / `Alt-J` / `Alt-K` (right: `Ctrl-a p L`) |
 | Previous / next tab | `Alt-,` / `Alt-.` |
 | Jump to tab 1 to 9 | `Alt-1` … `Alt-9` |
 | New tab | `Alt-t` |
 | Quick session switcher | `Alt-s` |
 | Agent switcher | `Alt-a` |
+| Layout switcher | `Alt-L` (`Alt+Shift+l`) |
 | Previous session | `Alt-o` |
 | Zoom the focused pane | `Alt-z` |
 | Toggle the popup terminal | `Alt-p` |

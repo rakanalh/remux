@@ -153,6 +153,7 @@ Only characters are sent. `Ctrl-<letter>` sends the control character; `Alt` and
 | Keys | Action | Notes |
 |---|---|---|
 | `Prefix Space` | `LayoutNext` | Cycle the tab's layout |
+| `Prefix L` | `LayoutQuickSwitch` | Open the layout switcher |
 | `Prefix f` | `PaneToggleZoom` | Zoom the focused pane |
 | `Prefix g` | `ToggleStyle` | Switch between zellij and tmux border styles |
 | `Prefix v` | `EnterVisualMode` | |
@@ -214,12 +215,13 @@ The `SidebarFocus*` actions have no default key. `Alt-h/j/k/l` move into and out
 | Key | Action |
 |---|---|
 | `Alt-h` `Alt-j` `Alt-k` `Alt-l` | `PaneFocusLeft/Down/Up/Right` |
-| `Alt-H` `Alt-J` `Alt-K` `Alt-L` | `PaneMoveLeft/Down/Up/Right` |
+| `Alt-H` `Alt-J` `Alt-K` | `PaneMoveLeft/Down/Up` |
 | `Alt-,` / `Alt-.` | `TabPrev` / `TabNext` |
 | `Alt-1` … `Alt-9` | `TabGoto 0` … `TabGoto 8` |
 | `Alt-t` | `TabNew` |
 | `Alt-s` | `SessionQuickSwitch` |
 | `Alt-a` | `AgentQuickSwitch` |
+| `Alt-L` | `LayoutQuickSwitch` |
 | `Alt-o` | `SessionSwitchLast` |
 | `Alt-z` | `PaneToggleZoom` |
 | `Alt-p` | `PopupToggle` |
@@ -302,6 +304,8 @@ Every action you can bind or run from the command palette. The names are PascalC
 | Command | Does |
 |---|---|
 | `LayoutNext` | Cycle to the next enabled automatic layout |
+| `LayoutSet <layout>` | Switch to a layout by name (`bsp` … `rows`, `custom`). Refused when `[layouts]` disables it |
+| `LayoutQuickSwitch` | Open the layout switcher: the layouts `LayoutNext` visits, current one marked |
 | `ToggleStyle` | Switch between zellij and tmux border styles |
 
 ### Sessions and folders

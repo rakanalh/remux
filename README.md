@@ -34,7 +34,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Move to tab** — `Ctrl-a p t` opens a picker of every session on the pane's server, each with its tabs and a `+ new tab`, the pane's own session first; pick one and the focused pane moves there with its running program and scrollback intact, and focus follows it, into another session too. A tab left empty closes, and so does a session.
 - **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
 - **Resize** — grow/shrink the focused pane edge by a configurable amount.
-- **Seven layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views while enabled), **Columns** (every pane side by side, equal widths), **Rows** (every pane stacked, equal heights), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid → Columns → Rows, then back to a remembered Custom arrangement); turn any of them off under `[layouts]`.
+- **Seven layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views while enabled), **Columns** (every pane side by side, equal widths), **Rows** (every pane stacked, equal heights), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid → Columns → Rows, then back to a remembered Custom arrangement), or pick one directly from the **layout switcher** (`Alt-Shift-L` / `Ctrl-a L`), which lists exactly the layouts the cycle visits with the current one marked; turn any of them off under `[layouts]`.
 - **Popup terminal** — a scratch terminal that floats centered on top of the layout instead of occupying a slot in it. Toggle with `Alt-p` (or `Ctrl-a p o`); it keeps running while hidden, so it's the same terminal with the same history every time you pull it up. One per session — toggle it from any tab and it follows you. Sized as a percentage of the screen (`popup_width_pct` / `popup_height_pct`, default 80×80) and resizable while open with the pane-resize keys. It takes no space from the surrounding panes and is excluded from every layout operation, so `Alt-Space`, zoom, and pane move/swap can never pull it into the layout.
 - **Login-shell panes** — new panes spawn their shell as a login shell so your profile/rc files run as expected.
 - **Two rendering styles** — **Zellij style** (rounded box borders with pane names) and **Tmux style** (minimal dividers). Toggle live with `Ctrl-a g`.
@@ -330,6 +330,7 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `v` | Enter Visual mode |
 | `g` | Toggle border style (Zellij ⇄ Tmux) *(→ Normal)* |
 | `Space` | Cycle layout (BSP → Master → Monocle → Grid → Columns → Rows) *(→ Normal)* |
+| `L` | Layout switcher |
 | `f` | Zoom the focused pane *(→ Normal)* |
 | `}` | Next tab *(→ Normal)* |
 | `{` | Previous tab *(→ Normal)* |
@@ -439,12 +440,13 @@ There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h
 | Shortcut | Action |
 |----------|--------|
 | `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` | Focus pane left / down / up / right — and into or out of a sidebar on that edge |
-| `Alt-H` / `Alt-J` / `Alt-K` / `Alt-L` | Move (swap) pane left / down / up / right |
+| `Alt-H` / `Alt-J` / `Alt-K` | Move (swap) pane left / down / up (move right is `Ctrl-a p L`) |
 | `Alt-,` / `Alt-.` | Previous / next tab |
 | `Alt-1` … `Alt-9` | Jump to tab 1–9 |
 | `Alt-t` | New tab |
 | `Alt-s` | Quick session switcher (local + remote) |
 | `Alt-a` | Agent switcher (local + remote) |
+| `Alt-L` | Layout switcher (`Alt-Shift-l`) |
 | `Alt-o` | Last session (toggle) |
 | `Alt-z` | Toggle pane zoom |
 | `Alt-p` | Toggle the popup terminal |
@@ -564,6 +566,7 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `SessionSwitchLast` | — | Toggle back to the previously-attached session. |
 | `ToggleStyle` | — | Toggle border rendering between Zellij and Tmux styles. |
 | `LayoutNext` | — | Cycle the layout mode (BSP → Master → Monocle → Grid → Columns → Rows), skipping any disabled under `[layouts]`, then back to a remembered Custom arrangement. |
+| `LayoutSet` | `<layout>` | Switch the active tab to `bsp`, `master`, `monocle`, `grid`, `columns`, `rows` or `custom`. The server refuses a layout disabled under `[layouts]`, and `custom` when the tab has no remembered Custom arrangement. |
 | `SetMaster` | — | Make the focused pane the master pane (Master layout). |
 | `PopupToggle` | — | Show/hide the session's popup terminal (created on first use, kept running while hidden). |
 | `ViewNew` | `[name]` | Create a view and enter it (prompts when no name is given). |
@@ -584,7 +587,7 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `EnterCommandMode` | — | Enter Command mode (navigate the leader tree). |
 | `EnterVisualMode` | — | Enter Visual/copy mode. |
 
-> A few binding-only actions are handled directly by the client and so aren't in the palette list above: `EnterSearchMode`, `SendKey <key-notation>`, `SessionQuickSwitch`, `AgentQuickSwitch`, and `CommandPaletteOpen`.
+> A few binding-only actions are handled directly by the client and so aren't in the palette list above: `EnterSearchMode`, `SendKey <key-notation>`, `SessionQuickSwitch`, `AgentQuickSwitch`, `LayoutQuickSwitch`, and `CommandPaletteOpen`.
 
 ## Chaining commands
 
@@ -675,7 +678,7 @@ size = 30
   - **A launcher is looked through to the agent it started.** An agent installed through npm or bun is often a shim — `codex` is a Node script that starts the real binary and stays alive as its parent — so the pane's foreground process is `node`, not the agent; the job underneath it is walked too, which is why you list the agent and never the interpreter.
   - **Two grades of evidence ship here, and the line does not run along agent names.** The Claude Code *question menu*, the `omp` and the `opencode` patterns were matched against a real pane, blocked and then answered again, so both that they turn the panel red and that they let it go are observed. The Claude Code *permission* pattern and both `codex` patterns were read out of the shipped binaries instead: the wordings are real, but nobody watched one of those prompts appear or clear — codex could not be driven as far as an approval on either machine available. If a pane ever sticks on *needs input*, this is the section to correct.
   - **Edits here need `remux restart`.** This section is read by the *server*, at startup — unlike keybindings and remotes, it does not hot-reload. It bites exactly when it matters, because you edit a pattern *because* an agent is blocked and the panel is not saying so.
-- **`[layouts]`** — `bsp`, `master`, `monocle`, `grid`, `columns`, `rows`, each `true` by default. `false` drops that layout from the `LayoutNext` cycle, for tabs and Views alike; the order of the rest is unchanged. After the last enabled layout, the cycle returns to a remembered Custom arrangement if there is one. A new tab, session or View whose default layout is disabled starts in the first enabled one. Custom is manual and not listed. Disabling everything is treated as enabling everything, with a warning. Read by the server at startup, so `remux restart` after a change; a tab already in a layout you disable keeps it until the next cycle.
+- **`[layouts]`** — `bsp`, `master`, `monocle`, `grid`, `columns`, `rows`, each `true` by default. `false` drops that layout from the `LayoutNext` cycle and from the layout switcher, for tabs and Views alike; the order of the rest is unchanged. After the last enabled layout, the cycle returns to a remembered Custom arrangement if there is one. A new tab, session or View whose default layout is disabled starts in the first enabled one. Custom is manual and not listed. Disabling everything is treated as enabling everything, with a warning. Read by the server at startup, so `remux restart` after a change; a tab already in a layout you disable keeps it until the next cycle.
 - **`[remotes.<name>]`** — declare SSH-reachable remote servers:
 
 ```toml
