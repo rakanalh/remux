@@ -4,8 +4,10 @@
 
 mod client;
 mod config;
+mod integrate;
 mod paths;
 mod protocol;
+mod relay;
 mod screen;
 mod server;
 
@@ -50,6 +52,13 @@ struct SearchToVisual {
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum IntegrateHarness {
+    /// Claude Code: the Stop and UserPromptSubmit hooks in
+    /// ~/.claude/settings.json, and the remux-messaging skill
+    ClaudeMessaging,
 }
 
 #[derive(Subcommand)]
@@ -157,6 +166,40 @@ enum Commands {
         argv: Vec<String>,
     },
 
+    /// Leave messages for other panes and read your own
+    #[command(subcommand)]
+    Msg(crate::client::msg_cli::MsgCmd),
+
+    /// Name panes and list the ones that can be sent to
+    #[command(subcommand)]
+    Agent(crate::client::agent_cli::AgentCmd),
+
+    /// Install, check or remove what a coding agent needs in its own files to
+    /// use remux. Run it on the machine the agent runs on.
+    #[command(group(clap::ArgGroup::new("action").args(["status", "dry_run", "uninstall"])))]
+    Integrate {
+        /// The coding agent
+        #[arg(value_enum)]
+        harness: IntegrateHarness,
+
+        /// Report whether the integration is installed, stale or absent
+        #[arg(long)]
+        status: bool,
+
+        /// Print what an install would change, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remove remux's hooks, and nothing of the user's
+        #[arg(long)]
+        uninstall: bool,
+
+        /// Write hooks that run this binary even though it is a cargo build
+        /// output (under a `target/` directory)
+        #[arg(long)]
+        allow_dev_path: bool,
+    },
+
     /// Internal: run the server (not for direct use)
     #[command(hide = true)]
     Server,
@@ -243,7 +286,7 @@ async fn run_cli_spawn(
         Some(ServerMessage::CliSpawned { pane_id }) => {
             log::debug!("cmd: cli-spawn created pane_id={pane_id}");
         }
-        Some(ServerMessage::Error { message }) => {
+        Some(ServerMessage::Error { message, .. }) => {
             eprintln!("remux: {message}");
             std::process::exit(1);
         }
@@ -254,6 +297,17 @@ async fn run_cli_spawn(
         }
     }
     Ok(())
+}
+
+/// The log file at `path`, created with its directory.
+fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
 }
 
 /// Route panics into the role's log file, in addition to stderr.
@@ -294,7 +348,19 @@ fn install_panic_logger() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // clap quotes what was typed in a usage error, and passes format and C1
+    // characters through raw. Help and version are printed as clap renders
+    // them.
+    let cli = Cli::try_parse().unwrap_or_else(|e| {
+        if e.use_stderr() {
+            eprint!(
+                "{}",
+                crate::client::cli_common::escape_lines(&e.render().to_string())
+            );
+            std::process::exit(e.exit_code());
+        }
+        e.exit()
+    });
 
     // Determine log file based on command: server.log vs relay.log vs client.log.
     let log_filename = match cli.command {
@@ -302,27 +368,37 @@ async fn main() -> Result<()> {
         Some(Commands::Relay) => "relay.log",
         _ => "client.log",
     };
-    let log_dir = paths::state_home().join("remux");
-    std::fs::create_dir_all(&log_dir).expect("failed to create log directory");
-    let log_path = log_dir.join(log_filename);
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .expect("failed to open log file");
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
-        .format_timestamp_millis()
-        .target(env_logger::Target::Pipe(Box::new(log_file)))
-        .init();
-
-    install_panic_logger();
-
+    let log_path = paths::state_home().join("remux").join(log_filename);
     let role = match cli.command {
         Some(Commands::Server) => "server",
         Some(Commands::Relay) => "relay",
         _ => "client",
     };
+    match open_log(&log_path) {
+        Ok(log_file) => env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Debug)
+            .format_timestamp_millis()
+            .target(env_logger::Target::Pipe(Box::new(log_file)))
+            .init(),
+        // The server and the relay run for days, and the server's log is the
+        // only record of attribution, refused peers and link events, so
+        // neither runs without its log.
+        Err(e) if role != "client" => {
+            eprintln!(
+                "remux {role}: cannot open its log {}: {e}",
+                log_path.display()
+            );
+            std::process::exit(1);
+        }
+        // A sandbox can leave the state directory read-only. A client then
+        // runs with no logger, which makes every `log` macro a no-op: stderr
+        // is not a substitute, because the CLI's stderr is part of its output
+        // to the hooks and scripts that run it.
+        Err(_) => {}
+    }
+
+    install_panic_logger();
+
     log::info!("remux starting as {role}, log={}", log_path.display());
 
     // Refuse to launch an interactive client inside an existing remux pane
@@ -476,7 +552,7 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                ServerMessage::Error { message } => {
+                ServerMessage::Error { message, .. } => {
                     eprintln!("Error: {}", message);
                 }
                 _ => {
@@ -518,20 +594,16 @@ async fn main() -> Result<()> {
             let sock = tokio::net::UnixStream::connect(socket_path())
                 .await
                 .context("relay: connecting to local server socket")?;
-            let (mut srd, mut swr) = sock.into_split();
-            let mut stdin = tokio::io::stdin();
-            let mut stdout = tokio::io::stdout();
-
-            // Exit as soon as EITHER direction hits EOF.
-            tokio::select! {
-                r = tokio::io::copy(&mut stdin, &mut swr) => {
-                    log::debug!("relay: stdin->socket ended: {:?}", r);
-                }
-                r = tokio::io::copy(&mut srd, &mut stdout) => {
-                    log::debug!("relay: socket->stdout ended: {:?}", r);
-                }
-            }
+            let (srd, swr) = sock.into_split();
+            let end = relay::pump(tokio::io::stdin(), tokio::io::stdout(), srd, swr).await;
+            log::info!("{}", end.summary());
             log::info!("cmd: relay exiting");
+            // Exit now rather than return: the runtime would wait on the
+            // blocking stdin read, so a relay whose server went away would
+            // linger until ssh next wrote to it, and the server that dialled
+            // it would not learn the link was gone.
+            log::logger().flush();
+            std::process::exit(0);
         }
         Some(Commands::Kill { name }) => {
             log::debug!("cmd: kill session={name:?}");
@@ -551,7 +623,7 @@ async fn main() -> Result<()> {
                 ))) => {
                     println!("Killed session '{}'.", deleted);
                 }
-                Some(ServerMessage::Error { message }) => {
+                Some(ServerMessage::Error { message, .. }) => {
                     eprintln!("Error: {}", message);
                 }
                 _ => {
@@ -583,6 +655,21 @@ async fn main() -> Result<()> {
             };
             run_cli_spawn(placement, cwd, argv).await?;
         }
+        Some(Commands::Msg(cmd)) => {
+            std::process::exit(crate::client::msg_cli::run_msg(cmd).await.into());
+        }
+        Some(Commands::Agent(cmd)) => {
+            std::process::exit(crate::client::agent_cli::run_agent(cmd).await.into());
+        }
+        Some(Commands::Integrate {
+            harness,
+            status,
+            dry_run,
+            uninstall,
+            allow_dev_path,
+        }) => {
+            run_integrate(harness, status, dry_run, uninstall, allow_dev_path)?;
+        }
         Some(Commands::NewTab { cwd, argv }) => {
             run_cli_spawn(CliPlacement::NewTab, cwd, argv).await?;
         }
@@ -592,7 +679,16 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Restart) => {
             log::debug!("cmd: restart server");
-            let _ = stop_server().await?;
+            // A server that has not exited still owns the socket, and its
+            // shutdown is still to come: starting another now would hand the
+            // "restart" to the old server, or lose the new one when the old
+            // one finally exits.
+            if let Stop::TimedOut { pid } = stop_server().await? {
+                anyhow::bail!(
+                    "the server (pid {pid}) did not exit, so no new server was started; \
+                     run `remux restart` again once it has"
+                );
+            }
             ensure_server_running().await?;
             println!("Server restarted.");
         }
@@ -605,24 +701,50 @@ async fn main() -> Result<()> {
 // Server lifecycle
 // ---------------------------------------------------------------------------
 
+/// `remux server`, as a client starts it, with no stdio. It never inherits
+/// `REMUX_TEST_PEER_ANCESTOR`: a pane process that sets it and then starts a
+/// server (a relay does, when none is running) would otherwise hand that
+/// server the peer-link test seam. Only a harness's own `remux server` sets it.
+fn server_command(exe: std::path::PathBuf) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("server")
+        .env_remove("REMUX_TEST_PEER_ANCESTOR")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
 /// Ensure a server is running, starting one in the background if needed.
 async fn ensure_server_running() -> Result<()> {
+    daemon::prepare_runtime_dir()?;
     let sock = socket_path();
     log::debug!(
         "ensure_server_running: checking socket at {}",
         sock.display()
     );
     if sock.exists() {
-        // Try connecting to verify the socket is live
-        match RemuxClient::connect().await {
+        // A bare connect, no handshake: whether a server is LISTENING is the
+        // only question here. Only "nothing is listening" makes the socket
+        // stale. A server that answers is left alone even when it speaks
+        // another protocol -- the handshake that follows reports that -- because
+        // unlinking its socket orphans a live server and every session in it.
+        match tokio::net::UnixStream::connect(&sock).await {
             Ok(_) => {
                 log::debug!("ensure_server_running: server already running");
                 return Ok(());
             }
-            Err(_) => {
-                // Stale socket file, remove it
-                log::debug!("ensure_server_running: stale socket detected, removing");
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                log::debug!("ensure_server_running: stale socket detected ({e}), removing");
                 let _ = std::fs::remove_file(&sock);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("connecting to {}", sock.display()));
             }
         }
     }
@@ -632,11 +754,7 @@ async fn ensure_server_running() -> Result<()> {
         "ensure_server_running: spawning server from {}",
         exe.display()
     );
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("server")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    let mut cmd = server_command(exe);
 
     // Detach the server from the terminal that is spawning it. Null stdio LOOKS
     // like daemonizing and is not: without this the child inherits our process
@@ -686,7 +804,7 @@ async fn ensure_server_running() -> Result<()> {
         });
     }
 
-    cmd.spawn().context("spawning server process")?;
+    let mut child = cmd.spawn().context("spawning server process")?;
 
     // Wait for the socket to appear
     for i in 0..50 {
@@ -696,26 +814,125 @@ async fn ensure_server_running() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(50)).await;
             return Ok(());
         }
+        // A server that cannot start exits at once. Saying so now, rather
+        // than at the end of the wait, is what lets a relay's cause reach a
+        // dialler whose own deadline is shorter than this wait. One that lost
+        // the bind to a server started at the same moment also exits, and
+        // that server's socket is the one to use.
+        if let (Ok(Some(status)), false) = (child.try_wait(), sock.exists()) {
+            log::debug!("ensure_server_running: the server exited ({status})");
+            anyhow::bail!(
+                "the server exited before its socket appeared at {} ({status}); see {} if it \
+                 exists: a server that cannot open its log exits without writing one",
+                sock.display(),
+                paths::state_home()
+                    .join("remux")
+                    .join("server.log")
+                    .display()
+            );
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     log::debug!("ensure_server_running: timed out waiting for socket");
-    anyhow::bail!("timed out waiting for server to start")
+    anyhow::bail!(
+        "timed out waiting for the server's socket at {}",
+        sock.display()
+    )
 }
 
-/// Gracefully stop the running server via SIGTERM.
-///
-/// Returns `Ok(true)` if a running server was stopped, `Ok(false)` if none was
-/// running (or only stale files existed). The SIGTERM triggers the server's
-/// existing graceful path, which saves session state before removing the socket
+/// `remux integrate`. Run by a human, so a failure exits non-zero.
+fn run_integrate(
+    harness: IntegrateHarness,
+    status: bool,
+    dry_run: bool,
+    uninstall: bool,
+    allow_dev_path: bool,
+) -> Result<()> {
+    use integrate::Integration;
+    let integration: Box<dyn Integration> = match harness {
+        IntegrateHarness::ClaudeMessaging => Box::new(
+            integrate::claude_messaging::ClaudeMessaging::from_env(allow_dev_path)?,
+        ),
+    };
+    let name = integration.name();
+    if status {
+        match integration.status()? {
+            integrate::IntegrationStatus::Installed { runs } => {
+                println!("{name}: Installed ({runs})")
+            }
+            integrate::IntegrationStatus::Stale { why } => println!("{name}: Stale ({why})"),
+            integrate::IntegrationStatus::Absent => println!("{name}: Absent"),
+        }
+        if let Some(text) = integration.instructions() {
+            println!("\n{text}");
+        }
+    } else if dry_run {
+        let (changes, notes) = integration.plan()?;
+        for note in &notes {
+            eprintln!("remux: {note}");
+        }
+        if changes.is_empty() {
+            println!("{name}: nothing to change");
+        }
+        for change in changes {
+            println!("{}", change.path.display());
+            println!("--- before");
+            println!("{}", change.before.as_deref().unwrap_or("(none)"));
+            println!("+++ after");
+            println!("{}", change.after.as_deref().unwrap_or("(none)"));
+        }
+    } else if uninstall {
+        let notes = integration.uninstall()?;
+        for note in &notes {
+            eprintln!("remux: {note}");
+        }
+        println!("{name}: removed{}", except_noted(&notes));
+    } else {
+        let notes = integration.install()?;
+        for note in &notes {
+            eprintln!("remux: {note}");
+        }
+        println!("{name}: installed{}", except_noted(&notes));
+        if let Some(text) = integration.instructions() {
+            println!("\n{text}");
+        }
+    }
+    Ok(())
+}
+
+fn except_noted(notes: &[String]) -> &'static str {
+    if notes.is_empty() {
+        ""
+    } else {
+        ", except where noted"
+    }
+}
+
+/// What `stop_server` came to.
+enum Stop {
+    Stopped,
+    /// No server was running, or none this command could signal.
+    NotRunning,
+    /// The server was signalled and is still there.
+    TimedOut {
+        pid: i32,
+    },
+}
+
+/// Gracefully stop the running server via SIGTERM, which triggers the
+/// server's graceful path: it saves session state before removing the socket
 /// and pid files.
-async fn stop_server() -> Result<bool> {
+async fn stop_server() -> Result<Stop> {
+    // The pid file names the process to signal; one in a directory another
+    // user controls could name any process of ours.
+    daemon::prepare_runtime_dir()?;
     let sock = socket_path();
     let pid_file = daemon::pid_path();
 
     if !sock.exists() && !pid_file.exists() {
         println!("No server running.");
-        return Ok(false);
+        return Ok(Stop::NotRunning);
     }
 
     // Read and parse the PID. Without a valid pid file we can't signal a live
@@ -727,12 +944,12 @@ async fn stop_server() -> Result<bool> {
                 println!(
                     "Server socket exists but pid file is unreadable; cannot signal the server."
                 );
-                return Ok(false);
+                return Ok(Stop::NotRunning);
             }
         },
         Err(_) => {
             println!("Server socket exists but pid file is missing; cannot signal the server.");
-            return Ok(false);
+            return Ok(Stop::NotRunning);
         }
     };
 
@@ -743,11 +960,31 @@ async fn stop_server() -> Result<bool> {
     ) {
         Ok(()) => {}
         Err(nix::errno::Errno::ESRCH) => {
-            // No such process: the pid file is stale. Clean up leftover files.
-            let _ = std::fs::remove_file(&sock);
+            // No such process: the pid file is stale, but the socket may not
+            // be. Unlinking a socket a server still listens on orphans that
+            // server and every session in it, so only "nothing is listening"
+            // makes the socket stale too.
+            match tokio::net::UnixStream::connect(&sock).await {
+                Ok(_) => anyhow::bail!(
+                    "a server is listening on {} but its pid file is stale (no process {pid}); \
+                     it cannot be signalled from here: stop it by its own pid",
+                    sock.display()
+                ),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    let _ = std::fs::remove_file(&sock);
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("connecting to {}", sock.display()));
+                }
+            }
             let _ = std::fs::remove_file(&pid_file);
             println!("No server running (removed stale files).");
-            return Ok(false);
+            return Ok(Stop::NotRunning);
         }
         Err(e) => {
             return Err(e).context("sending SIGTERM to server");
@@ -758,13 +995,13 @@ async fn stop_server() -> Result<bool> {
     for _ in 0..50 {
         if !sock.exists() {
             println!("Server stopped.");
-            return Ok(true);
+            return Ok(Stop::Stopped);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     println!("Warning: server did not exit within 5s.");
-    Ok(false)
+    Ok(Stop::TimedOut { pid })
 }
 
 // ---------------------------------------------------------------------------
@@ -7686,7 +7923,7 @@ async fn run_client_loop(
                             record_switch(&mut current_attached, &mut previous_attached, ConnId::Local, target);
                         }
                     }
-                    Some(ServerMessage::Error { message }) => {
+                    Some(ServerMessage::Error { message, .. }) => {
                         log::error!("Server error: {}", message);
                     }
                     Some(ServerMessage::ContextMenu { x, y, target }) => {
@@ -8407,6 +8644,19 @@ async fn run_client_loop(
                         // the message vanishing into a catch-all.
                         log::debug!("srv: CliSpawned pane_id={pane_id} (unexpected here)");
                     }
+                    // The interactive client sends neither `MsgSend` nor
+                    // `MsgRead`. The variant NAME only: a `MsgList` carries
+                    // message bodies, which never go to a log.
+                    Some(ServerMessage::MsgSent { .. })
+                    | Some(ServerMessage::MsgList { .. })
+                    | Some(ServerMessage::MsgAcked { .. })
+                    | Some(ServerMessage::AgentNamed { .. })
+                    | Some(ServerMessage::AgentStatusList { .. })
+                    | Some(ServerMessage::AgentWaited { .. })
+                    | Some(ServerMessage::Pong { .. })
+                    | Some(ServerMessage::MsgInbound { .. }) => {
+                        log::warn!("client: a messaging reply on the TUI connection; ignored");
+                    }
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {
                         log::debug!("srv: ScrollbackInfo total_lines={}", total_lines);
                         // Update visual state with accurate total line count.
@@ -9013,6 +9263,19 @@ async fn run_client_loop(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_server_a_client_starts_never_inherits_the_peer_seam() {
+        let cmd = super::server_command("remux".into());
+        assert!(cmd
+            .get_envs()
+            .any(|(key, value)| key == "REMUX_TEST_PEER_ANCESTOR" && value.is_none()));
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            ["server"],
+            "it is still `remux server`"
+        );
+    }
+
     use super::*;
 
     mod tree_focus {

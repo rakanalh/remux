@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -27,9 +27,11 @@ use crate::server::compositor::{
     pane_content_rect, render_popup_layer, ClickTarget, HitRegions, MouseSelection, PopupLayer,
     StatusInfo, NO_FOCUSED_PANE,
 };
+use crate::server::identity;
 use crate::server::layout::{
     self, CustomLayout, EnabledLayouts, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
 };
+use crate::server::messaging::Messaging;
 use crate::server::persistence::{self, PersistedState};
 use crate::server::pty::{self, PaneIdentity, Pty};
 use crate::server::session::{self, Folder, ServerState, Session};
@@ -461,25 +463,8 @@ pub(crate) fn process_pgid(pid: i32) -> Option<i32> {
     if pid <= 0 {
         return None;
     }
-    pgid_from_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
-}
-
-/// The `pgrp` field of a `/proc/<pid>/stat` line: `pid (comm) state ppid pgrp`.
-///
-/// **Parsed from the LAST `)`, never by splitting the line.** `comm` is up to
-/// 15 bytes of whatever the process last called itself, written raw and
-/// unescaped -- it may contain spaces, parentheses or both, and a Node worker
-/// thread or a browser helper routinely does. Counting whitespace fields from
-/// the start, or stopping at the first `)`, reads some byte of the NAME as the
-/// pgid; that answer matches no real group, so every descendant would be
-/// filtered out and the walk would quietly stop finding anything. A line that
-/// does not have the shape is refused rather than guessed at.
-#[cfg(target_os = "linux")]
-fn pgid_from_stat(line: &str) -> Option<i32> {
-    let mut fields = line[line.rfind(')')? + 1..].split_whitespace();
-    let _state = fields.next()?;
-    let _ppid = fields.next()?;
-    fields.next()?.parse().ok()
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    Some(crate::server::procfs::proc_stat(&stat)?.pgrp)
 }
 
 /// See the Linux variant. macOS answers from `libproc`'s BSD info block.
@@ -513,17 +498,4278 @@ pub(crate) fn process_pgid(_pid: i32) -> Option<i32> {
     None
 }
 
+/// A pane whose program has exited is left out, so that a leftover process
+/// still in its session is not attributed to it.
+fn proc_index(ps: &HashMap<PaneId, PaneData>) -> identity::ProcIndex {
+    identity::ProcIndex::new(ps.iter().filter(|(_, pd)| !pd.exited).map(|(&id, pd)| {
+        (
+            pd.pty.child_pid.as_raw(),
+            id,
+            pd.pty.slave_dev.map(identity::Tty::from_dev_t),
+        )
+    }))
+}
+
+/// How long the per-connection identity line may hold up the connection's
+/// reader. Past it the peer is logged as unattributed; the line is diagnostic,
+/// so a wedged `panes` lock or a slow `/proc` must never cost a connection.
+const ATTRIBUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a message handler waits for its caller to be attributed.
+///
+/// The bound covers the whole check (the pin's first read, the process table,
+/// the pin's second read) and a timeout gives no verdict at all, so it is
+/// refused as `sender_unverified` with its own reason. Longer than
+/// [`ATTRIBUTION_TIMEOUT`] because here a timeout refuses the user's request
+/// rather than dropping a log line, and shorter than the CLI's 10s reply
+/// deadline so that the CLI reports the refusal instead of its own timeout.
+pub(crate) const CALLER_ATTRIBUTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// The pane of the process that sent the frame being handled.
+///
+/// The reader loop awaits the handler that calls this, so the next frame is
+/// not read until the verdict is in or the timeout has fired. A task
+/// abandoned by the timeout is never awaited again, so its late answer is
+/// dropped rather than applied to a later frame.
+async fn attribute_frame_caller(
+    peer: &Arc<identity::Peer>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Result<identity::Attribution, identity::Unverified> {
+    let peer = Arc::clone(peer);
+    let checked = tokio::time::timeout(CALLER_ATTRIBUTION_TIMEOUT, async {
+        let index = proc_index(&*panes.lock().await);
+        tokio::task::spawn_blocking(move || {
+            identity::attribute_caller(&*peer, &index, &identity::system_table())
+        })
+        .await
+    })
+    .await;
+    match checked {
+        Ok(Ok(verdict)) => verdict,
+        Ok(Err(e)) => {
+            log::warn!("identity: attribution task failed: {e}");
+            Err(identity::Unverified::CheckFailed)
+        }
+        Err(_) => Err(identity::Unverified::TimedOut),
+    }
+}
+
+/// Refuse a caller whose attribution failed for a reason that says nothing
+/// about where it is. Only [`identity::Unverified::is_outside`] may be treated
+/// as a caller outside every pane, with an outsider's --pane.
+fn unverified_refusal(
+    caller: &Result<identity::Attribution, identity::Unverified>,
+) -> Option<ServerMessage> {
+    match caller {
+        Err(why) if !why.is_outside() => Some(ServerMessage::refused(
+            "sender_unverified",
+            format!("{}: {}", why.reason(), why.fix()),
+        )),
+        _ => None,
+    }
+}
+
+/// The attribution line a message handler writes. `how` is what the harnesses
+/// read to tell the session-id path from the walk.
+fn log_caller(client_id: u64, verb: &str, found: &identity::Attribution) {
+    log::debug!(
+        "identity: client_id={client_id} {verb} caller -> pane %{} by {:?}{}",
+        found.pane,
+        found.how,
+        if found.tty_differs {
+            "; its tty differs (nested pty?)"
+        } else {
+            ""
+        }
+    );
+}
+
+async fn reply(
+    client_id: u64,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    msg: ServerMessage,
+) {
+    if let Some(conn) = clients.lock().await.get(&client_id) {
+        let _ = conn.tx.send(msg);
+    }
+}
+
+/// The panes a message may name: in the table and not exited.
+async fn live_panes(
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> std::collections::HashSet<PaneId> {
+    panes
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, pd)| !pd.exited)
+        .map(|(&id, _)| id)
+        .collect()
+}
+
+/// A [`ClientMessage::MsgSend`], unpacked.
+struct OutgoingMessage {
+    to: Address,
+    body: String,
+    deliver: Deliver,
+    reply_to: Option<MsgRef>,
+    pane_hint: Option<PaneId>,
+    defer: bool,
+    timeout_ms: Option<u64>,
+    wait: bool,
+    origin: Option<crate::protocol::Origin>,
+    req: Option<u64>,
+}
+
+/// A [`ClientMessage::AgentName`], unpacked.
+struct NameRequest {
+    name: Option<String>,
+    pane: Option<PaneId>,
+    pane_hint: Option<PaneId>,
+}
+
+/// A [`ClientMessage::MsgAck`], unpacked.
+struct MailboxAck {
+    pane: Option<PaneId>,
+    ids: Vec<MsgId>,
+    all: bool,
+    pane_hint: Option<PaneId>,
+}
+
+/// A [`ClientMessage::MsgRead`], unpacked.
+struct MailboxRead {
+    pane: Option<PaneId>,
+    all: bool,
+    peek: bool,
+    wait_ms: Option<u64>,
+    pane_hint: Option<PaneId>,
+}
+
+/// A caller-supplied string as it may be logged: Debug-quoted, so a newline
+/// cannot start a forged log line, and cut to a bounded length.
+fn loggable(s: &str) -> String {
+    const MAX: usize = 64;
+    let quoted = format!("{s:?}");
+    if quoted.chars().count() <= MAX {
+        quoted
+    } else {
+        format!("{}...", quoted.chars().take(MAX).collect::<String>())
+    }
+}
+
+/// Why a popup is refused, as the popup's own pane: it is in no tab and no
+/// session tree, so nothing could address it or name where it lives.
+const POPUP_REFUSED: &str = "a popup cannot send or receive messages";
+
+fn log_hint(pane_hint: Option<PaneId>, attributed: PaneId) {
+    if let Some(hint) = pane_hint.filter(|&hint| hint != attributed) {
+        log::info!(
+            "msg: pane_hint=%{hint} disagrees with attribution %{attributed}; using the attribution"
+        );
+    }
+}
+
+/// Store a message from the calling pane. The sender is the attribution,
+/// never `pane_hint` and never anything else the caller sent; a caller that
+/// cannot be attributed is refused rather than sent anonymously.
+#[allow(clippy::too_many_arguments)]
+async fn handle_msg_send(
+    client_id: u64,
+    msg: OutgoingMessage,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    use crate::server::messaging::Refusal;
+
+    let link = links()
+        .lock()
+        .await
+        .peer_name(client_id, std::time::Instant::now())
+        .map(str::to_string);
+    if let Some(link) = link {
+        return handle_link_send(client_id, link, msg, state, panes, config, clients, store).await;
+    }
+    if msg.origin.is_some() {
+        log::warn!(
+            "msg: origin refused (origin_not_allowed): client_id={client_id} peer_pid={} is not a peer link",
+            peer_pid(peer)
+        );
+        return Some(ServerMessage::refused(
+            "origin_not_allowed",
+            "only a peer link may forward a message with its origin",
+        ));
+    }
+
+    let bad_host = msg
+        .to
+        .host
+        .iter()
+        .chain(msg.reply_to.as_ref().and_then(|r| r.host.as_ref()))
+        .find(|host| !valid_host(host));
+    if let Some(host) = bad_host {
+        let refusal = Refusal::BadAddress(format!("bad host {}", loggable(host)));
+        return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+    }
+    if let Some(host) = msg.to.host.clone() {
+        return send_to_host(
+            client_id, host, msg, peer, state, panes, config, clients, store,
+        )
+        .await;
+    }
+    // The CLI parses the address, but the wire accepts any string as a name.
+    if let Target::Name(name) = &msg.to.target {
+        if !valid_name(name) {
+            let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
+            return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+        }
+    }
+
+    let from = match attribute_frame_caller(peer, panes).await {
+        Ok(found) => found,
+        Err(why) => {
+            log::info!(
+                "msg: sender unverified: client_id={client_id} {}{}",
+                why.reason(),
+                msg.pane_hint
+                    .map(|hint| format!(" (pane_hint=%{hint})"))
+                    .unwrap_or_default()
+            );
+            return Some(ServerMessage::refused(
+                "sender_unverified",
+                format!("{}: {}", why.reason(), why.fix()),
+            ));
+        }
+    };
+    log_caller(client_id, "MsgSend", &from);
+    log_hint(msg.pane_hint, from.pane);
+
+    let live = live_panes(panes).await;
+    let (resolved, from_name) = {
+        let store = store.lock().await;
+        (
+            store.resolve(&msg.to.target, |pane| live.contains(&pane)),
+            store.name_of(from.pane).map(str::to_string),
+        )
+    };
+    let to = match resolved {
+        Ok(to) => to,
+        Err(refusal) => return Some(ServerMessage::refused(refusal.code(), refusal.message())),
+    };
+    let (session, to_in_a_tab, from_popup, to_popup) = {
+        let st = state.lock().await;
+        (
+            st.locate_pane(from.pane).map(|(session, _)| session),
+            st.locate_pane(to).is_some(),
+            st.is_popup(from.pane),
+            st.is_popup(to),
+        )
+    };
+    if from_popup {
+        return Some(ServerMessage::refused("sender_unverified", POPUP_REFUSED));
+    }
+    if to_popup {
+        return Some(ServerMessage::refused("no_such_target", POPUP_REFUSED));
+    }
+    let Some(session) = session else {
+        return Some(ServerMessage::refused(
+            "sender_unverified",
+            format!("pane %{} is closing", from.pane),
+        ));
+    };
+    if !to_in_a_tab {
+        let refusal = Refusal::NoSuchTarget(format!("%{to}"));
+        return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+    }
+
+    let bytes = msg.body.len();
+    let submit = msg.deliver != Deliver::Mailbox;
+    let reply_tx = if submit {
+        clients
+            .lock()
+            .await
+            .get(&client_id)
+            .map(|conn| conn.tx.clone())
+    } else {
+        None
+    };
+    // The parked-send check, the store and the enqueue are one section, so a
+    // send refused `bad_request` is never stored: its sender is told it was
+    // refused, and a message it cannot know about must not reach the pane.
+    let enqueued_at = std::time::Instant::now();
+    let deadline = submit_deadline(enqueued_at, msg.defer, msg.timeout_ms);
+    let wait_until = msg.wait.then(|| enqueued_at + wait_timeout(msg.timeout_ms));
+    let (sent, swept, answered, queued) = {
+        let mut store = store.lock().await;
+        if submit && (store.has_parked_send(client_id) || forward_parked(client_id)) {
+            drop(store);
+            log::info!(
+                "msg: refused from=%{} to=%{to}: bad_request (a send is already waiting)",
+                from.pane
+            );
+            return Some(ServerMessage::refused(
+                "bad_request",
+                "this connection already has a message waiting to be typed",
+            ));
+        }
+        let to_name = store.name_of(to).map(str::to_string);
+        let body = submit.then(|| msg.body.clone());
+        let sent = store
+            .send(
+                Sender::Pane {
+                    pane_id: from.pane,
+                    name: from_name.clone(),
+                    session,
+                },
+                to,
+                msg.body,
+                msg.reply_to,
+                now_ms(),
+                std::time::Instant::now(),
+            )
+            .map(|id| (id, to_name));
+        let answered = if sent.is_ok() {
+            store.answer_waiters(to, now_ms())
+        } else {
+            Vec::new()
+        };
+        let queued = match (&sent, body) {
+            (Ok((id, _)), Some(body)) => Some(
+                store.enqueue_submit(
+                    crate::server::messaging::SubmitEntry {
+                        id: *id,
+                        pane: to,
+                        deliver: msg.deliver,
+                        body,
+                        from: crate::server::messaging::SubmitFrom::Pane {
+                            pane: from.pane,
+                            name: from_name.clone(),
+                        },
+                        enqueued_at,
+                        defer: msg.defer,
+                        deadline,
+                        had_reply: reply_tx.is_some(),
+                        reply: reply_tx
+                            .map(|tx| crate::server::messaging::Reply::new(client_id, tx, None)),
+                        put_back: 0,
+                        waiting_on: None,
+                        wait_until,
+                    },
+                    config.messaging.submit_queue_len(),
+                ),
+            ),
+            _ => None,
+        };
+        (sent, store.take_swept(), answered, queued)
+    };
+    // The panel's unread count changed, though the pane printed nothing.
+    mark_agents_dirty();
+    for (waiter, messages) in answered {
+        log::info!(
+            "msg: wait on %{to} answered n={} for client_id={}",
+            messages.len(),
+            waiter.client_id
+        );
+        let _ = waiter.tx.send(ServerMessage::MsgList {
+            pane: to,
+            messages,
+            timed_out: false,
+            marked: waiter.mark,
+        });
+    }
+    if swept > 0 {
+        log::info!("msg: swept {swept} expired message(s)");
+    }
+    match sent {
+        Ok((id, to_name)) => {
+            log::info!(
+                "msg: id={id} from=%{}({}) to=%{to} bytes={bytes} deliver={:?}{} -> mailbox",
+                from.pane,
+                from_name.as_deref().unwrap_or("-"),
+                msg.deliver,
+                if msg.defer && submit { " defer" } else { "" }
+            );
+            let resolved = Resolved {
+                host: None,
+                pane_id: to,
+                name: to_name,
+            };
+            answer_enqueued(id, to, resolved, msg.deliver, queued)
+        }
+        Err(refusal) => {
+            log::info!(
+                "msg: refused from=%{} to=%{to}: {}",
+                from.pane,
+                refusal.code()
+            );
+            Some(ServerMessage::refused(refusal.code(), refusal.message()))
+        }
+    }
+}
+
+/// The longest a dial may count for in a forward's deadline, whatever
+/// `[messaging.links] dial_ms` says, so the server always answers a remote
+/// send before the CLI gives up on it (`msg_cli::send_deadline`).
+pub const LINK_DIAL_BUDGET_MS: u64 = 10_000;
+
+/// How long a forward waits for the far server's answer once the link is up.
+pub const FORWARD_ANSWER_MS: u64 = 8_000;
+
+/// The longest the server takes to answer a send to a remote: the caller's
+/// attribution, the dial, and the far server's answer. A CLI waiting less
+/// would report its own timeout over the server's answer.
+pub const FORWARD_BUDGET_MS: u64 =
+    CALLER_ATTRIBUTION_TIMEOUT.as_millis() as u64 + LINK_DIAL_BUDGET_MS + FORWARD_ANSWER_MS;
+
+/// How long after a send is stored its answer may take beyond a mailbox
+/// send's: a submit's whole typing budget, plus the longer of a deferral and
+/// a `--wait` (both count from the store). Zero for the mailbox. The CLI's
+/// deadline and a forward's bound are both built on it, so they agree.
+pub fn submit_answer_budget(
+    deliver: Deliver,
+    defer: bool,
+    wait: bool,
+    timeout_ms: Option<u64>,
+) -> std::time::Duration {
+    use std::time::Duration;
+    let asked = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_SUBMIT_TIMEOUT_MS));
+    let max = Duration::from_millis(MAX_WAIT_MS);
+    let deferred = if defer {
+        asked.clamp(Duration::from_millis(SUBMIT_HOLD_MS), max)
+    } else {
+        Duration::ZERO
+    };
+    let waited = if wait { asked.min(max) } else { Duration::ZERO };
+    match deliver {
+        Deliver::Mailbox => Duration::ZERO,
+        Deliver::Submit | Deliver::Auto => {
+            Duration::from_millis(SUBMIT_BUDGET_MS) + deferred.max(waited)
+        }
+    }
+}
+
+/// The local connections with a send to another server parked, waiting for
+/// the far server's answer: a connection parks one, as for a local submit,
+/// though nothing of it is queued here.
+static FORWARDS_PARKED: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
+
+/// A connection's parked forward, given back when it is dropped.
+struct ParkedForward(u64);
+
+impl ParkedForward {
+    /// Park a forward for `client_id`, or `None` when it already has one.
+    fn take(client_id: u64) -> Option<Self> {
+        FORWARDS_PARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(Default::default)
+            .insert(client_id)
+            .then(|| ParkedForward(client_id))
+    }
+}
+
+/// Whether connection `client_id` has a forward parked.
+fn forward_parked(client_id: u64) -> bool {
+    FORWARDS_PARKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|parked| parked.contains(&client_id))
+}
+
+impl Drop for ParkedForward {
+    fn drop(&mut self) {
+        if let Some(parked) = FORWARDS_PARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            parked.remove(&self.0);
+        }
+    }
+}
+
+/// How long a forward waits, once attributed, for a link dialled within
+/// `dial` to carry it and the far server to answer.
+pub fn forward_wait(dial: std::time::Duration) -> std::time::Duration {
+    dial.min(std::time::Duration::from_millis(LINK_DIAL_BUDGET_MS))
+        + std::time::Duration::from_millis(FORWARD_ANSWER_MS)
+}
+
+/// Where a send to `host:<target>` goes: back over the link `host` holds
+/// open to this server when there is one, else over a link this server
+/// dials to `[remotes.<host>]`.
+#[allow(clippy::too_many_arguments)]
+async fn send_to_host(
+    client_id: u64,
+    host: String,
+    msg: OutgoingMessage,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    use crate::server::links::{route_for, Route};
+
+    let inbound = links()
+        .lock()
+        .await
+        .live_inbound(&host, std::time::Instant::now());
+    match route_for(inbound, config.remotes.contains_key(&host)) {
+        Route::Inbound(link_client) => {
+            reply_over_inbound(
+                client_id,
+                host,
+                link_client,
+                msg,
+                peer,
+                state,
+                panes,
+                config,
+                clients,
+                store,
+            )
+            .await
+        }
+        Route::Dial => {
+            forward_send(
+                client_id, host, msg, peer, state, panes, config, clients, store,
+            )
+            .await
+        }
+        Route::Neither => Some(ServerMessage::refused(
+            "route_unavailable",
+            // `host` passed `valid_host` above, so it prints as itself.
+            format!("no link from {host} and no [remotes.{host}]"),
+        )),
+    }
+}
+
+/// The sending pane of a send that leaves this server, and its session, or
+/// the refusal to answer instead.
+async fn forwarding_sender(
+    client_id: u64,
+    pane_hint: Option<PaneId>,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Result<(PaneId, String), Box<ServerMessage>> {
+    let from = match attribute_frame_caller(peer, panes).await {
+        Ok(found) => found,
+        Err(why) => {
+            log::info!(
+                "msg: sender unverified: client_id={client_id} {}",
+                why.reason()
+            );
+            return Err(Box::new(ServerMessage::refused(
+                "sender_unverified",
+                format!("{}: {}", why.reason(), why.fix()),
+            )));
+        }
+    };
+    log_caller(client_id, "MsgSend", &from);
+    log_hint(pane_hint, from.pane);
+    let (session, from_popup) = {
+        let st = state.lock().await;
+        (
+            st.locate_pane(from.pane).map(|(session, _)| session),
+            st.is_popup(from.pane),
+        )
+    };
+    if from_popup {
+        return Err(Box::new(ServerMessage::refused(
+            "sender_unverified",
+            POPUP_REFUSED,
+        )));
+    }
+    match session {
+        Some(session) => Ok((from.pane, session)),
+        None => Err(Box::new(ServerMessage::refused(
+            "sender_unverified",
+            format!("pane %{} is closing", from.pane),
+        ))),
+    }
+}
+
+/// A send to `host`, which holds a live link open to this server: pushed
+/// back over that connection as a [`ServerMessage::MsgInbound`], and
+/// answered from the ack `host` returns, since only `host` can resolve the
+/// target. Mailbox delivery only: `auto` is answered with the reason, and
+/// `submit` refused, so nothing is typed by surprise.
+#[allow(clippy::too_many_arguments)]
+async fn reply_over_inbound(
+    client_id: u64,
+    host: String,
+    link_client: u64,
+    msg: OutgoingMessage,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    use crate::server::messaging::Refusal;
+
+    if msg.deliver == Deliver::Submit {
+        return Some(ServerMessage::refused(
+            "route_unavailable",
+            format!(
+                "{host}: reached over the link it holds open to this server, which delivers to the mailbox only; send it --deliver mailbox",
+                host = loggable(&host)
+            ),
+        ));
+    }
+    let to_name = match &msg.to.target {
+        Target::Name(name) if !valid_name(name) => {
+            let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
+            return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+        }
+        Target::Name(name) => Some(name.clone()),
+        Target::Pane(_) => None,
+    };
+    let (from_pane, session) =
+        match forwarding_sender(client_id, msg.pane_hint, peer, state, panes).await {
+            Ok(found) => found,
+            Err(refusal) => return Some(*refusal),
+        };
+    let (minted, from_name) = {
+        let mut store = store.lock().await;
+        let from_name = store.name_of(from_pane).map(str::to_string);
+        let sender = Sender::Pane {
+            pane_id: from_pane,
+            name: from_name.clone(),
+            session: session.clone(),
+        };
+        let minted = store
+            .check_body(&msg.body)
+            .and_then(|()| store.check_rate(&sender, std::time::Instant::now()))
+            .map(|()| store.mint_id());
+        (minted, from_name)
+    };
+    let id = match minted {
+        Ok(id) => id,
+        Err(refusal) => {
+            log::info!(
+                "msg: refused from=%{from_pane} to {}: {}",
+                loggable(&host),
+                refusal.code()
+            );
+            return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+        }
+    };
+    let bytes = msg.body.len();
+    let target = msg.to.target.clone();
+    let (req, acked) = links().lock().await.expect_ack(link_client);
+    let push = ServerMessage::MsgInbound {
+        to: msg.to.target.clone(),
+        body: msg.body,
+        deliver: Deliver::Mailbox,
+        reply_to: msg.reply_to.map(|r| MsgRef {
+            host: r.host.or_else(|| Some(host.clone())),
+            id: r.id,
+        }),
+        origin: Origin {
+            host: config.messaging.host_name(),
+            pane_id: from_pane,
+            name: from_name,
+            session,
+            id,
+        },
+        req,
+    };
+    let pushed = clients
+        .lock()
+        .await
+        .get(&link_client)
+        .is_some_and(|conn| conn.tx.send(push).is_ok());
+    if !pushed {
+        links().lock().await.forget_ack(req);
+        return Some(ServerMessage::refused(
+            "route_unavailable",
+            format!("{}: the link closed", loggable(&host)),
+        ));
+    }
+    log::info!("msg: id={id} forwarded to {host} over inbound link bytes={bytes}");
+    let ack =
+        tokio::time::timeout(std::time::Duration::from_millis(FORWARD_ANSWER_MS), acked).await;
+    // Pushed, so `host` may have stored it: no answer is an unknown outcome.
+    let ack = match ack {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) => {
+            let reason = format!("{}: link lost", loggable(&host));
+            return Some(forward_unknown(id, &host, &target, &reason));
+        }
+        Err(_) => {
+            links().lock().await.forget_ack(req);
+            let reason = format!("{}: no answer", loggable(&host));
+            return Some(forward_unknown(id, &host, &target, &reason));
+        }
+    };
+    if ack.code.is_some() {
+        let (code, message) = crate::server::links::far_refusal(
+            ack.code.as_deref(),
+            ack.message.as_deref().unwrap_or(""),
+        );
+        log::info!("msg: id={id} refused by {host}: {code}");
+        return Some(ServerMessage::refused(
+            "remote_refused",
+            format!("{host} refused: {code}: {message}"),
+        ));
+    }
+    // A success names where it was stored; one that does not is no answer.
+    let (Some(_), Some(pane_id)) = (ack.id, ack.pane_id) else {
+        let reason = format!("{}: a bad ack (no id or pane)", loggable(&host));
+        return Some(forward_unknown(id, &host, &target, &reason));
+    };
+    Some(ServerMessage::MsgSent {
+        id,
+        to: Resolved {
+            host: Some(host),
+            pane_id,
+            name: to_name,
+        },
+        delivery: Delivery::Forwarded,
+        reason: (msg.deliver == Deliver::Auto).then(|| "inbound_mailbox_only".to_string()),
+        timed_out: false,
+        final_state: None,
+        req: None,
+    })
+}
+
+/// What the peer is told when `inbound = "replies"` refuses a reply for its
+/// id: which check failed (no forward from that pane, an id never minted
+/// for it, an expired or exhausted one) stays in this server's log, so a
+/// peer cannot probe which panes forwarded and which ids are live.
+const NOT_EXPECTED: &str = "not a reply this server expects";
+
+/// The refusals of messages that came over dialled links, logged once per
+/// link and code in each 10 s window, with a count of the rest when the
+/// window turns: the peer decides how many it sends.
+#[derive(Default)]
+struct RefusalLog {
+    windows: HashMap<String, (std::time::Instant, std::collections::HashSet<String>, u64)>,
+}
+
+/// What [`RefusalLog::note`] says to log.
+#[derive(Debug, PartialEq, Eq)]
+struct RefusalNote {
+    /// This refusal, the first of its code on its link in the window.
+    log_this: bool,
+    /// Refusals left unlogged in the window that just ended.
+    unlogged_before: u64,
+}
+
+impl RefusalLog {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn note(&mut self, link: &str, code: &str, now: std::time::Instant) -> RefusalNote {
+        let entry = self
+            .windows
+            .entry(link.to_string())
+            .or_insert_with(|| (now, Default::default(), 0));
+        let mut unlogged_before = 0;
+        if now.saturating_duration_since(entry.0) >= Self::WINDOW {
+            unlogged_before = entry.2;
+            *entry = (now, Default::default(), 0);
+        }
+        let log_this = entry.1.insert(code.to_string());
+        if !log_this {
+            entry.2 += 1;
+        }
+        RefusalNote {
+            log_this,
+            unlogged_before,
+        }
+    }
+}
+
+static INBOUND_REFUSALS: std::sync::Mutex<Option<RefusalLog>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+mod refusal_log_tests {
+    use super::{RefusalLog, RefusalNote};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn each_code_is_logged_once_per_link_per_window_and_the_rest_counted() {
+        let mut log = RefusalLog::default();
+        let t0 = Instant::now();
+        let first = RefusalNote {
+            log_this: true,
+            unlogged_before: 0,
+        };
+        assert_eq!(log.note("mini", "origin_not_allowed", t0), first);
+        for _ in 0..5 {
+            assert!(!log.note("mini", "origin_not_allowed", t0).log_this);
+        }
+        assert_eq!(
+            log.note("mini", "bad_address", t0),
+            first,
+            "another code is news"
+        );
+        assert_eq!(
+            log.note("mini2", "origin_not_allowed", t0),
+            first,
+            "another link too"
+        );
+        let later = t0 + Duration::from_secs(11);
+        assert_eq!(
+            log.note("mini", "origin_not_allowed", later),
+            RefusalNote {
+                log_this: true,
+                unlogged_before: 5,
+            }
+        );
+    }
+}
+
+/// Log a refusal of a message from the dialled link `link`, by `kind`: the
+/// code, or for the reply gate which of its checks failed, so each kind is
+/// news once per window and a flood of one kind is a count.
+fn log_inbound_refusal(link: &str, from_pane: PaneId, kind: &str, code: &str, why: &str) {
+    let note = INBOUND_REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(RefusalLog::default)
+        .note(link, kind, std::time::Instant::now());
+    if note.unlogged_before > 0 {
+        log::info!(
+            "msg: inbound from {link}: {} more refusal(s) in the last 10s, not logged one by one",
+            note.unlogged_before
+        );
+    }
+    if note.log_this {
+        log::info!("msg: inbound from {link}:%{from_pane} refused: {code} ({why})");
+    }
+}
+
+/// Why a message that came back over a dialled link is refused before it
+/// is resolved.
+struct InboundRefusal {
+    code: &'static str,
+    /// Which check, for [`log_inbound_refusal`].
+    kind: &'static str,
+    /// The detail, for this server's log.
+    why: String,
+    /// What the peer is told, when it is not `why`.
+    told: Option<&'static str>,
+}
+
+impl InboundRefusal {
+    fn new(code: &'static str, kind: &'static str, why: String) -> Self {
+        InboundRefusal {
+            code,
+            kind,
+            why,
+            told: None,
+        }
+    }
+}
+
+/// The checks that need nothing but the request and the minted ids. The
+/// address checks come first, so a malformed request never counts as a
+/// reply to an id.
+/// `Some((pane, id))` when the message is a reply the gate admitted on that
+/// id, to be counted once it is stored.
+async fn gate_inbound(
+    req: &crate::server::links::InboundRequest,
+    store: &'static Mutex<Messaging>,
+) -> Result<Option<(PaneId, MsgId)>, InboundRefusal> {
+    use crate::config::Inbound;
+    use crate::server::messaging::ReplyGate;
+
+    let link = &req.link;
+    if let Some(host) = req
+        .reply_to
+        .as_ref()
+        .and_then(|r| r.host.as_deref())
+        .filter(|host| !valid_host(host))
+    {
+        return Err(InboundRefusal::new(
+            "bad_address",
+            "reply_to_host",
+            format!("bad reply_to host {}", loggable(host)),
+        ));
+    }
+    if let Some(name) = req.origin.name.as_deref().filter(|name| !valid_name(name)) {
+        return Err(InboundRefusal::new(
+            "bad_address",
+            "origin_name",
+            format!("bad origin name {}", loggable(name)),
+        ));
+    }
+    if let Target::Name(name) = &req.to {
+        if !valid_name(name) {
+            return Err(InboundRefusal::new(
+                "bad_address",
+                "target_name",
+                format!("bad name {}", loggable(name)),
+            ));
+        }
+    }
+    match req.policy {
+        Inbound::Off => Err(InboundRefusal::new(
+            "origin_not_allowed",
+            "off",
+            format!("inbound = off for {link}"),
+        )),
+        Inbound::Replies | Inbound::Unknown => {
+            let Target::Pane(pane) = req.to else {
+                return Err(InboundRefusal::new(
+                    "origin_not_allowed",
+                    "by_name",
+                    "inbound = replies admits replies to a pane, not a name".to_string(),
+                ));
+            };
+            let Some(reply_to) = &req.reply_to else {
+                return Err(InboundRefusal::new(
+                    "origin_not_allowed",
+                    "no_reply_to",
+                    "a reply needs --reply-to".to_string(),
+                ));
+            };
+            let gate = store
+                .lock()
+                .await
+                .check_reply(link, pane, reply_to.id, now_ms());
+            let (kind, why) = match gate {
+                Ok(()) => return Ok(Some((pane, reply_to.id))),
+                Err(ReplyGate::NoForward) => (
+                    "no_forward",
+                    format!("no message from %{pane} was forwarded over {link}"),
+                ),
+                Err(ReplyGate::NotMinted(id)) => {
+                    ("not_minted", format!("id {id} was not minted for %{pane}"))
+                }
+                Err(ReplyGate::Expired(id)) => ("expired", format!("id {id} has expired")),
+                Err(ReplyGate::Exhausted(id)) => (
+                    "exhausted",
+                    format!(
+                        "id {id} has had its {} replies",
+                        crate::server::messaging::MAX_REPLIES_PER_ID
+                    ),
+                ),
+            };
+            Err(InboundRefusal {
+                told: Some(NOT_EXPECTED),
+                ..InboundRefusal::new("origin_not_allowed", kind, why)
+            })
+        }
+        Inbound::Any => Ok(None),
+    }
+}
+
+/// A message that came back over a link this server dialled: gated by the
+/// link's `inbound`, then stored as a send from that link would be. Answered
+/// with the ack the link writes back. Every refusal counts against the
+/// link's rate, as a stored message does.
+async fn handle_inbound(
+    req: crate::server::links::InboundRequest,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    store: &'static Mutex<Messaging>,
+) -> crate::server::links::InboundAck {
+    use crate::server::links::InboundAck;
+    use crate::server::messaging::{Arrival, LinkSide, Refusal};
+
+    let link = req.link.clone();
+    let from_pane = req.origin.pane_id;
+    let per_10s = config.messaging.link_rate_per_10s();
+    let refuse = |code: &str, why: String| {
+        log_inbound_refusal(&link, from_pane, code, code, &why);
+        InboundAck::refused(code, why)
+    };
+    if let Err(full) = store
+        .lock()
+        .await
+        .link_has_room(&link, per_10s, std::time::Instant::now())
+    {
+        return refuse(full.code(), full.message());
+    }
+    let charged = |store: &'static Mutex<Messaging>, link: String| async move {
+        store
+            .lock()
+            .await
+            .charge_link(&link, std::time::Instant::now());
+    };
+    let admitted = match gate_inbound(&req, store).await {
+        Ok(admitted) => admitted,
+        Err(refused) => {
+            charged(store, link.clone()).await;
+            log_inbound_refusal(&link, from_pane, refused.kind, refused.code, &refused.why);
+            return InboundAck::refused(
+                refused.code,
+                refused.told.map_or(refused.why, str::to_string),
+            );
+        }
+    };
+    let live = live_panes(panes).await;
+    let resolved = store
+        .lock()
+        .await
+        .resolve(&req.to, |pane| live.contains(&pane));
+    let to = match resolved {
+        Ok(to) => to,
+        Err(refusal) => {
+            charged(store, link.clone()).await;
+            return refuse(refusal.code(), refusal.message());
+        }
+    };
+    if state.lock().await.locate_pane(to).is_none() {
+        charged(store, link.clone()).await;
+        let refusal = Refusal::NoSuchTarget(format!("%{to}"));
+        return refuse(refusal.code(), refusal.message());
+    }
+    let bytes = req.body.len();
+    let (sent, answered) = {
+        let mut store = store.lock().await;
+        let sent = store.send_arrival(
+            Sender::Remote {
+                host: link.clone(),
+                pane_id: from_pane,
+                name: req.origin.name,
+            },
+            to,
+            req.body,
+            req.reply_to,
+            Arrival {
+                link: &link,
+                side: LinkSide::Dialled,
+                link_rate_per_10s: per_10s,
+                origin: MsgRef {
+                    host: Some(link.clone()),
+                    id: req.origin.id,
+                },
+            },
+            now_ms(),
+            std::time::Instant::now(),
+        );
+        match &sent {
+            Ok(_) => {
+                if let Some((pane, reply_to)) = admitted {
+                    store.count_reply(&link, pane, reply_to);
+                }
+            }
+            Err(Refusal::LinkRateLimited { .. }) => {}
+            Err(_) => store.charge_link(&link, std::time::Instant::now()),
+        }
+        let answered = if sent.is_ok() {
+            store.answer_waiters(to, now_ms())
+        } else {
+            Vec::new()
+        };
+        (sent, answered)
+    };
+    mark_agents_dirty();
+    for (waiter, messages) in answered {
+        let _ = waiter.tx.send(ServerMessage::MsgList {
+            pane: to,
+            messages,
+            timed_out: false,
+            marked: waiter.mark,
+        });
+    }
+    match sent {
+        Ok(id) => {
+            log::info!(
+                "msg: id={id} inbound from {link}:%{from_pane} to=%{to} bytes={bytes} -> mailbox"
+            );
+            InboundAck {
+                id: Some(id),
+                pane_id: Some(to),
+                ..InboundAck::default()
+            }
+        }
+        Err(refusal) => refuse(refusal.code(), refusal.message()),
+    }
+}
+
+/// How many messages that came back over dialled links may wait to be
+/// stored, across every link. Each link already holds at most
+/// [`crate::server::links::INBOUND_IN_FLIGHT`] unanswered; this bounds the
+/// sum.
+const INBOUND_QUEUE: usize = 64;
+
+/// Where every link this server dials hands the messages that come back
+/// over it.
+static INBOUND: std::sync::OnceLock<crate::server::links::InboundTx> = std::sync::OnceLock::new();
+
+/// Store each message that comes back over a dialled link, one at a time.
+async fn run_inbound(
+    mut requests: crate::server::links::InboundRx,
+    state: Arc<Mutex<ServerState>>,
+    panes: Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: Arc<Config>,
+) {
+    while let Some((req, reply)) = requests.recv().await {
+        let ack = handle_inbound(req, &state, &panes, &config, messaging()).await;
+        let _ = reply.send(ack);
+    }
+}
+
+/// A send to `host:<target>` over the link this server dials to
+/// `[remotes.<host>]`: attributed and rate-checked here, then forwarded with
+/// its origin, and stored only there. Only mailbox delivery crosses a link
+/// in this build.
+#[allow(clippy::too_many_arguments)]
+async fn forward_send(
+    client_id: u64,
+    host: String,
+    msg: OutgoingMessage,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    use crate::server::links::Forward;
+    use crate::server::messaging::Refusal;
+
+    let Some(remote) = config.remotes.get(&host).cloned() else {
+        return Some(ServerMessage::refused(
+            "route_unavailable",
+            format!("no remote named {} in [remotes]", loggable(&host)),
+        ));
+    };
+    if let Target::Name(name) = &msg.to.target {
+        if !valid_name(name) {
+            let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
+            return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+        }
+    }
+    let (from_pane, session) =
+        match forwarding_sender(client_id, msg.pane_hint, peer, state, panes).await {
+            Ok(found) => found,
+            Err(refusal) => return Some(*refusal),
+        };
+    // A typed send parks this connection until the far server answers, as a
+    // local one does: one at a time, and never beside a local one.
+    let submit = msg.deliver != Deliver::Mailbox;
+    let _parked = if submit {
+        let local = store.lock().await.has_parked_send(client_id);
+        match ParkedForward::take(client_id).filter(|_| !local) {
+            Some(parked) => Some(parked),
+            None => {
+                log::info!("msg: refused from=%{from_pane} to {host}: bad_request (a send is already waiting)");
+                return Some(ServerMessage::refused(
+                    "bad_request",
+                    "this connection already has a message waiting to be typed",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let (minted, from_name) = {
+        let mut store = store.lock().await;
+        let from_name = store.name_of(from_pane).map(str::to_string);
+        let sender = Sender::Pane {
+            pane_id: from_pane,
+            name: from_name.clone(),
+            session: session.clone(),
+        };
+        (
+            store
+                .check_rate(&sender, std::time::Instant::now())
+                .map(|()| store.mint_for(&host, from_pane, now_ms())),
+            from_name,
+        )
+    };
+    let id = match minted {
+        Ok(id) => id,
+        Err(refusal) => {
+            log::info!(
+                "msg: refused from=%{} to={}: {}",
+                from_pane,
+                loggable(&msg.to.to_string()),
+                refusal.code()
+            );
+            return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+        }
+    };
+    let bytes = msg.body.len();
+    let target = msg.to.target.clone();
+    log::info!(
+        "msg: id={id} forwarded to {host} (origin=%{}) bytes={bytes}",
+        from_pane
+    );
+    let host_name = config.messaging.host_name();
+    let forwarded = ClientMessage::MsgSend {
+        to: Address {
+            host: None,
+            target: msg.to.target.clone(),
+        },
+        body: msg.body,
+        deliver: msg.deliver,
+        // The thread names the server whose id it is, as the far side sees it.
+        reply_to: msg.reply_to.map(|r| MsgRef {
+            host: r.host.or_else(|| Some(host.clone())),
+            id: r.id,
+        }),
+        pane_hint: None,
+        defer: msg.defer,
+        timeout_ms: msg.timeout_ms,
+        wait: msg.wait,
+        origin: Some(Origin {
+            host: host_name,
+            pane_id: from_pane,
+            name: from_name,
+            session,
+            id,
+        }),
+        req: None,
+    };
+    let spec = link_spec(&host, remote, config);
+    let dial = spec.dial;
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    let started = links().lock().await.forward(
+        spec,
+        Forward {
+            msg: forwarded,
+            reply,
+        },
+    );
+    if let Some(dial) = started {
+        tokio::spawn(crate::server::links::run_link(dial));
+    }
+    let budget =
+        forward_wait(dial) + submit_answer_budget(msg.deliver, msg.defer, msg.wait, msg.timeout_ms);
+    let forward = AwaitedForward {
+        id,
+        host,
+        target,
+        submit,
+        budget,
+    };
+    if !submit {
+        return Some(forward.answer(answer).await);
+    }
+    // A typed send parks: the connection goes on reading, so a second typed
+    // send on it is refused while this one waits, as for a local submit.
+    let tx = clients
+        .lock()
+        .await
+        .get(&client_id)
+        .map(|conn| conn.tx.clone())?;
+    tokio::spawn(async move {
+        let message = forward.answer(answer).await;
+        let _ = tx.send(message);
+        drop(_parked);
+    });
+    None
+}
+
+/// The link to `[remotes.<host>]`, as this server dials it.
+fn link_spec(
+    host: &str,
+    remote: crate::config::RemoteConfig,
+    config: &Config,
+) -> crate::server::links::LinkSpec {
+    crate::server::links::LinkSpec {
+        key: host.to_string(),
+        remote,
+        host_name: config.messaging.host_name(),
+        dial: config.messaging.links.dial(),
+        ping_ms: config.messaging.links.ping_ms,
+        idle: std::time::Duration::from_millis(config.messaging.links.idle_ms),
+        on_inbound: INBOUND.get().cloned(),
+    }
+}
+
+/// `agent status` or `agent wait` about a pane on `[remotes.<host>]`: `msg`,
+/// its host already stripped, forwarded over the link, and the far server's
+/// answer relayed under `host`. `wait_bound` is how long the far server may
+/// take to answer beyond a status, zero for a status; without it the
+/// forward would give up before the far server's wait could end. A wait
+/// parks this connection, as a typed send does, and is answered by a task;
+/// a status is answered here.
+#[allow(clippy::too_many_arguments)]
+async fn forward_agent_request(
+    client_id: u64,
+    host: String,
+    msg: ClientMessage,
+    wait_bound: std::time::Duration,
+    config: &Arc<Config>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    let Some(remote) = config.remotes.get(&host).cloned() else {
+        return Some(ServerMessage::refused(
+            "route_unavailable",
+            format!("no remote named {} in [remotes]", loggable(&host)),
+        ));
+    };
+    let (asked, targeted) = match &msg {
+        ClientMessage::AgentStatus { target, .. } => ("status", target.is_some()),
+        _ => ("wait", true),
+    };
+    let parked = if asked == "wait" {
+        let local = store.lock().await.has_parked_send(client_id);
+        match ParkedForward::take(client_id).filter(|_| !local) {
+            Some(parked) => Some(parked),
+            None => {
+                return Some(ServerMessage::refused(
+                    "bad_request",
+                    "this connection already has a request waiting",
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    match &msg {
+        ClientMessage::AgentWait { target, state, .. } => log::info!(
+            "agent: wait forwarded to {host} target={} state={state:?}",
+            loggable(&target.to_string())
+        ),
+        ClientMessage::AgentStatus { target, .. } => log::info!(
+            "agent: status forwarded to {host} target={}",
+            target
+                .as_ref()
+                .map_or("None".to_string(), |t| loggable(&t.to_string()))
+        ),
+        _ => {}
+    }
+    let spec = link_spec(&host, remote, config);
+    let budget = forward_wait(spec.dial) + wait_bound;
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    let started = links()
+        .lock()
+        .await
+        .forward(spec, crate::server::links::Forward { msg, reply });
+    if let Some(dial) = started {
+        tokio::spawn(crate::server::links::run_link(dial));
+    }
+    let answered = async move {
+        use crate::server::links::Undelivered;
+        let answer = match tokio::time::timeout(budget, answer).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err(Undelivered::Unknown(format!("{host}: link lost"))),
+            Err(_) => Err(Undelivered::Unknown(format!(
+                "{host}: no answer in {}s",
+                budget.as_secs()
+            ))),
+        };
+        relay_agent_answer(&host, asked, targeted, answer)
+    };
+    let Some(parked) = parked else {
+        return Some(answered.await);
+    };
+    let tx = clients
+        .lock()
+        .await
+        .get(&client_id)
+        .map(|conn| conn.tx.clone())?;
+    tokio::spawn(async move {
+        let _ = tx.send(answered.await);
+        drop(parked);
+    });
+    None
+}
+
+/// The longest command a far server's status entry keeps. A process may set
+/// its own name, so the far side chooses it, at any length.
+const FAR_COMMAND_MAX: usize = 256;
+
+/// The highest tab index a far server's status entry keeps. No server has
+/// that many tabs; past it the number is only the far side's to inflate.
+const FAR_TAB_INDEX_MAX: usize = 9_999;
+
+/// The far server's answer to a forwarded `agent status` or `agent wait`,
+/// as this server answers its own caller: each pane named under `host`, a
+/// name kept only when it could be one, the session and command bounded as
+/// labels, and at most one entry for a request about one pane. A request
+/// that was never answered is `route_unavailable` either way: unlike a
+/// send, asking twice has no effect to duplicate.
+fn relay_agent_answer(
+    host: &str,
+    asked: &str,
+    targeted: bool,
+    answer: crate::server::links::Answer,
+) -> ServerMessage {
+    use crate::server::links::Undelivered;
+    match answer {
+        Ok(ServerMessage::AgentStatusList { mut panes, .. }) => {
+            if targeted {
+                panes.truncate(1);
+            }
+            log::info!("agent: {host} answered status: {} entries", panes.len());
+            for entry in &mut panes {
+                entry.host = Some(host.to_string());
+                entry.name = entry.name.take().filter(|name| valid_name(name));
+                entry.session = crate::server::messaging::session_label(&entry.session);
+                entry.command = entry
+                    .command
+                    .take()
+                    .map(|command| command.chars().take(FAR_COMMAND_MAX).collect());
+                entry.tab_index = entry.tab_index.min(FAR_TAB_INDEX_MAX);
+            }
+            ServerMessage::AgentStatusList { panes, req: None }
+        }
+        Ok(ServerMessage::AgentWaited {
+            target,
+            state,
+            timed_out,
+            ..
+        }) => {
+            log::info!("agent: {host} answered wait: {state:?} timed_out={timed_out}");
+            ServerMessage::AgentWaited {
+                target: Resolved {
+                    host: Some(host.to_string()),
+                    pane_id: target.pane_id,
+                    name: target.name.filter(|name| valid_name(name)),
+                },
+                state,
+                timed_out,
+                req: None,
+            }
+        }
+        Ok(ServerMessage::Error { message, code, .. }) => {
+            let (code, message) = crate::server::links::far_refusal(code.as_deref(), &message);
+            log::info!("agent: {host} refused {asked}: {code}");
+            ServerMessage::refused(
+                "remote_refused",
+                format!("{host} refused: {code}: {message}"),
+            )
+        }
+        Ok(other) => ServerMessage::refused(
+            "route_unavailable",
+            format!("{host} answered {}", other.variant_name()),
+        ),
+        Err(Undelivered::NotSent(reason) | Undelivered::Unknown(reason)) => {
+            log::info!("agent: {asked} to {host} not answered: {reason}");
+            ServerMessage::refused("route_unavailable", reason)
+        }
+    }
+}
+
+#[cfg(test)]
+mod relay_agent_answer_tests {
+    use super::{relay_agent_answer, FAR_COMMAND_MAX, FAR_TAB_INDEX_MAX};
+    use crate::protocol::{PaneStatusEntry, ServerMessage};
+
+    #[test]
+    fn a_far_status_entry_is_bounded_before_it_is_relayed() {
+        let far = PaneStatusEntry {
+            pane_id: 7,
+            session: format!("s\u{1b}[2J{}", "x".repeat(1000)),
+            tab_index: usize::MAX,
+            command: Some("c".repeat(10_000)),
+            state: None,
+            name: Some("Not A Name".into()),
+            unread: 0,
+            host: None,
+        };
+        let answer = ServerMessage::AgentStatusList {
+            panes: vec![far],
+            req: Some(3),
+        };
+        let ServerMessage::AgentStatusList { panes, req } =
+            relay_agent_answer("mini", "status", true, Ok(answer))
+        else {
+            panic!("a list is relayed as a list");
+        };
+        let entry = &panes[0];
+        assert_eq!(req, None);
+        assert_eq!(entry.host.as_deref(), Some("mini"));
+        assert_eq!(
+            entry.name, None,
+            "a far name that could not be one is dropped"
+        );
+        assert!(
+            entry.session.chars().count() <= 128 && !entry.session.contains('\u{1b}'),
+            "{:?}",
+            entry.session
+        );
+        assert_eq!(
+            entry.command.as_deref().map(|c| c.chars().count()),
+            Some(FAR_COMMAND_MAX)
+        );
+        assert_eq!(entry.tab_index, FAR_TAB_INDEX_MAX);
+    }
+}
+
+/// A forward written to a link, and how to answer its caller.
+struct AwaitedForward {
+    id: MsgId,
+    host: String,
+    target: Target,
+    submit: bool,
+    budget: std::time::Duration,
+}
+
+impl AwaitedForward {
+    /// The caller's answer, from the far server's answer or its absence.
+    async fn answer(
+        self,
+        answer: tokio::sync::oneshot::Receiver<crate::server::links::Answer>,
+    ) -> ServerMessage {
+        use crate::server::links::Undelivered;
+        let AwaitedForward {
+            id,
+            host,
+            target,
+            submit,
+            budget,
+        } = self;
+        let answer = match tokio::time::timeout(budget, answer).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err(Undelivered::Unknown(format!("{host}: link lost"))),
+            Err(_) => Err(Undelivered::Unknown(format!(
+                "{host}: no answer in {}s",
+                budget.as_secs()
+            ))),
+        };
+        match answer {
+            Ok(ServerMessage::MsgSent {
+                to,
+                delivery,
+                reason,
+                timed_out,
+                final_state,
+                ..
+            }) => {
+                log::info!("msg: id={id} -> {host}:%{} (forwarded)", to.pane_id);
+                // A mailbox send is the far server's to store: forwarded. A
+                // typed one is answered with what the far server's typing
+                // came to, as a local one would be.
+                let (delivery, reason) = if submit {
+                    let reason =
+                        reason.map(|reason| crate::server::links::far_refusal(Some(&reason), "").0);
+                    (delivery, reason)
+                } else {
+                    (Delivery::Forwarded, None)
+                };
+                ServerMessage::MsgSent {
+                    id,
+                    to: Resolved {
+                        host: Some(host),
+                        pane_id: to.pane_id,
+                        // The far server's word for the pane's name, kept
+                        // only when it could be one.
+                        name: to.name.filter(|name| valid_name(name)),
+                    },
+                    delivery,
+                    reason,
+                    timed_out,
+                    final_state,
+                    req: None,
+                }
+            }
+            Ok(ServerMessage::Error { message, code, .. }) => {
+                let (code, message) = crate::server::links::far_refusal(code.as_deref(), &message);
+                log::info!("msg: id={id} refused by {host}: {code}");
+                ServerMessage::refused(
+                    "remote_refused",
+                    format!("{host} refused: {code}: {message}"),
+                )
+            }
+            Ok(other) => forward_unknown(
+                id,
+                &host,
+                &target,
+                &format!("{host} answered {}", other.variant_name()),
+            ),
+            Err(Undelivered::NotSent(reason)) => {
+                log::info!("msg: id={id} not forwarded: {reason}");
+                ServerMessage::refused("route_unavailable", reason)
+            }
+            Err(Undelivered::Unknown(reason)) => forward_unknown(id, &host, &target, &reason),
+        }
+    }
+}
+
+/// A forward that reached the link and was not answered: the far server may
+/// have stored it, so the caller is told how to look before sending it again,
+/// which could deliver it twice.
+fn forward_unknown(id: MsgId, host: &str, target: &Target, reason: &str) -> ServerMessage {
+    log::info!("msg: id={id} outcome unknown: {reason}");
+    let look = match target {
+        Target::Pane(pane) => format!("`remux msg read --pane %{pane} --all` on {host}"),
+        Target::Name(name) => {
+            format!("`remux msg read --pane %N --all` on {host}, for the pane named {name}")
+        }
+    };
+    ServerMessage::refused(
+        "forward_unknown",
+        format!("{reason}; the outcome is unknown: check {look} before re-sending"),
+    )
+}
+
+/// The connection's peer pid, for a log line: `?` when it cannot be read.
+fn peer_pid(peer: &identity::Peer) -> String {
+    use identity::PeerPin;
+    peer.begin()
+        .map_or_else(|_| "?".to_string(), |(pid, _)| pid.to_string())
+}
+
+/// How often expired inbound links are swept: well inside the shortest
+/// expiry, twice a one-second ping.
+const LINK_EXPIRY_SWEEP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Log each expired inbound link, and the connections to close for them.
+fn log_expired(expired: Vec<(String, std::time::Duration, u64)>) -> Vec<u64> {
+    expired
+        .into_iter()
+        .map(|(name, limit, client_id)| {
+            log::info!(
+                "peer link {name}: expired (no ping for {}s); closing client_id={client_id}",
+                limit.as_secs_f64()
+            );
+            client_id
+        })
+        .collect()
+}
+
+/// Close each connection in `ids` from this end, so that its far side sees
+/// EOF: a lapsed peer link, which the dialling side must re-dial rather than
+/// keep pinging while every message on it is refused.
+async fn close_connections(clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>, ids: &[u64]) {
+    if ids.is_empty() {
+        return;
+    }
+    static NO_CLOSER_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let cls = clients.lock().await;
+    for id in ids {
+        // A connection already gone needs no closing; one still here that
+        // has no closer stays open, which is the zombie link this exists
+        // to end.
+        let Some(conn) = cls.get(id) else { continue };
+        match &conn.closer {
+            Some(fd) => {
+                // SAFETY: `fd` is an open descriptor this connection owns
+                // for its whole life; shutdown affects the socket, not the
+                // fd.
+                unsafe {
+                    libc::shutdown(std::os::fd::AsRawFd::as_raw_fd(fd), libc::SHUT_RDWR);
+                }
+            }
+            None if !NO_CLOSER_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) => {
+                log::warn!(
+                    "peer link: cannot close client_id={id}, which has no second descriptor; \
+                     it stays open until its far side closes it (logged once)"
+                );
+            }
+            None => {}
+        }
+    }
+}
+
+/// A `PeerLink`: admit the connection as a link from the server `name`, or
+/// refuse it. `None` when it is admitted, since nothing waits on that: the
+/// declaring server learns it from the `Pong` to the ping it sends next.
+async fn handle_peer_link(
+    client_id: u64,
+    name: &str,
+    ping_ms: u64,
+    peer: &Arc<identity::Peer>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> Option<ServerMessage> {
+    use crate::server::links::Declare;
+    use identity::{PeerPin, PeerRefusal};
+
+    if !valid_host(name) {
+        return Some(ServerMessage::refused(
+            "bad_address",
+            format!("bad peer link name {}", loggable(name)),
+        ));
+    }
+    if let Some(held) = links()
+        .lock()
+        .await
+        .peer_name(client_id, std::time::Instant::now())
+    {
+        return Some(ServerMessage::refused(
+            "bad_request",
+            format!("this connection is already the peer link {held}"),
+        ));
+    }
+    let seam = peer_seam();
+    let server_pid = std::process::id() as i32;
+    let peer = Arc::clone(peer);
+    let checked = tokio::time::timeout(CALLER_ATTRIBUTION_TIMEOUT, async {
+        let index = proc_index(&*panes.lock().await);
+        tokio::task::spawn_blocking(move || {
+            let table = identity::system_table();
+            let (pid, mark) = match peer.begin() {
+                Ok(begun) => begun,
+                Err(why) => return (None, Err(PeerRefusal::Unverified(why))),
+            };
+            let verdict = identity::peer_link_check(pid, server_pid, seam, &index, &table);
+            let pinned = peer.confirm(mark, &table);
+            (
+                Some(pid),
+                pinned.map_err(PeerRefusal::Unverified).and(verdict),
+            )
+        })
+        .await
+    })
+    .await;
+    let (pid, verdict) = match checked {
+        Ok(Ok(found)) => found,
+        Ok(Err(e)) => {
+            log::warn!("identity: peer link check failed: {e}");
+            (
+                None,
+                Err(PeerRefusal::Unverified(identity::Unverified::CheckFailed)),
+            )
+        }
+        Err(_) => (
+            None,
+            Err(PeerRefusal::Unverified(identity::Unverified::TimedOut)),
+        ),
+    };
+    let pid = pid.map_or("?".to_string(), |pid| pid.to_string());
+    let sshd = match verdict {
+        Ok(sshd) => sshd,
+        Err(refusal) => {
+            log::info!(
+                "peer link {name}: refused client_id={client_id} peer_pid={pid}: {} ({})",
+                refusal.reason(),
+                refusal.ended()
+            );
+            return Some(ServerMessage::refused(
+                "sender_unverified",
+                refusal.reason(),
+            ));
+        }
+    };
+    let ping = crate::server::links::declared_ping(ping_ms);
+    let (declared, mut closing) = {
+        let mut links = links().lock().await;
+        let closing = log_expired(links.expire(std::time::Instant::now()));
+        (links.declare(name, client_id, ping), closing)
+    };
+    if let Ok(Some(old)) = declared {
+        log::info!("peer link {name}: expired; closing client_id={old}");
+        closing.push(old);
+    }
+    close_connections(clients, &closing).await;
+    match declared {
+        Ok(_) => {
+            log::info!(
+                "peer link {name}: declared by client_id={client_id} peer_pid={pid} under sshd={sshd}"
+            );
+            None
+        }
+        Err(Declare::Held { retry_after }) => Some(ServerMessage::refused(
+            "name_taken",
+            format!(
+                "peer link \"{name}\" is held by a live link; retry after {}s",
+                retry_after.as_secs()
+            ),
+        )),
+        Err(Declare::AlreadyPeer(held)) => Some(ServerMessage::refused(
+            "bad_request",
+            format!("this connection is already the peer link {held}"),
+        )),
+        Err(Declare::BadName) => Some(ServerMessage::refused(
+            "bad_address",
+            format!("bad peer link name {}", loggable(name)),
+        )),
+    }
+}
+
+/// A `MsgSend` on a peer link: no pane to attribute, since the relay is
+/// sshd's child. The sender is the link's declared name and the origin's
+/// pane; `origin.host` is checked and never stored, so one connection names
+/// one host. Only mailbox delivery arrives over a link in this build.
+#[allow(clippy::too_many_arguments)]
+async fn handle_link_send(
+    client_id: u64,
+    link: String,
+    msg: OutgoingMessage,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    use crate::server::messaging::{Arrival, Refusal};
+
+    let Some(origin) = msg.origin else {
+        return Some(ServerMessage::refused(
+            "bad_request",
+            "a peer link forwards every message with its origin",
+        ));
+    };
+    if !valid_host(&origin.host) {
+        return Some(ServerMessage::refused(
+            "bad_address",
+            format!("bad origin host {}", loggable(&origin.host)),
+        ));
+    }
+    if let Some(name) = origin.name.as_deref().filter(|name| !valid_name(name)) {
+        return Some(ServerMessage::refused(
+            "bad_address",
+            format!("bad origin name {}", loggable(name)),
+        ));
+    }
+    if msg.to.host.is_some() {
+        return Some(ServerMessage::refused(
+            "bad_address",
+            "a forwarded message names a pane on this server",
+        ));
+    }
+    if origin.host != link && links().lock().await.first_host_mismatch(client_id) {
+        log::info!(
+            "peer link {link}: an origin names host {}; stored as {link} (logged once per link)",
+            loggable(&origin.host)
+        );
+    }
+    if let Target::Name(name) = &msg.to.target {
+        if !valid_name(name) {
+            let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
+            return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+        }
+    }
+    let live = live_panes(panes).await;
+    let resolved = store
+        .lock()
+        .await
+        .resolve(&msg.to.target, |pane| live.contains(&pane));
+    let to = match resolved {
+        Ok(to) => to,
+        Err(refusal) => return Some(ServerMessage::refused(refusal.code(), refusal.message())),
+    };
+    if state.lock().await.locate_pane(to).is_none() {
+        let refusal = Refusal::NoSuchTarget(format!("%{to}"));
+        return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+    }
+    let bytes = msg.body.len();
+    let from_pane = origin.pane_id;
+    let submit = msg.deliver != Deliver::Mailbox;
+    let reply_tx = if submit {
+        clients
+            .lock()
+            .await
+            .get(&client_id)
+            .map(|conn| conn.tx.clone())
+    } else {
+        None
+    };
+    let from = crate::server::messaging::SubmitFrom::Remote {
+        link: link.clone(),
+        pane: from_pane,
+        name: origin.name.clone(),
+        origin_id: origin.id,
+    };
+    let enqueued_at = std::time::Instant::now();
+    let deadline = submit_deadline(enqueued_at, msg.defer, msg.timeout_ms);
+    let wait_until = msg.wait.then(|| enqueued_at + wait_timeout(msg.timeout_ms));
+    // As for a local send: the room to park it is checked in the section
+    // that stores it, so a send refused for want of room is never stored.
+    let (sent, swept, answered, queued) = {
+        let mut store = store.lock().await;
+        if let Some(refusal) = submit
+            .then(|| store.park_refusal(client_id, &from))
+            .flatten()
+        {
+            drop(store);
+            log::info!("msg: refused from {link}:%{from_pane} to=%{to}: queue_full (parked)");
+            return Some(link_full(&refusal));
+        }
+        let to_name = store.name_of(to).map(str::to_string);
+        let body = submit.then(|| msg.body.clone());
+        let sent = store
+            .send_arrival(
+                Sender::Remote {
+                    host: link.clone(),
+                    pane_id: from_pane,
+                    name: origin.name,
+                },
+                to,
+                msg.body,
+                msg.reply_to,
+                Arrival {
+                    link: &link,
+                    side: crate::server::messaging::LinkSide::Inbound,
+                    link_rate_per_10s: config.messaging.link_rate_per_10s(),
+                    origin: MsgRef {
+                        host: Some(link.clone()),
+                        id: origin.id,
+                    },
+                },
+                now_ms(),
+                std::time::Instant::now(),
+            )
+            .map(|id| (id, to_name));
+        let answered = if sent.is_ok() {
+            store.answer_waiters(to, now_ms())
+        } else {
+            Vec::new()
+        };
+        let queued = match (&sent, body) {
+            (Ok((id, _)), Some(body)) => Some(
+                store.enqueue_submit(
+                    crate::server::messaging::SubmitEntry {
+                        id: *id,
+                        pane: to,
+                        deliver: msg.deliver,
+                        body,
+                        from,
+                        enqueued_at,
+                        defer: msg.defer,
+                        deadline,
+                        had_reply: reply_tx.is_some(),
+                        reply: reply_tx
+                            .map(|tx| crate::server::messaging::Reply::new(client_id, tx, msg.req)),
+                        put_back: 0,
+                        waiting_on: None,
+                        wait_until,
+                    },
+                    config.messaging.submit_queue_len(),
+                ),
+            ),
+            _ => None,
+        };
+        (sent, store.take_swept(), answered, queued)
+    };
+    mark_agents_dirty();
+    for (waiter, messages) in answered {
+        log::info!(
+            "msg: wait on %{to} answered n={} for client_id={}",
+            messages.len(),
+            waiter.client_id
+        );
+        let _ = waiter.tx.send(ServerMessage::MsgList {
+            pane: to,
+            messages,
+            timed_out: false,
+            marked: waiter.mark,
+        });
+    }
+    if swept > 0 {
+        log::info!("msg: swept {swept} expired message(s)");
+    }
+    match sent {
+        Ok((id, to_name)) => {
+            log::info!(
+                "msg: id={id} from {link}:%{from_pane} to=%{to} bytes={bytes} deliver={:?}{} (client_id={client_id}) -> mailbox",
+                msg.deliver,
+                if msg.defer && submit { " defer" } else { "" }
+            );
+            let resolved = Resolved {
+                host: None,
+                pane_id: to,
+                name: to_name,
+            };
+            answer_enqueued(id, to, resolved, msg.deliver, queued)
+        }
+        Err(refusal) => {
+            log::info!(
+                "msg: refused from {link}:%{from_pane} to=%{to}: {}",
+                refusal.code()
+            );
+            Some(ServerMessage::refused(refusal.code(), refusal.message()))
+        }
+    }
+}
+
+/// The answer to a stored send, by what queueing it for typing did: `None`
+/// when it was queued, since the submitter answers it once it is typed or
+/// cannot be.
+fn answer_enqueued(
+    id: MsgId,
+    to: PaneId,
+    resolved: Resolved,
+    deliver: Deliver,
+    queued: Option<Result<(), crate::server::messaging::EnqueueRefusal>>,
+) -> Option<ServerMessage> {
+    use crate::server::messaging::EnqueueRefusal;
+    use crate::server::submit::{settle, SubmitRefusal};
+    match queued {
+        None => Some(ServerMessage::MsgSent {
+            req: None,
+            id,
+            to: resolved,
+            delivery: Delivery::Mailbox,
+            reason: None,
+            timed_out: false,
+            final_state: None,
+        }),
+        Some(Ok(())) => {
+            mark_submit_dirty();
+            None
+        }
+        // Checked in the same section before the send, so never reached.
+        Some(Err(EnqueueRefusal::SendParked)) => Some(ServerMessage::refused(
+            "bad_request",
+            "this connection already has a message waiting to be typed",
+        )),
+        Some(Err(refusal @ EnqueueRefusal::LinkFull { .. })) => Some(link_full(&refusal)),
+        Some(Err(EnqueueRefusal::QueueFull)) => {
+            let refusal = SubmitRefusal {
+                code: "queue_full",
+                message: format!(
+                    "%{to} already has the most messages waiting to be typed, or the most from this sender: this one is in the mailbox"
+                ),
+            };
+            Some(answer_submit(id, resolved, settle(deliver, refusal), None))
+        }
+    }
+}
+
+/// The refusal for a send its peer link has no room to park.
+fn link_full(refusal: &crate::server::messaging::EnqueueRefusal) -> ServerMessage {
+    use crate::server::messaging::EnqueueRefusal;
+    match refusal {
+        EnqueueRefusal::LinkFull { link, max } => ServerMessage::refused(
+            "queue_full",
+            format!("link {link} already has {max} messages waiting here to be typed or answered"),
+        ),
+        _ => ServerMessage::refused("queue_full", "no room to park this send"),
+    }
+}
+
+/// Wakes the submitter: a submit was queued, or a pane finished typing.
+/// Never fired from pane output, which would wake it once per output chunk
+/// while a build scrolls in another pane.
+static SUBMIT_DIRTY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+fn mark_submit_dirty() {
+    SUBMIT_DIRTY.notify_one();
+}
+
+/// How often the submitter looks again while a submit is waiting. A guard
+/// wait ends at most this late, inside the windows' tolerance.
+const SUBMIT_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Type queued messages into their panes, in order per pane, holding each
+/// while its pane is not ready. Runs for the life of the server. Woken by
+/// [`SUBMIT_DIRTY`], and every [`SUBMIT_TICK`] while anything is queued or
+/// mid-typing; idle, it parks on the `Notify` and costs nothing.
+async fn run_submitter(
+    state: Arc<Mutex<ServerState>>,
+    panes: Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: Arc<Config>,
+) {
+    let store = messaging();
+    loop {
+        let has_work = store.lock().await.has_submit_work();
+        if has_work {
+            tokio::select! {
+                _ = SUBMIT_DIRTY.notified() => {}
+                _ = tokio::time::sleep(SUBMIT_TICK) => {}
+            }
+        } else {
+            SUBMIT_DIRTY.notified().await;
+        }
+        let late = store
+            .lock()
+            .await
+            .take_overdue_submits(std::time::Instant::now());
+        for entry in late {
+            let answer = crate::server::submit::overdue(
+                entry.deliver,
+                entry.pane,
+                entry.id,
+                entry.waiting_on,
+            );
+            reply_submit(entry, answer, None, store).await;
+        }
+        let heads = store.lock().await.submit_heads();
+        for head in heads {
+            step_submit(head, &state, &panes, &clients, &config, store).await;
+        }
+        step_submit_waits(&state, &panes, &config, store).await;
+        step_state_waits(&state, &panes, &config, store).await;
+    }
+}
+
+/// One pass over the turns being waited on: sample each pane once and step
+/// its waits, answering those that are over. Two ends are answered at once,
+/// `Submitted` with no final state, because the agent's turn can no longer be
+/// watched: a pane whose agent is no longer in the foreground
+/// (`agent_exited`; the output after it is the shell's), and a pane that is
+/// no longer live (`pane_closed_after_submit`), which includes one whose
+/// program exited in a tab that is not shown, and so is never reaped. The
+/// reaper answers a closing pane's waits the same way, so the answer does not
+/// depend on which of the two sees the close first.
+///
+/// The state is [`submit_state`], as a submit takes it, not the agents
+/// panel's: a selector no pattern names, drawn at the end of a turn, is a
+/// question to the agent's user, and the wait answers `NeedsInput` for it.
+///
+/// A wait does not hold its pane's queue. A later message typed into the
+/// same agent during the wait makes output of its own, so the state answered
+/// can be that of the later message's turn.
+async fn step_submit_waits(
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    store: &'static Mutex<Messaging>,
+) {
+    let by_pane = store.lock().await.submit_waits_by_pane();
+    for (pane, ids) in by_pane {
+        let sample = sample_pane(pane, state, panes, config).await;
+        let now = std::time::Instant::now();
+        let ended = match (sample.last_output, sample.state) {
+            (None, _) => Some("pane_closed_after_submit"),
+            (Some(_), None) => Some("agent_exited"),
+            (Some(_), Some(_)) => None,
+        };
+        let mut st = store.lock().await;
+        let name = st.name_of(pane).map(str::to_string);
+        for id in ids {
+            match (ended, sample.last_output, sample.state) {
+                (Some(reason), _, _) => {
+                    if let Some(wait) = st.take_submit_wait(id) {
+                        answer_wait_ended(wait, name.clone(), now, reason);
+                    }
+                }
+                (None, Some(last_output), Some(agent_state)) => {
+                    if let Some((wait, step)) =
+                        st.step_submit_wait(id, now, last_output, agent_state)
+                    {
+                        answer_submit_wait(wait, step, name.clone(), now);
+                    }
+                }
+                (None, _, _) => {}
+            }
+        }
+    }
+}
+
+/// A submitted message, answered with no final state and why.
+fn submitted_because(id: MsgId, pane: PaneId, name: Option<String>, reason: &str) -> ServerMessage {
+    ServerMessage::MsgSent {
+        req: None,
+        id,
+        to: Resolved {
+            host: None,
+            pane_id: pane,
+            name,
+        },
+        delivery: Delivery::Submitted,
+        reason: Some(reason.to_string()),
+        timed_out: false,
+        final_state: None,
+    }
+}
+
+/// Answer a wait whose turn can no longer be watched, with `reason`. The
+/// message was typed and submitted, under `Submit` and `Auto` alike, so it is
+/// never an error: an error would have the sender send it again.
+fn answer_wait_ended(
+    wait: crate::server::messaging::SubmitWait,
+    name: Option<String>,
+    now: std::time::Instant,
+    reason: &str,
+) {
+    let after = now
+        .saturating_duration_since(wait.machine.enter_at())
+        .as_millis();
+    log::info!(
+        "msg: id={} wait ended after {after}ms on %{}: {reason}",
+        wait.id,
+        wait.pane
+    );
+    wait.reply
+        .send(submitted_because(wait.id, wait.pane, name, reason));
+}
+
+/// Answer a wait that is over, and log how it ended. A stall is an error
+/// under `Submit`. `Auto` never errors, and the message was typed, so a
+/// stall there is `Submitted` with the stall as its reason.
+fn answer_submit_wait(
+    wait: crate::server::messaging::SubmitWait,
+    step: crate::server::submit::WaitStep,
+    name: Option<String>,
+    now: std::time::Instant,
+) {
+    use crate::server::submit::{SubmitRefusal, WaitStep};
+    let (id, pane) = (wait.id, wait.pane);
+    let after = now
+        .saturating_duration_since(wait.machine.enter_at())
+        .as_millis();
+    let sent = |final_state: AgentState, timed_out: bool| ServerMessage::MsgSent {
+        req: None,
+        id,
+        to: Resolved {
+            host: None,
+            pane_id: pane,
+            name: name.clone(),
+        },
+        delivery: Delivery::Submitted,
+        reason: None,
+        timed_out,
+        final_state: Some(final_state),
+    };
+    let message = match step {
+        WaitStep::Settled(state) => {
+            log::info!("msg: id={id} wait -> {state:?} after {after}ms");
+            sent(state, false)
+        }
+        WaitStep::TimedOut(state) => {
+            log::info!("msg: id={id} wait timed out after {after}ms (last={state:?})");
+            sent(state, true)
+        }
+        WaitStep::Stalled => {
+            log::info!("msg: id={id} wait stalled after {after}ms");
+            let refusal = SubmitRefusal::stalled(pane, id, wait.machine.cfg().stall);
+            match wait.deliver {
+                Deliver::Auto => submitted_because(id, pane, name.clone(), refusal.code),
+                _ => ServerMessage::refused(refusal.code, refusal.message),
+            }
+        }
+        WaitStep::Continue => return,
+    };
+    wait.reply.send(message);
+}
+
+/// One pass over one queue head: answer it, hold it, or type it. Logs only on
+/// a transition (a new reason to wait, an answer), never per pass.
+///
+/// The steps take their locks one at a time and never nest them. Only the
+/// text is typed here; its Enter, and the answer, come from a task of their
+/// own, so one pane's wait for its agent to read never holds another pane's
+/// head. The pane stays in flight until then, so nothing behind it is typed.
+async fn step_submit(
+    head: crate::server::messaging::SubmitHead,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    store: &'static Mutex<Messaging>,
+) {
+    use crate::server::submit::{
+        guard_wait, overdue, precheck, settle, waits_while_blocked, working_first, Answer,
+        GuardVerdict, SubmitRefusal,
+    };
+
+    let (pane, id) = (head.pane, head.id);
+    let sample = sample_pane(pane, state, panes, config).await;
+    let rule = submit_policy(config).rule_for(sample.command.as_deref().unwrap_or(""));
+    let agent_state = sample.state;
+    if waits_while_blocked(
+        sample.live,
+        sample.command.is_some(),
+        agent_state,
+        head.defer,
+    ) {
+        return hold_while_blocked(pane, id, store).await;
+    }
+    if let Some(answer) = precheck(
+        pane,
+        sample.live,
+        sample.command.is_some(),
+        agent_state,
+        head.deliver,
+    ) {
+        return answer_head(pane, id, answer, None, store).await;
+    }
+    let working = std::time::Duration::from_millis(config.agents.working_ms);
+    let now = std::time::Instant::now();
+    if working_first(sample.last_human_input, now, working)
+        && answer_working(pane, id, agent_state, &rule, head.deliver, store).await
+    {
+        return;
+    }
+    let attended = pane_attended(pane, state, clients).await;
+    if attended && !config.messaging.submit_when_attended {
+        let answer = settle(head.deliver, SubmitRefusal::attended(pane));
+        return answer_head(pane, id, answer, None, store).await;
+    }
+    let guard = config.messaging.typing_guard();
+    match guard_wait(
+        sample.last_human_input,
+        attended,
+        head.enqueued_at,
+        now,
+        &guard,
+    ) {
+        GuardVerdict::Ready => {}
+        GuardVerdict::Expired if !head.defer => {
+            let answer = settle(head.deliver, SubmitRefusal::human_typing(pane));
+            return answer_head(pane, id, answer, None, store).await;
+        }
+        // A deferred submit outlasts the guard's cap: its own deadline ends
+        // it, in the sweep.
+        GuardVerdict::Wait(_) | GuardVerdict::Expired => {
+            if store.lock().await.set_waiting(pane, id, "human_typing") {
+                log::info!("msg: id={id} submit waiting: human_typing");
+            }
+            return;
+        }
+    }
+    if answer_working(pane, id, agent_state, &rule, head.deliver, store).await {
+        return;
+    }
+    // Claimed before anything is typed, so a read that took the message first
+    // (the pane's own waiting read, or an ack while the guard held it) wins
+    // and it is delivered once. The pop, the hold, the claim and the
+    // in-flight mark are one section, so the next pass cannot see this head
+    // again, and a head the sample took too long over is not typed.
+    enum Claim {
+        Typing(crate::server::messaging::SubmitEntry),
+        OutOfTime(crate::server::messaging::SubmitEntry),
+        AlreadyRead(crate::server::messaging::SubmitEntry),
+    }
+    let claim = {
+        let mut st = store.lock().await;
+        let Some(mut entry) = st.pop_submit(pane, id) else {
+            return;
+        };
+        if std::time::Instant::now() >= entry.deadline {
+            Claim::OutOfTime(entry)
+        } else if st.mark_submitted(pane, id) {
+            st.begin_typing(pane, entry.reply.take());
+            mark_agents_dirty();
+            Claim::Typing(entry)
+        } else {
+            Claim::AlreadyRead(entry)
+        }
+    };
+    let entry = match claim {
+        Claim::Typing(entry) => entry,
+        Claim::OutOfTime(entry) => {
+            let answer = overdue(entry.deliver, pane, id, entry.waiting_on);
+            reply_submit(entry, answer, None, store).await;
+            mark_submit_dirty();
+            return;
+        }
+        // The target has the message, which is what a submit is for: an
+        // error would make the sender retry and deliver it twice.
+        Claim::AlreadyRead(entry) => {
+            reply_submit(entry, Answer::Mailbox("already_read"), None, store).await;
+            mark_submit_dirty();
+            return;
+        }
+    };
+    // A mark per typing, never stored: the body was written before it.
+    let envelope = match rule.envelope.then(crate::client::msg_cli::render_mark) {
+        None => None,
+        Some(Some(mark)) => Some(crate::server::submit::envelope(id, &entry.from, &mark)),
+        Some(None) => {
+            let answer = settle(entry.deliver, SubmitRefusal::no_mark(pane));
+            return answer_untyped(entry, answer, None, store).await;
+        }
+    };
+    let command = sample.command.clone().unwrap_or_default();
+    let typed = type_text(
+        id,
+        pane,
+        &sample,
+        &command,
+        &entry.body,
+        envelope.as_ref(),
+        &rule,
+        entry.deliver,
+        config,
+        panes,
+    )
+    .await;
+    let (bracketed, bytes, enter, text) = match typed {
+        Ok(typed) => typed,
+        // Nothing was written, so the entry goes back to wait: for the guard
+        // again, or, deferred, for the agent's user to answer it.
+        Err(TextRefusal::HumanTyped) => return requeue_untyped(entry, false, store).await,
+        Err(TextRefusal::Blocked) if entry.defer => {
+            return requeue_untyped(entry, false, store).await
+        }
+        Err(TextRefusal::Working(answer)) => {
+            let policy = Some(working_policy(&rule));
+            return answer_untyped(entry, answer, policy, store).await;
+        }
+        Err(TextRefusal::Blocked) => {
+            let answer = settle(entry.deliver, SubmitRefusal::blocked(pane));
+            return answer_untyped(entry, answer, None, store).await;
+        }
+        Err(TextRefusal::Refuse(refusal)) => {
+            let answer = settle(entry.deliver, refusal);
+            return answer_untyped(entry, answer, None, store).await;
+        }
+    };
+    let (pgid, agent) = (sample.pgid, sample.agent);
+    let panes = Arc::clone(panes);
+    let rules = agent_rules(config);
+    // A message typed into an agent that is already working, as the `queue`
+    // policy allows, is taken up after the current turn. The output after it
+    // is that turn's, so there is nothing a wait could tell from it.
+    let wait = entry
+        .wait_until
+        .filter(|_| agent_state != Some(AgentState::Working))
+        .map(|until| (until, config.messaging.wait_cfg(config.agents.working_ms)));
+    tokio::spawn(async move {
+        let typing = EndTypingOnDrop { pane, armed: true };
+        let _ends = TypingEnds(Arc::clone(&text.typing));
+        let outcome = deliver_text(
+            pane,
+            pgid,
+            agent,
+            &command,
+            rules,
+            &enter,
+            rule.enter_delay,
+            bracketed,
+            text,
+            &panes,
+        )
+        .await;
+        match outcome {
+            Typed::Submitted => {
+                log::info!(
+                    "msg: id={id} submitted to %{pane} (bracketed={}, {bytes} bytes)",
+                    if bracketed { "on" } else { "off" }
+                );
+                let enter_at = std::time::Instant::now();
+                // Ending the typing and parking the wait are one section, so
+                // the sender's connection always has its send parked.
+                let answer = {
+                    let mut st = store.lock().await;
+                    let reply = st.end_typing(pane);
+                    match (wait, reply) {
+                        (Some((until, cfg)), Some(reply)) => {
+                            st.park_submit_wait(crate::server::messaging::SubmitWait {
+                                id,
+                                pane,
+                                from: entry.from.key(),
+                                deliver: entry.deliver,
+                                reply,
+                                machine: crate::server::submit::WaitMachine::new(
+                                    enter_at, until, cfg,
+                                ),
+                            });
+                            None
+                        }
+                        (_, reply) => Some((reply, st.name_of(pane).map(str::to_string))),
+                    }
+                };
+                match answer {
+                    None => log::info!("msg: id={id} waiting for %{pane}'s turn to end"),
+                    Some((reply, name)) => {
+                        let message = ServerMessage::MsgSent {
+                            req: None,
+                            id,
+                            to: Resolved {
+                                host: None,
+                                pane_id: pane,
+                                name,
+                            },
+                            delivery: Delivery::Submitted,
+                            reason: None,
+                            timed_out: false,
+                            final_state: None,
+                        };
+                        send_reply(id, reply, message);
+                    }
+                }
+            }
+            // The agent has the message, so it stays Submitted, and an error
+            // would make the sender retry and deliver it twice.
+            Typed::Read(refusal) => {
+                let reason = if refusal.code == "agent_blocked" {
+                    "agent_blocked_read"
+                } else {
+                    "typed_over_read"
+                };
+                let reply = store.lock().await.end_typing(pane);
+                reply_submit(
+                    crate::server::messaging::SubmitEntry { reply, ..entry },
+                    Answer::Mailbox(reason),
+                    None,
+                    store,
+                )
+                .await;
+            }
+            Typed::PutBack => requeue_untyped(entry, true, store).await,
+            // Only the probe reached the agent, so a deferred message waits
+            // for its user's answer as it would before anything was typed.
+            Typed::Untyped(refusal) if entry.defer && refusal.code == "agent_blocked" => {
+                requeue_untyped(entry, true, store).await
+            }
+            Typed::Untyped(refusal) | Typed::Refused(refusal) => {
+                if refusal.code == "agent_did_not_read" {
+                    log::info!(
+                        "msg: id={id} not read by %{pane}; typed text discarded, left in the mailbox"
+                    );
+                }
+                let answer = settle(entry.deliver, refusal);
+                answer_untyped(entry, answer, None, store).await;
+            }
+        }
+        typing.disarm();
+        mark_submit_dirty();
+    });
+}
+
+/// Hold `pane`'s deferred head `id` while its agent waits on its user. The
+/// entries behind it that were not deferred are answered `agent_blocked` now,
+/// as each would be at the head: nothing is typed, so the order of what is
+/// typed is kept.
+async fn hold_while_blocked(pane: PaneId, id: MsgId, store: &'static Mutex<Messaging>) {
+    use crate::server::submit::{settle, SubmitRefusal};
+    let (new, behind) = {
+        let mut st = store.lock().await;
+        (
+            st.set_waiting(pane, id, "agent_blocked"),
+            st.take_undeferred_behind(pane, id),
+        )
+    };
+    if new {
+        log::info!("msg: id={id} submit waiting: agent_blocked");
+    }
+    for entry in behind {
+        let answer = settle(entry.deliver, SubmitRefusal::blocked(pane));
+        reply_submit(entry, answer, None, store).await;
+    }
+}
+
+/// Move a claimed message back to Queued, the one way a message that was
+/// typed for becomes unread again. The agents panel counts it again, so the
+/// list is pushed: nothing else would push it, since an agent that did not
+/// read the message printed nothing.
+fn unsubmit_and_dirty(st: &mut Messaging, pane: PaneId, id: MsgId) {
+    if st.unsubmit(pane, id) {
+        mark_agents_dirty();
+    }
+}
+
+/// Answer an entry that was claimed but not written with `answer`.
+async fn answer_untyped(
+    entry: crate::server::messaging::SubmitEntry,
+    answer: crate::server::submit::Answer,
+    policy: Option<String>,
+    store: &'static Mutex<Messaging>,
+) {
+    let reply = {
+        let mut st = store.lock().await;
+        unsubmit_and_dirty(&mut st, entry.pane, entry.id);
+        st.end_typing(entry.pane)
+    };
+    reply_submit(
+        crate::server::messaging::SubmitEntry { reply, ..entry },
+        answer,
+        policy,
+        store,
+    )
+    .await;
+    mark_submit_dirty();
+}
+
+/// Put back an entry that was claimed but not written, at the front of its
+/// queue with its reply, so that it is decided again on the next pass:
+/// `after_probe` when its probe had been typed.
+///
+/// Not when nothing is waiting for it any more. Its sender's pane closed: a
+/// message typed later in its name would come from a pane that is gone. Or
+/// it was deferred and its sender has stopped waiting for the answer it
+/// asked for: it may otherwise wait minutes and be typed long after anyone
+/// cares. Either way it stays in the mailbox.
+async fn requeue_untyped(
+    mut entry: crate::server::messaging::SubmitEntry,
+    after_probe: bool,
+    store: &'static Mutex<Messaging>,
+) {
+    use crate::server::submit::{settle, SubmitRefusal};
+    let mut st = store.lock().await;
+    unsubmit_and_dirty(&mut st, entry.pane, entry.id);
+    entry.reply = st.end_typing(entry.pane);
+    let id = entry.id;
+    if let Some(from) = entry.from.local_pane().filter(|&from| st.is_closed(from)) {
+        drop(st);
+        let refusal = SubmitRefusal::sender_closed(from, id);
+        let answer = settle(entry.deliver, refusal);
+        reply_submit(entry, answer, None, store).await;
+        mark_submit_dirty();
+        return;
+    }
+    if entry.defer && entry.had_reply && entry.reply.is_none() {
+        drop(st);
+        log::info!(
+            "msg: id={id} not put back: its sender stopped waiting for it; it stays in the mailbox"
+        );
+        mark_submit_dirty();
+        return;
+    }
+    if after_probe && entry.defer && entry.note_put_back() {
+        log::info!("msg: id={id} put back after its probe more than once");
+    }
+    st.requeue_front(entry);
+    drop(st);
+    mark_submit_dirty();
+}
+
+/// Answer `pane`'s head by its row's `while_working`, if the agent is working
+/// and the row does not type into it. Returns whether it was answered.
+async fn answer_working(
+    pane: PaneId,
+    id: MsgId,
+    agent_state: Option<AgentState>,
+    rule: &crate::server::submit::SubmitRule,
+    deliver: Deliver,
+    store: &'static Mutex<Messaging>,
+) -> bool {
+    let Some(answer) = crate::server::submit::on_working(pane, agent_state, rule, deliver) else {
+        return false;
+    };
+    answer_head(pane, id, answer, Some(working_policy(rule)), store).await;
+    true
+}
+
+/// The row setting that answers a working agent, as the log names it.
+fn working_policy(rule: &crate::server::submit::SubmitRule) -> String {
+    format!("while_working={:?}", rule.while_working).to_lowercase()
+}
+
+/// Ends a pane's typing if the task typing into it stops without doing so
+/// itself, which only a panic does: a pane left in flight is never looked at
+/// again, and every message queued for it would wait for ever.
+struct EndTypingOnDrop {
+    pane: PaneId,
+    armed: bool,
+}
+
+impl EndTypingOnDrop {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EndTypingOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let pane = self.pane;
+            log::warn!("msg: typing into %{pane} stopped unfinished; ending it");
+            tokio::spawn(async move {
+                messaging().lock().await.end_typing(pane);
+                mark_submit_dirty();
+            });
+        }
+    }
+}
+
+/// Answer `pane`'s head `id` without typing it, if it is still the head.
+async fn answer_head(
+    pane: PaneId,
+    id: MsgId,
+    answer: crate::server::submit::Answer,
+    policy: Option<String>,
+    store: &'static Mutex<Messaging>,
+) {
+    let entry = store.lock().await.pop_submit(pane, id);
+    if let Some(entry) = entry {
+        reply_submit(entry, answer, policy, store).await;
+        mark_submit_dirty();
+    }
+}
+
+/// Answer `entry`'s parked send with `answer`, logged once.
+async fn reply_submit(
+    entry: crate::server::messaging::SubmitEntry,
+    answer: crate::server::submit::Answer,
+    policy: Option<String>,
+    store: &'static Mutex<Messaging>,
+) {
+    let name = store.lock().await.name_of(entry.pane).map(str::to_string);
+    let resolved = Resolved {
+        host: None,
+        pane_id: entry.pane,
+        name,
+    };
+    let message = answer_submit(entry.id, resolved, answer, policy);
+    send_reply(entry.id, entry.reply, message);
+}
+
+/// Send a submit's answer through its parked reply, or note that the sender
+/// has gone.
+fn send_reply(id: MsgId, reply: Option<crate::server::messaging::Reply>, message: ServerMessage) {
+    match reply {
+        Some(reply) => {
+            reply.send(message);
+        }
+        None => log::info!("msg: id={id} submit answered with its sender gone (reply detached)"),
+    }
+}
+
+/// Whether a client is looking at `pane`: it is the input target of a
+/// session some client is attached to. `clients` alone, then `state` alone,
+/// the order `handle_input` takes them in.
+async fn pane_attended(
+    pane: PaneId,
+    state: &Arc<Mutex<ServerState>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> bool {
+    let attached: Vec<String> = clients
+        .lock()
+        .await
+        .values()
+        .filter_map(|conn| conn.session_name.clone())
+        .collect();
+    if attached.is_empty() {
+        return false;
+    }
+    let st = state.lock().await;
+    attached.iter().any(|name| {
+        st.sessions
+            .get(name)
+            .is_some_and(|session| session.input_target() == Some(pane))
+    })
+}
+
+/// The server's submit policy, read from the config once like
+/// [`agent_rules`], and for the same reason: an edit needs `remux restart`.
+static SUBMIT_POLICY: std::sync::OnceLock<crate::server::submit::SubmitPolicy> =
+    std::sync::OnceLock::new();
+
+fn submit_policy(config: &Config) -> &'static crate::server::submit::SubmitPolicy {
+    SUBMIT_POLICY
+        .get_or_init(|| crate::server::submit::SubmitPolicy::from_config(&config.messaging))
+}
+
+/// The reply to a submit that did not type the message, logged once. `policy`
+/// names the row setting that decided, when one did.
+fn answer_submit(
+    id: MsgId,
+    resolved: Resolved,
+    answer: crate::server::submit::Answer,
+    policy: Option<String>,
+) -> ServerMessage {
+    use crate::server::submit::Answer;
+    let why = |code: &str| match &policy {
+        Some(policy) => format!("{code}, {policy}"),
+        None => code.to_string(),
+    };
+    match answer {
+        Answer::Refuse(refusal) => {
+            log::info!("msg: id={id} submit refused ({})", why(refusal.code));
+            ServerMessage::refused(refusal.code, refusal.message)
+        }
+        Answer::Mailbox(reason) => {
+            log::info!("msg: id={id} submit -> mailbox ({})", why(reason));
+            ServerMessage::MsgSent {
+                req: None,
+                id,
+                to: resolved,
+                delivery: Delivery::Mailbox,
+                reason: Some(reason.to_string()),
+                timed_out: false,
+                final_state: None,
+            }
+        }
+        Answer::TimedOut(reason) => {
+            log::info!(
+                "msg: id={id} submit -> mailbox ({}, timed out)",
+                why(reason)
+            );
+            ServerMessage::MsgSent {
+                req: None,
+                id,
+                to: resolved,
+                delivery: Delivery::Mailbox,
+                reason: Some(reason.to_string()),
+                timed_out: true,
+                final_state: None,
+            }
+        }
+    }
+}
+
+/// Why [`type_text`] did not write the text.
+enum TextRefusal {
+    /// A person typed into the pane after it was sampled. The submit is put
+    /// back to wait for the guard again, not refused.
+    HumanTyped,
+    /// The agent is waiting on its user. Refused `agent_blocked`, unless
+    /// the submit was deferred, when it waits again.
+    Blocked,
+    Refuse(crate::server::submit::SubmitRefusal),
+    /// The agent is working and its row's `while_working` does not type into
+    /// it: answered as the row says.
+    Working(crate::server::submit::Answer),
+}
+
+/// Write the framed text into `pane`, if the program there is still the one
+/// sampled (`sample.pgid`), reads its input unbuffered, is not waiting on its
+/// user and is not working against its row's `while_working`, and no person
+/// has typed into the pane since the sample. Returns
+/// whether it was wrapped, its length and the Enter to write after it. Every
+/// check and the write happen in one `panes` section, so nothing can change
+/// between them. The bytes are never logged: they are the message.
+#[allow(clippy::too_many_arguments)]
+async fn type_text(
+    id: MsgId,
+    pane: PaneId,
+    sample: &PaneSample,
+    command: &str,
+    body: &str,
+    envelope: Option<&crate::server::submit::Envelope>,
+    rule: &crate::server::submit::SubmitRule,
+    deliver: Deliver,
+    config: &Config,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Result<(bool, usize, Vec<u8>, TypedText), TextRefusal> {
+    use crate::config::messaging::Bracketed;
+    use crate::server::submit::{
+        encode, multi_line_refusal, newlines_safe, on_working, split_chunks, split_probe, Framing,
+        SubmitRefusal, PASTE_CLOSE,
+    };
+    use nix::sys::termios::{tcgetattr, LocalFlags};
+    let refuse = |refusal| Err(TextRefusal::Refuse(refusal));
+
+    let mut ps = panes.lock().await;
+    let Some(pd) = ps.get_mut(&pane).filter(|pd| !pd.exited) else {
+        return refuse(SubmitRefusal::closed(pane));
+    };
+    if pd.last_human_input != sample.last_human_input {
+        return Err(TextRefusal::HumanTyped);
+    }
+    let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
+    let pgid = sample.pgid;
+    if pgid.is_none() || nix::unistd::tcgetpgrp(master).ok() != pgid {
+        return refuse(SubmitRefusal::not_ready(pane));
+    }
+    // On a pty the master's termios requests reach the slave's settings. A
+    // line-buffered terminal means a shell, `read` or a password prompt is
+    // reading: it would take the text as a line of its own the moment the
+    // envelope's newline arrives.
+    match tcgetattr(master) {
+        Ok(termios) if !termios.local_flags.contains(LocalFlags::ICANON) => {}
+        _ => {
+            return refuse(SubmitRefusal {
+                code: "agent_not_reading",
+                message: format!(
+                    "%{pane}'s terminal is line-buffered, so its agent is not the one reading: its message is in the mailbox"
+                ),
+            })
+        }
+    }
+    let now = std::time::Instant::now();
+    let agent_state = submit_state(pd, command, agent_rules(config), now);
+    if agent_state == AgentState::NeedsInput {
+        return Err(TextRefusal::Blocked);
+    }
+    if let Some(answer) = on_working(pane, Some(agent_state), rule, deliver) {
+        return Err(TextRefusal::Working(answer));
+    }
+    let framing = match rule.bracketed {
+        Bracketed::On => Framing::Bracketed,
+        Bracketed::Off => Framing::Plain,
+        Bracketed::Auto if pd.screen.bracketed_paste => Framing::Bracketed,
+        Bracketed::Auto => Framing::Plain,
+    };
+    let paste_live = pd.screen.bracketed_paste;
+    if !newlines_safe(framing, paste_live) {
+        if let Some(refusal) = multi_line_refusal(body) {
+            return refuse(refusal);
+        }
+    }
+    // The terminal from the slave side, where its input queue is: without
+    // it nothing can tell whether the agent read the message.
+    let Some(slave) = pd
+        .pty
+        .slave_path
+        .as_deref()
+        .and_then(open_slave)
+        .filter(|slave| is_the_slave(slave, pd.pty.slave_dev))
+    else {
+        return refuse(SubmitRefusal::not_read(pane));
+    };
+    let (text, enter) = encode(
+        body,
+        framing,
+        paste_live,
+        rule.focus_in,
+        &rule.enter,
+        envelope,
+    );
+    let bytes = text.len();
+    let (probe, body) = split_probe(text, framing, rule.focus_in);
+    let bracketed = framing == Framing::Bracketed;
+    let tail = if bracketed { PASTE_CLOSE } else { &[] };
+    let content = body.strip_suffix(tail).unwrap_or(&body);
+    let chunks = split_chunks(content, tail, CHUNK_MAX);
+    if chunks.len() > MAX_CHUNKS {
+        return refuse(SubmitRefusal::too_many_lines(pane, MAX_CHUNKS));
+    }
+    let typing = Arc::new(SubmitTyping {
+        id,
+        cancel: Arc::new(pty::WriteCancel::default()),
+        slave: Arc::new(slave),
+        bracketed,
+        opener_read: AtomicBool::new(false),
+        last_sent: AtomicBool::new(false),
+        all_read: AtomicBool::new(false),
+        taken_over: AtomicBool::new(false),
+        ended: AtomicBool::new(false),
+    });
+    let written = pd.send_tracked(probe, Arc::clone(&typing.cancel));
+    pd.typing = Some(Arc::downgrade(&typing));
+    Ok((
+        framing == Framing::Bracketed,
+        bytes,
+        enter,
+        TypedText {
+            written,
+            chunks,
+            typing,
+            typed_at: now,
+        },
+    ))
+}
+
+/// How long the agent has to read a message's probe before it is judged not
+/// reading and the body is not written. Short, because an agent that is not
+/// reading may be about to exit, and the probe must be flushed before the
+/// shell after it reads the terminal.
+const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// How long the agent may go without reading any of the message, once the
+/// probe is read, before it is judged not to be reading it. Every byte it
+/// reads starts the time again, so a slow agent is never judged by this,
+/// only one that stopped.
+const CONSUME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the pane is checked while waiting for it to read the text.
+const CONSUME_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How often the pane is checked while a chunk of the body is being read.
+/// Short, because every chunk waits for one of these checks before the next
+/// is written, and a long body is many chunks.
+const CHUNK_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// How often, between chunks, the screen is read for a prompt. Reading it is
+/// the costly part of a check, and the chunks need it only before each write.
+const PROMPT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The largest chunk of a body written at once. Small enough to sit whole in
+/// the terminal's input queue on Linux and macOS, so that the queue's count
+/// shows every byte of it the agent reads.
+const CHUNK_MAX: usize = 1024;
+
+/// The longest the agent may take to read a whole body, however steadily.
+/// Past it the rest is withdrawn and the message is answered `agent_too_slow`.
+/// A body at the 64 KiB limit read at 2.2 KiB a second still fits.
+const BODY_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What one chunk is allowed to cost, written and read, in working out
+/// [`MAX_CHUNKS`]: more than a chunk costs against an agent that reads at
+/// once on a machine with every CPU busy twice over, so that a body at the
+/// limit still fits in [`BODY_CAP`] there.
+const CHUNK_COST: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The most chunks a body may take: as many as fit in [`BODY_CAP`] at
+/// [`CHUNK_COST`] each. A body of more lines is refused `too_many_lines`
+/// before anything is typed, rather than run into the cap part-way through.
+const MAX_CHUNKS: usize = (BODY_CAP.as_millis() / CHUNK_COST.as_millis()) as usize;
+
+/// How long a cancelled write is given to stop before its queue is flushed.
+const CANCEL_ACK: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// How long a deferred submit may wait when its sender names no timeout.
+pub const DEFAULT_SUBMIT_TIMEOUT_MS: u64 = 600_000;
+
+/// When a submit queued at `enqueued_at` is answered as out of time. A
+/// deferred one waits as long as its sender asked, between [`SUBMIT_HOLD_MS`]
+/// and [`MAX_WAIT_MS`]: it waits on a person answering their agent, which
+/// can take minutes, and it is never given less time than a submit that did
+/// not ask to wait. Any other is held at most [`SUBMIT_HOLD_MS`].
+fn submit_deadline(
+    enqueued_at: std::time::Instant,
+    defer: bool,
+    timeout_ms: Option<u64>,
+) -> std::time::Instant {
+    let ms = if defer {
+        timeout_ms
+            .unwrap_or(DEFAULT_SUBMIT_TIMEOUT_MS)
+            .clamp(SUBMIT_HOLD_MS, MAX_WAIT_MS)
+    } else {
+        SUBMIT_HOLD_MS
+    };
+    enqueued_at + std::time::Duration::from_millis(ms)
+}
+
+/// How long after a message is sent `--wait` watches for the agent's turn
+/// to end: `timeout_ms`, or [`DEFAULT_SUBMIT_TIMEOUT_MS`], at most
+/// [`MAX_WAIT_MS`]. Measured from the send, as the CLI's `--timeout` is.
+fn wait_timeout(timeout_ms: Option<u64>) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        timeout_ms
+            .unwrap_or(DEFAULT_SUBMIT_TIMEOUT_MS)
+            .min(MAX_WAIT_MS),
+    )
+}
+
+/// The longest a submit is held in its queue before it is typed: the typing
+/// guard at its cap, and one tick for the submitter to see it clear. Past
+/// this the submit is answered `timeout` and nothing is typed.
+pub const SUBMIT_HOLD_MS: u64 =
+    crate::config::messaging::MAX_TYPING_GUARD_MS + SUBMIT_TICK.as_millis() as u64;
+
+/// The longest from a submit's arrival to its answer: held for at most
+/// [`SUBMIT_HOLD_MS`]; its probe read within [`PROBE_DEADLINE`]; its body read
+/// within [`BODY_CAP`]; then the Enter delay at its cap and [`CONSUME_DEADLINE`]
+/// for the Enter's own checks; and [`CANCEL_ACK`] for a refusal's cancel. The
+/// CLI waits this long beyond its usual reply deadline, so a submit is never
+/// reported as having no answer while the server is still able to type it: a
+/// retry after such a report would deliver the message twice.
+pub const SUBMIT_BUDGET_MS: u64 = SUBMIT_HOLD_MS
+    + PROBE_DEADLINE.as_millis() as u64
+    + BODY_CAP.as_millis() as u64
+    + crate::config::messaging::MAX_ENTER_DELAY_MS
+    + CONSUME_DEADLINE.as_millis() as u64
+    + CANCEL_ACK.as_millis() as u64;
+
+/// A message being typed into a pane, as [`PaneData::send_human_input`] sees
+/// it. The pane holds it weakly: the task typing the message owns it, so the
+/// slave descriptor it carries is closed when that task ends. A pane that
+/// kept it open would hold its own terminal open, and its master would never
+/// read the end of file that closes the pane when its program exits.
+struct SubmitTyping {
+    id: MsgId,
+    /// Stops the message's writes that have not happened yet.
+    cancel: Arc<crate::server::pty::WriteCancel>,
+    /// The pane's terminal from the slave side, where its input queue is.
+    slave: Arc<std::fs::File>,
+    /// The message is wrapped in a paste.
+    bracketed: bool,
+    /// The agent read the paste opener: a paste is open in it until it reads
+    /// the closer.
+    opener_read: AtomicBool,
+    /// The last chunk of the body went to the writer.
+    last_sent: AtomicBool,
+    /// The agent read the whole body, the paste's closer included.
+    all_read: AtomicBool,
+    /// A person's key took the pane back before the message was submitted,
+    /// and the rest of it was cancelled and flushed.
+    taken_over: AtomicBool,
+    /// The message is no longer being typed: decided, in the same `panes`
+    /// section as its last write when it had one.
+    ended: AtomicBool,
+}
+
+impl SubmitTyping {
+    fn end(&self) {
+        self.ended.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the agent is inside the message's paste: it read the opener
+    /// and not yet the closer.
+    fn paste_open(&self) -> bool {
+        self.bracketed
+            && self.opener_read.load(Ordering::SeqCst)
+            && !self.all_read.load(Ordering::SeqCst)
+    }
+}
+
+/// Marks a [`SubmitTyping`] ended when the task typing it stops, however it
+/// stops, so a later key is never taken for one into this message.
+struct TypingEnds(Arc<SubmitTyping>);
+
+impl Drop for TypingEnds {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
+/// The probe's write, as `type_text` handed it to the pane's writer, and the
+/// rest of the message in the chunks it is written in.
+struct TypedText {
+    written: tokio::sync::oneshot::Receiver<bool>,
+    chunks: Vec<Vec<u8>>,
+    typing: Arc<SubmitTyping>,
+    /// When the probe was handed to the writer: a person's key after this was
+    /// pressed while the message was being typed.
+    typed_at: std::time::Instant,
+}
+
+/// How typing a message ended, once its probe was written.
+enum Typed {
+    Submitted,
+    /// The agent read the whole message, and it was not submitted: a person
+    /// typed, or the agent began waiting on its user. The message is in the
+    /// agent's input.
+    Read(crate::server::submit::SubmitRefusal),
+    /// Nothing of the message but the probe reached the agent, because a
+    /// person typed: it waits for the typing guard again.
+    PutBack,
+    /// Nothing of the message but the probe was written.
+    Untyped(crate::server::submit::SubmitRefusal),
+    /// Refused once the body was written. What the agent did not read was
+    /// cancelled and flushed.
+    Refused(crate::server::submit::SubmitRefusal),
+}
+
+/// Type the rest of a message whose probe `type_text` wrote, and its Enter.
+///
+/// The probe must be read first: written, and the input queue found empty
+/// on two checks [`CONSUME_POLL`] apart, within [`PROBE_DEADLINE`]. An agent
+/// that does not read it is not reading at all, and its probe is flushed with
+/// nothing else written.
+///
+/// The body follows in chunks, each written only once the one before has
+/// been read whole (the queue empty on two checks), in the same `panes`
+/// section as the checks that allow it: the agent still the reader, not
+/// waiting on its user. At most one chunk is ever unread, so an agent that
+/// stops reading and exits leaves the shell one chunk, never the rest. An
+/// agent that pauses is waited for: only [`CONSUME_DEADLINE`] without a byte
+/// read refuses it, or [`BODY_CAP`] for the whole body.
+///
+/// The Enter is written once the Enter delay has passed after the last chunk
+/// was read and the queue is still empty on two checks, in the same `panes`
+/// section as the checks; it is refused when the agent has begun waiting on
+/// its user, which the Enter would answer.
+///
+/// On a refusal the rest of the message is cancelled FIRST and the writer's
+/// stop awaited, then the queue is flushed: flushed first, the queue would
+/// only make room for the writer to write the tail into it. A paste the
+/// agent is still inside is then closed, if the agent is still the reader. A
+/// person's key before the message is submitted has done all of that
+/// already, and its own flush is not repeated, since that would discard the
+/// key.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_text(
+    pane: PaneId,
+    pgid: Option<nix::unistd::Pid>,
+    agent: Option<nix::unistd::Pid>,
+    command: &str,
+    rules: &crate::server::agents::AgentRules,
+    enter: &[u8],
+    delay: std::time::Duration,
+    bracketed: bool,
+    typed: TypedText,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Typed {
+    use crate::server::submit::{SubmitRefusal, PASTE_CLOSE};
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    let TypedText {
+        mut written,
+        chunks,
+        typing,
+        typed_at,
+    } = typed;
+    let slave = &*typing.slave;
+    let typed_after = |pd: &PaneData| pd.last_human_input.is_some_and(|t| t > typed_at);
+    let taken_over = || typing.taken_over.load(Ordering::SeqCst);
+    let close_paste = |pd: &PaneData| {
+        if typing.paste_open() {
+            pd.send_input(PASTE_CLOSE);
+        }
+    };
+
+    let deadline = tokio::time::Instant::now() + PROBE_DEADLINE;
+    let mut probe_written = false;
+    let mut read_once = false;
+    let mut agent_reading = true;
+    let probed = loop {
+        if taken_over() {
+            return Typed::PutBack;
+        }
+        if !probe_written {
+            match written.try_recv() {
+                Ok(true) => probe_written = true,
+                Ok(false) | Err(TryRecvError::Closed) => break Err(SubmitRefusal::not_read(pane)),
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        {
+            let ps = panes.lock().await;
+            let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
+                break Err(SubmitRefusal::closed(pane));
+            };
+            if !agent_reads(pd, pgid, agent) {
+                agent_reading = false;
+                break Err(SubmitRefusal::not_read(pane));
+            }
+            let read = probe_written && unread_input(slave) == Some(0);
+            if read {
+                typing.opener_read.store(bracketed, Ordering::SeqCst);
+            }
+            if read && read_once {
+                if typed_after(pd) {
+                    typing.end();
+                    close_paste(pd);
+                    return Typed::PutBack;
+                }
+                let now = std::time::Instant::now();
+                if submit_state(pd, command, rules, now) == AgentState::NeedsInput {
+                    typing.end();
+                    close_paste(pd);
+                    return Typed::Untyped(SubmitRefusal::blocked(pane));
+                }
+                written = pd.send_tracked(chunks[0].clone(), Arc::clone(&typing.cancel));
+                typing.last_sent.store(chunks.len() == 1, Ordering::SeqCst);
+                break Ok(());
+            }
+            read_once = read;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break Err(SubmitRefusal::not_read(pane));
+        }
+        tokio::time::sleep(CONSUME_POLL).await;
+    };
+    if let Err(refusal) = probed {
+        withdraw(
+            &typing,
+            &mut written,
+            !probe_written,
+            agent_reading,
+            pane,
+            panes,
+        )
+        .await;
+        return Typed::Untyped(refusal);
+    }
+
+    let body_deadline = tokio::time::Instant::now() + BODY_CAP;
+    let mut next = 1;
+    let mut done = false;
+    let mut human = false;
+    let mut read_once = false;
+    let mut level: Option<usize> = None;
+    let mut progress_at = tokio::time::Instant::now();
+    let mut enter_at: Option<tokio::time::Instant> = None;
+    let mut prompt_checked = tokio::time::Instant::now();
+    let refusal = loop {
+        if taken_over() {
+            let refusal = SubmitRefusal::typed_over(pane);
+            return if typing.all_read.load(Ordering::SeqCst) {
+                Typed::Read(refusal)
+            } else {
+                Typed::Refused(refusal)
+            };
+        }
+        // Waiting for the writer is part of this pass's wait, so a chunk
+        // written last pass is checked the moment its last byte is out.
+        let pass_start = tokio::time::Instant::now();
+        if !done {
+            match tokio::time::timeout(CHUNK_POLL, &mut written).await {
+                Ok(Ok(true)) => done = true,
+                Ok(Ok(false) | Err(_)) if !taken_over() => {
+                    break SubmitRefusal::stopped_reading(pane)
+                }
+                _ => {}
+            }
+        }
+        let tick = tokio::time::Instant::now();
+        {
+            let ps = panes.lock().await;
+            let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
+                break SubmitRefusal::closed(pane);
+            };
+            human |= typed_after(pd);
+            if !agent_reads(pd, pgid, agent) {
+                agent_reading = false;
+                break SubmitRefusal::read_by_another(pane);
+            }
+            let unread = unread_input(slave);
+            let empty = done && unread == Some(0);
+            if empty || tick.duration_since(prompt_checked) >= PROMPT_POLL {
+                prompt_checked = tick;
+                let now = std::time::Instant::now();
+                if submit_state(pd, command, rules, now) == AgentState::NeedsInput {
+                    if next == chunks.len() && empty {
+                        typing.all_read.store(true, Ordering::SeqCst);
+                    }
+                    break SubmitRefusal::blocked(pane);
+                }
+            }
+            if let (Some(n), Some(before)) = (unread, level) {
+                if n < before {
+                    progress_at = tick;
+                }
+            }
+            level = unread;
+            match enter_at {
+                // Between chunks, one empty reading means the chunk was read.
+                // The last chunk gets a second reading, before the Enter.
+                None if empty && next < chunks.len() => {
+                    written = pd.send_tracked(chunks[next].clone(), Arc::clone(&typing.cancel));
+                    next += 1;
+                    typing
+                        .last_sent
+                        .store(next == chunks.len(), Ordering::SeqCst);
+                    done = false;
+                    read_once = false;
+                    level = None;
+                    progress_at = tick;
+                }
+                None if empty && read_once && next == chunks.len() => {
+                    typing.all_read.store(true, Ordering::SeqCst);
+                    enter_at = Some(tick + delay);
+                    read_once = false;
+                }
+                None => read_once = empty,
+                Some(at) if tick >= at && empty && read_once => {
+                    typing.end();
+                    if human {
+                        break SubmitRefusal::typed_over(pane);
+                    }
+                    pd.send_input(enter);
+                    return Typed::Submitted;
+                }
+                Some(at) => read_once = empty && tick >= at,
+            }
+        }
+        match enter_at {
+            None if tick >= body_deadline => break SubmitRefusal::too_slow(pane, BODY_CAP),
+            None if tick.duration_since(progress_at) >= CONSUME_DEADLINE => {
+                break SubmitRefusal::stopped_reading(pane)
+            }
+            Some(at) if tick >= at + CONSUME_DEADLINE => {
+                break SubmitRefusal::stopped_reading(pane)
+            }
+            _ => {}
+        }
+        if enter_at.is_some() {
+            tokio::time::sleep(CONSUME_POLL).await;
+        } else {
+            tokio::time::sleep_until(pass_start + CHUNK_POLL).await;
+        }
+    };
+    let read_all = typing.all_read.load(Ordering::SeqCst);
+    let read_reason = matches!(refusal.code, "agent_blocked" | "human_typing");
+    if read_all && agent_reading && read_reason {
+        typing.end();
+        return Typed::Read(refusal);
+    }
+    if withdraw(&typing, &mut written, !done, agent_reading, pane, panes).await {
+        return Typed::Refused(SubmitRefusal::typed_over(pane));
+    }
+    Typed::Refused(refusal)
+}
+
+/// Withdraw what of a message the agent did not read: cancel the writes,
+/// await the writer's stop, flush the queue, and close a paste the agent is
+/// still inside, if it is still the reader. Returns whether a person's key
+/// had already done this, in which case none of it is repeated.
+async fn withdraw(
+    typing: &SubmitTyping,
+    written: &mut tokio::sync::oneshot::Receiver<bool>,
+    writing: bool,
+    agent_reading: bool,
+    pane: PaneId,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> bool {
+    typing.end();
+    typing.cancel.cancel();
+    if writing {
+        let _ = tokio::time::timeout(CANCEL_ACK, &mut *written).await;
+    }
+    if typing.taken_over.load(Ordering::SeqCst) {
+        return true;
+    }
+    flush_unread(typing.id, pane, &typing.slave, agent_reading);
+    if agent_reading && typing.paste_open() {
+        if let Some(pd) = panes.lock().await.get(&pane).filter(|pd| !pd.exited) {
+            pd.send_input(crate::server::submit::PASTE_CLOSE);
+        }
+    }
+    false
+}
+
+/// Flush `pane`'s input queue. When there was nothing left to flush because
+/// the agent had stopped reading, another program may have read the message,
+/// and the log says so.
+fn flush_unread(id: MsgId, pane: PaneId, slave: &std::fs::File, agent_reading: bool) {
+    let unread = unread_input(slave).unwrap_or(0);
+    if let Err(e) = nix::sys::termios::tcflush(slave, nix::sys::termios::FlushArg::TCIFLUSH) {
+        log::warn!("msg: flushing %{pane}'s unread input failed: {e}");
+    } else if unread == 0 && !agent_reading {
+        log::warn!(
+            "msg: id={id} %{pane}'s agent stopped reading with the message unread, and nothing was \
+             left to flush: another program may have read it"
+        );
+    }
+}
+
+/// Whether the program sampled as `pgid` is still the one reading `pd`'s
+/// terminal, unbuffered. The agent itself (`agent`, the process whose name
+/// matched) must be alive as well as its group in the foreground: a job
+/// outlives any one member (`agent | cat` keeps the terminal while `cat`
+/// runs), and a member that goes on reading the terminal raw after the agent
+/// is gone is not the agent. The agent rather than the group's leader,
+/// because a launcher that starts the agent and exits leaves a live agent in
+/// a group without its leader.
+fn agent_reads(
+    pd: &PaneData,
+    pgid: Option<nix::unistd::Pid>,
+    agent: Option<nix::unistd::Pid>,
+) -> bool {
+    let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
+    let same = pgid.is_some()
+        && nix::unistd::tcgetpgrp(master).ok() == pgid
+        && agent.is_some_and(|pid| nix::sys::signal::kill(pid, None).is_ok());
+    same && nix::sys::termios::tcgetattr(master).is_ok_and(|t| {
+        !t.local_flags
+            .contains(nix::sys::termios::LocalFlags::ICANON)
+    })
+}
+
+/// Whether `slave` is the pane's own terminal: the path was read at spawn,
+/// and a path is a name, which a later terminal could have been given.
+fn is_the_slave(slave: &std::fs::File, slave_dev: Option<libc::dev_t>) -> bool {
+    slave_dev.is_some_and(|dev| {
+        nix::sys::stat::fstat(std::os::fd::AsRawFd::as_raw_fd(slave))
+            .is_ok_and(|st| st.st_rdev == dev)
+    })
+}
+
+/// The pane's terminal from the slave side, where its input queue is. Opened
+/// without becoming the server's controlling terminal and without blocking.
+fn open_slave(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+        .open(path)
+        .ok()
+}
+
+/// Bytes in the slave's input queue: typed, and not yet read by the program.
+///
+/// Linux moves bytes written to the master into this queue as deferred work,
+/// so a count taken right after a write can be 0 for an unread chunk. Under
+/// CPU load that lasts many milliseconds. Polling the slave first makes the
+/// count exact, because the line discipline's poll finishes that deferred
+/// work before it looks at the queue. The poll reads nothing, so the agent
+/// loses no input. macOS writes into the queue directly and needs no such
+/// barrier, but the poll is harmless there.
+///
+/// Callers hold `panes`, so the poll can hold it while the kernel finishes
+/// that one piece of deferred work. A poll that fails answers `None`, which
+/// no caller takes as read.
+fn unread_input(slave: &std::fs::File) -> Option<usize> {
+    let mut queued: libc::c_int = 0;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(slave);
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for an fd `slave` keeps open, and no wait.
+    if unsafe { libc::poll(&mut pfd, 1, 0) } < 0 {
+        return None;
+    }
+    (unsafe { libc::ioctl(fd, libc::FIONREAD, &mut queued) } == 0).then(|| queued.max(0) as usize)
+}
+
+/// The mailbox a read or an ack is about, and the caller's own pane, if it is
+/// in one.
+///
+/// `pane` when given, else the caller's own pane. A caller outside any pane
+/// must name one. A pane that is not live, is in no tab, or is a popup is
+/// `no_such_target`; a closed pane is not live, so this also refuses the
+/// tombstoned ones.
+async fn mailbox_of(
+    client_id: u64,
+    verb: &str,
+    pane: Option<PaneId>,
+    pane_hint: Option<PaneId>,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Result<(PaneId, Option<PaneId>), Box<ServerMessage>> {
+    let caller = attribute_frame_caller(peer, panes).await;
+    if let Ok(found) = &caller {
+        log_caller(client_id, verb, found);
+        log_hint(pane_hint, found.pane);
+    }
+    if let Some(refused) = unverified_refusal(&caller) {
+        return Err(Box::new(refused));
+    }
+    let pane = match (pane, &caller) {
+        (Some(pane), _) => pane,
+        (None, Ok(found)) => found.pane,
+        (None, Err(why)) => {
+            return Err(Box::new(ServerMessage::refused(
+                "not_in_pane",
+                format!("not in a pane ({}): pass --pane %N", why.reason()),
+            )))
+        }
+    };
+    check_addressable(pane, state, panes).await?;
+    Ok((pane, caller.ok().map(|found| found.pane)))
+}
+
+/// Refuse a pane that mail, a name or a status request cannot address: one
+/// that is not live (closed or exited), is in no tab, or is a popup.
+async fn check_addressable(
+    pane: PaneId,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Result<(), Box<ServerMessage>> {
+    let live = live_panes(panes).await.contains(&pane);
+    let (in_a_tab, popup) = {
+        let st = state.lock().await;
+        (st.locate_pane(pane).is_some(), st.is_popup(pane))
+    };
+    if popup {
+        return Err(Box::new(ServerMessage::refused(
+            "no_such_target",
+            POPUP_REFUSED,
+        )));
+    }
+    if !live || !in_a_tab {
+        return Err(Box::new(ServerMessage::refused(
+            "no_such_target",
+            format!("no such target: %{pane}"),
+        )));
+    }
+    Ok(())
+}
+
+/// Name the caller's pane, or `pane` for a caller outside any pane.
+async fn handle_agent_name(
+    client_id: u64,
+    request: NameRequest,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    store: &Mutex<Messaging>,
+) -> ServerMessage {
+    let caller = attribute_frame_caller(peer, panes).await;
+    if let Ok(found) = &caller {
+        log_caller(client_id, "AgentName", found);
+        log_hint(request.pane_hint, found.pane);
+    }
+    if let Some(refused) = unverified_refusal(&caller) {
+        return refused;
+    }
+    let pane = match (request.pane, &caller) {
+        (Some(_), Ok(found)) => {
+            return ServerMessage::refused(
+                "bad_address",
+                format!(
+                    "--pane is for callers outside a pane; you are %{}",
+                    found.pane
+                ),
+            )
+        }
+        (Some(pane), Err(_)) => pane,
+        (None, Ok(found)) => found.pane,
+        (None, Err(why)) => {
+            return ServerMessage::refused(
+                "not_in_pane",
+                format!("not in a pane ({}): pass --pane %N", why.reason()),
+            )
+        }
+    };
+    if let Err(refused) = check_addressable(pane, state, panes).await {
+        return *refused;
+    }
+    let named = store.lock().await.set_name(pane, request.name.as_deref());
+    match named {
+        Ok(()) => {
+            mark_agents_dirty();
+            match &request.name {
+                Some(name) => log::info!("msg: pane %{pane} named {}", loggable(name)),
+                None => log::info!("msg: pane %{pane} unnamed"),
+            }
+            ServerMessage::AgentNamed {
+                pane,
+                name: request.name,
+            }
+        }
+        Err(refusal) => ServerMessage::refused(refusal.code(), refusal.message()),
+    }
+}
+
+/// Every agent, named pane and pane with mail, or only `target`. Answered per
+/// request and never on a timer, so it logs nothing per pane.
+/// The pane `address` names on this server, among the `live` ones, or the
+/// refusal to answer with: a bad host or name, a remote server, or no such
+/// pane.
+async fn resolve_target(
+    address: &Address,
+    live: &std::collections::HashSet<PaneId>,
+    store: &Mutex<Messaging>,
+) -> Result<PaneId, Box<ServerMessage>> {
+    use crate::server::messaging::Refusal;
+    let refused =
+        |refusal: Refusal| Box::new(ServerMessage::refused(refusal.code(), refusal.message()));
+    if let Some(host) = &address.host {
+        if !valid_host(host) {
+            return Err(refused(Refusal::BadAddress(format!(
+                "bad host {}",
+                loggable(host)
+            ))));
+        }
+        return Err(Box::new(ServerMessage::refused(
+            "bad_address",
+            "a forwarded request must name a pane on this server",
+        )));
+    }
+    if let Target::Name(name) = &address.target {
+        if !valid_name(name) {
+            return Err(refused(Refusal::BadAddress(format!(
+                "bad name {}",
+                loggable(name)
+            ))));
+        }
+    }
+    store
+        .lock()
+        .await
+        .resolve(&address.target, |pane| live.contains(&pane))
+        .map_err(refused)
+}
+
+/// `agent wait`: answer at once when `target`'s agent is already in `want`,
+/// else park the caller for the submitter to answer. The state is the one a
+/// submit takes ([`submit_state`]), sampled from the one pane, so a selector
+/// no pattern names counts as `NeedsInput` here as it does for a submit.
+#[allow(clippy::too_many_arguments)]
+async fn handle_agent_wait(
+    client_id: u64,
+    target: Address,
+    want: AgentState,
+    timeout_ms: Option<u64>,
+    req: Option<u64>,
+    link: Option<&str>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    let live = live_panes(panes).await;
+    let pane = match resolve_target(&target, &live, store).await {
+        Ok(pane) => pane,
+        Err(refusal) => return Some(*refusal),
+    };
+    let sample = sample_pane(pane, state, panes, config).await;
+    if !sample.live {
+        return Some(ServerMessage::refused(
+            "no_such_target",
+            format!("no such target: %{pane}"),
+        ));
+    }
+    let Some(now_state) = sample.state else {
+        return Some(ServerMessage::refused(
+            "agent_not_ready",
+            format!("%{pane} is not running an agent this server knows"),
+        ));
+    };
+    let name = store.lock().await.name_of(pane).map(str::to_string);
+    if now_state == want {
+        return Some(agent_waited(pane, name, now_state, false));
+    }
+    let tx = clients.lock().await.get(&client_id).map(|c| c.tx.clone())?;
+    let deadline = std::time::Instant::now() + wait_timeout(timeout_ms);
+    {
+        let mut st = store.lock().await;
+        // A peer link parks many, one per `req`, up to its cap; a local
+        // connection parks one.
+        match link {
+            Some(link) => {
+                if let Some(full) = st.link_park_refusal(client_id, link) {
+                    return Some(link_full(&full));
+                }
+            }
+            None if st.has_parked_send(client_id) || forward_parked(client_id) => {
+                return Some(ServerMessage::refused(
+                    "bad_request",
+                    "this connection already has a request waiting",
+                ));
+            }
+            None => {}
+        }
+        let wait = crate::server::messaging::StateWait {
+            pane,
+            want,
+            deadline,
+            reply: crate::server::messaging::Reply::new(client_id, tx, req),
+        };
+        if st.park_state_wait(wait).is_err() {
+            drop(st);
+            log::info!("agent: client_id={client_id} wait on %{pane} refused: busy");
+            return Some(ServerMessage::refused(
+                "busy",
+                format!(
+                    "{} callers already wait on agents' states; try again later",
+                    crate::server::messaging::MAX_STATE_WAITS
+                ),
+            ));
+        }
+    }
+    log::info!("agent: client_id={client_id} waits for %{pane} to be {want:?} (now {now_state:?})");
+    mark_submit_dirty();
+    None
+}
+
+fn agent_waited(
+    pane: PaneId,
+    name: Option<String>,
+    state: AgentState,
+    timed_out: bool,
+) -> ServerMessage {
+    ServerMessage::AgentWaited {
+        target: Resolved {
+            host: None,
+            pane_id: pane,
+            name,
+        },
+        state: Some(state),
+        timed_out,
+        req: None,
+    }
+}
+
+/// One pass over the `agent wait` callers: sample each pane once, and answer
+/// the waits it ends. A pane that is no longer live is `no_such_target`, and
+/// one no longer running an agent is `agent_not_ready`: the state waited for
+/// can no longer come.
+async fn step_state_waits(
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    store: &'static Mutex<Messaging>,
+) {
+    let watched = store.lock().await.state_wait_panes();
+    for pane in watched {
+        let sample = sample_pane(pane, state, panes, config).await;
+        let now = std::time::Instant::now();
+        let mut st = store.lock().await;
+        match (sample.live, sample.state) {
+            (true, Some(agent_state)) => {
+                let name = st.name_of(pane).map(str::to_string);
+                for (wait, timed_out) in st.answer_state_waits(pane, agent_state, now) {
+                    log::info!(
+                        "agent: client_id={} wait on %{pane} for {:?} {}",
+                        wait.reply.client_id,
+                        wait.want,
+                        if timed_out { "timed out" } else { "answered" }
+                    );
+                    let message = agent_waited(pane, name.clone(), agent_state, timed_out);
+                    wait.reply.send(message);
+                }
+            }
+            (live, _) => {
+                let (code, why) = if live {
+                    ("agent_not_ready", format!("the agent in %{pane} exited"))
+                } else {
+                    ("no_such_target", format!("pane %{pane} closed"))
+                };
+                for wait in st.take_state_waits(pane) {
+                    log::info!(
+                        "agent: client_id={} wait on %{pane} ended: {code}",
+                        wait.reply.client_id
+                    );
+                    let message = ServerMessage::refused(code, format!("{why} while waited on"));
+                    wait.reply.send(message);
+                }
+            }
+        }
+    }
+}
+
+/// Whether an `agent status` or `agent wait` that came over the peer link
+/// `link` must be refused before it is answered. A link asks about one pane
+/// at a time, under the link rate. Every request counts against that rate,
+/// a refused one too, so that refusals cannot write log lines faster than
+/// answers can.
+async fn peer_agent_refusal(
+    link: &str,
+    untargeted: bool,
+    config: &Config,
+    store: &Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    let per_10s = config.messaging.link_rate_per_10s();
+    let charged = store
+        .lock()
+        .await
+        .charge_inbound_link(link, per_10s, std::time::Instant::now());
+    if let Err(refusal) = charged {
+        log::info!("agent: link {link} refused: {}", refusal.code());
+        return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+    }
+    if untargeted {
+        log::info!("agent: link {link} asked for every pane: bad_request");
+        return Some(ServerMessage::refused(
+            "bad_request",
+            "a peer link asks about one pane at a time",
+        ));
+    }
+    None
+}
+
+async fn handle_agent_status(
+    target: Option<Address>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    store: &Mutex<Messaging>,
+) -> ServerMessage {
+    let live = live_panes(panes).await;
+    let wanted = match &target {
+        None => None,
+        Some(address) => match resolve_target(address, &live, store).await {
+            Ok(pane) => Some(pane),
+            Err(refusal) => return *refusal,
+        },
+    };
+
+    // It dups the masters itself and holds no lock while it reads them.
+    let agents: HashMap<PaneId, AgentEntry> = collect_agents(state, panes, clients, config)
+        .await
+        .into_iter()
+        .map(|entry| (entry.pane_id, entry))
+        .collect();
+    let now = now_ms();
+    let rows: Vec<(PaneId, Option<String>, usize)> = {
+        let store = store.lock().await;
+        let mut ids: Vec<PaneId> = match wanted {
+            Some(pane) => vec![pane],
+            None => agents
+                .keys()
+                .copied()
+                .chain(store.panes_with_mail_or_name(now))
+                .filter(|pane| live.contains(pane))
+                .collect(),
+        };
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .map(|pane| {
+                (
+                    pane,
+                    store.name_of(pane).map(str::to_string),
+                    store.unread(pane, now),
+                )
+            })
+            .collect()
+    };
+    let mut entries = Vec::with_capacity(rows.len());
+    {
+        let st = state.lock().await;
+        for (pane_id, name, unread) in rows {
+            let Some((session, tab_index)) = st.locate_pane(pane_id) else {
+                if wanted.is_some() {
+                    let why = if st.is_popup(pane_id) {
+                        POPUP_REFUSED.to_string()
+                    } else {
+                        format!("no such target: %{pane_id}")
+                    };
+                    return ServerMessage::refused("no_such_target", why);
+                }
+                log::debug!("msg: status skips pane %{pane_id}, which is in no tab");
+                continue;
+            };
+            let agent = agents.get(&pane_id);
+            entries.push(PaneStatusEntry {
+                pane_id,
+                session,
+                tab_index,
+                command: agent.map(|entry| entry.command.clone()),
+                state: agent.map(|entry| entry.state),
+                name,
+                unread,
+                host: None,
+            });
+        }
+    }
+    ServerMessage::AgentStatusList {
+        panes: entries,
+        req: None,
+    }
+}
+
+/// The longest a read may wait for mail, whatever it asks for. A waiter holds
+/// only a channel sender, so the bound is about not keeping a forgotten
+/// request alive for ever, not about cost.
+pub const MAX_WAIT_MS: u64 = 3_600_000;
+
+/// End a parked wait at its deadline, answering it timed out. Returns whether
+/// it did: removing the waiter from the store by any other path (answered,
+/// its pane closing, its client leaving, superseded) drops the waiter's end
+/// of `cancelled`, and the timer then ends at once without answering.
+async fn wait_out(
+    id: crate::server::messaging::WaiterId,
+    pane: PaneId,
+    wait_ms: u64,
+    cancelled: tokio::sync::oneshot::Receiver<()>,
+    store: &'static Mutex<Messaging>,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_millis(wait_ms)) => {}
+        _ = cancelled => return false,
+    }
+    let Some(waiter) = store.lock().await.unpark(id) else {
+        return false;
+    };
+    log::debug!("msg: wait on %{pane} timed out after {wait_ms}ms");
+    let _ = waiter.tx.send(ServerMessage::MsgList {
+        pane,
+        messages: Vec::new(),
+        timed_out: true,
+        marked: waiter.mark,
+    });
+    true
+}
+
+/// List a mailbox. Only the caller's own mailbox is ever marked read: a read
+/// of anyone else's, or from outside any pane, is a peek whatever it asked.
+///
+/// With `wait_ms`, a read that finds nothing parks instead of answering and
+/// returns `None`; see [`crate::server::messaging::Waiter`].
+async fn handle_msg_read(
+    client_id: u64,
+    msg: MailboxRead,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    let (pane, caller) = match mailbox_of(
+        client_id,
+        "MsgRead",
+        msg.pane,
+        msg.pane_hint,
+        peer,
+        state,
+        panes,
+    )
+    .await
+    {
+        Ok(found) => found,
+        Err(refused) => return Some(*refused),
+    };
+    let mark = caller == Some(pane) && !msg.peek;
+    // Cloned before the store is locked: a waiter answers through it later.
+    let tx = match msg.wait_ms {
+        Some(_) => clients
+            .lock()
+            .await
+            .get(&client_id)
+            .map(|conn| conn.tx.clone()),
+        None => None,
+    };
+    // The reader that called this is this client's, so it is in the map.
+    debug_assert!(
+        msg.wait_ms.is_none() || tx.is_some(),
+        "a waiting read from client_id={client_id}, which is not in the client map"
+    );
+    let has_tx = tx.is_some();
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    // The read and the park happen under one lock, and a send delivers and
+    // collects waiters under the same lock, so no message can arrive between
+    // "nothing to read" and "waiting".
+    let (messages, swept, parked) = {
+        let mut store = store.lock().await;
+        let messages = store.read(pane, msg.all, mark, now_ms());
+        let swept = store.take_swept();
+        let parked = match (msg.wait_ms, tx) {
+            (Some(wait_ms), Some(tx)) if messages.is_empty() => Some((
+                store.park(crate::server::messaging::Waiter {
+                    client_id,
+                    pane,
+                    all: msg.all,
+                    mark,
+                    tx,
+                    cancel,
+                }),
+                wait_ms.min(MAX_WAIT_MS),
+            )),
+            _ => None,
+        };
+        (messages, swept, parked)
+    };
+    if mark && !messages.is_empty() {
+        mark_agents_dirty();
+    }
+    if swept > 0 {
+        mark_agents_dirty();
+        log::info!("msg: swept {swept} expired message(s)");
+    }
+    match parked {
+        Some((Err(_), _)) => {
+            return Some(ServerMessage::refused(
+                "no_such_target",
+                format!("pane %{pane} closed while waiting"),
+            ))
+        }
+        Some((Ok((id, superseded)), wait_ms)) => {
+            if let Some(earlier) = superseded {
+                log::debug!(
+                    "msg: wait on %{} superseded for client_id={client_id}",
+                    earlier.pane
+                );
+                let _ = earlier.tx.send(ServerMessage::MsgList {
+                    pane: earlier.pane,
+                    messages: Vec::new(),
+                    timed_out: true,
+                    marked: earlier.mark,
+                });
+            }
+            log::debug!("msg: wait on %{pane} parked for client_id={client_id} ({wait_ms}ms)");
+            tokio::spawn(wait_out(id, pane, wait_ms, cancelled, store));
+            return None;
+        }
+        None => {}
+    }
+    if msg.wait_ms.is_some() && messages.is_empty() && !has_tx {
+        return Some(ServerMessage::MsgList {
+            pane,
+            messages,
+            timed_out: true,
+            marked: mark,
+        });
+    }
+    if !messages.is_empty() {
+        log::info!("msg: read pane=%{pane} n={} marked={mark}", messages.len());
+    }
+    Some(ServerMessage::MsgList {
+        pane,
+        messages,
+        timed_out: false,
+        marked: mark,
+    })
+}
+
+/// Mark messages Read without returning them. Naming another pane's mailbox
+/// does mark it, unlike a read: an ack exists to clear mail on purpose.
+async fn handle_msg_ack(
+    client_id: u64,
+    ack: MailboxAck,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    store: &Mutex<Messaging>,
+) -> ServerMessage {
+    if ack.all && !ack.ids.is_empty() {
+        return ServerMessage::refused(
+            "bad_request",
+            "an ack names ids or asks for all of them, not both",
+        );
+    }
+    let (pane, caller) = match mailbox_of(
+        client_id,
+        "MsgAck",
+        ack.pane,
+        ack.pane_hint,
+        peer,
+        state,
+        panes,
+    )
+    .await
+    {
+        Ok(found) => found,
+        Err(refused) => return *refused,
+    };
+    let count = {
+        let mut store = store.lock().await;
+        if ack.all {
+            store.ack_all(pane)
+        } else {
+            store.ack(pane, &ack.ids)
+        }
+    };
+    if count > 0 {
+        mark_agents_dirty();
+        log::info!(
+            "msg: acked pane=%{pane} n={count} by={}",
+            caller.map_or("outside".to_string(), |by| format!("%{by}"))
+        );
+    }
+    ServerMessage::MsgAcked { pane, count }
+}
+
+/// Log which pane a new connection's peer runs in, once per connection.
+///
+/// Diagnostic only. A message's sender is attributed again for each message,
+/// because a pane can close between two messages on one connection. The
+/// process table is read with no lock held.
+async fn log_peer_identity(
+    client_id: u64,
+    peer_pid: Option<i32>,
+    peer: Arc<identity::Peer>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) {
+    let pin = peer.pin_kind();
+    let verdict = tokio::time::timeout(ATTRIBUTION_TIMEOUT, async {
+        let index = proc_index(&*panes.lock().await);
+        tokio::task::spawn_blocking(move || {
+            identity::attribute_caller(&*peer, &index, &identity::system_table())
+        })
+        .await
+    })
+    .await;
+    let Ok(verdict) = verdict else {
+        log::warn!(
+            "identity: client_id={client_id} peer={peer_pid:?} not attributed: timed out after {ATTRIBUTION_TIMEOUT:?}"
+        );
+        return;
+    };
+    match verdict {
+        Ok(Ok(a)) if a.tty_differs => log::info!(
+            "identity: client_id={client_id} peer={peer_pid:?} pin={pin} -> pane %{} by {:?}; its tty differs (nested pty?)",
+            a.pane,
+            a.how
+        ),
+        Ok(Ok(a)) => log::debug!(
+            "identity: client_id={client_id} peer={peer_pid:?} pin={pin} -> pane %{} by {:?}",
+            a.pane,
+            a.how
+        ),
+        Ok(Err(e)) => log::debug!(
+            "identity: client_id={client_id} peer={peer_pid:?} pin={pin} not a pane: {}",
+            e.reason()
+        ),
+        Err(e) => log::warn!("identity: client_id={client_id} attribution task failed: {e}"),
+    }
+}
+
 /// Return the runtime directory used for the socket and pid files.
 fn runtime_dir() -> PathBuf {
-    dirs::runtime_dir()
-        .or_else(|| std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+    xdg_runtime_dir().unwrap_or_else(fallback_runtime_dir)
+}
+
+fn xdg_runtime_dir() -> Option<PathBuf> {
+    dirs::runtime_dir().or_else(|| std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from))
+}
+
+/// `$TMPDIR/remux-<uid>` (TMPDIR defaulting to `/tmp`), for a session with no
+/// XDG runtime directory. Per user and private, because the temp directory is
+/// shared: a socket straight in `/tmp` could be connected to, or created
+/// first, by any other user on the machine.
+fn fallback_runtime_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("remux-{}", own_uid()))
+}
+
+/// Make the runtime directory ready to hold the socket, or to trust a socket
+/// found in it, and return it.
+///
+/// An XDG runtime directory is the login session's, private to this user by
+/// the spec, and is used as it is. The fallback is created mode 0700, and then
+/// REFUSED unless it is a real directory (not a symlink) owned by this user
+/// with no group or other permission: another user who made it first would
+/// otherwise own the socket every client of ours connects to.
+pub fn prepare_runtime_dir() -> Result<PathBuf> {
+    if let Some(dir) = xdg_runtime_dir() {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating runtime directory {}", dir.display()))?;
+        return Ok(dir);
+    }
+    let dir = fallback_runtime_dir();
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating {}", dir.display()));
+            }
+        }
+    }
+    check_private_dir(&dir, own_uid())?;
+    Ok(dir)
+}
+
+/// `dir`, created 0700 if it is missing, then refused unless it is a private
+/// directory of ours, by the rules the socket's fallback directory follows.
+pub fn private_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+    }
+    check_private_dir(dir, own_uid())
+}
+
+/// Whether `dir` is a directory, not a symlink, owned by `uid`, and closed to
+/// group and other.
+fn check_private_dir(dir: &std::path::Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta =
+        std::fs::symlink_metadata(dir).with_context(|| format!("inspecting {}", dir.display()))?;
+    if !meta.file_type().is_dir() {
+        anyhow::bail!("refusing to use {}: it is not a directory", dir.display());
+    }
+    if meta.uid() != uid {
+        anyhow::bail!(
+            "refusing to use {}: it is owned by uid {}, not by this user (uid {uid})",
+            dir.display(),
+            meta.uid()
+        );
+    }
+    if meta.mode() & 0o077 != 0 {
+        anyhow::bail!(
+            "refusing to use {}: its mode {:o} lets other users in; it must be 0700",
+            dir.display(),
+            meta.mode() & 0o777
+        );
+    }
+    Ok(())
+}
+
+/// This process's effective uid.
+fn own_uid() -> u32 {
+    // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Whether a connection from `peer_uid` may talk to a server run by
+/// `own_uid`. The socket's own mode keeps other users out already; this is the
+/// check that does not depend on a file mode being right.
+fn peer_allowed(peer_uid: u32, own_uid: u32) -> bool {
+    peer_uid == own_uid
 }
 
 /// Return the path to the Unix domain socket used for client-server
 /// communication.
 pub fn socket_path() -> PathBuf {
     runtime_dir().join("remux.sock")
+}
+
+/// The file at `path` as (device, inode), to tell it from another file later
+/// put at the same path.
+fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Remove this server's socket and pid file at shutdown, but only while they
+/// are still this server's. A shutdown that runs long (a large save) can end
+/// after the next server has bound its own socket at the same path and
+/// written its own pid: removing those would leave that server unreachable
+/// and `remux stop` unable to find it.
+fn remove_own_files(socket_path: &std::path::Path, bound: Option<(u64, u64)>) {
+    if bound.is_some() && file_identity(socket_path) == bound {
+        let _ = std::fs::remove_file(socket_path);
+    } else {
+        log::info!(
+            "shutdown: {} is no longer the socket this server bound; left in place",
+            socket_path.display()
+        );
+    }
+    let pid_file = pid_path();
+    let ours = std::process::id().to_string();
+    match std::fs::read_to_string(&pid_file) {
+        Ok(text) if text.trim() == ours => {
+            let _ = std::fs::remove_file(&pid_file);
+        }
+        Ok(_) => log::info!(
+            "shutdown: {} names another process; left in place",
+            pid_file.display()
+        ),
+        Err(_) => {}
+    }
 }
 
 /// Return the path to the pid file recording the running server's PID.
@@ -552,10 +4798,25 @@ where
 /// Read a length-prefixed JSON message from an async reader.
 ///
 /// Returns `Ok(None)` if the connection was closed (EOF on the length header).
+/// A frame over [`protocol::MAX_FRAME_BYTES`] is an `Err` before anything is
+/// allocated, and every caller drops the connection on an `Err`. This is the
+/// one reader: the server's, the TUI client's, a remote's over ssh and the
+/// handshake's all go through it.
 pub async fn read_message<T>(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<Option<T>>
 where
     T: DeserializeOwned,
 {
+    let Some(payload) = read_frame(reader).await? else {
+        return Ok(None);
+    };
+    let msg: T = serde_json::from_slice(&payload).context("deserializing message")?;
+    Ok(Some(msg))
+}
+
+/// One frame's payload, undecoded, with [`read_message`]'s bounds: `Ok(None)`
+/// on EOF before a header. A reader that must outlive a frame it cannot
+/// decode reads with this and decodes itself.
+pub async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<Option<Vec<u8>>> {
     let mut header = [0u8; 4];
     match reader.read_exact(&mut header).await {
         Ok(_) => {}
@@ -564,14 +4825,24 @@ where
     }
 
     let len = protocol::decode_message_length(&header);
-    let mut payload = vec![0u8; len];
-    reader
-        .read_exact(&mut payload)
+    if len > protocol::MAX_FRAME_BYTES {
+        log::warn!(
+            "protocol: refusing a {len}-byte frame (the limit is {}); dropping the connection",
+            protocol::MAX_FRAME_BYTES
+        );
+        anyhow::bail!("frame of {len} bytes is over the limit");
+    }
+    // Grown as the bytes arrive rather than reserved at the claimed length, so
+    // a peer that sends a large header and nothing else costs almost nothing.
+    let mut payload = Vec::with_capacity(len.min(64 * 1024));
+    let got = AsyncReadExt::take(&mut *reader, len as u64)
+        .read_to_end(&mut payload)
         .await
         .context("reading message payload")?;
-
-    let msg: T = serde_json::from_slice(&payload).context("deserializing message")?;
-    Ok(Some(msg))
+    if got < len {
+        anyhow::bail!("connection closed mid-frame ({got} of {len} bytes)");
+    }
+    Ok(Some(payload))
 }
 
 // ---------------------------------------------------------------------------
@@ -598,7 +4869,7 @@ struct PaneData {
     /// the master is non-blocking, and a synchronous loop over it dropped the
     /// tail of any write the slave's input queue could not take -- a truncated
     /// or entirely vanished paste. See [`pty::start_writer`].
-    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    input_tx: mpsc::UnboundedSender<pty::WriteJob>,
     /// The background writer task draining `input_tx`.
     ///
     /// Held for the same reason `reader` is: dropping a `JoinHandle` detaches
@@ -640,11 +4911,22 @@ struct PaneData {
     /// [`crate::server::agents::Reason`] is the same reason with that number
     /// taken out.
     agent_verdict: Option<(AgentState, crate::server::agents::Reason)>,
+    /// When a human last typed into this pane: a client's keystroke, a View
+    /// cell's, a key binding's `SendKey`, or the wheel's arrow keys. Set only
+    /// by [`Self::send_human_input`]. The typing guard reads it.
+    last_human_input: Option<std::time::Instant>,
+    /// The message being typed into the pane, while it is. See
+    /// [`Self::send_human_input`].
+    typing: Option<std::sync::Weak<SubmitTyping>>,
     /// The pane's `OSC 0` / `OSC 2` titles and its foreground history.
     title: crate::server::title::TitleTracker,
     /// Process names and working directory, read outside the `panes` lock by
     /// [`refresh_pane_names`] so that naming a pane never does a syscall.
     names: PaneNames,
+    /// The pane's program has exited. Such a pane can stay in the table when
+    /// `close_pane` declines to close it (a background tab), and it must not
+    /// be a message target or a sender's pane in the meantime.
+    exited: bool,
 }
 
 /// A pane's cached process names and working directory.
@@ -788,12 +5070,97 @@ impl PaneData {
     /// would become an `error handling client message` line, and the two callers
     /// that log an error themselves would carry a branch nothing can reach.
     fn send_input(&self, data: &[u8]) {
-        if self.input_tx.send(data.to_vec()).is_err() {
+        if self.input_tx.send(data.to_vec().into()).is_err() {
             log::warn!(
                 "server: dropping {} input byte(s) for a pane whose writer has exited",
                 data.len()
             );
         }
+    }
+
+    /// [`Self::send_input`] for keys a person pressed, which arms the typing
+    /// guard. Every human key path writes through this, and nothing else
+    /// does: a submit's own writes arming it would hold the next submit
+    /// behind the guard the first one armed.
+    ///
+    /// A key that arrives while a message is being typed, before it is
+    /// submitted or refused, takes the pane back from it: the message's
+    /// writes are cancelled, and the key goes to the writer with a flush of
+    /// the queue ahead of it, which the writer runs only once the cancelled
+    /// write has stopped. Behind the message, the key would be read with it
+    /// by the next reader, and after the agent exits that is the shell, which
+    /// the key's Enter would make run it. A paste the agent is inside (it
+    /// read the opener, and not yet the closer) is closed first, so the key
+    /// is never taken as part of it. Only the first key does this.
+    fn send_human_input(&mut self, data: &[u8]) {
+        self.last_human_input = Some(std::time::Instant::now());
+        let typing = self
+            .typing
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .filter(|t| !t.ended.load(Ordering::SeqCst))
+            .filter(|t| !t.taken_over.swap(true, Ordering::SeqCst));
+        let Some(typing) = typing else {
+            return self.send_input(data);
+        };
+        self.typing = None;
+        // An empty queue after the writer finished the last job means the
+        // agent has read all it was given so far, whatever the typing task
+        // has yet to notice: the opener at least, and the closer too once the
+        // last chunk went out.
+        let unread = unread_input(&typing.slave);
+        if unread == Some(0) && typing.cancel.is_written() {
+            typing.opener_read.store(typing.bracketed, Ordering::SeqCst);
+            if typing.last_sent.load(Ordering::SeqCst) {
+                typing.all_read.store(true, Ordering::SeqCst);
+            }
+        }
+        typing.cancel.cancel();
+        let mut bytes = Vec::with_capacity(data.len() + 6);
+        if typing.paste_open() {
+            bytes.extend_from_slice(crate::server::submit::PASTE_CLOSE);
+        }
+        bytes.extend_from_slice(data);
+        log::info!(
+            "msg: id={} a person typed before it was submitted; its text is withdrawn, {} \
+             unread byte(s) flushed",
+            typing.id,
+            unread.unwrap_or(0)
+        );
+        let job = pty::WriteJob {
+            data: bytes,
+            done: None,
+            cancel: None,
+            flush_first: Some(Arc::clone(&typing.slave)),
+        };
+        if self.input_tx.send(job).is_err() {
+            log::warn!(
+                "server: dropping {} input byte(s) for a pane whose writer has exited",
+                data.len()
+            );
+        }
+    }
+
+    /// [`Self::send_input`], told when the last byte is written and able to
+    /// be cancelled; see [`pty::WriteJob`]. The receiver reports `false` (or
+    /// is closed) when the bytes were not all written.
+    fn send_tracked(
+        &self,
+        data: Vec<u8>,
+        cancel: Arc<pty::WriteCancel>,
+    ) -> tokio::sync::oneshot::Receiver<bool> {
+        let (done, written) = tokio::sync::oneshot::channel();
+        cancel.pending();
+        let job = pty::WriteJob {
+            data,
+            done: Some(done),
+            cancel: Some(cancel),
+            flush_first: None,
+        };
+        if self.input_tx.send(job).is_err() {
+            log::warn!("server: dropping a typed message for a pane whose writer has exited");
+        }
+        written
     }
 }
 
@@ -947,6 +5314,11 @@ struct ClientConnection {
     /// [`ClientMessage::TabStyle`]. `None` until it says, and for ever for an
     /// older client or the CLI.
     tab_style: Option<TabStyle>,
+    /// A second descriptor for the connection's socket, which
+    /// [`close_connections`] shuts down: the reader then sees EOF and the
+    /// connection ends the usual way. Only a peer link that has lapsed is
+    /// closed by this server.
+    closer: Option<std::os::fd::OwnedFd>,
     /// The popup interior this client asked for with
     /// [`ClientMessage::PopupSize`]. `None` for a client that never asked (an
     /// older client, or the CLI): the server then draws the popup into its
@@ -998,6 +5370,7 @@ impl ClientConnection {
 }
 
 /// The Remux server.
+#[derive(Clone)]
 pub struct RemuxServer {
     state: Arc<Mutex<ServerState>>,
     panes: Arc<Mutex<HashMap<PaneId, PaneData>>>,
@@ -1021,6 +5394,7 @@ impl RemuxServer {
     /// Create a new server instance.
     fn new(config: Config) -> Self {
         PANE_TITLE.get_or_init(|| config.appearance.pane_title.clone());
+        MESSAGING.get_or_init(|| Mutex::new(Messaging::new(config.messaging.limits())));
         Self {
             state: Arc::new(Mutex::new(ServerState::new())),
             panes: Arc::new(Mutex::new(HashMap::new())),
@@ -1038,6 +5412,69 @@ impl RemuxServer {
     /// Start the server: bind socket, accept connections, run the event loop.
     pub async fn run(config: Config) -> Result<()> {
         let server = Self::new(config);
+        let seam =
+            identity::seam_from_env(std::env::var("REMUX_TEST_PEER_ANCESTOR").ok().as_deref());
+        if let Some(warning) = server.config.messaging.host_name_warning() {
+            log::warn!("[messaging] {warning}");
+        }
+        if let Some(pid) = seam {
+            log::warn!("identity: TEST SEAM: pid {pid} counts as a root sshd for peer links");
+        }
+        let _ = PEER_SEAM.set(seam);
+
+        // Before anything is restored: a server that is about to refuse a
+        // live socket must not first spawn every restored pane's shell.
+        prepare_runtime_dir()?;
+        let path = socket_path();
+        // Only a socket nobody listens on is stale. Unlinking a live server's
+        // socket would leave that server running, and every session in it,
+        // where no client can reach it.
+        match tokio::net::UnixStream::connect(&path).await {
+            Ok(_) => anyhow::bail!(
+                "a remux server is already listening on {}; `remux stop` it first",
+                path.display()
+            ),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("probing {}", path.display()));
+            }
+        }
+
+        let listener = UnixListener::bind(&path).context("binding Unix listener")?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("restricting {} to this user", path.display()))?;
+        }
+        log::info!("server listening on {}", path.display());
+        // What shutdown may remove: this file, and no other that a later
+        // server binds at the same path.
+        let bound = file_identity(&path);
+
+        // Before the restore, which can take a while: a `remux stop` that
+        // finds the socket must also find the pid, and the SIGTERM it sends
+        // must be held for the main loop rather than kill a server that has
+        // no handler yet. tokio keeps a signal until the handler is polled, so
+        // a stop during the restore becomes a graceful save once it is done.
+        // The handlers come first: a pid file names a server that can take
+        // the signal.
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("registering SIGTERM handler")?;
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .context("registering SIGINT handler")?;
+        // Best-effort: a write failure here must not abort startup.
+        let pid_file = pid_path();
+        match std::fs::write(&pid_file, std::process::id().to_string()) {
+            Ok(()) => log::info!("wrote pid file {}", pid_file.display()),
+            Err(e) => log::warn!("failed to write pid file {}: {e}", pid_file.display()),
+        }
 
         // Load persisted state before accepting connections. Behavior depends
         // on two config flags:
@@ -1080,30 +5517,15 @@ impl RemuxServer {
             log::info!("save_sessions disabled: persistence is off");
         }
 
-        let path = socket_path();
-        // Create parent directory if needed.
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).context("creating socket directory")?;
-        }
-        // Remove stale socket if present.
-        let _ = std::fs::remove_file(&path);
-
-        let listener = UnixListener::bind(&path).context("binding Unix listener")?;
-        log::info!("server listening on {}", path.display());
-
-        // Record our PID so `remux stop` can signal us for a graceful save-and-
-        // exit. Best-effort: a write failure here must not abort startup.
-        let pid_file = pid_path();
-        match std::fs::write(&pid_file, std::process::id().to_string()) {
-            Ok(()) => log::info!("wrote pid file {}", pid_file.display()),
-            Err(e) => log::warn!("failed to write pid file {}: {e}", pid_file.display()),
+        // After the restore above has SPAWNED the restored panes: the load
+        // prunes against the live pane map, and loading any earlier would
+        // prune every mailbox on every restart.
+        if server.config.messaging.persist {
+            load_mailbox(&server).await;
+            spawn_mailbox_saver(Arc::clone(&server.state));
         }
 
-        // Set up signal handlers for graceful shutdown.
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .context("registering SIGTERM handler")?;
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .context("registering SIGINT handler")?;
+        let own_uid = own_uid();
 
         // Session-tree push task. Sleeping a full interval after each broadcast
         // is the coalescing: every change arriving during that sleep collapses
@@ -1155,6 +5577,39 @@ impl RemuxServer {
             });
         }
 
+        // Links from other servers that stopped pinging are forgotten, so
+        // their names are free and no reply is routed to them.
+        let sweep_clients = Arc::clone(&server.clients);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(LINK_EXPIRY_SWEEP).await;
+                let expired = links().lock().await.expire(std::time::Instant::now());
+                let closing = log_expired(expired);
+                close_connections(&sweep_clients, &closing).await;
+            }
+        });
+
+        // Messages that come back over the links this server dials.
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(INBOUND_QUEUE);
+        let _ = INBOUND.set(inbound_tx);
+        tokio::spawn(run_inbound(
+            inbound_rx,
+            Arc::clone(&server.state),
+            Arc::clone(&server.panes),
+            Arc::clone(&server.config),
+        ));
+
+        // The submitter: types queued messages into their panes. Its own
+        // `Notify`, never `AGENTS_DIRTY`: that one is `notify_one` with the
+        // pusher above as its only waiter, and a second waiter would take its
+        // wakeups.
+        tokio::spawn(run_submitter(
+            Arc::clone(&server.state),
+            Arc::clone(&server.panes),
+            Arc::clone(&server.clients),
+            Arc::clone(&server.config),
+        ));
+
         // Periodic tick that promotes quiet background `Activity` tabs to
         // `Silent` ("finished"). Runs in the real server binary, so
         // `Instant::now()`/`interval` are unrestricted.
@@ -1165,9 +5620,27 @@ impl RemuxServer {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
-                        Ok((stream, _addr)) => {
-                            server.handle_new_connection(stream).await;
-                        }
+                        Ok((stream, _addr)) => match stream.peer_cred() {
+                            Ok(cred) if peer_allowed(cred.uid(), own_uid) => {
+                                // Spawned so that a peer that never sends its Hello
+                                // holds only its own task for the handshake timeout,
+                                // not the accept loop, the tick or SIGTERM.
+                                let pidfd = identity::peer_pidfd(std::os::fd::AsFd::as_fd(&stream));
+                                let server = server.clone();
+                                tokio::spawn(async move {
+                                    server.handle_new_connection(stream, cred.pid(), pidfd).await;
+                                });
+                            }
+                            Ok(cred) => {
+                                log::warn!(
+                                    "server: refusing a connection from uid {} (this server runs as uid {own_uid})",
+                                    cred.uid()
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!("server: refusing a connection whose peer is unknown: {e}");
+                            }
+                        },
                         Err(e) => {
                             log::error!("accept error: {e}");
                         }
@@ -1205,17 +5678,24 @@ impl RemuxServer {
         }
 
         // Graceful shutdown: clean up resources.
-        server.shutdown(&path).await;
+        server.shutdown(&path, bound).await;
         Ok(())
     }
 
     /// Perform graceful shutdown: save state, drop panes, remove socket.
-    async fn shutdown(&self, socket_path: &std::path::Path) {
+    async fn shutdown(&self, socket_path: &std::path::Path, bound: Option<(u64, u64)>) {
+        // Before the save_sessions return below: `persist` is the one switch
+        // for this file. With save_sessions off no pane is restored, so the
+        // next start prunes every mailbox, which is the right answer without
+        // a second switch.
+        if self.config.messaging.persist {
+            save_mailbox_now(&self.state).await;
+        }
+
         // Persistence is fully off when save_sessions is disabled.
         if !self.config.general.save_sessions {
             log::info!("save_sessions disabled: skipping state save on shutdown");
-            let _ = std::fs::remove_file(socket_path);
-            let _ = std::fs::remove_file(pid_path());
+            remove_own_files(socket_path, bound);
             log::info!("shutdown complete");
             return;
         }
@@ -1254,14 +5734,25 @@ impl RemuxServer {
         drop(state);
         drop(panes);
 
-        // Remove socket and pid files.
-        let _ = std::fs::remove_file(socket_path);
-        let _ = std::fs::remove_file(pid_path());
+        remove_own_files(socket_path, bound);
         log::info!("shutdown complete");
     }
 
     /// Handle a newly accepted client connection.
-    async fn handle_new_connection(&self, stream: tokio::net::UnixStream) {
+    async fn handle_new_connection(
+        &self,
+        stream: tokio::net::UnixStream,
+        peer_pid: Option<i32>,
+        pidfd: Option<std::os::fd::OwnedFd>,
+    ) {
+        // Before the handshake, while the connector is as fresh as it gets. On
+        // a kernel without a pidfd this reads the connector's start time.
+        let peer = Arc::new(identity::Peer::capture(
+            peer_pid,
+            pidfd,
+            std::os::fd::AsFd::as_fd(&stream),
+        ));
+        let closer = std::os::fd::AsFd::as_fd(&stream).try_clone_to_owned().ok();
         let (mut read_half, mut write_half) = stream.into_split();
 
         // Version handshake: exchange Hello/Welcome as the first frames, directly
@@ -1313,6 +5804,7 @@ impl RemuxServer {
             clients.insert(
                 id,
                 ClientConnection {
+                    closer,
                     session_name: None,
                     tx,
                     cols: 80,
@@ -1342,6 +5834,10 @@ impl RemuxServer {
             log::debug!("server: new client connection, assigned client_id={id}");
             id
         };
+
+        // Before the reader task exists, so a one-shot CLI peer cannot have
+        // had its reply and exited while its process is being read.
+        log_peer_identity(client_id, peer_pid, Arc::clone(&peer), &self.panes).await;
 
         // Spawn writer task.
         let mut writer = write_half;
@@ -1386,12 +5882,20 @@ impl RemuxServer {
 
         tokio::spawn(async move {
             let mut reader = read_half;
+            // Owned by the reader for the life of the connection, which keeps
+            // the connector pinned for every frame this loop reads.
+            // A message handler that attributes its caller does so before this
+            // loop reads the next frame, because `handle_client_message` is
+            // awaited here rather than spawned. The macOS pin depends on that
+            // order: its token names whoever last used the peer's end.
+            let peer = peer;
             loop {
                 match read_message::<ClientMessage>(&mut reader).await {
                     Ok(Some(msg)) => {
                         if let Err(e) = handle_client_message(
                             client_id,
                             msg,
+                            &peer,
                             &state,
                             &panes,
                             &clients,
@@ -1405,7 +5909,9 @@ impl RemuxServer {
                             let cls = clients.lock().await;
                             if let Some(client) = cls.get(&client_id) {
                                 let _ = client.tx.send(ServerMessage::Error {
+                                    req: None,
                                     message: format!("{e}"),
+                                    code: None,
                                 });
                             }
                         }
@@ -1579,6 +6085,7 @@ fn log_list_directory(client_id: u64, path: &str) {
 async fn handle_client_message(
     client_id: u64,
     msg: ClientMessage,
+    peer: &Arc<identity::Peer>,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -1645,6 +6152,89 @@ async fn handle_client_message(
         ClientMessage::ListDirectory { path } => {
             log_list_directory(client_id, path);
         }
+        // Every field is named, so a field added later cannot reach the
+        // catch-all below: a message body is user content and never logged.
+        ClientMessage::MsgSend {
+            to,
+            body,
+            deliver,
+            reply_to,
+            pane_hint,
+            defer,
+            timeout_ms,
+            wait,
+            origin,
+            req,
+        } => {
+            // A host and a pane id are labels, never content.
+            let origin = origin.as_ref().map_or("None".to_string(), |o| {
+                format!("{}:%{}", loggable(&o.host), o.pane_id)
+            });
+            log::debug!(
+                "server: client_id={client_id} msg=MsgSend(to={}, deliver={deliver:?}, {} bytes, \
+                 reply_to={}, pane_hint={pane_hint:?}, defer={defer}, timeout={timeout_ms:?}, \
+                 wait={wait}, origin={origin}, req={req:?})",
+                loggable(&to.to_string()),
+                body.len(),
+                reply_to
+                    .as_ref()
+                    .map_or("None".to_string(), |r| loggable(&format!("{r:?}")))
+            );
+        }
+        ClientMessage::MsgAck {
+            pane,
+            ids,
+            all,
+            pane_hint,
+        } => {
+            log::debug!(
+                "server: client_id={client_id} msg=MsgAck(pane={pane:?}, {} id(s), all={all}, \
+                 pane_hint={pane_hint:?})",
+                ids.len()
+            );
+        }
+        ClientMessage::AgentName {
+            name,
+            pane,
+            pane_hint,
+        } => {
+            log::debug!(
+                "server: client_id={client_id} msg=AgentName(name={}, pane={pane:?}, pane_hint={pane_hint:?})",
+                name.as_deref().map_or("None".to_string(), loggable)
+            );
+        }
+        ClientMessage::AgentStatus { target, req } => {
+            log::debug!(
+                "server: client_id={client_id} msg=AgentStatus(target={}, req={req:?})",
+                target
+                    .as_ref()
+                    .map_or("None".to_string(), |t| loggable(&t.to_string()))
+            );
+        }
+        ClientMessage::AgentWait {
+            target,
+            state,
+            timeout_ms,
+            req,
+        } => {
+            log::debug!(
+                "server: client_id={client_id} msg=AgentWait(target={}, state={state:?}, \
+                 timeout={timeout_ms:?}, req={req:?})",
+                loggable(&target.to_string())
+            );
+        }
+        ClientMessage::MsgRead {
+            pane,
+            all,
+            peek,
+            wait_ms,
+            pane_hint,
+        } => {
+            log::debug!(
+                "server: client_id={client_id} msg=MsgRead(pane={pane:?}, all={all}, peek={peek}, \
+                 wait_ms={wait_ms:?}, pane_hint={pane_hint:?})"
+            );
+        }
         ClientMessage::ScrollDelta { delta } => {
             log::debug!("server: client_id={client_id} msg=ScrollDelta(delta={delta})");
         }
@@ -1661,12 +6251,322 @@ async fn handle_client_message(
                 "server: client_id={client_id} msg=MouseDrag(start=({start_x},{start_y}), end=({end_x},{end_y}), is_final={is_final}, pane_id={pane_id:?})"
             );
         }
+        // A link pings every second or so: one line each would be a line per
+        // ping, for as long as the link lives.
+        ClientMessage::Ping { .. } => {}
+        // The peer writes the code and the message: only a code spelled like
+        // one, and the message's length, reach the log.
+        ClientMessage::MsgInboundAck {
+            req,
+            id,
+            pane_id,
+            code,
+            message,
+        } => {
+            let code = code.as_deref().map(|c| {
+                if crate::server::links::code_like(c) {
+                    c
+                } else {
+                    "?"
+                }
+            });
+            log::debug!(
+                "server: client_id={client_id} msg=MsgInboundAck(req={req}, id={}, pane={}, code={}, message={} bytes)",
+                id.map_or("-".to_string(), |id| id.to_string()),
+                pane_id.map_or("?".to_string(), |pane| format!("%{pane}")),
+                code.unwrap_or("-"),
+                message.as_deref().map_or(0, str::len)
+            );
+        }
         other => {
             log::debug!("server: client_id={client_id} msg={other:?}");
         }
     }
 
     match msg {
+        ClientMessage::MsgSend {
+            to,
+            body,
+            deliver,
+            reply_to,
+            pane_hint,
+            defer,
+            timeout_ms,
+            wait,
+            origin,
+            req,
+        } => {
+            let outgoing = OutgoingMessage {
+                to,
+                body,
+                deliver,
+                reply_to,
+                pane_hint,
+                defer,
+                timeout_ms,
+                wait,
+                origin,
+                req,
+            };
+            let answer = handle_msg_send(
+                client_id,
+                outgoing,
+                peer,
+                state,
+                panes,
+                config,
+                clients,
+                messaging(),
+            )
+            .await;
+            // `None` is a submit that was queued: its answer comes from the
+            // submitter, once it is typed or cannot be.
+            if let Some(answer) = answer {
+                reply(client_id, clients, answer.with_req(req)).await;
+            }
+            Ok(())
+        }
+        ClientMessage::MsgRead {
+            pane,
+            all,
+            peek,
+            wait_ms,
+            pane_hint,
+        } => {
+            let answer = handle_msg_read(
+                client_id,
+                MailboxRead {
+                    pane,
+                    all,
+                    peek,
+                    wait_ms,
+                    pane_hint,
+                },
+                peer,
+                state,
+                panes,
+                clients,
+                messaging(),
+            )
+            .await;
+            // `None` is a read that parked: its answer comes later, from the
+            // send that brings mail, the pane closing, or its timeout.
+            if let Some(answer) = answer {
+                reply(client_id, clients, answer).await;
+            }
+            Ok(())
+        }
+        ClientMessage::MsgAck {
+            pane,
+            ids,
+            all,
+            pane_hint,
+        } => {
+            let answer = handle_msg_ack(
+                client_id,
+                MailboxAck {
+                    pane,
+                    ids,
+                    all,
+                    pane_hint,
+                },
+                peer,
+                state,
+                panes,
+                messaging(),
+            )
+            .await;
+            reply(client_id, clients, answer).await;
+            Ok(())
+        }
+        ClientMessage::AgentName {
+            name,
+            pane,
+            pane_hint,
+        } => {
+            let answer = handle_agent_name(
+                client_id,
+                NameRequest {
+                    name,
+                    pane,
+                    pane_hint,
+                },
+                peer,
+                state,
+                panes,
+                messaging(),
+            )
+            .await;
+            reply(client_id, clients, answer).await;
+            Ok(())
+        }
+        ClientMessage::AgentStatus { target, req } => {
+            let link = links()
+                .lock()
+                .await
+                .peer_name(client_id, std::time::Instant::now())
+                .map(str::to_string);
+            // Forwarded only from a local caller: a host on a request that
+            // came over a link is refused by the local handler.
+            let remote = target
+                .as_ref()
+                .and_then(|t| t.host.clone())
+                .filter(|host| valid_host(host) && link.is_none());
+            let answer = match (remote, link.as_deref()) {
+                (Some(host), _) => {
+                    let msg = ClientMessage::AgentStatus {
+                        target: target.map(|t| Address {
+                            host: None,
+                            target: t.target,
+                        }),
+                        req: None,
+                    };
+                    forward_agent_request(
+                        client_id,
+                        host,
+                        msg,
+                        std::time::Duration::ZERO,
+                        config,
+                        clients,
+                        messaging(),
+                    )
+                    .await
+                }
+                (None, Some(link)) => Some(
+                    match peer_agent_refusal(link, target.is_none(), config, messaging()).await {
+                        Some(refusal) => refusal,
+                        None => {
+                            handle_agent_status(target, state, panes, clients, config, messaging())
+                                .await
+                        }
+                    },
+                ),
+                (None, None) => Some(
+                    handle_agent_status(target, state, panes, clients, config, messaging()).await,
+                ),
+            };
+            if let Some(answer) = answer {
+                reply(client_id, clients, answer.with_req(req)).await;
+            }
+            Ok(())
+        }
+        ClientMessage::PeerLink { name, ping_ms } => {
+            if let Some(answer) =
+                handle_peer_link(client_id, &name, ping_ms, peer, panes, clients).await
+            {
+                reply(client_id, clients, answer).await;
+            }
+            Ok(())
+        }
+        ClientMessage::Ping { nonce } => {
+            // A link from another server pings to stay declared. One that has
+            // lapsed is closed, not answered: a pong would keep its far side
+            // Up while every message on it is refused.
+            let lapsed = {
+                let now = std::time::Instant::now();
+                let mut links = links().lock().await;
+                links.pinged(client_id, now);
+                links.lapsed(client_id, now)
+            };
+            if lapsed {
+                log::info!(
+                    "peer link: client_id={client_id} pinged after its link lapsed; closing"
+                );
+                close_connections(clients, &[client_id]).await;
+            } else {
+                reply(client_id, clients, ServerMessage::Pong { nonce }).await;
+            }
+            Ok(())
+        }
+        ClientMessage::MsgInboundAck {
+            req,
+            id,
+            pane_id,
+            code,
+            message,
+        } => {
+            // An ack no send waits for is dropped: the summary line above
+            // already logged it, and the peer decides how many it sends.
+            if let Some(tx) = links().lock().await.take_ack(client_id, req) {
+                let _ = tx.send(crate::server::links::InboundAck {
+                    id,
+                    pane_id,
+                    code,
+                    message,
+                });
+            }
+            Ok(())
+        }
+        ClientMessage::AgentWait {
+            target,
+            state: want,
+            timeout_ms,
+            req,
+        } => {
+            let link = links()
+                .lock()
+                .await
+                .peer_name(client_id, std::time::Instant::now())
+                .map(str::to_string);
+            let remote = target
+                .host
+                .clone()
+                .filter(|host| valid_host(host) && link.is_none());
+            let answer = match (remote, link.as_deref()) {
+                (Some(host), _) => {
+                    let msg = ClientMessage::AgentWait {
+                        target: Address {
+                            host: None,
+                            target: target.target,
+                        },
+                        state: want,
+                        timeout_ms,
+                        req: None,
+                    };
+                    forward_agent_request(
+                        client_id,
+                        host,
+                        msg,
+                        wait_timeout(timeout_ms),
+                        config,
+                        clients,
+                        messaging(),
+                    )
+                    .await
+                }
+                (None, link) => {
+                    let refused = match link {
+                        Some(link) => peer_agent_refusal(link, false, config, messaging()).await,
+                        None => None,
+                    };
+                    match refused {
+                        Some(refusal) => Some(refusal),
+                        None => {
+                            handle_agent_wait(
+                                client_id,
+                                target,
+                                want,
+                                timeout_ms,
+                                req,
+                                link,
+                                state,
+                                panes,
+                                clients,
+                                config,
+                                messaging(),
+                            )
+                            .await
+                        }
+                    }
+                }
+            };
+            // `None` is a wait that was parked: the submitter answers it, or
+            // the forward's task does.
+            if let Some(answer) = answer {
+                reply(client_id, clients, answer.with_req(req)).await;
+            }
+            Ok(())
+        }
         ClientMessage::Attach { session_name } => {
             let result = handle_attach(
                 client_id,
@@ -2152,15 +7052,29 @@ async fn handle_client_message(
             // take hundreds of milliseconds, and this task also drives every
             // pane's output: blocking it would stall the whole server, not just
             // this listing.
+            //
+            // THIS machine's home rides along, for the path it might shorten.
+            // Resolving its symlinks reads the filesystem too, so it runs here
+            // as well, and it is re-read per listing on purpose: a server whose
+            // `$HOME` changed under it should not keep answering with the old
+            // one for the life of the daemon.
             let requested = path.clone();
-            let listing = tokio::task::spawn_blocking(move || {
-                browse::list_directory(std::path::Path::new(&path))
+            let (listing, home) = tokio::task::spawn_blocking(move || {
+                (
+                    browse::list_directory(std::path::Path::new(&path)),
+                    browse::home_dir(),
+                )
             })
             .await
-            .unwrap_or_else(|e| browse::Listing {
-                entries: Vec::new(),
-                error: Some(format!("listing failed: {e}")),
-                truncated: false,
+            .unwrap_or_else(|e| {
+                (
+                    browse::Listing {
+                        entries: Vec::new(),
+                        error: Some(format!("listing failed: {e}")),
+                        truncated: false,
+                    },
+                    None,
+                )
             });
             log::debug!(
                 "server: ListDirectory client_id={client_id} path={requested:?} \
@@ -2179,12 +7093,7 @@ entries={} error={:?} truncated={}",
                     entries: listing.entries,
                     error: listing.error,
                     truncated: listing.truncated,
-                    // THIS machine's home, sent with the path it might shorten.
-                    // A getenv, so it stays out of the `spawn_blocking` above --
-                    // and it is re-read per listing on purpose: a server whose
-                    // `$HOME` changed under it should not keep answering with
-                    // the old one for the life of the daemon.
-                    home: browse::home_dir(),
+                    home,
                 });
             }
             Ok(())
@@ -2257,10 +7166,10 @@ entries={} error={:?} truncated={}",
             // output will trigger the existing forwarding task, which fans out
             // PaneContent to subscribers, so no explicit broadcast is needed.
             let alive = {
-                let ps = panes.lock().await;
-                match ps.get(&pane_id) {
+                let mut ps = panes.lock().await;
+                match ps.get_mut(&pane_id) {
                     Some(pane_data) => {
-                        pane_data.send_input(&data);
+                        pane_data.send_human_input(&data);
                         true
                     }
                     None => false,
@@ -2331,7 +7240,7 @@ entries={} error={:?} truncated={}",
                     log::debug!(
                         "server: ScrollPane->alt-arrows client_id={client_id} pane_id={pane_id} app_cursor={app_cursor} up={up}"
                     );
-                    return write_to_pane(panes, pane_id, &bytes).await;
+                    return write_keys_to_pane(panes, pane_id, &bytes).await;
                 }
                 MouseRoute::Remux { .. } => {}
             }
@@ -2496,7 +7405,9 @@ async fn handle_attach(
             let cls = clients.lock().await;
             if let Some(client) = cls.get(&client_id) {
                 let _ = client.tx.send(ServerMessage::Error {
+                    req: None,
                     message: format!("session '{}' not found", session_name),
+                    code: None,
                 });
             }
             return Ok(());
@@ -2661,7 +7572,7 @@ async fn handle_input(
 
     let mut ps = panes.lock().await;
     if let Some(pane_data) = ps.get_mut(&active_pane) {
-        pane_data.send_input(data);
+        pane_data.send_human_input(data);
 
         // Ctrl+L (0x0C / FF): shells' readline/zsh clear-screen typically emits
         // only \e[H\e[2J (no \e[3J), so the scrollback would otherwise survive.
@@ -4081,9 +8992,9 @@ async fn handle_command(
                 };
                 tab.focused_pane
             };
-            let panes_lock = panes.lock().await;
-            if let Some(pane) = panes_lock.get(&pane_id) {
-                pane.send_input(&bytes);
+            let mut panes_lock = panes.lock().await;
+            if let Some(pane) = panes_lock.get_mut(&pane_id) {
+                pane.send_human_input(&bytes);
             }
         }
         RemuxCommand::PaneNew => {
@@ -5213,6 +10124,198 @@ async fn refresh_pane_names(
 /// [`AGENT_RULES`].
 static PANE_TITLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
+/// Every mailbox and agent name on this server, set up once from `[messaging]`
+/// in [`RemuxServer::new`]. A static rather than a field because pane death
+/// reaches [`reap_panes`] through seven call chains that carry only `panes`
+/// and `clients`.
+///
+/// Taken ALONE: never while `state`, `panes` or `clients` is held, and
+/// nothing else is taken while it is held, so it adds no lock ordering.
+static MESSAGING: std::sync::OnceLock<Mutex<Messaging>> = std::sync::OnceLock::new();
+
+/// The server's links to other servers. Taken alone, like the store.
+static LINKS: std::sync::OnceLock<Mutex<crate::server::links::Links>> = std::sync::OnceLock::new();
+
+pub(crate) fn links() -> &'static Mutex<crate::server::links::Links> {
+    LINKS.get_or_init(|| Mutex::new(crate::server::links::Links::new()))
+}
+
+/// The debug-only test seam for [`identity::peer_link_check`], read once from
+/// this server's own environment at startup: a pane cannot set it on a
+/// running server, and a release build ignores it.
+static PEER_SEAM: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+
+fn peer_seam() -> Option<i32> {
+    PEER_SEAM.get().copied().flatten()
+}
+
+fn messaging() -> &'static Mutex<Messaging> {
+    MESSAGING.get_or_init(|| {
+        Mutex::new(Messaging::new(
+            crate::config::messaging::MessagingConfig::default().limits(),
+        ))
+    })
+}
+
+/// Replace the empty store with what `mailbox.json` holds, pruned to panes
+/// that exist and to mail that has not expired, and never issue a pane id the
+/// file refers to: a surviving message's sender must not become a new pane.
+/// `state.json` carries the pane counter too, but it is not rewritten when a
+/// pane is merely created, so after a crash it can be older than this file.
+///
+/// A pane "exists" if it is live or in a DORMANT session
+/// (`automatic_restore = false`): a dormant session is resurrected with its
+/// own pane ids, and pruning its mail would lose it for good at the next save.
+async fn load_mailbox(server: &RemuxServer) {
+    let path = crate::server::persistence::mailbox_path();
+    let ttl_ms = server.config.messaging.ttl_ms();
+    let Some(file) = tokio::task::spawn_blocking(move || {
+        crate::server::persistence::remove_stale_bad_mailbox(&path, ttl_ms);
+        crate::server::persistence::load_mailbox_from(&path)
+    })
+    .await
+    .ok()
+    .flatten() else {
+        return;
+    };
+    let mut known: std::collections::HashSet<PaneId> =
+        server.panes.lock().await.keys().copied().collect();
+    {
+        let dormant = server.dormant.lock().await;
+        known.extend(
+            dormant
+                .state
+                .sessions
+                .values()
+                .flat_map(|sess| sess.tabs.iter())
+                .flat_map(|tab| layout::all_pane_ids(&tab.layout)),
+        );
+    }
+    let high_water = file.pane_high_water;
+    let closed = messaging().lock().await.closed_panes();
+    let (restored, pruned) = Messaging::restore(
+        server.config.messaging.limits(),
+        file,
+        |pane| known.contains(&pane),
+        closed,
+        now_ms(),
+    );
+    log::info!(
+        "mailbox: restored {} message(s), {} name(s); pruned {} for closed panes, {} expired, {} invalid, {} over a cap, {} name(s); repaired {} session label(s); dropped {} reserved sender name(s); pane ids reserved through %{high_water}",
+        restored.message_count(),
+        restored.name_count(),
+        pruned.dead_pane,
+        pruned.expired,
+        pruned.invalid,
+        pruned.over_cap,
+        pruned.names,
+        pruned.relabelled,
+        pruned.unnamed
+    );
+    *messaging().lock().await = restored;
+    SAVED_HIGH_WATER.store(high_water, Ordering::Relaxed);
+    server
+        .state
+        .lock()
+        .await
+        .reserve_pane_ids_through(high_water);
+}
+
+/// How long the saver waits after a change before writing, so a burst of
+/// sends is one write.
+const MAILBOX_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Woken whenever a pane is created, so that the file's pane high water
+/// follows the pane counter even when no mail moves.
+static PANE_CREATED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The high water last written, so a pane creation writes only when it moved.
+static SAVED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+
+/// Held from the snapshot through the rename, so writes cannot overtake one
+/// another: without it a slow older write could land after a newer one, and
+/// the shutdown write could race a debounced write still in flight.
+static MAILBOX_SAVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Write `mailbox.json` after each change, debounced. Logs a write at debug
+/// only: on a busy pane this runs about once a second.
+fn spawn_mailbox_saver(state: Arc<Mutex<ServerState>>) {
+    tokio::spawn(async move {
+        loop {
+            let changes = messaging().lock().await.changes();
+            tokio::select! {
+                _ = changes.notified() => {}
+                _ = PANE_CREATED.notified() => {}
+            }
+            tokio::time::sleep(MAILBOX_SAVE_DEBOUNCE).await;
+            save_mailbox_now(&state).await;
+        }
+    });
+}
+
+/// Sweep expired mail, then write the store if anything changed since the
+/// last write, or if the pane counter has passed the high water written.
+///
+/// The high water is the larger of every pane id the store refers to and the
+/// last id the pane counter has issued, read under `state` alone before the
+/// store is locked, so a crash can reissue no id this server has handed out.
+async fn save_mailbox_now(state: &Arc<Mutex<ServerState>>) {
+    save_mailbox_with(
+        state,
+        messaging(),
+        crate::server::persistence::mailbox_path(),
+    )
+    .await;
+}
+
+async fn save_mailbox_with(
+    state: &Arc<Mutex<ServerState>>,
+    store: &Mutex<Messaging>,
+    path: PathBuf,
+) {
+    let _serial = MAILBOX_SAVE.lock().await;
+    let issued = state.lock().await.peek_next_pane_id().saturating_sub(1);
+    let (file, swept) = {
+        let mut store = store.lock().await;
+        store.sweep(now_ms());
+        let swept = store.take_swept();
+        if swept > 0 {
+            mark_agents_dirty();
+        }
+        let changed = store.take_dirty();
+        if !changed && issued <= SAVED_HIGH_WATER.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut file = store.snapshot();
+        file.pane_high_water = file.pane_high_water.max(issued);
+        (file, swept)
+    };
+    if swept > 0 {
+        log::info!("msg: swept {swept} expired message(s)");
+    }
+    let count = file.messages.len();
+    let high_water = file.pane_high_water;
+    let written = tokio::task::spawn_blocking(move || {
+        crate::server::persistence::save_mailbox_to(&path, &file)
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => {
+            SAVED_HIGH_WATER.store(high_water, Ordering::Relaxed);
+            log::debug!("mailbox: saved {count} message(s), pane ids through %{high_water}");
+        }
+        Ok(Err(e)) => log::warn!("mailbox: save failed: {e}"),
+        Err(e) => log::warn!("mailbox: save task failed: {e}"),
+    }
+}
+
+/// Unix milliseconds, the clock mail expiry is measured on.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 fn pane_title_template() -> Option<&'static str> {
     PANE_TITLE.get().and_then(|t| t.as_deref())
 }
@@ -5286,6 +10389,136 @@ static AGENT_RULES: std::sync::OnceLock<crate::server::agents::AgentRules> =
 
 fn agent_rules(config: &Config) -> &'static crate::server::agents::AgentRules {
     AGENT_RULES.get_or_init(|| crate::server::agents::AgentRules::from_config(&config.agents))
+}
+
+/// The classifier's verdict on `pd` running `command`, as of `now`. The one
+/// place a pane's screen is classified, for the agents list and, through
+/// [`submit_state`], for submit.
+fn pane_verdict(
+    pd: &PaneData,
+    command: &str,
+    rules: &crate::server::agents::AgentRules,
+    now: std::time::Instant,
+) -> crate::server::agents::Verdict {
+    let bottom = rules.visible_bottom(&pd.screen);
+    rules.classify(
+        command,
+        &bottom,
+        now.saturating_duration_since(pd.last_output),
+    )
+}
+
+/// The state a submit takes `pd`'s agent to be in: the classifier's, but
+/// `NeedsInput` also when the screen looks like a selector no configured
+/// pattern names ([`crate::server::submit::looks_like_prompt`]).
+fn submit_state(
+    pd: &PaneData,
+    command: &str,
+    rules: &crate::server::agents::AgentRules,
+    now: std::time::Instant,
+) -> AgentState {
+    let bottom = rules.visible_bottom(&pd.screen);
+    if crate::server::submit::looks_like_prompt(&bottom) {
+        return AgentState::NeedsInput;
+    }
+    rules
+        .classify(
+            command,
+            &bottom,
+            now.saturating_duration_since(pd.last_output),
+        )
+        .state
+}
+
+/// One pane, as a submit needs it.
+struct PaneSample {
+    /// In the table, not exited, in a tab and not a popup.
+    live: bool,
+    /// The foreground's configured command, or `None` when it is no agent.
+    command: Option<String>,
+    /// The agent's state as a submit takes it ([`submit_state`]), when
+    /// `command` is an agent.
+    state: Option<AgentState>,
+    /// Whether the program in the pane has bracketed paste on, as of now.
+    bracketed_paste: bool,
+    /// The terminal's foreground process group, read before `command`, so a
+    /// later write can check the program it was meant for is still there.
+    pgid: Option<nix::unistd::Pid>,
+    /// The process whose name matched the agent, which may be a descendant
+    /// of the group's leader.
+    agent: Option<nix::unistd::Pid>,
+    /// When a human last typed into the pane, for the typing guard.
+    last_human_input: Option<std::time::Instant>,
+    /// When output last reached the pane, for `--wait`. `None` when the
+    /// pane is not live.
+    last_output: Option<std::time::Instant>,
+}
+
+/// One pane, sampled the way [`collect_agents`] samples every pane: the
+/// master dup'd under `panes`, the foreground syscalls with no lock held, the
+/// tree under `state`, then the screen and clocks under `panes` again. It
+/// logs nothing, so a submit re-sampling a pane never logs a classification.
+async fn sample_pane(
+    pane_id: PaneId,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+) -> PaneSample {
+    let gone = PaneSample {
+        live: false,
+        command: None,
+        state: None,
+        bracketed_paste: false,
+        pgid: None,
+        agent: None,
+        last_human_input: None,
+        last_output: None,
+    };
+    let rules = agent_rules(config);
+    let master = {
+        let ps = panes.lock().await;
+        ps.get(&pane_id)
+            .filter(|pd| !pd.exited)
+            .and_then(|pd| pd.pty.master_fd.try_clone().ok())
+    };
+    let Some(master) = master else {
+        return gone;
+    };
+    let pgid = nix::unistd::tcgetpgrp(std::os::fd::AsFd::as_fd(&master)).ok();
+    let found = if rules.is_empty() {
+        None
+    } else {
+        crate::server::agents::foreground_agent(std::os::fd::AsFd::as_fd(&master), rules)
+    };
+    drop(master);
+    let (command, agent) = match found {
+        Some((command, pid)) => (Some(command), Some(nix::unistd::Pid::from_raw(pid))),
+        None => (None, None),
+    };
+    let placed = {
+        let st = state.lock().await;
+        st.locate_pane(pane_id).is_some() && !st.is_popup(pane_id)
+    };
+    if !placed {
+        return gone;
+    }
+    let ps = panes.lock().await;
+    let Some(pd) = ps.get(&pane_id).filter(|pd| !pd.exited) else {
+        return gone;
+    };
+    let now = std::time::Instant::now();
+    PaneSample {
+        live: true,
+        state: command
+            .as_deref()
+            .map(|command| submit_state(pd, command, rules, now)),
+        command,
+        bracketed_paste: pd.screen.bracketed_paste,
+        pgid,
+        agent,
+        last_human_input: pd.last_human_input,
+        last_output: Some(pd.last_output),
+    }
 }
 
 /// Every pane running a configured agent command, with its state.
@@ -5379,12 +10612,7 @@ async fn collect_agents(
             let Some(pd) = ps.get_mut(&pane_id) else {
                 continue;
             };
-            let bottom = rules.visible_bottom(&pd.screen);
-            let verdict = rules.classify(
-                &command,
-                &bottom,
-                now.saturating_duration_since(pd.last_output),
-            );
+            let verdict = pane_verdict(pd, &command, rules, now);
             // The explain path: say WHY, but only on a TRANSITION -- keyed on
             // the state and the sample-independent reason, never on `why`.
             let key = (verdict.state, verdict.reason.clone());
@@ -5407,8 +10635,19 @@ async fn collect_agents(
                 title: pd.name_parts(now).0.map(str::to_string),
                 custom_name,
                 cwd: pd.names.cwd.clone(),
+                name: None,
+                unread: 0,
                 focused: focused.contains(&pane_id),
             });
+        }
+    }
+    // The store alone, after `panes` is released, as everywhere.
+    let ids: Vec<PaneId> = entries.iter().map(|e| e.pane_id).collect();
+    let mail = messaging().lock().await.names_and_unread(&ids, now_ms());
+    for entry in &mut entries {
+        if let Some((name, unread)) = mail.get(&entry.pane_id) {
+            entry.name = name.clone();
+            entry.unread = *unread;
         }
     }
     // A stable order, so a refresh never reshuffles the panel under the user's
@@ -5540,6 +10779,41 @@ async fn handle_client_disconnect(
         let mut cls = clients.lock().await;
         cls.remove(&client_id).and_then(|c| c.session_name)
     };
+    if let Some(name) = links().lock().await.drop_client(client_id) {
+        log::info!("peer link {name}: closed (client_id={client_id})");
+    }
+    let (dropped, (queued, typing, deferred), waits) = {
+        let mut store = messaging().lock().await;
+        (
+            store.drop_waiters_of(client_id),
+            store.detach_replies_of(client_id),
+            store.drop_submit_waits_of(client_id),
+        )
+    };
+    let state_waits = messaging().lock().await.drop_state_waits_of(client_id);
+    if state_waits > 0 {
+        log::info!("agent: dropped {state_waits} wait(s) of client_id={client_id} (disconnected)");
+    }
+    for id in waits {
+        log::info!(
+            "msg: id={id} wait dropped: client_id={client_id} disconnected before the turn ended"
+        );
+    }
+    if dropped > 0 {
+        log::info!("msg: dropped {dropped} waiter(s) of client_id={client_id} (disconnected)");
+    }
+    if deferred > 0 {
+        log::info!(
+            "msg: dropped {deferred} deferred submit(s) of client_id={client_id} (disconnected): \
+             nobody waits for them now, and they stay in the mailbox"
+        );
+    }
+    if queued + typing > 0 {
+        log::info!(
+            "msg: detached {} submit reply(ies) of client_id={client_id} (disconnected): {queued} still queued to be typed, {typing} being typed now",
+            queued + typing
+        );
+    }
     // Drop this client's diff baseline so the per-client cache doesn't grow
     // unbounded as clients come and go.
     {
@@ -5901,6 +11175,20 @@ async fn write_to_pane(
     let ps = panes.lock().await;
     if let Some(pane_data) = ps.get(&pane_id) {
         pane_data.send_input(bytes);
+    }
+    Ok(())
+}
+
+/// [`write_to_pane`] for bytes that stand in for keys a person pressed: the
+/// wheel's arrow keys edit an agent's input line exactly as typed arrows do,
+/// so they arm the typing guard. A mouse report is not a key and does not.
+async fn write_keys_to_pane(
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    pane_id: PaneId,
+    bytes: &[u8],
+) -> Result<()> {
+    if let Some(pane_data) = panes.lock().await.get_mut(&pane_id) {
+        pane_data.send_human_input(bytes);
     }
     Ok(())
 }
@@ -6379,7 +11667,7 @@ async fn handle_mouse_scroll(
             log::debug!(
                 "server: MouseScroll->alt-arrows client_id={client_id} pane_id={target_pane} app_cursor={app_cursor} up={up}"
             );
-            write_to_pane(panes, target_pane, &bytes).await
+            write_keys_to_pane(panes, target_pane, &bytes).await
         }
         MouseRoute::Remux { .. } => {
             // Plain shell: preserve remux's own scrollback scroll (delta ±3).
@@ -8508,6 +13796,7 @@ resolved={session:?} placement={placement:?} program={:?} ({} more arg(s)) cwd={
         let msg = match spawned {
             Some(pane_id) => ServerMessage::CliSpawned { pane_id },
             None => ServerMessage::Error {
+                req: None,
                 message: match pane.filter(|_| resolved.is_none()) {
                     Some(pane) => format!(
                         "no session named '{session}' on this server \
@@ -8515,6 +13804,7 @@ resolved={session:?} placement={placement:?} program={:?} ({} more arg(s)) cwd={
                     ),
                     None => format!("no session named '{session}' on this server"),
                 },
+                code: None,
             },
         };
         let _ = conn.tx.send(msg);
@@ -8601,6 +13891,8 @@ async fn spawn_pane(
             streamed_session_visible: false,
             last_output: std::time::Instant::now(),
             agent_verdict: None,
+            last_human_input: None,
+            typing: None,
             title: crate::server::title::TitleTracker::default(),
             names: PaneNames {
                 // Until the forwarding loop reads the real name, the program
@@ -8612,8 +13904,11 @@ async fn spawn_pane(
                     .unwrap_or_default(),
                 ..PaneNames::default()
             },
+            exited: false,
         },
     );
+    drop(ps);
+    PANE_CREATED.notify_one();
     Ok(())
 }
 
@@ -10682,7 +15977,8 @@ fn place_popup<'a>(
             y: interior.y,
             width: interior.width,
             height: interior.height,
-            // The server refuses `PaneFocus*` while the popup is up.
+            // `PaneFocus*` closes the popup rather than moving inside it, so
+            // the popup has no neighbour in any direction.
             neighbors: FocusNeighbors::default(),
         }),
         layer: None,
@@ -11033,6 +16329,80 @@ async fn reap_panes(
     // Taken under `clients` alone (the panes lock above is released) to keep the
     // locks unnested.
     notify_panes_exited(&exits, clients).await;
+    {
+        let mut store = messaging().lock().await;
+        for &pane_id in pane_ids {
+            for waiter in store.take_waiters_for(pane_id) {
+                log::info!(
+                    "msg: wait on %{pane_id} ended: the pane closed (client_id={})",
+                    waiter.client_id
+                );
+                let _ = waiter.tx.send(ServerMessage::refused(
+                    "no_such_target",
+                    format!("pane %{pane_id} closed while waiting"),
+                ));
+            }
+            let orphans = store.take_submits_from(pane_id);
+            if !orphans.is_empty() {
+                log::info!(
+                    "msg: pane %{pane_id} closed with {} of its message(s) waiting to be typed \
+                     elsewhere; they stay in the mailbox",
+                    orphans.len()
+                );
+            }
+            for entry in orphans {
+                let resolved = Resolved {
+                    host: None,
+                    pane_id: entry.pane,
+                    name: store.name_of(entry.pane).map(str::to_string),
+                };
+                let refusal =
+                    crate::server::submit::SubmitRefusal::sender_closed(pane_id, entry.id);
+                let answer = crate::server::submit::settle(entry.deliver, refusal);
+                let message = answer_submit(entry.id, resolved, answer, None);
+                send_reply(entry.id, entry.reply, message);
+            }
+            for wait in store.take_state_waits(pane_id) {
+                log::info!(
+                    "agent: client_id={} wait on %{pane_id} ended: the pane closed",
+                    wait.reply.client_id
+                );
+                wait.reply.send(ServerMessage::refused(
+                    "no_such_target",
+                    format!("pane %{pane_id} closed while waited on"),
+                ));
+            }
+            let name = store.name_of(pane_id).map(str::to_string);
+            for wait in store.take_submit_waits(pane_id) {
+                answer_wait_ended(
+                    wait,
+                    name.clone(),
+                    std::time::Instant::now(),
+                    "pane_closed_after_submit",
+                );
+            }
+            let (queued, replies) = store.take_submits(pane_id);
+            if queued > 0 {
+                log::info!(
+                    "msg: pane %{pane_id} closed with {queued} message(s) waiting to be typed"
+                );
+            }
+            for reply in replies {
+                reply.send(ServerMessage::refused(
+                    "no_such_target",
+                    format!("pane %{pane_id} closed while its message was queued"),
+                ));
+            }
+            let (dropped, name) = store.drop_pane(pane_id);
+            if dropped > 0 || name.is_some() {
+                log::info!(
+                    "msg: pane %{pane_id} closed; dropped {dropped} message(s){}",
+                    name.map(|name| format!(", name {}", loggable(&name)))
+                        .unwrap_or_default()
+                );
+            }
+        }
+    }
     // Every path that destroys a pane funnels through here, so this is the one
     // place an agent that has GONE has to be noticed. Nothing else would: the
     // pusher is woken by output, and a dead pane produces none.
@@ -11443,6 +16813,9 @@ async fn start_forwarding_for_pane(
                         log::debug!(
                             "server: PTY channel disconnected for pane_id={pane_id} session={session_name}"
                         );
+                        if let Some(pd) = panes.lock().await.get_mut(&pane_id) {
+                            pd.exited = true;
+                        }
                         close_pane(pane_id, &state, &panes, &clients, &config, &prev_frames).await;
                         notify_if_close_declined(pane_id, &panes, &clients).await;
                         save_if_enabled(&state, &panes, &config, &dormant).await;
@@ -11878,6 +17251,127 @@ mod tests {
     use crate::server::session::ServerState;
     use std::collections::HashMap;
 
+    /// Pane ids for tests that use the process-wide `messaging()` store. Every
+    /// `Rig` test closing its panes runs `reap_panes` on that store, which
+    /// removes the mail each closed pane sent, and Rig panes are numbered
+    /// from one. An id in that range loses a test's entries whenever such a
+    /// test finishes alongside it, so these tests take their ids from here.
+    const TEST_ONLY_PANE_IDS_FROM: crate::protocol::PaneId = 9_000_000;
+
+    #[tokio::test]
+    async fn a_typing_task_that_panics_still_ends_its_panes_typing() {
+        use crate::server::messaging::SubmitEntry;
+        let pane = TEST_ONLY_PANE_IDS_FROM + 1;
+        let sender = TEST_ONLY_PANE_IDS_FROM + 2;
+        let store = super::messaging();
+        {
+            let mut st = store.lock().await;
+            st.begin_typing(pane, None);
+            let queued = SubmitEntry {
+                id: 1,
+                pane,
+                deliver: crate::protocol::Deliver::Submit,
+                body: String::new(),
+                from: crate::server::messaging::SubmitFrom::pane(sender),
+                enqueued_at: std::time::Instant::now(),
+                defer: false,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                reply: None,
+                had_reply: false,
+                put_back: 0,
+                waiting_on: None,
+                wait_until: None,
+            };
+            st.enqueue_submit(queued, 8).unwrap();
+            assert!(st.submit_heads().iter().all(|h| h.pane != pane));
+        }
+        let typing = super::EndTypingOnDrop { pane, armed: true };
+        let task = tokio::spawn(async move {
+            let _typing = typing;
+            panic!("the typing task stops");
+        });
+        assert!(task.await.is_err());
+        for _ in 0..100 {
+            if store
+                .lock()
+                .await
+                .submit_heads()
+                .iter()
+                .any(|h| h.pane == pane)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the pane is still typing, so its queue is never looked at");
+    }
+
+    #[test]
+    fn the_most_chunks_fit_the_body_cap_with_room_to_spare() {
+        use super::{BODY_CAP, MAX_CHUNKS};
+        assert_eq!(MAX_CHUNKS, 1500);
+        let idle = std::time::Duration::from_micros(4100);
+        let loaded = std::time::Duration::from_micros(12800);
+        assert!(
+            idle * (MAX_CHUNKS as u32) * 3 <= BODY_CAP,
+            "a body at the limit, at the cost per chunk measured idle, takes under a third of the cap"
+        );
+        assert!(
+            loaded * (MAX_CHUNKS as u32) <= BODY_CAP,
+            "a body at the limit, at the cost per chunk measured under load, fits in the cap"
+        );
+    }
+
+    #[test]
+    fn a_deferred_submit_is_bounded_by_its_own_timeout_not_the_hold() {
+        use super::{submit_deadline, DEFAULT_SUBMIT_TIMEOUT_MS, MAX_WAIT_MS, SUBMIT_HOLD_MS};
+        let t0 = std::time::Instant::now();
+        let at = |ms| t0 + std::time::Duration::from_millis(ms);
+        assert_eq!(submit_deadline(t0, false, None), at(SUBMIT_HOLD_MS));
+        assert_eq!(
+            submit_deadline(t0, false, Some(1)),
+            at(SUBMIT_HOLD_MS),
+            "a timeout bounds only a deferred wait"
+        );
+        assert_eq!(
+            submit_deadline(t0, true, Some(0)),
+            at(SUBMIT_HOLD_MS),
+            "never less than a submit that did not ask to wait"
+        );
+        assert_eq!(submit_deadline(t0, true, Some(1500)), at(SUBMIT_HOLD_MS));
+        assert_eq!(
+            submit_deadline(t0, true, Some(SUBMIT_HOLD_MS * 2)),
+            at(SUBMIT_HOLD_MS * 2),
+            "past the hold"
+        );
+        assert_eq!(
+            submit_deadline(t0, true, None),
+            at(DEFAULT_SUBMIT_TIMEOUT_MS)
+        );
+        assert_eq!(submit_deadline(t0, true, Some(u64::MAX)), at(MAX_WAIT_MS));
+    }
+
+    #[test]
+    fn a_wait_runs_for_its_own_timeout_with_no_floor() {
+        use super::{wait_timeout, DEFAULT_SUBMIT_TIMEOUT_MS, MAX_WAIT_MS};
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(wait_timeout(Some(1500)), ms(1500), "not raised to the hold");
+        assert_eq!(wait_timeout(None), ms(DEFAULT_SUBMIT_TIMEOUT_MS));
+        assert_eq!(wait_timeout(Some(u64::MAX)), ms(MAX_WAIT_MS));
+    }
+
+    #[test]
+    fn the_typing_guard_at_any_setting_ends_inside_the_hold() {
+        let cfg = crate::config::messaging::MessagingConfig {
+            typing_guard_max_ms: u64::MAX,
+            ..Default::default()
+        };
+        assert!(
+            cfg.typing_guard().max < std::time::Duration::from_millis(super::SUBMIT_HOLD_MS),
+            "a guard that outlasts the hold answers `timeout` where it should answer `human_typing`"
+        );
+    }
+
     #[test]
     fn a_split_along_the_columns_or_rows_axis_becomes_auto() {
         assert_eq!(
@@ -12065,6 +17559,46 @@ mod tests {
         let mut short = 1i32.to_ne_bytes().to_vec();
         short.extend_from_slice(b"/tmp/x/sssss\0claude\0");
         assert_eq!(argv0(&short).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn only_a_private_directory_of_ours_holds_the_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = super::own_uid();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("remux-test");
+        std::fs::create_dir(&dir).unwrap();
+        let set = |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode));
+
+        set(0o700).unwrap();
+        assert!(super::check_private_dir(&dir, uid).is_ok());
+
+        set(0o755).unwrap();
+        let err = super::check_private_dir(&dir, uid).unwrap_err().to_string();
+        assert!(err.contains("755") && err.contains("0700"), "{err}");
+
+        set(0o700).unwrap();
+        let err = super::check_private_dir(&dir, uid + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("owned by uid"), "{err}");
+
+        let link = root.path().join("remux-link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let err = super::check_private_dir(&link, uid)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not a directory"),
+            "a symlink is refused: {err}"
+        );
+    }
+
+    #[test]
+    fn only_this_user_may_connect() {
+        assert!(super::peer_allowed(1000, 1000));
+        assert!(!super::peer_allowed(1001, 1000));
+        assert!(!super::peer_allowed(0, 1000), "not even root");
     }
 
     /// On macOS a pane is named by `argv[0]`: the `KERN_PROCARGS2` read must
@@ -12702,6 +18236,295 @@ mod tests {
         assert!(!saved_custom_is_restorable(&None, &[1, 2]));
     }
 
+    mod framing {
+        use super::super::read_message;
+        use crate::protocol::{ClientMessage, MAX_FRAME_BYTES};
+
+        #[tokio::test]
+        async fn a_frame_over_the_cap_is_refused_before_it_is_read() {
+            for len in [u32::MAX, MAX_FRAME_BYTES as u32 + 1] {
+                let header = len.to_be_bytes();
+                let mut wire: &[u8] = &header;
+                // A reader holding only the header fails at the payload anyway,
+                // so the error has to be the cap's, not the end of input.
+                let err = read_message::<ClientMessage>(&mut wire)
+                    .await
+                    .expect_err("an oversized frame was accepted");
+                assert!(
+                    format!("{err:#}").contains("over the limit"),
+                    "a {len}-byte frame got past the cap and failed later: {err:#}"
+                );
+            }
+        }
+
+        /// A peer that promises a frame and hangs up partway is a closed
+        /// connection, and says so, rather than an I/O error about EOF.
+        #[tokio::test]
+        async fn a_frame_cut_short_is_a_connection_closed_mid_frame() {
+            for claimed in [10u32, MAX_FRAME_BYTES as u32] {
+                let mut wire = claimed.to_be_bytes().to_vec();
+                wire.extend_from_slice(b"{\"Det");
+                let mut reader: &[u8] = &wire;
+                let err = read_message::<ClientMessage>(&mut reader)
+                    .await
+                    .expect_err("a truncated frame was accepted");
+                assert!(
+                    format!("{err:#}").contains("connection closed mid-frame (5 of"),
+                    "claimed {claimed}: {err:#}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_frame_under_the_cap_still_reads() {
+            let frame = crate::protocol::encode_message(&ClientMessage::Detach).unwrap();
+            let mut wire: &[u8] = &frame;
+            let got = read_message::<ClientMessage>(&mut wire).await.unwrap();
+            assert!(matches!(got, Some(ClientMessage::Detach)));
+        }
+    }
+
+    mod identity_line {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use tokio::sync::Mutex;
+
+        use super::super::{log_peer_identity, ATTRIBUTION_TIMEOUT};
+        use crate::server::identity::Peer;
+
+        #[tokio::test(start_paused = true)]
+        async fn a_wedged_panes_lock_does_not_hold_up_the_connection() {
+            let panes = Arc::new(Mutex::new(HashMap::new()));
+            let _wedged = panes.lock().await;
+            let done = tokio::time::timeout(
+                ATTRIBUTION_TIMEOUT * 2,
+                log_peer_identity(0, Some(1), Arc::new(Peer::unpinned()), &panes),
+            )
+            .await;
+            assert!(done.is_ok(), "the identity line waited on the panes lock");
+        }
+    }
+
+    mod mailbox_save {
+        use std::sync::Arc;
+
+        use tokio::sync::Mutex;
+
+        use super::super::{save_mailbox_with, MAILBOX_SAVE};
+        use crate::protocol::Sender;
+        use crate::server::messaging::Messaging;
+        use crate::server::session::ServerState;
+
+        /// A save waits for one already in flight, so an older write can
+        /// never land after a newer one, and the shutdown write never races
+        /// the debounced one.
+        #[tokio::test(start_paused = true)]
+        async fn a_save_waits_for_the_one_in_flight() {
+            let dir = std::env::temp_dir().join(format!("rmx-savelock-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let path = dir.join("mailbox.json");
+            let state = Arc::new(Mutex::new(ServerState::new()));
+            let store: &'static Mutex<Messaging> = Box::leak(Box::new(Mutex::new(Messaging::new(
+                crate::config::messaging::MessagingConfig::default().limits(),
+            ))));
+            store
+                .lock()
+                .await
+                .send(
+                    Sender::Pane {
+                        pane_id: 1,
+                        name: None,
+                        session: "main".into(),
+                    },
+                    2,
+                    "a".into(),
+                    None,
+                    0,
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+
+            let in_flight = MAILBOX_SAVE.lock().await;
+            let save = {
+                let path = path.clone();
+                tokio::spawn(async move { save_mailbox_with(&state, store, path).await })
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            assert!(
+                !save.is_finished(),
+                "a save ran while another held the lock"
+            );
+            assert!(!path.exists());
+            drop(in_flight);
+            save.await.unwrap();
+            assert!(path.exists(), "the save did not run once the lock was free");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    mod waiting {
+        use tokio::sync::Mutex;
+
+        use super::super::wait_out;
+        use crate::protocol::{Sender, ServerMessage};
+        use crate::server::messaging::{Messaging, Waiter};
+
+        fn store() -> &'static Mutex<Messaging> {
+            Box::leak(Box::new(Mutex::new(Messaging::new(
+                crate::config::messaging::MessagingConfig::default().limits(),
+            ))))
+        }
+
+        fn waiter(
+            pane: u64,
+        ) -> (
+            Waiter,
+            tokio::sync::mpsc::UnboundedReceiver<ServerMessage>,
+            tokio::sync::oneshot::Receiver<()>,
+        ) {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (cancel, cancelled) = tokio::sync::oneshot::channel();
+            let w = Waiter {
+                client_id: 1,
+                pane,
+                all: false,
+                mark: false,
+                tx,
+                cancel,
+            };
+            (w, rx, cancelled)
+        }
+
+        /// An answered waiter's timer ends at once, without answering again;
+        /// a waiter nobody answers is answered timed out at its deadline.
+        #[tokio::test(start_paused = true)]
+        async fn answering_a_waiter_ends_its_timer_early() {
+            const HOUR_MS: u64 = 3_600_000;
+            let store = store();
+            let (w, mut answers, cancelled) = waiter(2);
+            let id = store.lock().await.park(w).unwrap().0;
+            let timer = tokio::spawn(wait_out(id, 2, HOUR_MS, cancelled, store));
+            tokio::task::yield_now().await;
+            let started = tokio::time::Instant::now();
+            {
+                let mut s = store.lock().await;
+                s.send(
+                    Sender::Pane {
+                        pane_id: 1,
+                        name: None,
+                        session: "main".into(),
+                    },
+                    2,
+                    "hi".into(),
+                    None,
+                    0,
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+                drop(s.answer_waiters(2, 0));
+            }
+            assert!(
+                !timer.await.unwrap(),
+                "the answered waiter's timer answered it again"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(HOUR_MS),
+                "the timer ran to its deadline"
+            );
+            assert!(answers.try_recv().is_err(), "a timed-out answer was sent");
+
+            let (w, mut answers, cancelled) = waiter(3);
+            let id = store.lock().await.park(w).unwrap().0;
+            assert!(wait_out(id, 3, HOUR_MS, cancelled, store).await);
+            assert!(matches!(
+                answers.try_recv(),
+                Ok(ServerMessage::MsgList {
+                    timed_out: true,
+                    ..
+                })
+            ));
+        }
+    }
+
+    /// A caller whose attribution FAILED is not a caller outside every pane:
+    /// it may be a pane the server was too slow to check. Its --pane requests
+    /// are refused, never honoured.
+    mod unverified_caller {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use tokio::sync::Mutex;
+
+        use super::super::{
+            handle_agent_name, handle_msg_ack, MailboxAck, NameRequest, CALLER_ATTRIBUTION_TIMEOUT,
+        };
+        use crate::protocol::ServerMessage;
+        use crate::server::identity::Peer;
+        use crate::server::messaging::Messaging;
+        use crate::server::session::ServerState;
+
+        fn refused_unverified(answer: &ServerMessage) -> bool {
+            matches!(
+                answer,
+                ServerMessage::Error { code: Some(code), message, .. }
+                    if code == "sender_unverified" && message.contains("in time")
+            )
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_timed_out_check_does_not_grant_outside_powers() {
+            let state = Arc::new(Mutex::new(ServerState::new()));
+            let panes = Arc::new(Mutex::new(HashMap::new()));
+            let store = Mutex::new(Messaging::new(
+                crate::config::messaging::MessagingConfig::default().limits(),
+            ));
+            let peer = Arc::new(Peer::unpinned());
+            // Held for the whole test, so every attribution times out.
+            let _wedged = panes.lock().await;
+            let bound = CALLER_ATTRIBUTION_TIMEOUT * 4;
+
+            let named = tokio::time::timeout(
+                bound,
+                handle_agent_name(
+                    0,
+                    NameRequest {
+                        name: Some("stolen".to_string()),
+                        pane: Some(5),
+                        pane_hint: None,
+                    },
+                    &peer,
+                    &state,
+                    &panes,
+                    &store,
+                ),
+            )
+            .await
+            .expect("the name request went on past the failed check");
+            assert!(refused_unverified(&named), "{named:?}");
+
+            let acked = tokio::time::timeout(
+                bound,
+                handle_msg_ack(
+                    0,
+                    MailboxAck {
+                        pane: Some(5),
+                        ids: Vec::new(),
+                        all: true,
+                        pane_hint: None,
+                    },
+                    &peer,
+                    &state,
+                    &panes,
+                    &store,
+                ),
+            )
+            .await
+            .expect("the ack went on past the failed check");
+            assert!(refused_unverified(&acked), "{acked:?}");
+        }
+    }
+
     mod focused_panes {
         use super::super::focused_panes;
         use crate::config::BorderStyle;
@@ -12781,41 +18604,21 @@ mod tests {
         }
     }
 
-    /// The `/proc` parser, which only exists on Linux.
+    /// `process_pgid` through the real `/proc` read, which only exists on Linux.
     #[cfg(target_os = "linux")]
     mod stat {
-        use super::super::pgid_from_stat;
-
-        /// `/proc/<pid>/stat`, as the kernel writes it: pid, comm in parentheses,
-        /// then state, ppid and pgrp.
         #[test]
-        fn the_stat_line_gives_up_its_process_group() {
-            // state R, ppid 693892, pgrp 693891 -- the THIRD field after the
-            // comm, checked against `ps -o pgid=` on a live process.
-            let line = "693899 (rtk) R 693892 693891 693890 0 -1 4194304 501 0";
-            assert_eq!(pgid_from_stat(line), Some(693891));
-        }
-
-        /// **The parse starts at the LAST `)`, and that is the whole of it.**
-        ///
-        /// `comm` is up to 15 bytes of whatever the process called itself, and it
-        /// is not escaped or quoted: a Node worker thread, a browser tab or
-        /// anything else may put a space, a parenthesis or both in there. Splitting
-        /// on whitespace, or on the FIRST `)`, reads the wrong field -- and the
-        /// wrong field is a pgid that matches nothing, so every descendant is
-        /// filtered out and the walk silently stops finding anything.
-        #[test]
-        fn a_comm_containing_spaces_and_a_paren_does_not_move_the_fields() {
-            let line = "42 (we ) ird) S 7 1234 99 0 -1 0 0 0";
-            assert_eq!(pgid_from_stat(line), Some(1234));
-        }
-
-        #[test]
-        fn a_stat_line_that_is_not_one_is_refused_rather_than_guessed() {
-            assert_eq!(pgid_from_stat(""), None);
-            assert_eq!(pgid_from_stat("42 (sh"), None);
-            assert_eq!(pgid_from_stat("42 (sh) S 7"), None);
-            assert_eq!(pgid_from_stat("42 (sh) S 7 notanumber"), None);
+        fn a_live_process_whose_comm_is_not_utf8_reports_its_group() {
+            let child = crate::server::procfs::testing::TruncatedCommChild::spawn("comm");
+            assert!(
+                child.comm_is_truncated(),
+                "the fixture's comm is not the truncated name, so it tests nothing: {:?}",
+                child.comm
+            );
+            assert_eq!(
+                super::super::process_pgid(child.pid.as_raw()),
+                Some(nix::unistd::getpgrp().as_raw())
+            );
         }
     }
 }
@@ -13204,6 +19007,7 @@ mod popup_tests {
             agents_subscribed: false,
             naming: None,
             tab_style: None,
+            closer: None,
             popup_want: want,
             right_press: None,
         }
@@ -14034,6 +19838,135 @@ mod popup_tests {
         rig.finish().await;
     }
 
+    /// Every `Rig` command saves `state.json`, because `Config::default()` has
+    /// `save_sessions = true`. The save must land in the test sandbox and never
+    /// in the data directory the environment names, which is the user's own.
+    ///
+    /// The user's file usually exists already, so the check is that its
+    /// identity is unchanged, not that it is absent. A save replaces it by a
+    /// rename, which gives it a new inode and mtime. A remux server the user is
+    /// running also saves to that file, so a save of its own inside this test's
+    /// window makes the test fail although no test wrote the file.
+    #[tokio::test]
+    async fn a_command_saves_the_session_state_into_the_test_sandbox() {
+        use std::os::unix::fs::MetadataExt;
+        let configured = std::env::var_os("XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(dirs::data_dir)
+            .expect("a data directory")
+            .join("remux")
+            .join("state.json");
+        let identity = || {
+            std::fs::symlink_metadata(&configured)
+                .ok()
+                .map(|m| (m.ino(), m.len(), m.modified().ok()))
+        };
+        let before = identity();
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        rig.command(RemuxCommand::SessionRename("sandboxed".to_string()))
+            .await;
+        assert!(
+            crate::paths::data_home()
+                .join("remux")
+                .join("state.json")
+                .exists(),
+            "the save ran"
+        );
+        assert_eq!(
+            identity(),
+            before,
+            "{} changed during the test: a test wrote it, unless a remux server \
+             you are running saved it at the same moment",
+            configured.display()
+        );
+        rig.finish().await;
+    }
+
+    /// A pane's shell inherits the test process's environment. With the
+    /// user's `HOME` it reads their rc files and appends this test's commands
+    /// to their real history file when it exits.
+    ///
+    /// The `where` file proves on every `/bin/sh` that the shell ran in the
+    /// sandbox: its `HOME`, its runtime directory (the user's server socket
+    /// lives in the real one) and its `TMPDIR`, and without a variable the
+    /// allow-list drops. The history check can only fail where `/bin/sh` keeps
+    /// history, which bash does (Fedora, macOS) and dash (Debian, Ubuntu)
+    /// never does.
+    #[tokio::test]
+    async fn a_pane_shell_runs_in_the_sandbox_and_leaves_the_users_history_alone() {
+        use std::os::unix::fs::MetadataExt;
+        // A name no other code reads, so setting it process-wide cannot change
+        // another test's outcome.
+        std::env::set_var("REMUX_TEST_PANE_LEAK", "leaked");
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+        let mut watched: Vec<std::path::PathBuf> =
+            [".bash_history", ".sh_history", ".zsh_history", ".history"]
+                .iter()
+                .map(|name| home.join(name))
+                .collect();
+        watched.extend(std::env::var_os("HISTFILE").map(std::path::PathBuf::from));
+        let identity = || {
+            watched
+                .iter()
+                .map(|p| {
+                    std::fs::symlink_metadata(p)
+                        .ok()
+                        .map(|m| (m.ino(), m.len(), m.modified().ok()))
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = identity();
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let pane = *rig.panes.lock().await.keys().next().expect("pane");
+        rig.panes.lock().await[&pane]
+            .pty
+            .write_input(
+                b"printf 'HOME:%s RUN:%s TMP:%s LEAK:%s' \"$HOME\" \"$XDG_RUNTIME_DIR\" \
+                  \"$TMPDIR\" \"${REMUX_TEST_PANE_LEAK-}\" > \"$HOME/where-sandbox-test\"\nexit\n",
+            )
+            .expect("write");
+        let mut exited = false;
+        for _ in 0..100 {
+            if rig.panes.lock().await[&pane]
+                .pty
+                .try_wait()
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        std::env::remove_var("REMUX_TEST_PANE_LEAK");
+        assert!(exited, "the pane's shell exited");
+        rig.finish().await;
+        let sandbox_home = crate::paths::sandbox::home();
+        let root = sandbox_home.parent().expect("sandbox root");
+        assert_eq!(
+            std::fs::read_to_string(sandbox_home.join("where-sandbox-test")).ok(),
+            Some(format!(
+                "HOME:{} RUN:{} TMP:{} LEAK:",
+                sandbox_home.display(),
+                root.join("run").display(),
+                root.join("tmp").display()
+            )),
+            "the pane's shell ran with the sandbox environment"
+        );
+        assert_eq!(
+            identity(),
+            before,
+            "a history file under {} changed during the test: a pane's shell \
+             wrote it, unless a shell you are running saved its history at the \
+             same moment",
+            home.display()
+        );
+    }
+
     #[tokio::test]
     async fn a_session_rename_is_announced_to_every_client() {
         let dir = tempfile::tempdir().expect("dir");
@@ -14425,6 +20358,7 @@ mod popup_tests {
             handle_client_message(
                 CLIENT,
                 msg,
+                &Arc::new(identity::Peer::unpinned()),
                 &rig.state,
                 &rig.panes,
                 &rig.clients,

@@ -1,0 +1,717 @@
+//! `[messaging]` configuration: how long mail lives and how much of it a
+//! mailbox and a sender may hold, and how a message is typed into each kind
+//! of agent (`[messaging.submit.<command>]`).
+//!
+//! The server reads this at startup, so an edit needs `remux restart`.
+
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
+
+use crate::server::messaging::Limits;
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MessagingConfig {
+    /// A float so that a harness can expire mail in about a second.
+    pub ttl_hours: f64,
+    pub mailbox_max_messages: usize,
+    pub mailbox_max_bytes: usize,
+    pub max_body_bytes: usize,
+    pub rate_per_10s: u32,
+    /// Messages one server link may deliver here in any 10 seconds, whatever
+    /// pane each names: a peer that rotates its sender's pane id is held by
+    /// this rather than by the per-pane rate.
+    pub link_rate_per_10s: u32,
+    /// Sends one server link may have waiting to be typed or answered at
+    /// once: a local connection parks one, a link carries many.
+    pub link_parked_max: usize,
+    /// `false` keeps mailboxes and names in memory only, so they do not
+    /// survive `remux restart`.
+    pub persist: bool,
+    /// How long a pane must be keyboard-quiet before a message is typed into
+    /// it, when a client is looking at it (attended) and when none is.
+    pub typing_guard_ms: u64,
+    pub typing_guard_unattended_ms: u64,
+    /// The longest a submit waits for a typing human before it gives up.
+    pub typing_guard_max_ms: u64,
+    /// `false` never types into a pane a client is looking at.
+    pub submit_when_attended: bool,
+    /// The most messages a pane's submit queue holds.
+    pub submit_queue_len: usize,
+    /// For `--wait`: how long after the prompt's echo the agent has to print
+    /// something before the wait ends `agent_prompt_stalled`.
+    pub stall_ms: u64,
+    /// For `--wait`: how long the agent must stay out of `Working` for its
+    /// turn to count as ended.
+    pub settle_ms: u64,
+    /// How to type into each agent, by its `[agents] commands` spelling.
+    /// Merged field by field over [`shipped_rows`].
+    pub submit: BTreeMap<String, SubmitRow>,
+    /// This server's name to the servers it sends to: their `From:
+    /// <host_name>:%N`. `None` is the machine's hostname, read at use, never
+    /// stored here, so the sample block stays the defaults on every machine.
+    pub host_name: Option<String>,
+    /// How the server dials the remotes it sends to.
+    pub links: LinksConfig,
+}
+
+/// `[messaging.links]`: the server's own connections to `[remotes]`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LinksConfig {
+    /// How long a dial (ssh plus the handshake) may take.
+    pub dial_ms: u64,
+    /// How often a live link is pinged.
+    pub ping_ms: u64,
+    /// A link with nothing in flight and no message for this long is closed.
+    pub idle_ms: u64,
+}
+
+impl Default for LinksConfig {
+    fn default() -> Self {
+        Self {
+            dial_ms: 10_000,
+            ping_ms: 15_000,
+            idle_ms: 300_000,
+        }
+    }
+}
+
+impl LinksConfig {
+    /// How long a dial may take: `dial_ms` capped at the server's dial
+    /// budget, and the default for a zero, which would fail every dial.
+    pub fn dial(&self) -> std::time::Duration {
+        let ms = match self.dial_ms {
+            0 => Self::default().dial_ms,
+            ms => ms,
+        };
+        std::time::Duration::from_millis(ms.min(crate::server::daemon::LINK_DIAL_BUDGET_MS))
+    }
+}
+
+/// Below this a ping is noise; only a harness wants it.
+pub const MIN_PING_MS: u64 = 1_000;
+
+/// Whether a typed message is wrapped in bracketed paste.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Bracketed {
+    /// As the pane's program asked (mode 2004), read when the text is typed.
+    Auto,
+    On,
+    Off,
+}
+
+/// What a submit does while the agent is working.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WhileWorking {
+    /// Type it now: the agent takes typed input as its next prompt.
+    Queue,
+    /// Leave it in the mailbox, for the agent's hook to deliver.
+    Mailbox,
+    /// Refuse a `Submit`; an `Auto` leaves it in the mailbox.
+    Refuse,
+}
+
+/// One `[messaging.submit.<command>]` row. Every field is optional, so a
+/// user's row changes only the fields it names and keeps the shipped value
+/// of the rest.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SubmitRow {
+    pub bracketed: Option<Bracketed>,
+    /// The bytes that submit the typed text, `"\r"` unless set.
+    pub enter: Option<String>,
+    pub enter_delay_ms: Option<u64>,
+    /// Report focus (`ESC[I`) before the text, for an agent that ignores
+    /// input it believes is not for it.
+    pub focus_in: Option<bool>,
+    pub while_working: Option<WhileWorking>,
+    /// Open the typed text with a line naming the message and its sender.
+    pub envelope: Option<bool>,
+}
+
+impl SubmitRow {
+    /// `self`, with each field `over` sets replaced by `over`'s.
+    pub fn merged(&self, over: &SubmitRow) -> SubmitRow {
+        SubmitRow {
+            bracketed: over.bracketed.or(self.bracketed),
+            enter: over.enter.clone().or_else(|| self.enter.clone()),
+            enter_delay_ms: over.enter_delay_ms.or(self.enter_delay_ms),
+            focus_in: over.focus_in.or(self.focus_in),
+            while_working: over.while_working.or(self.while_working),
+            envelope: over.envelope.or(self.envelope),
+        }
+    }
+}
+
+/// The rows that ship: Claude Code takes typed input while it works as its
+/// next prompt, so `queue`; Copilot's CLI ignores input until it has focus,
+/// so `focus_in`; Codex's behaviour while working is inferred rather than
+/// verified, so it waits in the `mailbox`. Every other command gets the
+/// generic default.
+pub fn shipped_rows() -> BTreeMap<String, SubmitRow> {
+    BTreeMap::from([
+        (
+            "claude".to_string(),
+            SubmitRow {
+                while_working: Some(WhileWorking::Queue),
+                ..SubmitRow::default()
+            },
+        ),
+        (
+            "copilot".to_string(),
+            SubmitRow {
+                focus_in: Some(true),
+                ..SubmitRow::default()
+            },
+        ),
+        (
+            "codex".to_string(),
+            SubmitRow {
+                while_working: Some(WhileWorking::Mailbox),
+                ..SubmitRow::default()
+            },
+        ),
+    ])
+}
+
+/// The longest `typing_guard_max_ms`. A send's reply waits for the guard, and
+/// the submit budget the CLI waits for (`daemon::SUBMIT_BUDGET_MS`) is built
+/// from this cap, so raising it lengthens the CLI's wait with it.
+pub const MAX_TYPING_GUARD_MS: u64 = 30_000;
+
+/// The shortest `enter_delay_ms`: with no delay the paste and its Enter can
+/// arrive in one read, which an agent can take as part of the paste.
+pub const MIN_ENTER_DELAY_MS: u64 = 50;
+
+/// The longest `enter_delay_ms`. The reply to a send waits for the Enter, so
+/// this must stay well inside the CLI's reply deadline (10 s,
+/// `cli_common::REPLY_DEADLINE`): a CLI that gives up first leaves a message
+/// that is typed after all, and a retry then delivers it twice.
+pub const MAX_ENTER_DELAY_MS: u64 = 5000;
+
+/// The most bytes an `enter` may be.
+pub const MAX_ENTER_BYTES: usize = 4;
+
+/// Whether `enter` can submit a typed message: one to four control bytes
+/// (`"\r"`, `"\n"`, `"\r\n"`), so it can neither type text of its own nor
+/// end a bracketed paste early.
+pub fn valid_enter(enter: &str) -> bool {
+    (1..=MAX_ENTER_BYTES).contains(&enter.len()) && enter.bytes().all(|b| b < 0x20 || b == 0x7f)
+}
+
+impl Default for MessagingConfig {
+    fn default() -> Self {
+        Self {
+            ttl_hours: 24.0,
+            mailbox_max_messages: 256,
+            mailbox_max_bytes: 4 * 1024 * 1024,
+            max_body_bytes: 64 * 1024,
+            rate_per_10s: 20,
+            link_rate_per_10s: 60,
+            link_parked_max: 8,
+            persist: true,
+            typing_guard_ms: 3000,
+            typing_guard_unattended_ms: 500,
+            typing_guard_max_ms: 15000,
+            submit_when_attended: true,
+            submit_queue_len: 8,
+            stall_ms: 5000,
+            settle_ms: 1000,
+            submit: BTreeMap::new(),
+            host_name: None,
+            links: LinksConfig::default(),
+        }
+    }
+}
+
+impl MessagingConfig {
+    /// A negative or NaN `ttl_hours` saturates to 0, which expires mail at
+    /// once rather than keeping it for ever.
+    pub fn ttl_ms(&self) -> u64 {
+        (self.ttl_hours * 3_600_000.0) as u64
+    }
+
+    /// The bounds the store enforces, with every value [`Self::problems`]
+    /// reports replaced. A zero cap would refuse every send, which reads as
+    /// broken messaging rather than a setting, so it falls back to the default.
+    pub fn limits(&self) -> Limits {
+        let default = Self::default();
+        let or_default = |value: usize, fallback: usize| if value == 0 { fallback } else { value };
+        let max_bytes = or_default(self.mailbox_max_bytes, default.mailbox_max_bytes);
+        Limits {
+            max_messages: or_default(self.mailbox_max_messages, default.mailbox_max_messages),
+            max_bytes,
+            max_body: self.max_body_bytes.min(max_bytes),
+            rate_per_10s: if self.rate_per_10s == 0 {
+                default.rate_per_10s
+            } else {
+                self.rate_per_10s
+            },
+            ttl_ms: self.ttl_ms(),
+            link_parked_max: or_default(self.link_parked_max, default.link_parked_max),
+        }
+    }
+
+    /// The guard's windows, with `typing_guard_max_ms` capped at
+    /// [`MAX_TYPING_GUARD_MS`].
+    pub fn typing_guard(&self) -> crate::server::submit::GuardConfig {
+        use std::time::Duration;
+        crate::server::submit::GuardConfig {
+            attended: Duration::from_millis(self.typing_guard_ms),
+            unattended: Duration::from_millis(self.typing_guard_unattended_ms),
+            max: Duration::from_millis(self.typing_guard_max_ms.min(MAX_TYPING_GUARD_MS)),
+        }
+    }
+
+    /// How `--wait` reads a pane, with `working_ms` from `[agents]`: the
+    /// output that reads as working is the same output the wait watches for.
+    pub fn wait_cfg(&self, working_ms: u64) -> crate::server::submit::WaitCfg {
+        use std::time::Duration;
+        crate::server::submit::WaitCfg {
+            working: Duration::from_millis(working_ms),
+            stall: Duration::from_millis(self.stall_ms),
+            settle: Duration::from_millis(self.settle_ms),
+        }
+    }
+
+    /// The per-link rate, a zero falling back to the default.
+    pub fn link_rate_per_10s(&self) -> u32 {
+        if self.link_rate_per_10s == 0 {
+            Self::default().link_rate_per_10s
+        } else {
+            self.link_rate_per_10s
+        }
+    }
+
+    /// The name this server gives itself on a link: `host_name` when it is a
+    /// valid host, else the machine's hostname, else `localhost`.
+    pub fn host_name(&self) -> String {
+        self.host_name
+            .clone()
+            .filter(|name| crate::protocol::valid_host(name))
+            .or_else(hostname)
+            .unwrap_or_else(|| "localhost".to_string())
+    }
+
+    /// The warning for a server that calls itself `localhost` because no
+    /// `host_name` is set and the machine's hostname cannot be a host (such
+    /// as `claude-dev`): every peer would see the same name.
+    pub fn host_name_warning(&self) -> Option<String> {
+        if self
+            .host_name
+            .as_deref()
+            .is_some_and(crate::protocol::valid_host)
+        {
+            return None;
+        }
+        localhost_because(raw_hostname().as_deref())
+    }
+
+    /// The submit queue's length, a zero falling back to the default.
+    pub fn submit_queue_len(&self) -> usize {
+        if self.submit_queue_len == 0 {
+            Self::default().submit_queue_len
+        } else {
+            self.submit_queue_len
+        }
+    }
+
+    /// One line per value that [`Self::limits`] does not use as written, for
+    /// the config loader to warn with.
+    pub fn problems(&self) -> Vec<String> {
+        let default = Self::default();
+        let mut out = Vec::new();
+        for (key, value, fallback) in [
+            (
+                "mailbox_max_messages",
+                self.mailbox_max_messages,
+                default.mailbox_max_messages,
+            ),
+            (
+                "mailbox_max_bytes",
+                self.mailbox_max_bytes,
+                default.mailbox_max_bytes,
+            ),
+            (
+                "rate_per_10s",
+                self.rate_per_10s as usize,
+                default.rate_per_10s as usize,
+            ),
+            (
+                "link_rate_per_10s",
+                self.link_rate_per_10s as usize,
+                default.link_rate_per_10s as usize,
+            ),
+        ] {
+            if value == 0 {
+                out.push(format!(
+                    "[messaging] {key} = 0 would refuse every send; using {fallback}"
+                ));
+            }
+        }
+        let max_bytes = self.limits().max_bytes;
+        if self.max_body_bytes > max_bytes {
+            out.push(format!(
+                "[messaging] max_body_bytes = {} is larger than a whole mailbox; using {max_bytes}",
+                self.max_body_bytes
+            ));
+        }
+        if self.typing_guard_max_ms > MAX_TYPING_GUARD_MS {
+            out.push(format!(
+                "[messaging] typing_guard_max_ms = {} is capped at {MAX_TYPING_GUARD_MS}",
+                self.typing_guard_max_ms
+            ));
+        }
+        if self.submit_queue_len == 0 {
+            out.push(format!(
+                "[messaging] submit_queue_len = 0 would refuse every submit; using {}",
+                Self::default().submit_queue_len
+            ));
+        }
+        if let Some(name) = self
+            .host_name
+            .as_deref()
+            .filter(|name| !crate::protocol::valid_host(name))
+        {
+            out.push(format!(
+                "[messaging] host_name = {name:?} is not a valid host name; using {:?}",
+                self.host_name()
+            ));
+        }
+        let budget = crate::server::daemon::LINK_DIAL_BUDGET_MS;
+        if self.links.dial_ms == 0 {
+            out.push(format!(
+                "[messaging.links] dial_ms = 0 would fail every dial; using {}",
+                LinksConfig::default().dial_ms
+            ));
+        }
+        if self.links.dial_ms > budget {
+            out.push(format!(
+                "[messaging.links] dial_ms = {} is capped at {budget}",
+                self.links.dial_ms
+            ));
+        }
+        if self.links.ping_ms < MIN_PING_MS {
+            out.push(format!(
+                "[messaging.links] ping_ms = {} is under {MIN_PING_MS}",
+                self.links.ping_ms
+            ));
+        }
+        for (command, row) in &self.submit {
+            if let Some(enter) = row.enter.as_deref().filter(|e| !valid_enter(e)) {
+                out.push(format!(
+                    "[messaging.submit.{command}] enter = {enter:?} is not 1 to {MAX_ENTER_BYTES} control bytes; using \"\\r\""
+                ));
+            }
+            if let Some(ms) = row.enter_delay_ms {
+                if ms > MAX_ENTER_DELAY_MS {
+                    out.push(format!(
+                        "[messaging.submit.{command}] enter_delay_ms = {ms} is capped at {MAX_ENTER_DELAY_MS}"
+                    ));
+                } else if ms < MIN_ENTER_DELAY_MS {
+                    out.push(format!(
+                        "[messaging.submit.{command}] enter_delay_ms = {ms} is raised to {MIN_ENTER_DELAY_MS}"
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The machine's hostname, when it is one a link can carry.
+fn hostname() -> Option<String> {
+    raw_hostname().filter(|name| crate::protocol::valid_host(name))
+}
+
+/// Why a server with no valid `host_name` calls itself `localhost`, given
+/// the machine's hostname: `None` when the hostname is a valid host, and so
+/// is used.
+fn localhost_because(raw: Option<&str>) -> Option<String> {
+    match raw {
+        Some(name) if crate::protocol::valid_host(name) => None,
+        Some(name) => Some(format!(
+            "this machine's hostname {} is not a valid host name, so this server calls itself \"localhost\" on its links; set [messaging] host_name",
+            crate::client::cli_common::escape(name)
+        )),
+        None => Some(
+            "this machine's hostname could not be read, so this server calls itself \"localhost\" on its links; set [messaging] host_name"
+                .to_string(),
+        ),
+    }
+}
+
+fn raw_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a valid, writable buffer of `buf.len()` bytes.
+    let got = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if got != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn a_hostname_that_cannot_be_a_host_is_why_the_server_is_localhost() {
+        assert_eq!(localhost_because(Some("fedoradesktop")), None);
+        let why = localhost_because(Some("claude-dev")).unwrap();
+        assert!(
+            why.contains("claude-dev") && why.contains("localhost"),
+            "{why}"
+        );
+        assert!(localhost_because(None)
+            .unwrap()
+            .contains("could not be read"));
+        let named = parse("[messaging]\nhost_name = \"laptop\"");
+        assert_eq!(
+            named.host_name_warning(),
+            None,
+            "a valid host_name needs no hostname"
+        );
+    }
+
+    #[test]
+    fn host_name_none_means_the_hostname() {
+        let m = parse("");
+        assert_eq!(m.host_name, None);
+        assert_eq!(
+            m.host_name(),
+            hostname().unwrap_or_else(|| "localhost".into())
+        );
+        assert_eq!(
+            parse("[messaging]\nhost_name = \"laptop\"").host_name(),
+            "laptop"
+        );
+    }
+
+    #[test]
+    fn a_bad_host_name_is_reported_and_replaced() {
+        for bad in ["-oProxyCommand=x", "user", "my_claude", ""] {
+            let m = parse(&format!("[messaging]\nhost_name = {bad:?}"));
+            assert_ne!(m.host_name(), bad);
+            assert!(
+                m.problems().iter().any(|p| p.contains("host_name")),
+                "{bad:?}: {:?}",
+                m.problems()
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_dial_is_reported_and_dials_with_the_default() {
+        let zero = parse("[messaging.links]\ndial_ms = 0");
+        assert_eq!(zero.links.dial(), LinksConfig::default().dial());
+        assert!(
+            zero.problems().iter().any(|p| p.contains("dial_ms = 0")),
+            "{:?}",
+            zero.problems()
+        );
+        let over = parse("[messaging.links]\ndial_ms = 999999");
+        assert_eq!(
+            over.links.dial(),
+            std::time::Duration::from_millis(crate::server::daemon::LINK_DIAL_BUDGET_MS)
+        );
+    }
+
+    #[test]
+    fn a_dial_over_the_servers_budget_is_reported_capped() {
+        let budget = crate::server::daemon::LINK_DIAL_BUDGET_MS;
+        let at = parse(&format!("[messaging.links]\ndial_ms = {budget}"));
+        assert!(at.problems().is_empty(), "{:?}", at.problems());
+        let over = parse(&format!("[messaging.links]\ndial_ms = {}", budget + 1));
+        assert_eq!(
+            over.problems(),
+            vec![format!(
+                "[messaging.links] dial_ms = {} is capped at {budget}",
+                budget + 1
+            )]
+        );
+    }
+
+    /// The `[messaging.links]` block in `config.sample.toml`, uncommented, is
+    /// the default.
+    #[test]
+    fn the_sample_links_block_is_the_default() {
+        let sample = include_str!("../../config.sample.toml");
+        let block: String = sample
+            .lines()
+            .skip_while(|l| *l != "# [messaging.links]")
+            .take_while(|l| l.starts_with("# "))
+            .map(|l| format!("{}\n", &l[2..]))
+            .collect();
+        assert!(
+            block.starts_with("[messaging.links]\n"),
+            "no [messaging.links] block"
+        );
+        assert_eq!(block.lines().count(), 4, "{block}");
+        assert_eq!(parse(&block).links, LinksConfig::default());
+    }
+
+    fn parse(s: &str) -> MessagingConfig {
+        toml::from_str::<Config>(s).unwrap().messaging
+    }
+
+    #[test]
+    fn messaging_defaults_are_the_spec_values() {
+        let m = parse("");
+        assert_eq!(m, MessagingConfig::default());
+        assert_eq!(m.ttl_hours, 24.0);
+        assert_eq!(m.mailbox_max_messages, 256);
+        assert_eq!(m.mailbox_max_bytes, 4 * 1024 * 1024);
+        assert_eq!(m.max_body_bytes, 64 * 1024);
+        assert_eq!(m.rate_per_10s, 20);
+        assert!(m.persist);
+        assert_eq!(
+            m.limits(),
+            Limits {
+                max_messages: 256,
+                max_bytes: 4 * 1024 * 1024,
+                max_body: 64 * 1024,
+                rate_per_10s: 20,
+                ttl_ms: 24 * 3_600_000,
+                link_parked_max: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn ttl_hours_accepts_a_fraction() {
+        assert_eq!(parse("[messaging]\nttl_hours = 0.0005").ttl_ms(), 1_800);
+        assert_eq!(parse("[messaging]\nttl_hours = 2").ttl_ms(), 7_200_000);
+    }
+
+    /// The commented block in `config.sample.toml`, uncommented, is the
+    /// defaults, so the sample cannot drift from the code.
+    #[test]
+    fn the_sample_config_block_is_the_defaults() {
+        let sample = include_str!("../../config.sample.toml");
+        let block: String = sample
+            .lines()
+            .skip_while(|l| *l != "# [messaging]")
+            .take_while(|l| l.starts_with("# "))
+            .map(|l| format!("{}\n", &l[2..]))
+            .collect();
+        assert!(block.starts_with("[messaging]\n"), "no [messaging] block");
+        assert_eq!(
+            block.lines().count(),
+            16,
+            "the block is not all fifteen keys"
+        );
+        assert_eq!(parse(&block), MessagingConfig::default());
+    }
+
+    #[test]
+    fn the_sample_submit_rows_are_the_shipped_rows() {
+        let sample = include_str!("../../config.sample.toml");
+        let block: String = sample
+            .lines()
+            .skip_while(|l| *l != "# [messaging.submit.claude]")
+            .take_while(|l| l.starts_with('#'))
+            .map(|l| format!("{}\n", l.strip_prefix("# ").unwrap_or("")))
+            .collect();
+        assert!(!block.is_empty(), "no [messaging.submit.claude] block");
+        assert_eq!(parse(&block).submit, shipped_rows());
+    }
+
+    #[test]
+    fn a_submit_row_parses_every_field() {
+        let m = parse(
+            "[messaging.submit.aider]\nbracketed = \"off\"\nenter = \"\\n\"\nenter_delay_ms = 50\nfocus_in = true\nwhile_working = \"refuse\"\nenvelope = false",
+        );
+        assert_eq!(
+            m.submit["aider"],
+            SubmitRow {
+                bracketed: Some(Bracketed::Off),
+                enter: Some("\n".into()),
+                enter_delay_ms: Some(50),
+                focus_in: Some(true),
+                while_working: Some(WhileWorking::Refuse),
+                envelope: Some(false),
+            }
+        );
+        assert!(m.problems().is_empty(), "{:?}", m.problems());
+    }
+
+    #[test]
+    fn a_bad_enter_and_a_delay_out_of_range_are_reported() {
+        let m = parse(
+            "[messaging.submit.a]\nenter = \"\"\n[messaging.submit.b]\nenter = \"\\u001b[201~\"\n[messaging.submit.c]\nenter_delay_ms = 9000\n[messaging.submit.d]\nenter = \"ok\"\n[messaging.submit.e]\nenter = \"\\r\\r\\r\\r\\r\"\nenter_delay_ms = 0",
+        );
+        let problems = m.problems();
+        assert_eq!(problems.len(), 6, "{problems:?}");
+        assert!(problems[0].starts_with("[messaging.submit.a] enter"));
+        assert!(problems[1].starts_with("[messaging.submit.b] enter"));
+        assert!(problems[2].contains("is capped at 5000"));
+        assert!(problems[3].starts_with("[messaging.submit.d] enter"));
+        assert!(problems[4].starts_with("[messaging.submit.e] enter "));
+        assert!(problems[5].contains("is raised to 50"));
+    }
+
+    #[test]
+    fn a_row_for_a_command_that_is_no_agent_is_reported() {
+        let cfg: Config = toml::from_str(
+            "[agents]\ncommands = [\"claude\"]\n[messaging.submit.claude]\nfocus_in = true\n[messaging.submit.clade]\nfocus_in = true",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.submit_rows_without_an_agent(),
+            ["[messaging.submit.clade] names no command in [agents] commands, so it is never used"]
+        );
+    }
+
+    #[test]
+    fn an_enter_is_one_to_four_control_bytes() {
+        for ok in ["\r", "\n", "\r\n", "\u{1b}\r", "\r\r\r\r"] {
+            assert!(valid_enter(ok), "{ok:?}");
+        }
+        for bad in ["", "x", "\ry", "\u{1b}[201~", "\r\r\r\r\r"] {
+            assert!(!valid_enter(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_zero_cap_falls_back_to_the_default_and_is_reported() {
+        let m =
+            parse("[messaging]\nmailbox_max_messages = 0\nmailbox_max_bytes = 0\nrate_per_10s = 0");
+        assert_eq!(m.limits(), MessagingConfig::default().limits());
+        let problems = m.problems();
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        for key in ["mailbox_max_messages", "mailbox_max_bytes", "rate_per_10s"] {
+            assert!(
+                problems.iter().any(|p| p.contains(key)),
+                "{key} not reported"
+            );
+        }
+        assert!(MessagingConfig::default().problems().is_empty());
+    }
+
+    #[test]
+    fn the_body_cap_is_clamped_to_the_mailbox_cap_and_reported() {
+        let m = parse("[messaging]\nmailbox_max_bytes = 1000\nmax_body_bytes = 5000");
+        assert_eq!(m.limits().max_body, 1000);
+        assert_eq!(m.problems().len(), 1);
+        assert!(m.problems()[0].contains("max_body_bytes"));
+
+        let fits = parse("[messaging]\nmailbox_max_bytes = 1000\nmax_body_bytes = 1000");
+        assert_eq!(fits.limits().max_body, 1000);
+        assert!(fits.problems().is_empty());
+    }
+
+    #[test]
+    fn a_partial_table_keeps_the_other_defaults() {
+        let m = parse("[messaging]\npersist = false\nrate_per_10s = 3");
+        assert!(!m.persist);
+        assert_eq!(m.rate_per_10s, 3);
+        assert_eq!(m.mailbox_max_messages, 256);
+    }
+}

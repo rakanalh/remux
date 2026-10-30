@@ -6381,6 +6381,8 @@ mod tests {
             title: None,
             custom_name: None,
             cwd: None,
+            name: None,
+            unread: 0,
             focused: false,
         }
     }

@@ -180,10 +180,18 @@ try:
     # panes, so a pane is narrow enough to wrap a long path across two rows --
     # and a wrapped path fails a row-wise substring search while the cwd is
     # perfectly correct.
+    #
+    # The expected path is resolved because the server does not set `PWD`, so
+    # the shell's `pwd` is `getcwd()`, which reports the physical path. On
+    # macOS `/tmp` is a symlink to `/private/tmp`. The resolved path is
+    # `WORKDIR` unchanged unless the run dir is under a symlink. It is passed
+    # as `$1` rather than spliced into the script, because it is computed at
+    # run time and must not be parsed as shell.
     reply_c = cli_spawn(
         "SplitBelow", cwd=WORKDIR,
         argv=["/bin/sh", "-c",
-              f'[ "$(pwd)" = "{WORKDIR}" ] && printf "CWD-OK\\n" || printf "CWD-BAD\\n"; exec /bin/sh'])
+              '[ "$(pwd)" = "$1" ] && printf "CWD-OK\\n" || printf "CWD-BAD\\n"; exec /bin/sh',
+              "sh", os.path.realpath(WORKDIR)])
     check(name_of(reply_c) == "CliSpawned", f"a CliSpawn with a cwd is answered (got {reply_c})")
     c_id = reply_c["CliSpawned"]["pane_id"] if name_of(reply_c) == "CliSpawned" else None
     ok_c, seen_c, _ = pane_content(cli, c_id, "CWD-OK")

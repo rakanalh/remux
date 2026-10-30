@@ -1,0 +1,9 @@
+{
+  "model": "sonnet",
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)"
+    ]
+  },
+  "theme": "dark"
+}

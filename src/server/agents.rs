@@ -142,13 +142,19 @@ pub const DETECTION_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = 
 /// the agent was actually found at. See [`log_detection`] for why it is
 /// deduplicated instead of levelled down.
 pub fn foreground_command(fd: BorrowedFd<'_>, rules: &AgentRules) -> Option<String> {
+    foreground_agent(fd, rules).map(|(command, _)| command)
+}
+
+/// [`foreground_command`], with the pid of the process whose name matched:
+/// the agent itself, which may be a descendant of the group's leader.
+pub fn foreground_agent(fd: BorrowedFd<'_>, rules: &AgentRules) -> Option<(String, i32)> {
     let pgid = nix::unistd::tcgetpgrp(fd).ok()?;
     let leader_pid = pgid.as_raw();
     let leader = crate::server::daemon::get_process_names(leader_pid);
     if let Some(command) = rules.match_command(&leader.name, leader.argv0.as_deref()) {
         let command = command.to_string();
         log_detection(leader_pid, &leader, Detected::Leader(&command));
-        return Some(command);
+        return Some((command, leader_pid));
     }
     // Only the processes of THIS job. `child_pids` lists every child the
     // leader has, and a job the user PARKED -- `Ctrl-Z`, or `&` under an
@@ -185,7 +191,7 @@ pub fn foreground_command(fd: BorrowedFd<'_>, rules: &AgentRules) -> Option<Stri
                     command: &command,
                 },
             );
-            Some(command)
+            Some((command, pid))
         }
         None => {
             log_detection(leader_pid, &leader, Detected::Nothing);
@@ -737,15 +743,87 @@ mod tests {
         AgentRules::from_config(&AgentsConfig::default())
     }
 
-    /// The approval questions present in the installed Claude Code 2.1.251
+    /// The approval questions present in the installed Claude Code 2.1.296
     /// binary, read with `strings`. The shipped patterns exist to match these.
-    const CLAUDE_QUESTIONS: [&str; 5] = [
+    /// The file dialogs' questions are rendered from the bare "Do you want to "
+    /// prefix, a verb phrase and the file name; each verb phrase is in the
+    /// binary, and the file names are examples.
+    const CLAUDE_QUESTIONS: [&str; 14] = [
         "Do you want to proceed?",
         "Do you want to continue?",
         "Do you want to allow this connection?",
         "Do you want to allow Claude to fetch this content?",
         "Do you want to use this API key?",
+        "Do you want to make this edit to x.rs?",
+        "Do you want to create notes.md?",
+        "Do you want to overwrite notes.md?",
+        "Do you want to write to notes.md?",
+        "Do you want to insert this cell into a.ipynb?",
+        "Do you want to delete this cell from a.ipynb?",
+        "Would you like to proceed?",
+        "Would you like to install this LSP plugin?",
+        "Are you sure you want to delete this permission rule?",
     ];
+
+    /// A known gap: this wording, also in the binary, goes on past its `?`
+    /// on the same line, so the anchored pattern misses it and the panel
+    /// reads the pane Idle. A submit still refuses it, through
+    /// `submit::looks_like_prompt` and the dialog's numbered options.
+    #[test]
+    fn a_question_with_text_after_its_mark_is_a_known_gap() {
+        let line = "Are you sure you want to delete this rule? The classifier stops applying it.";
+        assert_eq!(
+            shipped()
+                .classify("claude", &[line.to_string()], Duration::from_secs(30))
+                .state,
+            AgentState::Idle
+        );
+    }
+
+    /// Claude Code's dialog for an Edit tool call, as it draws it. Its default
+    /// is "Yes", so an Enter typed into it approves the edit.
+    const CLAUDE_EDIT_DIALOG: [&str; 6] = [
+        "Edit file",
+        " src/x.rs",
+        "Do you want to make this edit to x.rs?",
+        "\u{276f} 1. Yes",
+        "  2. Yes, allow all edits during this session (shift+tab)",
+        "  3. No, and tell Claude what to do differently (esc)",
+    ];
+
+    /// An agent's own prose using the dialogs' words is not a dialog: the
+    /// file verbs need a single file name and the line's last `?`.
+    #[test]
+    fn claudes_dialog_wordings_in_prose_are_not_a_blocked_signal() {
+        let r = shipped();
+        for prose in [
+            "Do you want to create a PR?",
+            "Do you want to make this edit to the parser and run the tests?",
+            "Do you want to overwrite x.rs? I can keep a backup.",
+            "Would you like to proceed with the refactor, or stop here",
+            "Are you sure you want to delete it? Say so and I will.",
+        ] {
+            assert_eq!(
+                r.classify("claude", &[prose.to_string()], Duration::from_secs(30))
+                    .state,
+                AgentState::Idle,
+                "{prose:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_patterns_recognise_claudes_file_edit_dialog() {
+        let r = shipped();
+        let screen: Vec<String> = CLAUDE_EDIT_DIALOG.iter().map(|s| s.to_string()).collect();
+        let v = r.classify("claude", &screen, Duration::from_secs(30));
+        assert_eq!(v.state, AgentState::NeedsInput, "{v:?}");
+        // Its refusing option alone, as when the question has scrolled out of
+        // the window.
+        let options = screen[3..].to_vec();
+        let v = r.classify("claude", &options, Duration::from_secs(30));
+        assert_eq!(v.reason, Reason::Pattern("claude-decline".to_string()));
+    }
 
     #[test]
     fn only_configured_commands_are_agents() {
@@ -1240,7 +1318,7 @@ mod tests {
     }
 
     /// The shipped patterns against the prompt wordings actually present in the
-    /// installed Claude Code binary (2.1.251, read with `strings`).
+    /// installed Claude Code binary (2.1.296, read with `strings`).
     #[test]
     fn the_shipped_patterns_recognise_claudes_real_permission_prompts() {
         let r = shipped();

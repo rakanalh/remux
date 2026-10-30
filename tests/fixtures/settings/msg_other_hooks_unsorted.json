@@ -1,0 +1,32 @@
+{
+  "theme": "dark",
+  "zeta": 1,
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "notify-send stopped"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo pre"
+          }
+        ]
+      }
+    ]
+  },
+  "alpha": {
+    "b": 2,
+    "a": 1
+  },
+  "model": "opus"
+}

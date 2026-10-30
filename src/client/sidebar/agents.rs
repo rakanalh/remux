@@ -56,13 +56,23 @@ impl AgentRow {
         (self.conn.clone(), self.entry.pane_id)
     }
 
-    /// The label beside the marker, e.g. `claude main/1` -- host-prefixed for a
+    /// The label beside the marker, e.g. `claude main/1 @alpha`: the pane's
+    /// display name, then its messaging name, the address other panes send
+    /// to, when it has one.
+    pub fn label(&self) -> String {
+        match &self.entry.name {
+            Some(name) => format!("{} @{name}", self.display_name()),
+            None => self.display_name(),
+        }
+    }
+
+    /// The pane's display name, e.g. `claude main/1` -- host-prefixed for a
     /// remote, since two machines routinely have a session of the same name.
     ///
     /// A name the user gave the pane wins outright. Otherwise a `pane_title`
     /// template decides; with none, a titled agent is shown by its title alone
     /// and an untitled one by this command-and-location form.
-    pub fn label(&self) -> String {
+    pub fn display_name(&self) -> String {
         if let Some(custom) = &self.entry.custom_name {
             return custom.clone();
         }
@@ -100,7 +110,7 @@ impl AgentRow {
     /// tail.
     ///
     /// A name the user gave the pane, a `pane_title` template result or the
-    /// pane's own title is shown whole, as [`AgentRow::label`] shows it. With
+    /// pane's own title is shown whole, as `display_name` gives it. With
     /// none of those, the location is the name: the session, then ` · ` and the
     /// tab's name, or its index when `tab_name` is not known (a tree not yet
     /// received). The command is left out because the second line carries it.
@@ -109,7 +119,7 @@ impl AgentRow {
             || self.pane_title.is_some()
             || self.entry.title.as_deref().is_some_and(|t| !t.is_empty());
         if titled {
-            return (self.label(), None);
+            return (self.display_name(), None);
         }
         (
             self.entry.session.clone(),
@@ -120,11 +130,16 @@ impl AgentRow {
         )
     }
 
-    /// A row's second line: the agent, and the host when it runs on a remote.
+    /// A row's second line: the agent, the host when it runs on a remote, and
+    /// the pane's messaging name when it has one.
     pub fn row_detail(&self) -> String {
-        match &self.conn {
+        let detail = match &self.conn {
             ConnId::Local => self.entry.command.clone(),
             ConnId::Remote(host) => format!("{} \u{b7} {host}", self.entry.command),
+        };
+        match &self.entry.name {
+            Some(name) => format!("{detail} @{name}"),
+            None => detail,
         }
     }
 
@@ -138,6 +153,24 @@ impl AgentRow {
             pane_id: self.entry.pane_id,
         }
     }
+}
+
+/// The unread badge, `*N`, or nothing when there is no unread mail. Width 1
+/// per character on every terminal, which a panel 20 columns wide needs.
+fn badge(unread: usize) -> Option<String> {
+    (unread > 0).then(|| format!("*{unread}"))
+}
+
+/// `text` cut to at most `width` display columns.
+fn fit(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut used = 0;
+    text.chars()
+        .take_while(|&c| {
+            used += UnicodeWidthChar::width(c).unwrap_or(0);
+            used <= width
+        })
+        .collect()
 }
 
 /// The colour a state's marker is drawn in.
@@ -373,7 +406,27 @@ impl AgentsPlugin {
             let x = text_x.saturating_add(u16::try_from(name_width).unwrap_or(u16::MAX));
             draw_text(grid, x, y, &tail, dim_fg.clone(), bg.clone());
         }
-        draw_text(grid, text_x, y + 1, &row.row_detail(), dim_fg, bg);
+        // The badge holds the right edge, and the detail is cut to leave it a
+        // column of space: the count is what a glance looks for. A row too
+        // narrow for the badge and that column shows no badge.
+        let room = usize::from(cols.saturating_sub(text_x));
+        let badge = badge(row.entry.unread).filter(|b| room > b.len());
+        let detail_room = match &badge {
+            Some(b) => room - (b.len() + 1),
+            None => room,
+        };
+        draw_text(
+            grid,
+            text_x,
+            y + 1,
+            &fit(&row.row_detail(), detail_room),
+            dim_fg,
+            bg.clone(),
+        );
+        if let Some(b) = badge {
+            let x = cols.saturating_sub(u16::try_from(b.len()).unwrap_or(u16::MAX));
+            draw_text(grid, x, y + 1, &b, theme.tab_bell_fg.clone(), bg);
+        }
     }
 
     fn layout(&self) -> ListLayout {
@@ -678,6 +731,8 @@ mod tests {
             title: None,
             custom_name: None,
             cwd: None,
+            name: None,
+            unread: 0,
             focused: false,
         }
     }
@@ -869,6 +924,87 @@ mod tests {
         );
         assert_eq!(state_fg(AgentState::Working, &theme), theme.tab_activity_fg);
         assert_eq!(state_fg(AgentState::Idle, &theme), theme.status_bar_fg);
+    }
+
+    #[test]
+    fn a_named_row_carries_its_name_after_the_label() {
+        let mut e = agent(3, "claude", "main", AgentState::Idle);
+        assert_eq!(row(ConnId::Local, e.clone(), None).label(), "claude main/0");
+        e.name = Some("alpha".into());
+        assert_eq!(
+            row(ConnId::Local, e.clone(), None).label(),
+            "claude main/0 @alpha"
+        );
+        e.custom_name = Some("Fixer".into());
+        assert_eq!(row(remote("mini"), e, None).label(), "Fixer @alpha");
+    }
+
+    #[test]
+    fn a_named_row_carries_its_name_on_the_detail_line() {
+        let mut e = agent(3, "claude", "main", AgentState::Idle);
+        e.name = Some("alpha".into());
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(remote("pi"), vec![e]));
+        let rows = painted(&p, 30, 4);
+        assert_eq!(rows[1], "\u{25CB} main \u{b7} 0");
+        assert_eq!(rows[2], "  claude \u{b7} pi @alpha");
+    }
+
+    /// The panel's raw row holding the first agent's detail line: under the
+    /// header, the gap and the name line.
+    const DETAIL_ROW: usize = 3;
+
+    #[test]
+    fn a_badge_is_right_aligned_and_the_detail_truncates_first() {
+        let mut e = agent(3, "claude", "main", AgentState::Idle);
+        e.name = Some("a-long-messaging-name".into());
+        e.unread = 3;
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(ConnId::Local, vec![e]));
+        let theme = CompositorTheme::default();
+        let grid = p.render(20, 5, false, &theme);
+        let line: String = grid[DETAIL_ROW].iter().map(|c| c.c).collect();
+        assert!(line.ends_with("*3"), "{line:?}");
+        assert_eq!(grid[DETAIL_ROW][18].fg, theme.tab_bell_fg);
+        let cells: Vec<char> = line.chars().collect();
+        assert_eq!(
+            cells[3..17].iter().collect::<String>(),
+            "claude @a-long",
+            "the detail is cut to leave the badge room"
+        );
+        assert_eq!(cells[17], ' ', "a column between them: {line:?}");
+    }
+
+    #[test]
+    fn a_row_too_narrow_for_the_badge_shows_none() {
+        let mut e = agent(3, "claude", "main", AgentState::Idle);
+        e.unread = 12;
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(ConnId::Local, vec![e]));
+        let theme = CompositorTheme::default();
+        let narrow = painted_raw(&p, 6, 5);
+        assert!(!narrow[DETAIL_ROW].contains('*'), "{narrow:?}");
+        assert!(
+            narrow[DETAIL_ROW - 1].starts_with(" \u{25CB}"),
+            "the marker survives: {narrow:?}"
+        );
+        let fits: String = p.render(7, 5, false, &theme)[DETAIL_ROW]
+            .iter()
+            .map(|c| c.c)
+            .collect();
+        assert!(fits.ends_with("*12"), "{fits:?}");
+    }
+
+    #[test]
+    fn no_badge_at_zero() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(3, "claude", "main", AgentState::Idle)],
+        ));
+        let rows = painted_raw(&p, 20, 5);
+        assert!(!rows[DETAIL_ROW].contains('*'), "{rows:?}");
+        assert_eq!(rows[DETAIL_ROW], "   claude");
     }
 
     #[test]

@@ -73,7 +73,7 @@ A notification is skipped when the agent's pane is focused in any client attache
 The server is what reports which panes are focused in its clients. A server from before desktop notifications, such as a remote you have not upgraded, does not report it, so only this client's own knowledge of where you are can skip a notification for one of its agents. That covers a View cell, and the focused pane while a `sessions`, `agents` or `files` panel is configured. Without such a panel you may get notifications for the pane you are looking at, and a pane focused in another client is never skipped. Upgrade the remote to fix both.
 :::
 
-The title names the agent the same way the agents panel does, followed by the event, for example `claude main/0 needs input`. The body says where it is: `session · tab N`, with the remote's name in front for a remote agent.
+The title names the agent by a name you gave the pane, your `pane_title` template, its window title, or `command session/tab` (`command host:session/tab` for a remote agent), followed by the event, for example `claude main/0 needs input`. The body says where it is: `session · tab N`, with the remote's name in front for a remote agent.
 
 Turn it off, pick events, or use another notifier in `[notifications]`. Changes apply when you save the file:
 

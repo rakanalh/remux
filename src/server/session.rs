@@ -1040,6 +1040,18 @@ impl ServerState {
         }
     }
 
+    /// Never issue a pane id at or below `id` from now on.
+    pub fn reserve_pane_ids_through(&mut self, id: PaneId) {
+        if self.next_pane_id <= id {
+            self.next_pane_id = id.saturating_add(1);
+        }
+    }
+
+    /// The id the next pane will get, without taking it.
+    pub fn peek_next_pane_id(&self) -> PaneId {
+        self.next_pane_id
+    }
+
     /// Raise this state's pane/tab id counters so future allocations never
     /// collide with any id used by `other`.
     ///
@@ -1748,6 +1760,25 @@ impl ServerState {
                 }
             }
         }
+    }
+
+    /// Whether `pane_id` is some tab's popup, which is in no tab's layout.
+    pub fn is_popup(&self, pane_id: PaneId) -> bool {
+        self.sessions
+            .values()
+            .flat_map(|sess| &sess.tabs)
+            .any(|tab| tab.popup_pane == Some(pane_id))
+    }
+
+    /// The session and tab index that own `pane_id`, by [`Tab::panes`]. A
+    /// popup is in no tab's [`Tab::panes`], so it is `None` like an unknown id.
+    pub fn locate_pane(&self, pane_id: PaneId) -> Option<(SessionId, usize)> {
+        self.sessions.iter().find_map(|(name, sess)| {
+            sess.tabs
+                .iter()
+                .position(|tab| tab.panes().contains(&pane_id))
+                .map(|idx| (name.clone(), idx))
+        })
     }
 
     /// Promote any background tab that has been quietly in `Activity` past the
@@ -2503,6 +2534,62 @@ mod tests {
         assert_eq!(sess.active_tab, 1);
         assert_eq!(sess.tabs[1].name, "new-tab");
         assert_eq!(sess.tabs[1].focused_pane, pane_id);
+    }
+
+    fn create_plain_session(st: &mut ServerState, name: &str) -> PaneId {
+        st.create_session(name, None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .unwrap()
+    }
+
+    #[test]
+    fn locate_pane_finds_a_pane_in_a_background_tab_of_another_session() {
+        let mut st = ServerState::new();
+        create_plain_session(&mut st, "a");
+        let b_pane = create_plain_session(&mut st, "b");
+        let b_tab1_pane = st.create_tab("b", "t1", LayoutMode::default()).unwrap();
+        assert_eq!(st.locate_pane(b_pane), Some(("b".to_string(), 0)));
+        assert_eq!(st.locate_pane(b_tab1_pane), Some(("b".to_string(), 1)));
+    }
+
+    #[test]
+    fn reserved_pane_ids_are_never_issued() {
+        let mut st = ServerState::new();
+        st.reserve_pane_ids_through(40);
+        assert_eq!(st.next_pane_id(), 41);
+        st.reserve_pane_ids_through(10);
+        assert_eq!(
+            st.next_pane_id(),
+            42,
+            "a lower reservation moved the counter back"
+        );
+    }
+
+    #[test]
+    fn reserving_the_largest_id_does_not_overflow() {
+        let mut st = ServerState::new();
+        st.reserve_pane_ids_through(PaneId::MAX);
+        assert_eq!(st.peek_next_pane_id(), PaneId::MAX);
+    }
+
+    #[test]
+    fn is_popup_is_true_only_for_a_tabs_popup() {
+        let mut st = ServerState::new();
+        let pane = create_plain_session(&mut st, "a");
+        let popup = st.next_pane_id();
+        assert!(!st.is_popup(popup));
+        st.sessions.get_mut("a").unwrap().tabs[0].popup_pane = Some(popup);
+        assert!(st.is_popup(popup));
+        assert!(!st.is_popup(pane));
+    }
+
+    #[test]
+    fn locate_pane_is_none_for_an_unknown_id_and_for_the_popup() {
+        let mut st = ServerState::new();
+        create_plain_session(&mut st, "a");
+        assert_eq!(st.locate_pane(9_999), None);
+        let popup = st.next_pane_id();
+        st.sessions.get_mut("a").unwrap().tabs[0].popup_pane = Some(popup);
+        assert_eq!(st.locate_pane(popup), None, "a popup is in no tab's panes");
     }
 
     #[test]

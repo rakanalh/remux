@@ -6,8 +6,8 @@ the agent list it pushes to a subscriber.
 
 What it covers:
 
-  1  with NO sidebar configured, Alt+a lists every agent pane, each with its
-     state marker in the agents panel's state colour, and the pane the user is
+  1  with NO sidebar configured, Alt+a lists every agent pane, a named one
+     with its " @name" after the label, each with its state marker in the agents panel's state colour, and the pane the user is
      in on the current-pane background (the selection sits elsewhere)
   2  a printable key neither narrows the list nor reaches the pane: there is no
      type-to-filter, and the key is swallowed
@@ -17,8 +17,8 @@ What it covers:
      contains, so an echo cannot fake it
   5  with an agents SIDEBAR configured, closing the switcher does not tear down
      the panel's subscription: a later state change still reaches the panel
-  6  a REMOTE agent (fake ssh -> a second server) is listed host-prefixed and
-     jumped to
+  6  a REMOTE agent (fake ssh -> a second server) is listed host-prefixed,
+     with the name it was given on ITS server, and jumped to
 
 Uses a stand-in `claude` script on `PATH`, so no real agent need be installed.
 
@@ -102,7 +102,12 @@ auto_connect = true
 #   claude TAG        prints a tag, then answers each stdin line with GOT:<line>
 #   claude spin       prints for ever, so it is permanently `Working`
 #   "block" on stdin  prints an approval prompt, so it is `NeedsInput`
+#   claude BETATAG / claude FARTAG name THEMSELVES, as a real agent would
 AGENT = """#!/bin/sh
+case "$1" in
+  BETATAG) '@BIN@' agent name bee > /dev/null 2>&1 ;;
+  FARTAG) '@BIN@' agent name yonder > /dev/null 2>&1 ;;
+esac
 printf 'agent ready %s\\n' "$*"
 if [ "$1" = "spin" ]; then
   while :; do printf '.'; sleep 0.2; done
@@ -173,7 +178,7 @@ def setup_dirs():
     write_config("cfg-none", NOTIFY_OFF)
     write_config("cfg-sidebar", AGENTS_SIDEBAR + NOTIFY_OFF)
     write_config("cfg-remote", REMOTE + NOTIFY_OFF)
-    install_agent_standin(f"{RUN}/bin", "claude", AGENT)
+    install_agent_standin(f"{RUN}/bin", "claude", AGENT.replace("@BIN@", BIN))
     shim = f"{RUN}/bin/ssh"
     with open(shim, "w") as f:
         f.write(
@@ -345,7 +350,33 @@ def switcher_rows(screen):
 LAYOUT_BG = "8a8a8a"  # `layout_indicator_bg`, Indexed(245), through pyte's palette
 
 
-def check_paint(label, screen, opened, owned):
+def paint_verdicts(screen, opened, owned):
+    """`check_paint`'s checks, as `(what, ok, detail)`, read off one screen."""
+    rows = screen.display
+    chips = [y for y, r in enumerate(rows) if r.startswith(" [")]
+    bar_y = chips[-1] if chips else None
+    if bar_y is None:
+        return [("the status bar is on screen", False, rows)]
+    bar = rows[bar_y]
+    end = len(bar.rstrip())
+    out = [("the status bar is intact, ending in the layout indicator",
+            end > 0 and str(screen.buffer[bar_y][end].bg) == LAYOUT_BG, repr(bar))]
+    if owned:
+        out.append(("the client's bar spans the last row",
+                    bar_y == ROWS - 1 and end == COLS - 1, (bar_y, repr(bar))))
+    left = popup_x(screen)
+    if opened:
+        bottom = [y for y, r in enumerate(rows)
+                  if left is not None and left >= 0 and r[left:left + 1] == "\u2570"]
+        out.append(("the popup is drawn whole, above the status bar",
+                    left is not None and left >= 0 and bool(bottom) and max(bottom) < bar_y, rows))
+    else:
+        out.append(("the closed popup left nothing behind",
+                    not any("Switch Agent" in r or "\u25cf claude" in r[SIDEBAR_W:] for r in rows), rows))
+    return out
+
+
+def check_paint(label, screen, opened, owned, pump):
     """The overlay and the status bar agree about the screen.
 
     An overlay is torn down by replaying the front buffer, and with a sidebar
@@ -358,31 +389,19 @@ def check_paint(label, screen, opened, owned):
     clients here are smaller than this terminal and the frame is sized to the
     smallest client, so that row is not the terminal's last: the bar is found
     as the lowest row carrying a mode chip, and must end in the layout
-    indicator. With a sidebar it must be the last row, full width."""
-    rows = screen.display
-    chips = [y for y, r in enumerate(rows) if r.startswith(" [")]
-    bar_y = chips[-1] if chips else None
-    if bar_y is None:
-        check(f"{label}: the status bar is on screen", False, rows)
-        return
-    bar = rows[bar_y]
-    end = len(bar.rstrip())
-    check(f"{label}: the status bar is intact, ending in the layout indicator",
-          end > 0 and str(screen.buffer[bar_y][end].bg) == LAYOUT_BG, repr(bar))
-    if owned:
-        check(f"{label}: the client's bar spans the last row",
-              bar_y == ROWS - 1 and end == COLS - 1, (bar_y, repr(bar)))
-    left = popup_x(screen)
+    indicator. With a sidebar it must be the last row, full width.
+
+    An open popup is read once every check holds, or once 4 s have passed:
+    a frame still arriving is not a broken one, and a slower machine reads
+    one mid-paint more often. A paint that never comes right still fails. A
+    closed one is read at once, with no retry: a remnant that a later frame
+    happens to paint over is still one the user saw.
+    """
     if opened:
-        bottom = [y for y, r in enumerate(rows)
-                  if left is not None and left >= 0 and r[left:left + 1] == "\u2570"]
-        check(f"{label}: the popup is drawn whole, above the status bar",
-              left is not None and left >= 0 and bool(bottom) and max(bottom) < bar_y,
-              rows)
-    else:
-        check(f"{label}: the closed popup left nothing behind",
-              not any("Switch Agent" in r or "\u25cf claude" in r[SIDEBAR_W:] for r in rows),
-              rows)
+        wait_until(pump, lambda: all(ok for _, ok, _ in paint_verdicts(screen, opened, owned)),
+                   timeout=4.0)
+    for what, ok, detail in paint_verdicts(screen, opened, owned):
+        check(f"{label}: {what}", ok, detail)
 
 
 def switcher_open(screen):
@@ -433,13 +452,13 @@ def scenario_no_sidebar():
 
     # -- 1 ----------------------------------------------------------------------
     child.send(ALT_A)
-    ok = wait_until(pump, lambda: len(switcher_rows(screen)) == 3)
+    want = ["claude alpha/0", "claude alpha/0", "claude beta/0 @bee"]
+    ok = wait_until(pump, lambda: [r[2] for r in switcher_rows(screen)] == want)
     rows = switcher_rows(screen)
     log("switcher:", rows)
     check("1 Alt+a opens the switcher", switcher_open(screen), screen.display)
-    check("1 every agent pane is listed, with the panel's labels",
-          ok and [r[2] for r in rows] == ["claude alpha/0", "claude alpha/0", "claude beta/0"],
-          rows)
+    check("1 every agent pane is listed, with the panel's labels and beta's @name",
+          ok and [r[2] for r in rows] == want, rows)
     if len(rows) == 3:
         markers = [str(cell(screen, y, x).fg) for y, x, _ in rows]
         check("1 each marker is in its state colour (Working, NeedsInput, Idle)",
@@ -453,25 +472,28 @@ def scenario_no_sidebar():
                         timeout=4.0)
         check("1 the pane the user is in has the current-pane background",
               ok, str(cell(screen, y1, x1 + 3).bg))
+        ok = wait_until(pump, lambda: str(cell(screen, y1, x1).fg) == NEEDS_INPUT, timeout=4.0)
         check("1 the current row's marker keeps its state colour",
-              str(cell(screen, y1, x1).fg) == NEEDS_INPUT, str(cell(screen, y1, x1).fg))
-    check_paint("1 no sidebar, open", screen, True, False)
+              ok, str(cell(screen, y1, x1).fg))
+    check_paint("1 no sidebar, open", screen, True, False, pump)
     check("1 subscribed with no panel configured",
           "subscribing to the agent list" in client_log(), client_log()[-800:])
 
     # -- 2 ----------------------------------------------------------------------
-    before = [r[2] for r in switcher_rows(screen)]
+    # Against the whole list case 1 established, not a snapshot that may be
+    # caught mid-paint. A filter would keep the list narrowed, so waiting for
+    # the full list cannot pass one that narrowed it.
     child.send(b"X")
     pump(0.8)
-    check("2 a letter does not narrow the list",
-          [r[2] for r in switcher_rows(screen)] == before and switcher_open(screen),
-          (before, switcher_rows(screen)))
+    ok = wait_until(pump, lambda: [r[2] for r in switcher_rows(screen)] == want and switcher_open(screen),
+                    timeout=4.0)
+    check("2 a letter does not narrow the list", ok, (want, switcher_rows(screen)))
 
     # -- 3 ----------------------------------------------------------------------
     child.send(ESC)
     ok = wait_until(pump, lambda: not switcher_open(screen), timeout=3.0)
     check("3 Esc closes the switcher", ok, screen.display)
-    check_paint("3 no sidebar, closed", screen, False, False)
+    check_paint("3 no sidebar, closed", screen, False, False, pump)
     check("2 the letter never reached the pane", not any("X" in r for r in screen.display),
           [r for r in screen.display if "X" in r])
     ok = wait_until(pump, lambda: "unsubscribing from the agent list" in client_log(),
@@ -528,13 +550,13 @@ def scenario_with_panel():
     child.send(ALT_A)
     check("5 the switcher opens beside the panel",
           wait_until(pump, lambda: len(switcher_rows(screen)) == 3), switcher_rows(screen))
-    check_paint("5 sidebar, open", screen, True, True)
+    check_paint("5 sidebar, open", screen, True, True, pump)
     check("5 the panel is still painted under an open switcher",
           panel_marker_fg(screen, PANEL_BETA) == IDLE, panel_marker_fg(screen, PANEL_BETA))
     child.send(ESC)
     wait_until(pump, lambda: not switcher_open(screen), timeout=3.0)
     pump(1.0)
-    check_paint("5 sidebar, closed", screen, False, True)
+    check_paint("5 sidebar, closed", screen, False, True, pump)
     check("5 the panel survives the popup's teardown",
           panel_marker_fg(screen, PANEL_BETA) == IDLE, panel_marker_fg(screen, PANEL_BETA))
     check("5 closing it did not unsubscribe",
@@ -558,11 +580,12 @@ def scenario_remote():
     child, screen, pump = spawn(env_local("cfg-remote"))
     pump(3.5)
     child.send(ALT_A)
-    ok = wait_until(pump, lambda: len(switcher_rows(screen)) == 4)
+    far = "claude mini:far/0 @yonder"
+    ok = wait_until(pump, lambda: [r[2] for r in switcher_rows(screen)][3:] == [far])
     rows = switcher_rows(screen)
     log("switcher:", rows)
-    check("6 the remote agent is listed after the local ones, host-prefixed",
-          ok and rows[-1][2] == "claude mini:far/0", rows)
+    check("6 the remote agent is listed after the local ones, host-prefixed, with its @name",
+          ok and len(rows) == 4 and rows[-1][2] == far, rows)
     child.send(b"G")
     pump(0.3)
     child.send(b"\r")

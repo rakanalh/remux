@@ -57,6 +57,12 @@ Covers `SubscribeAgents` / `UnsubscribeAgents` / `AgentList`:
      state. Leader-only detection never listed a parked job; this is what keeps
      that true. The process is asserted ALIVE and stopped first, because "the
      pane is not listed" is answered just as well by a process that died.
+ 20. **mail moves an entry's `unread`, pushed with no output from its pane.**
+     Two messages sent from another pane while every agent is Idle reach the
+     subscriber as `unread == 2`: the send marks the list dirty, because
+     nothing else would.
+ 21. **so does every other mail transition**: a name given, mail read by its
+     own pane, mail acked. Each starts from a quiet list.
 
 Uses a stand-in `claude` script on `PATH`, so nothing here needs a real agent
 installed.
@@ -87,6 +93,7 @@ And BOTH logs are checked for:
 
 Run: python3 tests/frame/agents_panel.py
 """
+import json
 import os
 import re
 import shutil
@@ -96,16 +103,27 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from harness import Client, Server, name_of  # noqa: E402
+import standin  # noqa: E402
 
-RUNDIR = "/tmp/rmx-agents"
+DARWIN = sys.platform == "darwin"
+
+RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-agents")
 # The second server, run with the SHIPPED patterns (see cases 13-14).
-RUNDIR2 = "/tmp/rmx-agents-shipped"
+RUNDIR2 = RUNDIR + "-shipped"
 # OUTSIDE the rundir on purpose: `Server.start` wipes the rundir, so a stand-in
 # written inside it would be deleted before the server ever looked for it -- and
 # the pane would silently fall back to whatever real `claude` the developer
 # happens to have installed.
-BINDIR = "/tmp/rmx-agents-bin"
+BINDIR = RUNDIR + "-bin"
+if DARWIN:
+    # macOS reports a process's executable by its resolved path, and `/tmp`
+    # is a symlink there, so case 18 compares against the resolved form. Only
+    # the parent is resolved: a `BINDIR` that is itself a symlink must stay one,
+    # so that `write_bins` refuses it instead of clearing where it points.
+    BINDIR = os.path.join(os.path.realpath(os.path.dirname(BINDIR)), os.path.basename(BINDIR))
+WIRE_SEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wire_send.py")
 FAILURES = []
 
 # The stand-in agent. `comm` for a `#!`-script is the SCRIPT's basename, so
@@ -190,14 +208,24 @@ def check(cond, msg):
 
 
 def write_bins():
+    if DARWIN and os.path.islink(BINDIR):
+        raise SystemExit(f"{BINDIR} is a symlink; refusing to clear it")
     shutil.rmtree(BINDIR, ignore_errors=True)
     os.makedirs(BINDIR, exist_ok=True)
     for name, body in (("claude", AGENT), ("notanagent", NOT_AGENT)):
         p = f"{BINDIR}/{name}"
+        # The stand-in's `child` arm launches another stand-in by absolute
+        # path, so it has to be told where they live.
+        body = body.replace("@BINDIR@", BINDIR)
+        if DARWIN:
+            # macOS names a script's process after its interpreter, so the
+            # script runs under a compiled wrapper that carries the name and
+            # leads the foreground group (`tests/standin.py`). Without `cc`,
+            # `install_wrapper` exits on macOS before it would call the fallback.
+            standin.install_wrapper(p, ["/bin/sh", p + ".sh"], {p + ".sh": body}, lambda: None)
+            continue
         with open(p, "w") as f:
-            # The stand-in's `child` arm launches another stand-in by absolute
-            # path, so it has to be told where they live.
-            f.write(body.replace("@BINDIR@", BINDIR))
+            f.write(body)
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     real = shutil.which("sleep")
     if real is None:
@@ -211,6 +239,11 @@ def write_bins():
         raise SystemExit("cases 16-18 need `pgrep` to prove their processes are alive")
     for name in (VERSIONED, CHILD_AGENT, CHILD_NOT_AGENT):
         shutil.copy(real, f"{BINDIR}/{name}")
+        if DARWIN:
+            # A copy of a system binary fails Apple's signature check and is
+            # killed at exec, so it is signed again, ad hoc.
+            subprocess.run(["codesign", "--force", "-s", "-", f"{BINDIR}/{name}"],
+                           check=True, capture_output=True)
     os.environ["PATH"] = BINDIR + ":" + os.environ["PATH"]
 
 
@@ -296,6 +329,72 @@ def resubscribe(c):
     return first_list(c) or []
 
 
+def held(srv, name, requests, argv0=None, deaf=False):
+    """Spawn a pane whose one process sends `requests` once `go` exists.
+
+    Returns `(pane_id, go, out_file)`. The process is `wire_send.py --held`,
+    so the pane shows no output and keeps one foreground process from spawn to
+    the end of the run: neither can mark the agents list dirty around the
+    send. With `argv0`, python is re-executed under that `argv[0]`, which is
+    how the pane is listed as an agent (case 12's rescue) while staying one
+    process. With `deaf`, its terminal is put in raw mode first and never
+    read: an agent the server's probe finds not reading.
+
+    `requests` may be a callable taking the new pane's id, for a pane that
+    must address itself.
+    """
+    go, in_file, out_file = (f"{RUNDIR}/{name}-{n}" for n in ("go", "in.json", "out.json"))
+    argv = ["python3"]
+    if argv0 is not None:
+        raw = "import tty; tty.setraw(0); " if deaf else ""
+        exe = "sys.executable"
+        if DARWIN:
+            # A macOS `python3` is a stub that re-execs the framework's
+            # `Python.app` under that binary's own path, which drops the
+            # chosen argv[0]. Exec'ing the binary that is running, found with
+            # `proc_pidpath`, keeps it.
+            raw += ("import ctypes; b = ctypes.create_string_buffer(4096); "
+                    "ctypes.CDLL('/usr/lib/libproc.dylib').proc_pidpath(os.getpid(), b, 4096); ")
+            exe = "b.value.decode()"
+        argv += ["-c", f"import os, sys; {raw}os.execv({exe}, [{argv0!r}] + sys.argv[1:])"]
+    argv += [WIRE_SEND, "--held", go, srv.sock, in_file, out_file]
+    caller = Client(srv.sock)
+    caller.hello()
+    caller.send({"CliSpawn": {"session": "main", "placement": "SplitBelow", "argv": argv}})
+    reply = next((m for m in caller.drain(2.0) if name_of(m) == "CliSpawned"), None)
+    caller.close()
+    pane = reply["CliSpawned"]["pane_id"] if reply else None
+    with open(in_file, "w") as f:
+        json.dump(requests(pane) if callable(requests) else requests, f)
+    return pane, go, out_file
+
+
+def release(go):
+    with open(go, "w"):
+        pass
+
+
+def replies(out_file, timeout=4.0):
+    end = time.time() + timeout
+    while time.time() < end and not os.path.exists(out_file):
+        time.sleep(0.1)
+    if not os.path.exists(out_file):
+        return None
+    with open(out_file) as f:
+        return [name_of(m) for m in json.load(f)]
+
+
+def quiet_then(c, label):
+    """Wait until no push arrives for 2s, so the pusher is parked.
+
+    A push after this can only come from something marking the list dirty,
+    which is the whole question cases 20 and 21 ask.
+    """
+    c.drain(1.5)
+    pushed = lists(c.drain(2.0))
+    check(pushed == [], f"{label} the list is quiet first (got {len(pushed)})")
+
+
 def poll_for_new_pane(c, before, timeout=8.0):
     """Re-sample until an agent appears in a pane that is not in `before`.
 
@@ -318,12 +417,20 @@ def pids_matching(pattern):
     return [int(x) for x in r.stdout.split()]
 
 
+def ps_field(pid, field):
+    """One `ps` column for `pid`, for macOS, which has no `/proc`."""
+    r = subprocess.run(["ps", "-o", f"{field}=", "-p", str(pid)], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def proc_state(pid):
     """A process's scheduling state letter -- `T` while it is stopped.
 
     Read from the LAST `)` for the same reason the server does: `comm` is raw
     and may contain spaces and parentheses.
     """
+    if DARWIN:
+        return ps_field(pid, "stat")[:1] or None
     try:
         with open(f"/proc/{pid}/stat") as f:
             line = f.read()
@@ -334,12 +441,28 @@ def proc_state(pid):
 
 def proc_pgid(pid):
     """A process's process-group id, read the way the server reads it."""
+    if DARWIN:
+        pgid = ps_field(pid, "pgid")
+        return int(pgid) if pgid else None
     try:
         with open(f"/proc/{pid}/stat") as f:
             line = f.read()
     except OSError:
         return None
     return int(line[line.rindex(")") + 1 :].split()[2])
+
+
+def proc_exe(pid):
+    """macOS: a process's executable path, by the `proc_pidpath` the server uses.
+
+    Case 18 needs it because a compiled stand-in runs under the bare name the
+    shell found on PATH, so its argv does not contain `BINDIR`.
+    """
+    import ctypes
+
+    buf = ctypes.create_string_buffer(4096)
+    n = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidpath(int(pid), buf, len(buf))
+    return buf.value.decode("utf-8", "replace") if n > 0 else ""
 
 
 def proc_cmdline(pid):
@@ -457,7 +580,9 @@ def main():
     )
     # It is deduplicated, because the logger is pinned at Debug and this fires
     # per pane per sample. Once per distinct answer, not once per sample.
-    rescues = log.count("matched on argv[0]")
+    # Counted on case 12's process name, because case 21's reader is rescued
+    # by its `argv[0]` too and logs a line of its own.
+    rescues = log.count('names the process "2.1.251"')
     check(rescues == 1, f"12 and said so ONCE, not once per sample (got {rescues})")
 
     # 15. The classification line, on both servers.
@@ -809,7 +934,9 @@ def run(srv):
     # group leader's pid IS the pgid, so naming it is what identifies the group.
     child_pid = next(iter(started)) if started else None
     group_leader = proc_pgid(child_pid) if child_pid else None
-    leader_argv = proc_cmdline(group_leader) if group_leader else ""
+    leader_argv = ""
+    if group_leader:
+        leader_argv = proc_exe(group_leader) if DARWIN else proc_cmdline(group_leader)
     check(
         f"{BINDIR}/claude" in leader_argv,
         f"18 and the child shares the process group led by the stand-in agent "
@@ -898,7 +1025,116 @@ def run(srv):
         f"19 and comes straight back when it is resumed ({back})",
     )
 
+    # 20. Mail moves the unread count, though the agent's pane prints nothing.
+    #
+    #     The sender is a pane of its own, because the harness's connection is
+    #     not a pane and could not send. It is one python process from spawn to
+    #     the end of the run, held on a file, so its pane shows no output and no
+    #     change of foreground process around the send. Either one would mark
+    #     the agents list dirty by itself, and a typed `remux msg send` shows
+    #     both: the case was green on a build without the send's own mark.
+    mail_pane = agent_pane
+    entry = next((a for a in resubscribe(c) if a["pane_id"] == mail_pane), None)
+    check(
+        entry is not None and entry.get("name") is None and entry.get("unread") == 0,
+        f"20 an entry carries its messaging name and unread count ({entry})",
+    )
+    sends = [mail_to(mail_pane, n) for n in ("one", "two")]
+    sender, go, out_file = held(srv, "mail", sends)
+    check(sender is not None, "20 the sender pane was spawned")
+    quiet_then(c, "20")
+    release(go)
+
+    def field_of(ags, pane, key):
+        return next((a.get(key) for a in ags or [] if a["pane_id"] == pane), None)
+
+    got = wait_for(c, lambda ags: field_of(ags, mail_pane, "unread") == 2, timeout=4.0)
+    sent = replies(out_file)
+    check(sent == ["MsgSent", "MsgSent"], f"20 both sends were accepted ({sent})")
+    check(
+        field_of(got, mail_pane, "unread") == 2,
+        f"20 two messages reach the panel as unread 2, pushed with no output "
+        f"from the agent's pane (got {field_of(got, mail_pane, 'unread')})",
+    )
+
+    # 21. Every other mail transition pushes too: a name given, mail read by
+    #     its own pane, mail acked. Each is quiet first, for the reason in 20.
+    #
+    #     The reader has to be the mailbox's OWN pane, since reading another
+    #     pane's mail only peeks. So it is a held pane listed as an agent by
+    #     its `argv[0]`, with a held sender of its own.
+    reader, read_go, read_out = held(
+        srv, "reader", lambda pane: [{"MsgRead": {"pane": pane, "peek": False}}], argv0="claude",
+    )
+    _, feed_go, feed_out = held(srv, "feed", [mail_to(reader, "three")])
+    listed = wait_for(c, lambda ags: field_of(ags, reader, "unread") == 0, timeout=6.0)
+    if field_of(listed, reader, "unread") is None:
+        listed = resubscribe(c)
+    check(field_of(listed, reader, "unread") == 0, f"21 the reader is listed as an agent ({listed})")
+    quiet_then(c, "21 feed")
+    release(feed_go)
+    got = wait_for(c, lambda ags: field_of(ags, reader, "unread") == 1, timeout=4.0)
+    check(replies(feed_out) == ["MsgSent"] and field_of(got, reader, "unread") == 1,
+          f"21 the reader has one unread ({field_of(got, reader, 'unread')})")
+
+    quiet_then(c, "21 name")
+    c.send({"AgentName": {"name": "zed", "pane": reader}})
+    got = wait_for(c, lambda ags: field_of(ags, reader, "name") == "zed", timeout=4.0)
+    check(field_of(got, reader, "name") == "zed",
+          f"21 a name given is pushed ({field_of(got, reader, 'name')})")
+
+    quiet_then(c, "21 read")
+    release(read_go)
+    got = wait_for(c, lambda ags: field_of(ags, reader, "unread") == 0, timeout=4.0)
+    check(replies(read_out) == ["MsgList"], f"21 the reader read its mail ({replies(read_out)})")
+    check(field_of(got, reader, "unread") == 0,
+          f"21 mail read by its own pane is pushed as unread 0 ({field_of(got, reader, 'unread')})")
+
+    quiet_then(c, "21 ack")
+    c.send({"MsgAck": {"pane": mail_pane, "all": True}})
+    got = wait_for(c, lambda ags: field_of(ags, mail_pane, "unread") == 0, timeout=4.0)
+    check(field_of(got, mail_pane, "unread") == 0,
+          f"21 mail acked is pushed as unread 0 ({field_of(got, mail_pane, 'unread')})")
+
+    # 22. A message typed for and then taken back is unread again, and pushed.
+    #
+    #     The target is a held agent whose terminal is raw and never read, so
+    #     the server's probe goes unread and the submit is refused
+    #     `agent_did_not_read`. The message was Submitted while the probe was
+    #     typed, which counts it read, and moves back to Queued after: nothing
+    #     from the pane says so, since a deaf agent prints nothing.
+    deaf, _, _ = held(srv, "deaf", [], argv0="claude", deaf=True)
+    _, submit_go, submit_out = held(srv, "submit", lambda _: [
+        {"MsgSend": {"to": {"host": None, "target": {"Pane": deaf}},
+                     "body": "M:typed", "deliver": "Submit"}}])
+    listed = wait_for(c, lambda ags: field_of(ags, deaf, "unread") == 0, timeout=6.0)
+    if field_of(listed, deaf, "unread") is None:
+        listed = resubscribe(c)
+    check(field_of(listed, deaf, "unread") == 0, f"22 the deaf agent is listed ({listed})")
+    quiet_then(c, "22")
+    release(submit_go)
+    seen = []
+    end = time.time() + 15.0
+    while time.time() < end and not os.path.exists(submit_out):
+        seen += [field_of(ags, deaf, "unread") for ags in lists(c.drain(0.15))]
+    seen += [field_of(ags, deaf, "unread") for ags in lists(c.drain(1.5))]
+    answer = None
+    if os.path.exists(submit_out):
+        with open(submit_out) as f:
+            answer = json.load(f)[0]
+    code = (answer or {}).get("Error", {}).get("code")
+    check(code == "agent_did_not_read", f"22 the submit is refused agent_did_not_read ({answer})")
+    check(0 in seen, f"22 typing it counted it read (unread seen {seen})")
+    after = seen[seen.index(0):] if 0 in seen else []
+    check(after[-1:] == [1],
+          f"22 taken back, it is pushed as unread 1 with no output from the pane (unread seen {seen})")
+
     c.close()
+
+
+def mail_to(pane, tag):
+    return {"MsgSend": {"to": {"host": None, "target": {"Pane": pane}},
+                        "body": f"M:{tag}", "deliver": "Mailbox"}}
 
 
 class Grid:

@@ -1066,12 +1066,21 @@
 #
 # Declaring ANY `[[agents.pattern]]` replaces the shipped set outright — there
 # is no merge, so you own the whole list and cannot be surprised by a built-in
-# pattern you cannot see. TWO ship for Claude Code:
+# pattern you cannot see. THREE ship for Claude Code:
 #
 #   claude-proceed — its permission prompts, taken from the wordings actually
 #                    present in the binary ("Do you want to proceed?",
 #                    "...continue?", "...allow this connection?", "...use this
-#                    API key?").
+#                    API key?", "Would you like to proceed?", "...install",
+#                    "Are you sure you want to delete...?", and its file
+#                    dialogs' "...make this edit to x.rs?", "...create",
+#                    "...overwrite", "...write to", "...insert this cell",
+#                    "...delete this cell", each only as the whole question
+#                    at the end of its line, so prose using the words is not
+#                    taken for a dialog).
+#   claude-decline — the option every approval dialog draws to refuse ("No, and
+#                    tell Claude what to do differently (esc)"), which is still
+#                    on screen when the question has scrolled out of it.
 #   claude-select  — its QUESTION menu, which asks you something rather than
 #                    asking permission ("Which color do you like?" over a list
 #                    of options) and so matches none of the wordings above. That
@@ -1139,7 +1148,12 @@
 #   [[agents.pattern]]
 #   name = "claude-proceed"
 #   command = "claude"
-#   regex = "(?i)do you want to (proceed|continue|allow|use this api key)"
+#   regex = "(?i)do you want to (proceed|continue|allow|use this api key|(make this edit to|create|overwrite|write to|insert this cell into|delete this cell from) \\S+\\?\\s*$)|(would you like to (proceed|install)|are you sure you want to delete)\\b[^?]*\\?\\s*$"
+#
+#   [[agents.pattern]]
+#   name = "claude-decline"
+#   command = "claude"
+#   regex = "(?i)tell claude what to do differently"
 #
 #   [[agents.pattern]]
 #   name = "claude-select"
@@ -1174,12 +1188,116 @@
 # Two grades of evidence, and the line does not run along agent names.
 # claude-select, omp-allow and the two opencode patterns were matched against a
 # real pane — blocked, and then again after answering — so both that they fire
-# and that they STOP are observed. claude-proceed and the two codex patterns
-# were read out of the shipped binaries with `strings`: the wordings are real,
-# but nobody here has watched one of those prompts appear or clear, because
-# codex could not be driven as far as an approval. If a pane ever sticks on
+# and that they STOP are observed. claude-proceed, claude-decline and the two
+# codex patterns were read out of the shipped binaries with `strings`: the
+# wordings are real, but nobody here has watched one of those prompts appear or
+# clear, because codex could not be driven as far as an approval. If a pane ever sticks on
 # "needs input", that is the pattern to correct — a state that never decays is
 # the price of matching a prompt that never leaves the screen.
+
+# -----------------------------------------------------------------------------
+# AGENT MESSAGING
+# -----------------------------------------------------------------------------
+
+# Mailboxes that let a process in one pane leave a message for another pane
+# (`remux msg send`, `remux msg read`). The server attributes every message to
+# the pane the SENDING process runs in, never to `$REMUX_PANE`.
+#
+# ttl_hours            how long a message lives before it is dropped unread.
+#                      A fraction is fine (0.5 = 30 minutes).
+# mailbox_max_messages  a mailbox this full makes room by dropping its oldest
+# mailbox_max_bytes    READ messages; unread mail is never dropped, so if that
+#                      is not enough the SENDER is refused (`mailbox_full`).
+# max_body_bytes       one message larger than this is refused
+#                      (`message_too_large`).
+# rate_per_10s         sends one pane may make in any 10 seconds
+#                      (`rate_limited`), so a looping agent cannot flood a peer.
+# link_rate_per_10s    messages one other server may deliver here in any 10
+#                      seconds, whatever pane it says each is from.
+# link_parked_max      sends one other server may have waiting here at once
+#                      to be typed or answered (`queue_full`).
+# persist              keep mailboxes and names across `remux restart`, in
+#                      $XDG_DATA_HOME/remux/mailbox.json (mode 0600). Message
+#                      bodies are then stored on disk; `false` keeps them in
+#                      memory only.
+# typing_guard_ms      a message is typed into a pane only once it has been
+#                      keyboard-quiet this long, while a client looks at it
+# typing_guard_unattended_ms  ...and this long when no client does,
+# typing_guard_max_ms  and for at most this long (capped at 30000) before the
+#                      submit gives up (`human_typing`).
+# submit_when_attended `false` never types into a pane a client looks at
+#                      (`pane_attended`).
+# submit_queue_len     the most messages waiting to be typed into one pane
+#                      (`queue_full`).
+# stall_ms             `remux msg send --wait`: once the prompt's echo is over,
+#                      the agent has this long to print something, or the wait
+#                      ends `agent_prompt_stalled`.
+# settle_ms            ...and its turn has ended once it has stopped working
+#                      for this long (see `[agents] working_ms`).
+#
+# Read by the SERVER at startup, so an edit needs `remux restart`.
+#
+# [messaging]
+# ttl_hours = 24.0
+# mailbox_max_messages = 256
+# mailbox_max_bytes = 4194304
+# max_body_bytes = 65536
+# rate_per_10s = 20
+# link_rate_per_10s = 60
+# link_parked_max = 8
+# persist = true
+# typing_guard_ms = 3000
+# typing_guard_unattended_ms = 500
+# typing_guard_max_ms = 15000
+# submit_when_attended = true
+# submit_queue_len = 8
+# stall_ms = 5000
+# settle_ms = 1000
+#
+# This server's name on the servers it sends to (their `From: laptop:%1`),
+# which must be a valid host name. The machine's hostname when unset:
+# host_name = "laptop"
+#
+# How the server dials a `[remotes.<name>]` to send to it (`remux msg send
+# mini:alpha`): ssh plus the handshake must finish in dial_ms (at most 10000),
+# a live link is pinged every ping_ms and is down after two pings go
+# unanswered, and one with nothing but pings for idle_ms is closed; the next
+# send dials again. The far server forgets a link that has not pinged it for
+# twice ping_ms, which this server tells it when it dials.
+#
+# [messaging.links]
+# dial_ms = 10000
+# ping_ms = 15000
+# idle_ms = 300000
+#
+# How a message is TYPED into an agent's pane (`remux msg send --deliver
+# submit`, or `auto`, the default), one row per `[agents] commands` spelling.
+# A row changes only the fields it names; the rest keep the shipped row, or
+# the default below for a command with none.
+#
+# bracketed        "auto" (as the agent asked, read when typing), "on", "off".
+#                  With it off, a message of more than one line is refused.
+# enter            the bytes that submit the text (default "\r"), written
+# enter_delay_ms   this long after it (default 300), outside the paste.
+# focus_in         report focus (ESC[I) before the text (default false).
+# while_working    "queue" types it anyway, "mailbox" (default) leaves it
+#                  for the agent's hook, "refuse" refuses `--deliver submit`.
+# envelope         open the text with a line naming the message and its
+#                  sender, "# [remux message #7 from lead (%1), mark ...;
+#                  reply: ...]", and close it with "# [end of remux message
+#                  #7, mark ...]", so the agent can tell another agent's
+#                  message from its user's (default true).
+#
+# The shipped rows:
+#
+# [messaging.submit.claude]
+# while_working = "queue"
+#
+# [messaging.submit.codex]
+# while_working = "mailbox"
+#
+# [messaging.submit.copilot]
+# focus_in = true
 
 # -----------------------------------------------------------------------------
 # NOTIFICATIONS
@@ -1232,6 +1350,22 @@
 #   extra_args  — extra ssh arguments placed before the destination (default: []).
 #   auto_connect — connect this remote automatically at client startup instead
 #                  of lazily on demand (default: false).
+#   inbound     — what the SERVER stores from this remote over a link it dialled
+#                 to send to it: "replies" (default) only answers to messages
+#                 sent from here over that link, "any" anything addressed to a
+#                 pane here, "off" nothing.
+#
+# Any machine whose remux can reach this one over ssh as you (it has a
+# [remotes] entry pointing here) can store mail in, and type into, this
+# machine's agent panes, subject only to [messaging.submit] here. `inbound`
+# does not restrict it: `inbound` governs replies over links this machine
+# dials. It is the same trust a remote view already has.
+#
+# To send messages to a remote (`remux msg send mini:alpha`), its key must be a
+# valid host name: no leading - or ., and none of user, system, claude, remux,
+# human, assistant, anthropic, operator or developer as a part between - and _.
+# A remote whose key is not can still be connected to; messaging refuses it,
+# and the logs name it at startup.
 #
 # [remotes.pi]
 # ssh = "pi@raspberrypi.local"

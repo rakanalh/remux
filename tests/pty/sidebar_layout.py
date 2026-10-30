@@ -16,6 +16,9 @@ import time
 import pexpect
 import pyte
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from standin import require_private_dir  # noqa: E402
+
 BIN = os.path.abspath("target/debug/remux")
 RUNDIR = "/tmp/rmx-sb"
 COLS, ROWS = 100, 30
@@ -53,13 +56,27 @@ size = 5
 """
 
 
+def write_private(directory: str, name: str, text: str) -> None:
+    """Write `directory/name`, refusing a directory another user could have
+    planted under the fixed /tmp run dir, and never following a link at `name`."""
+    require_private_dir(directory)
+    fd = os.open(os.path.join(directory, name),
+                 os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+
+
 def make_env(config: str) -> dict:
     shutil.rmtree(RUNDIR, ignore_errors=True)
     for sub in ("run", "state", "data", "config", "home"):
         os.makedirs(f"{RUNDIR}/{sub}", exist_ok=True)
     os.makedirs(f"{RUNDIR}/config/remux", exist_ok=True)
-    with open(f"{RUNDIR}/config/remux/config.toml", "w") as fh:
-        fh.write(config)
+    write_private(f"{RUNDIR}/config/remux", "config.toml", config)
+    if sys.platform == "darwin":
+        # A pane's shell is a login shell, and macOS's /etc/profile replaces
+        # the inherited PS1 with `\h:\W \u\$ `. The login shell reads
+        # ~/.profile after it, so the pinned prompt is set again there.
+        write_private(f"{RUNDIR}/home", ".profile", "PS1='> '\n")
     env = dict(os.environ)
     env.update(
         HOME=f"{RUNDIR}/home",
@@ -449,6 +466,12 @@ def test_search_highlights_land_on_the_match():
     pump(1.5)
     child.send(f"echo {needle}\r".encode())
     pump(1.5)
+    # The sidebar paints chrome with backgrounds of its own, such as the panel
+    # title band. Only a cell whose background the search changed is a
+    # highlight.
+    bg_before = {
+        (x, y): str(screen.buffer[y][x].bg) for y in range(ROWS) for x in range(COLS)
+    }
     # Prefix (Ctrl-a) then `s s` enters search; type the needle and confirm.
     child.send(b"\x01ss")
     pump(0.8)
@@ -467,7 +490,9 @@ def test_search_highlights_land_on_the_match():
         (x, y)
         for y in range(ROWS)
         for x in range(COLS)
-        if y not in skip and str(screen.buffer[y][x].bg) != "default"
+        if y not in skip
+        and str(screen.buffer[y][x].bg) != "default"
+        and str(screen.buffer[y][x].bg) != bg_before[(x, y)]
     ]
     assert highlighted, "search produced no highlights"
     # The sidebar's collapse chip is chrome with a background of its own: three

@@ -8,6 +8,9 @@ import atexit, os, shutil, signal, subprocess, sys, time, pexpect, pyte
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import home_guard  # noqa: E402,F401  (installs the real-HOME refusal)
+import standin  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
+from harness import guard_rundir, kill_relays, reap_rundir  # noqa: E402,F401
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 PREFIX = b"\x01"  # Ctrl-a
@@ -57,89 +60,24 @@ def install_notify_shims(bindir):
     return log
 
 
-# remux names a pane's agent from the PTY foreground process (`tcgetpgrp`). A
-# `#!/bin/sh` stand-in keeps its own name only where the kernel reports the
-# script's basename (Linux `comm`); on macOS the foreground process is `sh`, so
-# the agent is never detected. This wrapper is a real binary under the agent's
-# name that runs `<name>.sh` as a child, so the group leader keeps the name.
-# The child stays in the wrapper's process group (a group kill or tty Ctrl-C
-# reaches both), and the signals below are forwarded so a kill aimed at the
-# wrapper's pid alone does not orphan the script.
-_STANDIN_C = r"""
-#include <errno.h>
-#include <signal.h>
-#include <stdio.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-static volatile pid_t child;
-
-static void forward(int sig) {
-    if (child > 0) kill(child, sig);
-}
-
-int main(int argc, char **argv) {
-    char script[4096];
-    snprintf(script, sizeof script, "%s.sh", SCRIPT);
-    int fwd[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT};
-    for (unsigned i = 0; i < sizeof fwd / sizeof *fwd; i++) signal(fwd[i], forward);
-    char *args[argc + 3];
-    args[0] = "sh";
-    args[1] = script;
-    for (int i = 1; i < argc; i++) args[i + 1] = argv[i];
-    args[argc + 1] = NULL;
-    pid_t pid = fork();
-    if (pid == 0) {
-        for (unsigned i = 0; i < sizeof fwd / sizeof *fwd; i++) signal(fwd[i], SIG_DFL);
-        execv("/bin/sh", args);
-        _exit(127);
-    }
-    child = pid;
-    int st;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-    if (WIFEXITED(st)) return WEXITSTATUS(st);
-    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
-    return 1;
-}
-"""
-
-_standin_cc_warned = False
-
-
 def install_agent_standin(bin_dir, name, script_body):
     """Install a stand-in agent called `name` in `bin_dir`.
 
     `script_body` is a `#!/bin/sh` script. It is written as `<name>.sh` and
-    `<name>` is a compiled wrapper that runs it, so process detection sees the
-    agent's name on macOS as well as Linux. Without a C compiler, `<name>` is
-    the script itself (detected on Linux only) and a notice is printed once.
+    `<name>` is a compiled wrapper that runs it (`tests/standin.py`), so
+    process detection sees the agent's name on macOS as well as Linux.
+    `bin_dir` is closed to 0700, and refused if it or an ancestor is open to
+    other users, so it must be the caller's own directory.
     """
-    global _standin_cc_warned
     os.makedirs(bin_dir, exist_ok=True)
     script = os.path.join(bin_dir, f"{name}.sh")
-    with open(script, "w") as f:
-        f.write(script_body)
-    os.chmod(script, 0o755)
     target = os.path.join(bin_dir, name)
-    cc = shutil.which("cc")
-    if cc:
-        src = os.path.join(bin_dir, f".{name}-standin.c")
-        with open(src, "w") as f:
-            f.write(_STANDIN_C)
-        r = subprocess.run(
-            [cc, "-O1", f'-DSCRIPT="{os.path.join(bin_dir, name)}"', "-o", target, src],
-            capture_output=True, text=True)
-        os.remove(src)
-        if r.returncode == 0:
-            return target
-        print(f"note: stand-in wrapper compile failed ({r.stderr.strip()[:200]}); "
-              f"using a script stand-in", file=sys.stderr)
-    elif not _standin_cc_warned:
-        print("note: no `cc` on PATH; agent stand-ins are plain scripts "
-              "(not detected on macOS)", file=sys.stderr)
-    _standin_cc_warned = True
-    shutil.copyfile(script, target)
-    os.chmod(target, 0o755)
+
+    def script_only():
+        shutil.copyfile(script, target)
+        os.chmod(target, 0o755)
+
+    standin.install_wrapper(target, ["/bin/sh", script], {script: script_body}, script_only)
     return target
 
 
@@ -160,15 +98,20 @@ class Tui:
         self.config = config
 
     def start(self):
+        # `kill()` runs `remux stop` against this rundir, and the reaper kills
+        # under it; a relative one would resolve against whatever directory
+        # the harness runs from.
+        assert os.path.isabs(self.rundir), f"rundir must be absolute: {self.rundir}"
+        # Before `atexit.register(self.kill)`: atexit runs last-registered
+        # first, so `kill()`'s graceful `remux stop` runs before the reaper
+        # SIGKILLs whatever survived it.
+        guard_rundir(self.rundir)
         # The client auto-spawns a server that outlives it, so a harness that
         # exits without reaching `kill()` (an uncaught exception, an early
         # `sys.exit`) would leave that server running. `atexit` covers both.
         if not self._cleanup_registered:
             atexit.register(self.kill)
             self._cleanup_registered = True
-        # `kill()` runs `remux stop` against this rundir; a relative one would
-        # resolve against whatever directory the harness runs from.
-        assert os.path.isabs(self.rundir), f"rundir must be absolute: {self.rundir}"
         shutil.rmtree(self.rundir, ignore_errors=True)
         for s in ("run", "state", "data", "config", "home"):
             os.makedirs(f"{self.rundir}/{s}", exist_ok=True)
@@ -413,12 +356,34 @@ def sm_title(t):
     raise AssertionError("session manager is not on screen")
 
 
+def sm_settled(t, read, timeout=4.0):
+    """`read(t)`, retried while it raises, for up to `timeout` seconds.
+
+    The client paints a server frame and then the overlay over it, so a screen
+    read between the two sees the popup half drawn or gone. On a slow machine
+    that window is wide enough to hit. A popup that is really missing, or a
+    tree that really has no single highlight, still raises after the timeout.
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            return read(t)
+        except AssertionError:
+            if time.time() >= deadline:
+                raise
+            t.pump(0.1)
+
+
 def sm_tree(t):
     """Every tree row the manager is currently painting, top to bottom.
 
     The popup is found by its title line, its columns by that line's corners --
     so this is immune to the popup moving or resizing with the terminal.
     """
+    return sm_settled(t, _sm_tree_once)
+
+
+def _sm_tree_once(t):
     rows = t.rows_text()
     title_y = None
     for i, r in enumerate(rows):
@@ -448,7 +413,11 @@ def sm_tree(t):
 
 def sm_selected(t):
     """The highlighted tree row. Raises unless exactly one row is highlighted."""
-    tree = sm_tree(t)
+    return sm_settled(t, _sm_selected_once)
+
+
+def _sm_selected_once(t):
+    tree = _sm_tree_once(t)
     hits = [r for r in tree if r.selected]
     if len(hits) != 1:
         raise AssertionError(
