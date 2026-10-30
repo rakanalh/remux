@@ -1234,6 +1234,14 @@ pub enum ServerMessage {
         /// cannot be resolved at all; the panel then shows the full path, which
         /// is the behaviour it had before this existed. That graceful `None` is
         /// what keeps the addition off [`PROTOCOL_VERSION`].
+        ///
+        /// Sent with its symlinks resolved, because the paths it is matched
+        /// against come from a pane's cwd and are physical. A home under a
+        /// symlink (Silverblue's `/home` -> `/var/home`) sent as `$HOME` spells
+        /// it would never prefix them. An older server sends `$HOME` verbatim,
+        /// which only loses the `~` on such a machine. A path that did not come
+        /// from a cwd, such as one a user typed, has to be resolved the same way
+        /// before it is matched against this.
         #[serde(default)]
         home: Option<String>,
     },

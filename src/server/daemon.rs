@@ -7040,15 +7040,29 @@ async fn handle_client_message(
             // take hundreds of milliseconds, and this task also drives every
             // pane's output: blocking it would stall the whole server, not just
             // this listing.
+            //
+            // THIS machine's home rides along, for the path it might shorten.
+            // Resolving its symlinks reads the filesystem too, so it runs here
+            // as well, and it is re-read per listing on purpose: a server whose
+            // `$HOME` changed under it should not keep answering with the old
+            // one for the life of the daemon.
             let requested = path.clone();
-            let listing = tokio::task::spawn_blocking(move || {
-                browse::list_directory(std::path::Path::new(&path))
+            let (listing, home) = tokio::task::spawn_blocking(move || {
+                (
+                    browse::list_directory(std::path::Path::new(&path)),
+                    browse::home_dir(),
+                )
             })
             .await
-            .unwrap_or_else(|e| browse::Listing {
-                entries: Vec::new(),
-                error: Some(format!("listing failed: {e}")),
-                truncated: false,
+            .unwrap_or_else(|e| {
+                (
+                    browse::Listing {
+                        entries: Vec::new(),
+                        error: Some(format!("listing failed: {e}")),
+                        truncated: false,
+                    },
+                    None,
+                )
             });
             log::debug!(
                 "server: ListDirectory client_id={client_id} path={requested:?} \
@@ -7067,12 +7081,7 @@ entries={} error={:?} truncated={}",
                     entries: listing.entries,
                     error: listing.error,
                     truncated: listing.truncated,
-                    // THIS machine's home, sent with the path it might shorten.
-                    // A getenv, so it stays out of the `spawn_blocking` above --
-                    // and it is re-read per listing on purpose: a server whose
-                    // `$HOME` changed under it should not keep answering with
-                    // the old one for the life of the daemon.
-                    home: browse::home_dir(),
+                    home,
                 });
             }
             Ok(())

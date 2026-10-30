@@ -49,7 +49,7 @@ to exist where the file is), and a harness that exported it on both sides would
 pass whichever side resolved it.
 
 Run from the repo root:
-    python3 tests/pty/sidebar_files.py [-v]
+    python3 tests/pty/sidebar_files.py [-v] [--symlinked-home]
 """
 import json
 import os
@@ -77,6 +77,11 @@ NOT_HOME = f"{RUN}/homework"
 FIX = f"{HOME}/fixture"
 SOCK = f"{RUN}/run/remux.sock"
 VERBOSE = "-v" in sys.argv
+# `--symlinked-home` gives both sides HOME through a symlink to HOME, the shape
+# of Fedora Silverblue's /home -> /var/home. Every path the panel shows comes
+# from a pane's cwd, which the kernel reports physically, so case 13 can only
+# pass if the server resolves the home it reports.
+ENV_HOME = f"{RUN}/homelink" if "--symlinked-home" in sys.argv else HOME
 
 COLS, ROWS = 100, 30
 # Long enough for the panel's 2s poll plus a round trip, short enough that a
@@ -181,7 +186,7 @@ def base_env():
         # it. Set for both sides because the XDG dirs above are explicit, so
         # nothing else here reads it -- and pinning it keeps the run independent
         # of whose machine it is on.
-        "HOME": HOME,
+        "HOME": ENV_HOME,
     }
 
 
@@ -223,6 +228,8 @@ def setup_dirs():
     shutil.rmtree(RUN, ignore_errors=True)
     for s in ("run", "state", "data", "bin", "cfg", "home", "homework"):
         os.makedirs(f"{RUN}/{s}", exist_ok=True)
+    if ENV_HOME != HOME:
+        os.symlink(HOME, ENV_HOME)
     os.makedirs(f"{RUN}/cfg/remux", exist_ok=True)
     write_config(CFG)
     for name, body in (("stand-in-editor", EDITOR),
