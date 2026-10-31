@@ -1,3 +1,4 @@
+pub mod agent_session;
 pub mod agents;
 pub mod browse;
 pub mod compositor;

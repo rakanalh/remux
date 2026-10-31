@@ -429,6 +429,21 @@ fn client_message_summary(msg: &ClientMessage) -> String {
             pane,
             pane_hint,
         } => format!("AgentName(name={name:?}, pane={pane:?}, pane_hint={pane_hint:?})"),
+        // The id names a transcript on disk and a path names a file in the
+        // user's home; neither is a diagnostic. The agent, the kind and the
+        // length are.
+        ClientMessage::AgentSession {
+            agent,
+            reference,
+            source,
+            pane,
+            pane_hint,
+        } => format!(
+            "AgentSession(agent={agent:?}, {}, {} bytes, source={source:?}, pane={pane:?}, \
+             pane_hint={pane_hint:?})",
+            reference.kind().as_str(),
+            reference.value().len()
+        ),
         ClientMessage::AgentStatus { target, req } => format!(
             "AgentStatus(target={:?}, req={req:?})",
             target.as_ref().map(|t| t.to_string())
@@ -515,6 +530,33 @@ mod tests {
         assert!(s.contains("psql"), "but the program must: {s}");
         assert!(s.contains("1 more arg"), "and how many were dropped: {s}");
         assert!(s.contains("pane=Some(7)"), "and the caller's pane id: {s}");
+    }
+
+    #[test]
+    fn agent_session_names_the_kind_and_length_but_not_the_value() {
+        let id = "7f3c2a9e-51d4-4b8e-9a61-0c2f5d8e4b17";
+        let path = "/home/sam/.pi/sessions/secret-project.jsonl";
+        for (reference, kind, value) in [
+            (crate::protocol::AgentSessionRef::Id(id.into()), "id", id),
+            (
+                crate::protocol::AgentSessionRef::Path(path.into()),
+                "path",
+                path,
+            ),
+        ] {
+            let s = client_message_summary(&ClientMessage::AgentSession {
+                agent: "claude".to_string(),
+                reference,
+                source: Some("startup".to_string()),
+                pane: None,
+                pane_hint: Some(7),
+            });
+            assert!(!s.contains(value), "the value must not appear: {s}");
+            assert!(
+                s.contains(&format!("agent=\"claude\", {kind}, {} bytes", value.len())),
+                "but the agent, kind and length must: {s}"
+            );
+        }
     }
 
     #[test]

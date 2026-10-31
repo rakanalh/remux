@@ -8733,6 +8733,7 @@ async fn run_client_loop(
                     | Some(ServerMessage::AgentStatusList { .. })
                     | Some(ServerMessage::AgentWaited { .. })
                     | Some(ServerMessage::Pong { .. })
+                    | Some(ServerMessage::AgentSessionStored { .. })
                     | Some(ServerMessage::MsgInbound { .. }) => {
                         log::warn!("client: a messaging reply on the TUI connection; ignored");
                     }

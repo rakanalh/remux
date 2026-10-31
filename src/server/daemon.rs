@@ -629,6 +629,15 @@ struct NameRequest {
     pane_hint: Option<PaneId>,
 }
 
+/// A [`ClientMessage::AgentSession`], unpacked.
+struct SessionReport {
+    agent: String,
+    reference: crate::protocol::AgentSessionRef,
+    source: Option<String>,
+    pane: Option<PaneId>,
+    pane_hint: Option<PaneId>,
+}
+
 /// A [`ClientMessage::MsgAck`], unpacked.
 struct MailboxAck {
     pane: Option<PaneId>,
@@ -4081,6 +4090,92 @@ async fn handle_agent_name(
     }
 }
 
+/// Keep the session the caller's pane's agent reports, or `pane`'s for a
+/// caller outside every pane. The pane is the attribution, never `pane_hint`.
+async fn handle_agent_session(
+    client_id: u64,
+    report: SessionReport,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> ServerMessage {
+    use crate::protocol::AgentSessionOutcome;
+    use crate::server::agent_session::{self, AgentSessionRecord};
+
+    let caller = attribute_frame_caller(peer, panes).await;
+    if let Ok(found) = &caller {
+        log_caller(client_id, "AgentSession", found);
+        log_hint(report.pane_hint, found.pane);
+    }
+    if let Some(refused) = unverified_refusal(&caller) {
+        return refused;
+    }
+    let pane = match (report.pane, &caller) {
+        (Some(_), Ok(found)) => {
+            return ServerMessage::refused(
+                "bad_address",
+                format!(
+                    "--pane is for callers outside a pane; you are %{}",
+                    found.pane
+                ),
+            )
+        }
+        (None, Ok(found)) if found.parent_is_shell => {
+            return ServerMessage::refused(
+                "not_from_agent",
+                "run by an agent's hook or plugin, not from the prompt",
+            )
+        }
+        (Some(pane), Err(_)) => pane,
+        (None, Ok(found)) => found.pane,
+        (None, Err(why)) => {
+            return ServerMessage::refused(
+                "not_in_pane",
+                format!("not in a pane ({}): pass --pane %N", why.reason()),
+            )
+        }
+    };
+    if let Err(refused) = check_addressable(pane, state, panes).await {
+        return *refused;
+    }
+    let kind = report.reference.kind().as_str();
+    let bytes = report.reference.value().len();
+    let source = report
+        .source
+        .as_deref()
+        .map_or("None".to_string(), loggable);
+    let verdict: Result<Option<AgentSessionOutcome>, agent_session::Refusal> = async {
+        agent_session::validate(&report.agent, &report.reference)?;
+        let record = AgentSessionRecord::new(&report.agent, &report.reference);
+        let mut ps = panes.lock().await;
+        let Some(pd) = ps.get_mut(&pane).filter(|pd| !pd.exited) else {
+            return Ok(None);
+        };
+        let outcome = agent_session::decide(pd.agent_session.as_ref(), &record)?;
+        pd.agent_session = Some(record);
+        Ok(Some(outcome))
+    }
+    .await;
+    match verdict {
+        Ok(Some(outcome)) => {
+            log::info!(
+                "agent session: pane %{pane} {} {kind} {bytes} bytes source={source} -> {outcome:?}",
+                loggable(&report.agent)
+            );
+            ServerMessage::AgentSessionStored { pane, outcome }
+        }
+        Ok(None) => ServerMessage::refused("no_such_target", format!("no such target: %{pane}")),
+        Err(refusal) => {
+            log::info!(
+                "agent session: pane %{pane} {} {kind} {bytes} bytes source={source} -> {}",
+                loggable(&report.agent),
+                refusal.code()
+            );
+            ServerMessage::refused(refusal.code(), refusal.message())
+        }
+    }
+}
+
 /// Every agent, named pane and pane with mail, or only `target`. Answered per
 /// request and never on a timer, so it logs nothing per pane.
 /// The pane `address` names on this server, among the `live` ones, or the
@@ -4927,6 +5022,8 @@ struct PaneData {
     /// `close_pane` declines to close it (a background tab), and it must not
     /// be a message target or a sender's pane in the meantime.
     exited: bool,
+    /// The session the pane's agent reported, which a restore resumes.
+    agent_session: Option<crate::server::agent_session::AgentSessionRecord>,
 }
 
 /// A pane's cached process names and working directory.
@@ -6203,6 +6300,25 @@ async fn handle_client_message(
                 name.as_deref().map_or("None".to_string(), loggable)
             );
         }
+        // The id names a transcript on disk and a path names a file in the
+        // user's home; neither is a diagnostic. The agent, the kind and the
+        // length are.
+        ClientMessage::AgentSession {
+            agent,
+            reference,
+            source,
+            pane,
+            pane_hint,
+        } => {
+            log::debug!(
+                "server: client_id={client_id} msg=AgentSession(agent={}, {}, {} bytes, \
+                 source={}, pane={pane:?}, pane_hint={pane_hint:?})",
+                loggable(agent),
+                reference.kind().as_str(),
+                reference.value().len(),
+                source.as_deref().map_or("None".to_string(), loggable)
+            );
+        }
         ClientMessage::AgentStatus { target, req } => {
             log::debug!(
                 "server: client_id={client_id} msg=AgentStatus(target={}, req={req:?})",
@@ -6374,6 +6490,30 @@ async fn handle_client_message(
                 state,
                 panes,
                 messaging(),
+            )
+            .await;
+            reply(client_id, clients, answer).await;
+            Ok(())
+        }
+        ClientMessage::AgentSession {
+            agent,
+            reference,
+            source,
+            pane,
+            pane_hint,
+        } => {
+            let answer = handle_agent_session(
+                client_id,
+                SessionReport {
+                    agent,
+                    reference,
+                    source,
+                    pane,
+                    pane_hint,
+                },
+                peer,
+                state,
+                panes,
             )
             .await;
             reply(client_id, clients, answer).await;
@@ -14031,6 +14171,7 @@ async fn spawn_pane(
                 ..PaneNames::default()
             },
             exited: false,
+            agent_session: None,
         },
     );
     drop(ps);

@@ -278,6 +278,11 @@ pub struct Attribution {
     /// the pane), where the ancestry still reaches the pane, so it is reported
     /// and never refused.
     pub tty_differs: bool,
+    /// The peer's parent is the pane's shell: it was started straight from
+    /// the prompt rather than by a program running there. An accident guard
+    /// for reports only an agent should make, never a security boundary,
+    /// because `sh -c '...'` at the prompt puts a `sh` in between.
+    pub parent_is_shell: bool,
 }
 
 /// Why a peer is not attributed to a pane. Every variant fails closed: the
@@ -409,6 +414,7 @@ pub fn attribute(
         pane,
         how,
         tty_differs: matches!((info.tty, pane_tty), (Some(a), Some(b)) if a != b),
+        parent_is_shell: procs.get(info.ppid).is_some_and(|(shell, _)| shell == pane),
     };
 
     if let Some((pane, pane_tty)) = info.sid.and_then(|sid| procs.get(sid)) {
@@ -1319,7 +1325,8 @@ mod tests {
             Ok(Attribution {
                 pane: 1,
                 how: How::Sid,
-                tty_differs: false
+                tty_differs: false,
+                parent_is_shell: false
             })
         );
     }
@@ -1338,7 +1345,8 @@ mod tests {
             Ok(Attribution {
                 pane: 1,
                 how: How::Walk { depth: 3 },
-                tty_differs: false
+                tty_differs: false,
+                parent_is_shell: false
             })
         );
     }
@@ -1352,9 +1360,54 @@ mod tests {
             Ok(Attribution {
                 pane: 1,
                 how: How::Walk { depth: 0 },
-                tty_differs: false
+                tty_differs: false,
+                parent_is_shell: false
             })
         );
+    }
+
+    /// Pane shell 100 under server 50. Each entry is `(pid, ppid)`, read once
+    /// with the sid naming the shell (Linux) and once with no sid (macOS),
+    /// because the two take different returns out of `attribute`.
+    fn parent_is_shell(peer: i32, chain: &[(i32, i32)]) -> [bool; 2] {
+        let procs = ProcIndex::new([(100, 1, None)]);
+        [Some(100), None].map(|sid| {
+            let table = FakeTable(
+                chain
+                    .iter()
+                    .map(|&(pid, ppid)| (pid, proc(ppid, sid, None)))
+                    .collect(),
+            );
+            let found = attribute(Some(peer), &procs, &table).expect("attributed");
+            assert_eq!(found.pane, 1);
+            found.parent_is_shell
+        })
+    }
+
+    #[test]
+    fn a_hook_run_by_an_agent_through_sh_is_not_from_the_prompt() {
+        let chain = [(500, 400), (400, 300), (300, 100), (100, 50)];
+        assert_eq!(parent_is_shell(500, &chain), [false, false]);
+    }
+
+    #[test]
+    fn a_plugin_run_by_an_agent_directly_is_not_from_the_prompt() {
+        let chain = [(500, 300), (300, 100), (100, 50)];
+        assert_eq!(parent_is_shell(500, &chain), [false, false]);
+    }
+
+    #[test]
+    fn a_command_typed_at_the_prompt_has_the_shell_as_its_parent() {
+        let chain = [(500, 100), (100, 50)];
+        assert_eq!(parent_is_shell(500, &chain), [true, true]);
+    }
+
+    /// The accepted hole: a shell that `exec`s the command makes it the pane's
+    /// leader, whose parent is the server, so nothing marks it as typed.
+    #[test]
+    fn a_command_the_shell_execs_is_the_leader_and_passes() {
+        let chain = [(100, 50)];
+        assert_eq!(parent_is_shell(100, &chain), [false, false]);
     }
 
     #[test]
@@ -1367,7 +1420,8 @@ mod tests {
                 how: How::Walk {
                     depth: MAX_GENERATIONS
                 },
-                tty_differs: false
+                tty_differs: false,
+                parent_is_shell: false
             })
         );
         assert_eq!(

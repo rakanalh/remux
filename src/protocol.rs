@@ -208,7 +208,13 @@ pub enum ConnDescriptor {
 /// build that reports 21. `request` is the id that lets a switcher apply only
 /// the reply to the open it is showing; `popup_open` lets it say why the list
 /// is empty.
-pub const PROTOCOL_VERSION: u32 = 21;
+///
+/// 21 -> 22: agent session restore. Adds [`ClientMessage::AgentSession`] and
+/// its reply [`ServerMessage::AgentSessionStored`]. A 21 server cannot decode
+/// the request and drops the connection, so the bump turns that into a
+/// refused handshake for the upgraded client. Developed as 20 -> 21 and
+/// renumbered when it merged after the layout switcher.
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -881,6 +887,25 @@ pub enum ClientMessage {
         #[serde(default)]
         message: Option<String>,
     },
+    /// A pane's agent names the session it is running, so that a restore can
+    /// resume it. Attributed to the SENDER's pane; `pane_hint` is
+    /// `$REMUX_PANE`, logged when it disagrees and never trusted.
+    ///
+    /// Answered with [`ServerMessage::AgentSessionStored`], or
+    /// [`ServerMessage::Error`].
+    AgentSession {
+        agent: String,
+        reference: AgentSessionRef,
+        /// The agent's session-start source: `startup`, `resume`, `clear`,
+        /// `compact`, `fork`, `new` or `select`.
+        #[serde(default)]
+        source: Option<String>,
+        /// Another pane, `%N`: only from outside every pane.
+        #[serde(default)]
+        pane: Option<PaneId>,
+        #[serde(default)]
+        pane_hint: Option<PaneId>,
+    },
 }
 
 fn default_ping_ms() -> u64 {
@@ -1197,6 +1222,12 @@ pub enum ServerMessage {
     },
     /// The answer to a [`ClientMessage::Ping`].
     Pong { nonce: u64 },
+    /// The answer to a [`ClientMessage::AgentSession`]: the pane the report
+    /// was attributed to and what became of it.
+    AgentSessionStored {
+        pane: PaneId,
+        outcome: AgentSessionOutcome,
+    },
     /// A message for a pane on the server that dialled this link, pushed to
     /// that link's connection alone: a reply going back the way the message
     /// it answers came. A request, not a stored [`Message`], since only the
@@ -1862,6 +1893,7 @@ impl ServerMessage {
             ServerMessage::AgentStatusList { .. } => "AgentStatusList",
             ServerMessage::AgentWaited { .. } => "AgentWaited",
             ServerMessage::Pong { .. } => "Pong",
+            ServerMessage::AgentSessionStored { .. } => "AgentSessionStored",
             ServerMessage::MsgInbound { .. } => "MsgInbound",
             ServerMessage::DirectoryListing { .. } => "DirectoryListing",
             ServerMessage::AgentList { .. } => "AgentList",
@@ -1908,6 +1940,7 @@ impl ServerMessage {
             | ServerMessage::AgentStatusList { .. }
             | ServerMessage::AgentWaited { .. }
             | ServerMessage::Pong { .. }
+            | ServerMessage::AgentSessionStored { .. }
             | ServerMessage::DirectoryListing { .. }
             | ServerMessage::ContextMenu { .. }
             | ServerMessage::LayoutList { .. }
@@ -1915,6 +1948,53 @@ impl ServerMessage {
             | ServerMessage::ViewCreated { .. } => false,
         }
     }
+}
+
+/// Which session an agent is running: an id, or the path of its session
+/// file for an agent that names sessions by file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentSessionRef {
+    Id(String),
+    Path(String),
+}
+
+/// The kind of an [`AgentSessionRef`], without its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RefKind {
+    Id,
+    Path,
+}
+
+impl RefKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefKind::Id => "id",
+            RefKind::Path => "path",
+        }
+    }
+}
+
+impl AgentSessionRef {
+    pub fn kind(&self) -> RefKind {
+        match self {
+            AgentSessionRef::Id(_) => RefKind::Id,
+            AgentSessionRef::Path(_) => RefKind::Path,
+        }
+    }
+
+    pub fn value(&self) -> &str {
+        match self {
+            AgentSessionRef::Id(v) | AgentSessionRef::Path(v) => v,
+        }
+    }
+}
+
+/// What a [`ClientMessage::AgentSession`] did to the pane's record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentSessionOutcome {
+    Stored,
+    Replaced,
+    Unchanged,
 }
 
 /// How the sender wants a message delivered. Every message is stored in the
@@ -4563,12 +4643,41 @@ mod tests {
         serde_json::from_slice(&encoded[4..4 + len]).unwrap()
     }
 
-    /// 19 introduced `RightClick` and `ContextMenu`, 20 agent messaging, and
-    /// 21 the layout switcher; a peer on 20 cannot decode `ListLayouts`, so the
-    /// handshake has to refuse that pairing.
+    /// 21 introduced the layout switcher and 22 agent session restore; a peer
+    /// on 21 cannot decode `AgentSession`, so the handshake has to refuse that
+    /// pairing.
     #[test]
-    fn protocol_version_is_21_for_the_layout_switcher() {
-        assert_eq!(PROTOCOL_VERSION, 21);
+    fn protocol_version_is_22_for_agent_session_restore() {
+        assert_eq!(PROTOCOL_VERSION, 22);
+    }
+
+    #[test]
+    fn agent_session_decodes_with_only_agent_and_reference() {
+        let msg: ClientMessage =
+            serde_json::from_str(r#"{"AgentSession":{"agent":"claude","reference":{"Id":"abc"}}}"#)
+                .unwrap();
+        match msg {
+            ClientMessage::AgentSession {
+                agent,
+                reference,
+                source: None,
+                pane: None,
+                pane_hint: None,
+            } => {
+                assert_eq!(agent, "claude");
+                assert_eq!(reference, AgentSessionRef::Id("abc".into()));
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+        let reply = serde_json::to_string(&ServerMessage::AgentSessionStored {
+            pane: 3,
+            outcome: AgentSessionOutcome::Unchanged,
+        })
+        .unwrap();
+        assert_eq!(
+            reply,
+            r#"{"AgentSessionStored":{"pane":3,"outcome":"Unchanged"}}"#
+        );
     }
 
     #[test]
