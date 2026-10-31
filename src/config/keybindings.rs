@@ -485,11 +485,13 @@ impl NormalizedKeyEvent {
     /// crossterm reports the `ESC L` a terminal sends for Alt+Shift+L as
     /// `'L'` + `ALT | SHIFT`, and the CSI-u form `CSI 108;4u` as `'l'` +
     /// `ALT | SHIFT`. Without this the exact-match lookup misses both, and the
-    /// keys reach the pane instead. A non-letter keeps its `SHIFT` bit because
-    /// the shifted character of `'1'` depends on the keyboard layout.
+    /// keys reach the pane instead. A character without case keeps its `SHIFT`
+    /// bit: the shifted character of `'1'` depends on the keyboard layout, and
+    /// an uncased letter such as `'あ'` or `'ب'` has no shifted form, so the
+    /// `SHIFT` bit is the only record that Shift was held.
     pub fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
         if let KeyCode::Char(c) = code {
-            if modifiers.contains(KeyModifiers::SHIFT) && c.is_alphabetic() {
+            if modifiers.contains(KeyModifiers::SHIFT) && (c.is_lowercase() || c.is_uppercase()) {
                 // `ß` uppercases to `SS`; taking the first char would turn it
                 // into an `S` binding, so a multi-char uppercase is left alone.
                 let mut upper = c.to_uppercase();
@@ -2498,6 +2500,28 @@ mod tests {
         assert_eq!(
             lookup_mods(&bindings, '1', KeyModifiers::ALT | KeyModifiers::SHIFT),
             None
+        );
+    }
+
+    #[test]
+    fn shift_on_an_uncased_letter_is_kept() {
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        for c in ['あ', 'ب'] {
+            assert_eq!(
+                NormalizedKeyEvent::new(KeyCode::Char(c), alt_shift),
+                NormalizedKeyEvent {
+                    code: KeyCode::Char(c),
+                    modifiers: alt_shift,
+                },
+                "{c}"
+            );
+        }
+        assert_eq!(
+            NormalizedKeyEvent::new(KeyCode::Char('g'), alt_shift),
+            NormalizedKeyEvent {
+                code: KeyCode::Char('G'),
+                modifiers: KeyModifiers::ALT,
+            }
         );
     }
 
