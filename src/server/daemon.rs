@@ -2888,7 +2888,7 @@ async fn handle_command(
             let st = state.lock().await;
             st.sessions
                 .get(&session_name)
-                .map(|s| s.popup_visible && s.popup_pane.is_some())
+                .map(Session::popup_shown)
                 .unwrap_or(false)
         };
         if popup_visible {

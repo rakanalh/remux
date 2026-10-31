@@ -225,6 +225,13 @@ impl Session {
         }
     }
 
+    /// Whether the popup is drawn and owns input. `handle_command` drops
+    /// layout-mutating commands under this condition, and `ListLayouts` offers
+    /// nothing under it, so the two must read the same predicate.
+    pub fn popup_shown(&self) -> bool {
+        self.popup_visible && self.popup_pane.is_some()
+    }
+
     /// Clear the popup, returning its pane id so the caller can kill the PTY.
     pub fn take_popup(&mut self) -> Option<PaneId> {
         self.popup_visible = false;
