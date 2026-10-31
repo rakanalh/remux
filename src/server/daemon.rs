@@ -21,6 +21,7 @@ use crate::config::{BorderStyle, Config, ZoomMode};
 use crate::protocol;
 use crate::protocol::*;
 use crate::screen::Screen;
+use crate::server::agent_session::AgentSessionRecord;
 use crate::server::browse;
 use crate::server::compositor::{
     composite, draw_popup, fits_zellij_border, float_zoom_box, hit_test, is_multi_stack,
@@ -4098,9 +4099,11 @@ async fn handle_agent_session(
     peer: &Arc<identity::Peer>,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    dormant: &DormantStore,
 ) -> ServerMessage {
     use crate::protocol::AgentSessionOutcome;
-    use crate::server::agent_session::{self, AgentSessionRecord};
+    use crate::server::agent_session;
 
     let caller = attribute_frame_caller(peer, panes).await;
     if let Ok(found) = &caller {
@@ -4162,6 +4165,12 @@ async fn handle_agent_session(
                 "agent session: pane %{pane} {} {kind} {bytes} bytes source={source} -> {outcome:?}",
                 loggable(&report.agent)
             );
+            // The `panes` lock is released by now: `save_if_enabled` takes
+            // `state` and then `panes`, so saving under it would invert that
+            // order.
+            if outcome != AgentSessionOutcome::Unchanged {
+                save_if_enabled(state, panes, config, dormant).await;
+            }
             ServerMessage::AgentSessionStored { pane, outcome }
         }
         Ok(None) => ServerMessage::refused("no_such_target", format!("no such target: %{pane}")),
@@ -5023,7 +5032,7 @@ struct PaneData {
     /// be a message target or a sender's pane in the meantime.
     exited: bool,
     /// The session the pane's agent reported, which a restore resumes.
-    agent_session: Option<crate::server::agent_session::AgentSessionRecord>,
+    agent_session: Option<AgentSessionRecord>,
 }
 
 /// A pane's cached process names and working directory.
@@ -5502,6 +5511,7 @@ impl RemuxServer {
             dormant: Arc::new(Mutex::new(PersistedState {
                 state: ServerState::new(),
                 pane_cwds: HashMap::new(),
+                agent_sessions: HashMap::new(),
             })),
         }
     }
@@ -5810,9 +5820,11 @@ impl RemuxServer {
             }
         }
 
-        if let Ok(mut persisted) =
-            crate::server::persistence::PersistedState::from_server(&state, &pane_cwds)
-        {
+        if let Ok(mut persisted) = crate::server::persistence::PersistedState::from_server(
+            &state,
+            &pane_cwds,
+            &agent_sessions_of(&panes),
+        ) {
             forget_titles(&mut persisted.state, &panes);
             // Persist live + still-dormant sessions so a live-only save never
             // clobbers un-resurrected dormant sessions on disk.
@@ -6514,6 +6526,8 @@ async fn handle_client_message(
                 peer,
                 state,
                 panes,
+                config,
+                dormant,
             )
             .await;
             reply(client_id, clients, answer).await;
@@ -17177,9 +17191,11 @@ async fn save_if_enabled(
             pane_cwds.insert(pane_id, cwd);
         }
     }
-    if let Ok(mut persisted) =
-        crate::server::persistence::PersistedState::from_server(&st, &pane_cwds)
-    {
+    if let Ok(mut persisted) = crate::server::persistence::PersistedState::from_server(
+        &st,
+        &pane_cwds,
+        &agent_sessions_of(&ps),
+    ) {
         forget_titles(&mut persisted.state, &ps);
         // Persist live + still-dormant sessions so a live-only save never
         // clobbers un-resurrected dormant sessions on disk. No-op (byte-identical
@@ -17194,6 +17210,13 @@ async fn save_if_enabled(
             log::error!("failed to save state: {e}");
         }
     }
+}
+
+/// Every live pane's agent session, for a save.
+fn agent_sessions_of(ps: &HashMap<PaneId, PaneData>) -> HashMap<u64, AgentSessionRecord> {
+    ps.iter()
+        .filter_map(|(&id, pd)| pd.agent_session.clone().map(|record| (id, record)))
+        .collect()
 }
 
 /// Replace every pane name that did not come from the user with the pane's
@@ -17259,6 +17282,12 @@ fn merge_dormant_into(target: &mut PersistedState, dormant: &PersistedState) {
     for (&pid, cwd) in &dormant.pane_cwds {
         target.pane_cwds.entry(pid).or_insert_with(|| cwd.clone());
     }
+    for (&pid, record) in &dormant.agent_sessions {
+        target
+            .agent_sessions
+            .entry(pid)
+            .or_insert_with(|| record.clone());
+    }
     // Keep id counters above any merged pane/tab id.
     target.state.ensure_id_counters();
 }
@@ -17279,6 +17308,8 @@ fn merge_dormant_into(target: &mut PersistedState, dormant: &PersistedState) {
 async fn materialize_session(
     session_name: &str,
     pane_cwds: &HashMap<u64, String>,
+    agent_sessions: &HashMap<u64, AgentSessionRecord>,
+    typed: &mut usize,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -17325,6 +17356,11 @@ async fn materialize_session(
         .await
         {
             log::warn!("failed to spawn PTY for restored pane {pane_id}: {e}");
+            continue;
+        }
+        if let Some(record) = agent_sessions.get(pane_id) {
+            type_resume(*pane_id, record, panes).await;
+            *typed += 1;
         }
     }
 
@@ -17343,6 +17379,32 @@ async fn materialize_session(
     }
 
     Ok(())
+}
+
+/// Type `record`'s resume command into the freshly spawned shell of `pane_id`
+/// and hold the record on the pane again. The bytes wait in the tty's input
+/// queue until the shell first reads, so this need not wait for a prompt.
+async fn type_resume(
+    pane_id: PaneId,
+    record: &AgentSessionRecord,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) {
+    let Some(line) = crate::server::agent_session::typed_line(record) else {
+        log::warn!("agent session: pane %{pane_id} holds an unknown agent; not resumed");
+        return;
+    };
+    let mut ps = panes.lock().await;
+    let Some(pd) = ps.get_mut(&pane_id) else {
+        return;
+    };
+    pd.send_input(line.as_bytes());
+    pd.agent_session = Some(record.clone());
+    drop(ps);
+    log::info!(
+        "typed resume for pane %{pane_id} agent={} ({} bytes)",
+        loggable(&record.agent),
+        line.len()
+    );
 }
 
 /// Restore server state from a persisted snapshot on startup
@@ -17375,10 +17437,13 @@ async fn restore_state(
         *st = restored_state;
     }
 
+    let mut typed = 0;
     for session_name in &session_names {
         materialize_session(
             session_name,
             &persisted.pane_cwds,
+            &persisted.agent_sessions,
+            &mut typed,
             &server.state,
             &server.panes,
             &server.clients,
@@ -17394,9 +17459,9 @@ async fn restore_state(
 }
 
 /// Move the named session from a dormant snapshot into live `ServerState`,
-/// recreating folder membership. Returns the CWDs of the session's panes (for
-/// PTY spawning) on success, or `None` if the name isn't dormant or a live
-/// session already exists under that name.
+/// recreating folder membership. Returns the CWDs and agent sessions of the
+/// session's panes (for PTY spawning) on success, or `None` if the name isn't
+/// dormant or a live session already exists under that name.
 ///
 /// Pure state manipulation with no PTY side effects, so it is unit-testable
 /// independently of [`materialize_session`]. Guards on the live collision
@@ -17406,7 +17471,7 @@ fn take_dormant_session(
     dormant: &mut PersistedState,
     live: &mut ServerState,
     name: &str,
-) -> Option<HashMap<u64, String>> {
+) -> Option<(HashMap<u64, String>, HashMap<u64, AgentSessionRecord>)> {
     if live.sessions.contains_key(name) {
         log::warn!("resurrect: live session '{name}' already exists; ignoring");
         return None;
@@ -17438,9 +17503,13 @@ fn take_dormant_session(
         .flat_map(|t| layout::all_pane_ids(&t.layout))
         .collect();
     let mut cwds = HashMap::new();
+    let mut agent_sessions = HashMap::new();
     for pid in &pane_ids {
         if let Some(cwd) = dormant.pane_cwds.remove(pid) {
             cwds.insert(*pid, cwd);
+        }
+        if let Some(record) = dormant.agent_sessions.remove(pid) {
+            agent_sessions.insert(*pid, record);
         }
     }
 
@@ -17456,7 +17525,7 @@ fn take_dormant_session(
     }
     live.sessions.insert(name.to_string(), session);
     live.ensure_id_counters();
-    Some(cwds)
+    Some((cwds, agent_sessions))
 }
 
 /// Materialize a dormant session into a live session on client request.
@@ -17476,7 +17545,7 @@ async fn handle_resurrect_session(
 ) -> Result<()> {
     // Lock state before dormant to match `save_if_enabled`'s ordering and avoid
     // any lock-order inversion.
-    let cwds = {
+    let (cwds, agent_sessions) = {
         let mut st = state.lock().await;
         let mut d = dormant.lock().await;
         match take_dormant_session(&mut d, &mut st, name) {
@@ -17489,6 +17558,8 @@ async fn handle_resurrect_session(
     materialize_session(
         name,
         &cwds,
+        &agent_sessions,
+        &mut 0,
         state,
         panes,
         clients,
@@ -17976,10 +18047,11 @@ mod tests {
         let mut dormant = PersistedState {
             state: dstate,
             pane_cwds: cwds,
+            agent_sessions: HashMap::new(),
         };
 
         let mut live = ServerState::new();
-        let got =
+        let (got, _) =
             take_dormant_session(&mut dormant, &mut live, "alpha").expect("alpha should resurrect");
 
         // alpha migrated into live with its folder membership recreated.
@@ -18008,10 +18080,12 @@ mod tests {
         let mut target = PersistedState {
             state: state_with_sessions(&[("live1", None)]),
             pane_cwds: HashMap::new(),
+            agent_sessions: HashMap::new(),
         };
         let dormant = PersistedState {
             state: state_with_sessions(&[("dorm1", Some("f"))]),
             pane_cwds: HashMap::new(),
+            agent_sessions: HashMap::new(),
         };
 
         merge_dormant_into(&mut target, &dormant);
@@ -18034,12 +18108,14 @@ mod tests {
         let mut target = PersistedState {
             state: state_with_sessions(&[("live1", None), ("live2", None)]),
             pane_cwds: HashMap::new(),
+            agent_sessions: HashMap::new(),
         };
         let before = serde_json::to_string(&target).unwrap();
 
         let empty = PersistedState {
             state: ServerState::new(),
             pane_cwds: HashMap::new(),
+            agent_sessions: HashMap::new(),
         };
         merge_dormant_into(&mut target, &empty);
 
@@ -19421,6 +19497,7 @@ mod popup_tests {
                 dormant: Arc::new(Mutex::new(PersistedState {
                     state: ServerState::new(),
                     pane_cwds: HashMap::new(),
+                    agent_sessions: HashMap::new(),
                 })),
                 rx,
             }

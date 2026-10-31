@@ -112,6 +112,33 @@ pub fn decide(
     }
 }
 
+/// The command that resumes `record`'s session, one argv word each. `None`
+/// for an agent this server does not know, which [`validate`] refuses.
+pub fn plan(record: &AgentSessionRecord) -> Option<Vec<String>> {
+    let value = record.value.clone();
+    let words = match record.agent.as_str() {
+        "claude" => vec!["claude".into(), "--resume".into(), value],
+        "codex" => vec!["codex".into(), "resume".into(), value],
+        // omp has no `--session`, and takes the value only joined to the flag.
+        "omp" => vec!["omp".into(), format!("--resume={value}")],
+        "pi" => vec!["pi".into(), "--session".into(), value],
+        "opencode" => vec!["opencode".into(), "--session".into(), value],
+        _ => return None,
+    };
+    Some(words)
+}
+
+/// What a restore types into the respawned shell to resume `record`. The
+/// leading space keeps the line out of the history of a shell that sets
+/// `ignorespace` or `HIST_IGNORE_SPACE`, and the `\r` submits it.
+pub fn typed_line(record: &AgentSessionRecord) -> Option<String> {
+    let words: Vec<String> = plan(record)?
+        .iter()
+        .map(|w| crate::integrate::hooks_file::sh_word(w))
+        .collect();
+    Some(format!(" {}\r", words.join(" ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +215,62 @@ mod tests {
         assert_eq!(decide(Some(&a), &a), Ok(AgentSessionOutcome::Unchanged));
         assert_eq!(decide(Some(&a), &b), Err(Refusal::SessionHeld));
         assert_eq!(decide(Some(&a), &c), Err(Refusal::SessionHeld));
+    }
+
+    fn record(agent: &str, reference: AgentSessionRef) -> AgentSessionRecord {
+        AgentSessionRecord::new(agent, &reference)
+    }
+
+    #[test]
+    fn plan_builds_each_agents_resume_command() {
+        let cases = [
+            ("claude", id(UUID), vec!["claude", "--resume", UUID]),
+            ("codex", id(UUID), vec!["codex", "resume", UUID]),
+            (
+                "opencode",
+                id("ses_3f9a"),
+                vec!["opencode", "--session", "ses_3f9a"],
+            ),
+            (
+                "pi",
+                path("/home/u/s.jsonl"),
+                vec!["pi", "--session", "/home/u/s.jsonl"],
+            ),
+            ("pi", id(UUID), vec!["pi", "--session", UUID]),
+            (
+                "omp",
+                path("/home/u/s.jsonl"),
+                vec!["omp", "--resume=/home/u/s.jsonl"],
+            ),
+            (
+                "omp",
+                id(UUID),
+                vec!["omp", "--resume=7f3c2a9e-51d4-4b8e-9a61-0c2f5d8e4b17"],
+            ),
+        ];
+        for (agent, reference, want) in cases {
+            assert_eq!(
+                plan(&record(agent, reference)),
+                Some(want.iter().map(|w| w.to_string()).collect()),
+                "{agent}"
+            );
+        }
+        assert_eq!(plan(&record("vim", id(UUID))), None);
+    }
+
+    #[test]
+    fn the_typed_line_is_space_prefixed_quoted_and_submitted() {
+        assert_eq!(
+            typed_line(&record("claude", id(UUID))).as_deref(),
+            Some(format!(" claude --resume {UUID}\r").as_str())
+        );
+        assert_eq!(
+            typed_line(&record("pi", path("/home/u/my sessions/it's.jsonl"))).as_deref(),
+            Some(" pi --session '/home/u/my sessions/it'\\''s.jsonl'\r")
+        );
+        assert_eq!(
+            typed_line(&record("omp", path("/home/u/a b.jsonl"))).as_deref(),
+            Some(" omp '--resume=/home/u/a b.jsonl'\r")
+        );
     }
 }

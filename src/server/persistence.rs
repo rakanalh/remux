@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::server::agent_session::AgentSessionRecord;
 use crate::server::session::ServerState;
 
 /// The command string for manual session save, used by the command dispatcher.
@@ -23,6 +24,10 @@ pub struct PersistedState {
     /// Mapping from PaneId to the current working directory of the pane's
     /// child process at the time of the save.
     pub pane_cwds: HashMap<u64, String>,
+    /// Mapping from PaneId to the session the pane's agent reported, which a
+    /// restore resumes. Absent from a file an older build wrote.
+    #[serde(default)]
+    pub agent_sessions: HashMap<u64, AgentSessionRecord>,
 }
 
 impl PersistedState {
@@ -30,12 +35,17 @@ impl PersistedState {
     ///
     /// `pane_cwds` maps PaneId to the current working directory of the child
     /// process running in that pane.
-    pub fn from_server(state: &ServerState, pane_cwds: &HashMap<u64, String>) -> Result<Self> {
+    pub fn from_server(
+        state: &ServerState,
+        pane_cwds: &HashMap<u64, String>,
+        agent_sessions: &HashMap<u64, AgentSessionRecord>,
+    ) -> Result<Self> {
         let json = serde_json::to_string(state)?;
         let cloned: ServerState = serde_json::from_str(&json)?;
         Ok(Self {
             state: cloned,
             pane_cwds: pane_cwds.clone(),
+            agent_sessions: agent_sessions.clone(),
         })
     }
 }
@@ -562,13 +572,38 @@ mod tests {
         let mut cwds = HashMap::new();
         cwds.insert(1u64, "/home/user".to_string());
 
-        let persisted = PersistedState::from_server(&state, &cwds).unwrap();
+        let persisted = PersistedState::from_server(&state, &cwds, &HashMap::new()).unwrap();
 
         let json = serde_json::to_string(&persisted).unwrap();
         let loaded: PersistedState = serde_json::from_str(&json).unwrap();
 
         assert!(loaded.state.sessions.contains_key("test"));
         assert_eq!(loaded.pane_cwds.get(&1).unwrap(), "/home/user");
+    }
+
+    #[test]
+    fn the_agent_sessions_round_trip_and_an_old_file_loads_without_them() {
+        let state = ServerState::new();
+        let record = AgentSessionRecord::new(
+            "claude",
+            &crate::protocol::AgentSessionRef::Id("7f3c2a9e".into()),
+        );
+        let sessions = HashMap::from([(4u64, record.clone())]);
+        let persisted = PersistedState::from_server(&state, &HashMap::new(), &sessions).unwrap();
+        let json = serde_json::to_string(&persisted).unwrap();
+        assert!(
+            json.contains(
+                r#""agent_sessions":{"4":{"agent":"claude","kind":"Id","value":"7f3c2a9e"}}"#
+            ),
+            "{json}"
+        );
+        let loaded: PersistedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.agent_sessions.get(&4), Some(&record));
+
+        let mut old: serde_json::Value = serde_json::from_str(&json).unwrap();
+        old.as_object_mut().unwrap().remove("agent_sessions");
+        let loaded: PersistedState = serde_json::from_value(old).unwrap();
+        assert!(loaded.agent_sessions.is_empty());
     }
 
     #[test]
@@ -585,7 +620,7 @@ mod tests {
         state.create_tab("s1", "tab2", Default::default()).unwrap();
 
         let cwds = HashMap::new();
-        let persisted = PersistedState::from_server(&state, &cwds).unwrap();
+        let persisted = PersistedState::from_server(&state, &cwds, &HashMap::new()).unwrap();
 
         assert!(persisted.state.sessions.contains_key("s1"));
         assert!(persisted.state.folders.contains_key("work"));
@@ -609,7 +644,8 @@ mod tests {
         let tab = &mut state.sessions.get_mut("floaty").unwrap().tabs[0];
         assert!(tab.toggle_zoom(crate::config::ZoomMode::Float));
         let floated = tab.focused_pane;
-        let persisted = PersistedState::from_server(&state, &HashMap::new()).unwrap();
+        let persisted =
+            PersistedState::from_server(&state, &HashMap::new(), &HashMap::new()).unwrap();
         std::fs::write(
             &state_path,
             serde_json::to_string_pretty(&persisted).unwrap(),
@@ -639,7 +675,8 @@ mod tests {
             .unwrap();
         let tab = &mut state.sessions.get_mut("old").unwrap().tabs[0];
         tab.zoomed_pane = Some(tab.focused_pane);
-        let persisted = PersistedState::from_server(&state, &HashMap::new()).unwrap();
+        let persisted =
+            PersistedState::from_server(&state, &HashMap::new(), &HashMap::new()).unwrap();
         let mut json: serde_json::Value = serde_json::to_value(&persisted).unwrap();
         let tabs = json["state"]["sessions"]["old"]["tabs"]
             .as_array_mut()
@@ -675,7 +712,7 @@ mod tests {
         let mut cwds = HashMap::new();
         cwds.insert(1u64, "/tmp".to_string());
 
-        let persisted = PersistedState::from_server(&state, &cwds).unwrap();
+        let persisted = PersistedState::from_server(&state, &cwds, &HashMap::new()).unwrap();
         let json = serde_json::to_string_pretty(&persisted).unwrap();
         std::fs::write(&state_path, &json).unwrap();
 
@@ -735,7 +772,8 @@ mod tests {
                 Default::default(),
             )
             .unwrap();
-        let persisted = PersistedState::from_server(&state, &HashMap::new()).unwrap();
+        let persisted =
+            PersistedState::from_server(&state, &HashMap::new(), &HashMap::new()).unwrap();
         std::fs::write(path, serde_json::to_string(&persisted).unwrap()).unwrap();
     }
 

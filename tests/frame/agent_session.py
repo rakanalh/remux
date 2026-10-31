@@ -24,12 +24,19 @@ cli_filters     a subagent payload, a non-SessionStart payload, and
                 `CURSOR_VERSION` set each exit 0 without connecting, with
                 `$REMUX_PANE` set so that the filter is what stops them; the
                 plain SessionStart payload does connect.
+persist         state.json holds the record right after the report, before any
+                structural change; a report that hangs (a lock-order deadlock
+                in the save) is a timeout red here.
+restart_types   after `remux restart` the restored /bin/sh pane runs the stub
+                `claude` on PATH with `--resume` and the id as two argv words,
+                read from the file the stub writes, never from the screen.
 redaction       server.log and client.log carry the summary line with the id's
                 byte count and never the id.
 no_panic        server.log has no `panicked at`.
 
 Run: python3 tests/frame/agent_session.py   (RMX_RUNDIR overrides the run dir)
 """
+import json
 import os
 import re
 import socket
@@ -44,6 +51,15 @@ RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-agentsess")
 UUID = "7f3c2a9e-51d4-4b8e-9a61-0c2f5d8e4b17"
 OTHER = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
 CLI_ID = "c11a77e1-9d0b-4c3a-8e2f-6b5a4d3c2b1a"
+RESTORE_ID = "4e5a1f0c-7b2d-4c8e-a3f9-1d6b0e2c5a7f"
+CONFIG = """
+[general]
+save_sessions = true
+automatic_restore = true
+"""
+STUB = """#!/bin/sh
+for a in "$@"; do printf '%s\\n' "$a"; done > "{argv_dir}/$(basename "$0").$$"
+"""
 FIXTURES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "fixtures", "agent_session")
 
@@ -59,13 +75,45 @@ def check(cond, label):
 class Rig:
     def __init__(self, rundir, config=None):
         self.srv = Server(rundir)
+        # The pane shells inherit the server's PATH, so the stub agents must
+        # come first on it. The directory is filled after `start()`, which
+        # wipes the run dir.
+        self.bin = f"{rundir}/bin"
+        self.argv_dir = f"{rundir}/argv"
+        os.environ["PATH"] = f"{self.bin}:{os.environ['PATH']}"
         self.srv.start(config=config)
+        for d in (self.bin, self.argv_dir):
+            os.makedirs(d, exist_ok=True)
+        for agent in ("claude", "codex", "opencode", "pi", "omp"):
+            stub = f"{self.bin}/{agent}"
+            with open(stub, "w") as f:
+                f.write(STUB.format(argv_dir=self.argv_dir))
+            os.chmod(stub, 0o755)
+        self.attach(create=True)
+
+    def attach(self, create=False):
         self.cli = Client(self.srv.sock)
         self.cli.hello()
-        self.cli.send({"CreateSession": {"name": "main", "folder": None}})
+        if create:
+            self.cli.send({"CreateSession": {"name": "main", "folder": None}})
         self.cli.send({"Attach": {"session_name": "main"}})
         self.cli.send({"Resize": {"cols": 160, "rows": 50}})
         self.cli.drain(0.8)
+
+    def restart(self):
+        self.cli.close()
+        self.srv.restart()
+        self.attach()
+
+    def state_json(self):
+        try:
+            with open(f"{self.srv.rundir}/data/remux/state.json") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def argv_files(self, agent):
+        return sorted(n for n in os.listdir(self.argv_dir) if n.startswith(agent + "."))
 
     def spawn(self, argv=None):
         c = Client(self.srv.sock)
@@ -219,8 +267,51 @@ def cli_filters(rig):
           f"(got {run.returncode}, {run.stdout!r}, {run.stderr!r})")
 
 
+def persist(rig):
+    pane = rig.spawn()
+    before = rig.state_json() or {}
+    check(str(pane) not in before.get("agent_sessions", {}),
+          "persist: the new pane holds no record before the report")
+    started = time.time()
+    r = report(rig, pane, "claude", {"Id": RESTORE_ID}, source="startup")
+    check(outcome(r) == "Stored", f"persist: the report is Stored without hanging (got {r} "
+                                  f"after {time.time() - started:.1f}s)")
+    held = (rig.state_json() or {}).get("agent_sessions", {}).get(str(pane))
+    check(held == {"agent": "claude", "kind": "Id", "value": RESTORE_ID},
+          f"persist: state.json holds the record at once (got {held})")
+    return pane
+
+
+def restart_types(rig, pane):
+    check(rig.argv_files("claude") == [], "restart_types: the stub has not run before the restart")
+    rig.restart()
+
+    def runs():
+        """The stub's argv, one list per run that named this case's id. The
+        earlier cases' panes hold records too, and are resumed alongside."""
+        out = []
+        for name in rig.argv_files("claude"):
+            with open(f"{rig.argv_dir}/{name}") as f:
+                argv = f.read().split("\n")
+            if RESTORE_ID in argv:
+                out.append(argv)
+        return out
+
+    end = time.time() + 8.0
+    while time.time() < end and not runs():
+        time.sleep(0.1)
+    time.sleep(0.5)
+    got = runs()
+    check(len(got) == 1, f"restart_types: the restore ran the stub claude once for the id (got {got})")
+    check(bool(got) and got[0] == ["--resume", RESTORE_ID, ""],
+          f"restart_types: --resume and the id are two argv words and nothing else (got {got})")
+    r = report(rig, pane, "claude", {"Id": RESTORE_ID}, source="resume")
+    check(outcome(r) == "Unchanged",
+          f"restart_types: the restored pane %{pane} holds the record again (got {r})")
+
+
 def main():
-    rig = Rig(RUNDIR)
+    rig = Rig(RUNDIR, CONFIG)
     try:
         pane = rig.spawn()
         check(pane is not None, f"a pane to report into (got {pane})")
@@ -256,6 +347,8 @@ def main():
         cli_stdout(rig)
         cli_outside(rig)
         cli_filters(rig)
+        restored = persist(rig)
+        restart_types(rig, restored)
 
         log = rig.srv.log()
         client_log = read(f"{rig.srv.rundir}/state/remux/client.log")
