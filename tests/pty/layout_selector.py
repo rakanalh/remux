@@ -28,12 +28,14 @@ What it covers:
      switcher says why, and Enter closes it without changing the layout; once
      the popup is closed the list comes back
   9  in a View the switcher says it is unavailable there instead of doing
-     nothing, Enter closes it, and the client stays alive
+     nothing, Enter closes it, the rows it covered show the View's cells
+     again, and the client stays alive
 
 Run from the repo root:
     python3 tests/pty/layout_selector.py [-v]
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -94,6 +96,21 @@ def popup_rows(t):
         inner = cell[1:].split("│")[0]
         items.append(inner.rstrip())
     return items
+
+
+def popup_extent(t):
+    """(top, bottom, left, right) of the switcher box on screen, or None."""
+    rows = t.rows_text()
+    top = next((i for i, r in enumerate(rows) if TITLE in r), -1)
+    if top < 0:
+        return None
+    left = rows[top].index("╭")
+    right = rows[top].index("╮", left)
+    bottom = next((i for i in range(top + 1, len(rows))
+                   if rows[i][left:left + 1] == "╰"), -1)
+    if bottom < 0:
+        return None
+    return top, bottom, left, right
 
 
 def status_layout(t):
@@ -314,8 +331,10 @@ def view_section():
         screen = "\n".join(t.rows_text())
         check("view: the cells show both panes", "PA" in screen and "PB" in screen, screen)
         before = t.rows_text()[-1]
+        view_rows = t.rows_text()
         t.send(OPEN, 1.0)
         items = popup_rows(t)
+        extent = popup_extent(t)
         if VERBOSE:
             t.dump("switcher in a view")
         check("view: the switcher says it is unavailable",
@@ -326,11 +345,30 @@ def view_section():
               "\n".join(t.rows_text()))
         check("view: still in the view, status bar unchanged",
               t.rows_text()[-1] == before, f"{before!r} -> {t.rows_text()[-1]!r}")
-        # The cells alias the first tab's panes while the session shows the
-        # second, so the markers are on screen only if the View was repainted.
-        screen = "\n".join(t.rows_text())
-        check("view: the cells are repainted after the switcher closes",
-              "PA" in screen and "PB" in screen, screen)
+        # Judged on the rows the box covered, not on the markers: those sit
+        # above the box and survive whether or not anything repainted. The
+        # View's two cells put a divider through those rows; the single-pane
+        # tab behind it has none, and a box left on screen breaks the match.
+        check("view: the switcher box was found", extent is not None,
+              "\n".join(t.rows_text()))
+        if extent is not None:
+            top, bottom, left, right = extent
+            covered = range(top, bottom + 1)
+            divider_cols = [m.start() for m in re.finditer("│", view_rows[top])
+                            if left <= m.start() <= right
+                            and all(view_rows[y][m.start():m.start() + 1] == "│"
+                                    for y in covered)]
+            check("view: a cell divider runs under the switcher box",
+                  bool(divider_cols),
+                  f"cols {left}..{right}, rows {top}..{bottom}\n"
+                  + "\n".join(view_rows))
+            after = t.rows_text()
+            stale = [y for y in covered
+                     if after[y] != view_rows[y]
+                     or any(x in after[y] for x in (TITLE, "no layouts", "╭", "╰"))]
+            check("view: the rows the switcher covered show the cells again",
+                  not stale and bool(divider_cols),
+                  "\n".join(f"{y:2} {after[y]!r}" for y in covered))
         check("client is alive after the view checks", t.alive())
     finally:
         t.kill()
