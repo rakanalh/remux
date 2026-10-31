@@ -839,11 +839,17 @@ pub enum ServerMessage {
     /// Both are empty when the requester has no session or no active tab.
     ///
     /// `request` is the id the [`ClientMessage::ListLayouts`] carried.
+    ///
+    /// `layouts` is also empty while the session's popup is open, and
+    /// `popup_open` says so. The server ignores `LayoutSet` then, because
+    /// the popup is the input target and a layout switch would act on it.
     LayoutList {
         #[serde(default)]
         request: u64,
         layouts: Vec<String>,
         current: String,
+        #[serde(default)]
+        popup_open: bool,
     },
     /// The panes running an AI coding agent, pushed to every client subscribed
     /// with [`ClientMessage::SubscribeAgents`].

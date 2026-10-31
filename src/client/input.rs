@@ -1523,6 +1523,8 @@ impl TabPickerOverlay {
     }
 }
 
+const POPUP_OPEN: &str = "popup open";
+
 /// The layout switcher behind `LayoutQuickSwitch`: the layouts the active tab
 /// can switch to, with its current one marked.
 ///
@@ -1534,11 +1536,14 @@ impl TabPickerOverlay {
 pub struct LayoutSwitchOverlay {
     conn: ConnId,
     /// The id of the `ListLayouts` this open sent. A reply carrying any other
-    /// id answers an earlier open of the switcher.
-    request: u64,
+    /// id answers an earlier open of the switcher. `None` when this open sent
+    /// no request, so no reply is taken.
+    request: Option<u64>,
     /// `None` until the server answers.
     layouts: Option<Vec<String>>,
     current: String,
+    /// Why `layouts` is empty, shown in place of the list.
+    why_empty: Option<&'static str>,
     nav: crate::client::sidebar::nav::NavList,
 }
 
@@ -1546,9 +1551,22 @@ impl LayoutSwitchOverlay {
     pub fn new(conn: ConnId, request: u64) -> Self {
         Self {
             conn,
-            request,
+            request: Some(request),
             layouts: None,
             current: String::new(),
+            why_empty: None,
+            nav: crate::client::sidebar::nav::NavList::new(),
+        }
+    }
+
+    /// A switcher that offers nothing and says `why`. Enter closes it.
+    pub fn unavailable(conn: ConnId, why: &'static str) -> Self {
+        Self {
+            conn,
+            request: None,
+            layouts: Some(Vec::new()),
+            current: String::new(),
+            why_empty: Some(why),
             nav: crate::client::sidebar::nav::NavList::new(),
         }
     }
@@ -1566,9 +1584,13 @@ impl LayoutSwitchOverlay {
         request: u64,
         layouts: Vec<String>,
         current: String,
+        popup_open: bool,
     ) -> bool {
-        if *src != self.conn || request != self.request {
+        if *src != self.conn || self.request != Some(request) {
             return false;
+        }
+        if popup_open {
+            self.why_empty = Some(POPUP_OPEN);
         }
         let start = layouts.iter().position(|l| *l == current).unwrap_or(0);
         self.nav.set_selected(start);
@@ -1599,7 +1621,11 @@ impl LayoutSwitchOverlay {
         let rows: Vec<SwitchRow> = match &self.layouts {
             None => vec![SwitchRow::item("  ...".to_string(), false)],
             Some(layouts) if layouts.is_empty() => {
-                vec![SwitchRow::item("  no layouts".to_string(), false)]
+                let text = match self.why_empty {
+                    Some(why) => format!("  no layouts: {why}"),
+                    None => "  no layouts".to_string(),
+                };
+                vec![SwitchRow::item(text, false)]
             }
             Some(layouts) => layouts
                 .iter()
@@ -6534,7 +6560,8 @@ mod tests {
             &ConnId::Local,
             request,
             layout_names(),
-            "master".to_string()
+            "master".to_string(),
+            false
         ));
         handler
     }
@@ -6568,7 +6595,8 @@ mod tests {
             &ConnId::Remote("mini".to_string()),
             1,
             vec!["grid".to_string()],
-            "grid".to_string()
+            "grid".to_string(),
+            false
         ));
         assert_eq!(overlay.choice(), None);
     }
@@ -6583,6 +6611,36 @@ mod tests {
             InputAction::LayoutSwitchClose
         );
         assert!(handler.layout_switch.is_none());
+    }
+
+    #[test]
+    fn the_layout_switcher_offers_nothing_while_the_popup_is_open() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        let request = handler.open_layout_switch(ConnId::Local);
+        let overlay = handler.layout_switch.as_mut().expect("opened");
+        assert!(overlay.apply_from(&ConnId::Local, request, Vec::new(), "bsp".to_string(), true));
+        assert_eq!(overlay.why_empty, Some(POPUP_OPEN));
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::LayoutSwitchClose
+        );
+        assert!(handler.layout_switch.is_none());
+    }
+
+    #[test]
+    fn an_unavailable_layout_switcher_takes_no_reply() {
+        let mut overlay = LayoutSwitchOverlay::unavailable(ConnId::Local, "in a view");
+        for request in 0..3 {
+            assert!(!overlay.apply_from(
+                &ConnId::Local,
+                request,
+                layout_names(),
+                "bsp".to_string(),
+                false
+            ));
+        }
+        assert_eq!(overlay.choice(), None);
     }
 
     /// Alt-g, Esc, Alt-g sends two `ListLayouts` before either reply arrives.
@@ -6608,6 +6666,7 @@ mod tests {
                 request,
                 layout_names(),
                 "bsp".to_string(),
+                false,
             )
         };
         assert!(!reply(&mut handler, first), "the first reply is stale");

@@ -1991,21 +1991,29 @@ async fn handle_client_message(
                 let cls = clients.lock().await;
                 cls.get(&client_id).and_then(|c| c.session_name.clone())
             };
-            let (layouts, current) = {
+            let (layouts, current, popup_open) = {
                 let st = state.lock().await;
-                session_name
+                let sess = session_name
                     .as_deref()
-                    .and_then(|name| st.sessions.get(name))
+                    .and_then(|name| st.sessions.get(name));
+                // The popup command guard in `handle_command` drops `LayoutSet`
+                // while the popup is shown, so a list offered now would be one
+                // whose every pick is ignored.
+                let popup_open = sess.is_some_and(Session::popup_shown);
+                let (layouts, current) = sess
                     .and_then(|sess| sess.tabs.get(sess.active_tab))
                     .map(|tab| {
                         let restorable =
                             saved_custom_is_restorable(&tab.saved_custom_layout, &tab.pane_order);
-                        (
-                            layout_choices(&tab.layout_mode, restorable, &config.layouts),
-                            tab.layout_mode.name().to_string(),
-                        )
+                        let layouts = if popup_open {
+                            Vec::new()
+                        } else {
+                            layout_choices(&tab.layout_mode, restorable, &config.layouts)
+                        };
+                        (layouts, tab.layout_mode.name().to_string())
                     })
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                (layouts, current, popup_open)
             };
             let cls = clients.lock().await;
             if let Some(client) = cls.get(&client_id) {
@@ -2013,6 +2021,7 @@ async fn handle_client_message(
                     request,
                     layouts,
                     current,
+                    popup_open,
                 });
             }
             Ok(())

@@ -19,8 +19,8 @@ use futures::StreamExt;
 
 use crate::client::editor::copy_to_clipboard;
 use crate::client::input::{
-    AgentSwitchOverlay, FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget,
-    SessionSwitchOverlay, SidebarIntent, TabPickerOverlay, TabPickerTree,
+    AgentSwitchOverlay, FolderSelectOverlay, InputAction, InputHandler, LayoutSwitchOverlay, Mode,
+    RenameTarget, SessionSwitchOverlay, SidebarIntent, TabPickerOverlay, TabPickerTree,
 };
 use crate::client::registry::{ConnId, ConnectionManager, Incoming, RemoteState};
 use crate::client::renderer::Renderer;
@@ -5158,39 +5158,27 @@ async fn run_client_loop(
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
                                 }
-                                if let Some(av) = active_view {
+                                let conn = mgr.foreground().clone();
+                                if active_view.is_some() {
                                     // A view cycles its own client-side layout
                                     // (`ViewLayoutNext`), which no server list
-                                    // describes.
-                                    log::debug!("layout switcher: not opened, a view is displayed");
-                                    input.mode = Mode::Normal;
-                                    paint_view(
-                                        &mut renderer,
-                                        &chrome,
-                                        &views[av],
-                                        &input,
-                                        &whichkey,
-                                        &theme,
-                                        &compositor_theme,
-                                        &view_border_style,
-                                        &which_key_position,
-                                        viewport_top,
-                                        focused_pane_rect.as_ref(),
-                                    )?;
-                                    renderer.flush()?;
-                                    mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                    // describes. The switcher still opens, to
+                                    // say so: a key that does nothing reads as
+                                    // a dropped keypress.
+                                    log::debug!("layout switcher: unavailable, a view is displayed");
+                                    input.layout_switch =
+                                        Some(LayoutSwitchOverlay::unavailable(conn, "in a view"));
                                 } else {
-                                    let conn = mgr.foreground().clone();
                                     let request = input.open_layout_switch(conn.clone());
                                     mgr.send(&conn, ClientMessage::ListLayouts { request }).await?;
-                                    if let Some(ref ls) = input.layout_switch {
-                                        let (c, r) = crossterm::terminal::size()?;
-                                        renderer.clear_overlay(c, r)?;
-                                        renderer.render_whichkey_overlay(&ls.render(c, r, &theme))?;
-                                        renderer.flush()?;
-                                    }
-                                    mgr.send_foreground(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
                                 }
+                                if let Some(ref ls) = input.layout_switch {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
+                                    renderer.render_whichkey_overlay(&ls.render(c, r, &theme))?;
+                                    renderer.flush()?;
+                                }
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
                             }
                             InputAction::LayoutSwitchUpdate => {
                                 if let Some(ref ls) = input.layout_switch {
@@ -7369,12 +7357,13 @@ async fn run_client_loop(
                         // the message vanishing into a catch-all.
                         log::debug!("srv: CliSpawned pane_id={pane_id} (unexpected here)");
                     }
-                    Some(ServerMessage::LayoutList { request, layouts, current }) => {
+                    Some(ServerMessage::LayoutList { request, layouts, current, popup_open }) => {
                         log::debug!(
-                            "srv: LayoutList src={src:?} request={request} layouts={layouts:?} current={current}"
+                            "srv: LayoutList src={src:?} request={request} layouts={layouts:?} \
+                             current={current} popup_open={popup_open}"
                         );
                         if let Some(ls) = input.layout_switch.as_mut() {
-                            if ls.apply_from(&src, request, layouts, current) {
+                            if ls.apply_from(&src, request, layouts, current, popup_open) {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 renderer.render_whichkey_overlay(&ls.render(c, r, &theme))?;
