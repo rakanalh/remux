@@ -12,23 +12,40 @@ bad_agent       an agent nobody configured is refused bad_agent.
 bad_reference   a 129-byte id, a path for claude, and a control char are each
                 refused bad_reference.
 not_in_pane     an outside caller that names no pane is refused not_in_pane.
-redaction       server.log carries the summary line with the id's byte count
-                and never the id.
+cli_attributed  `remux agent session claude --id` run as a pane's own program,
+                with a DIRECT argv so remux's parent is the server and not the
+                pane's shell, is attributed to that pane by the server and
+                Stored.
+cli_stdout      the CLI prints nothing on stdout for any outcome, exits 0, and
+                writes one stderr line for a refusal.
+cli_outside     with `$REMUX_PANE` unset and no --pane the CLI exits 0, prints
+                nothing and never connects.
+cli_filters     a subagent payload, a non-SessionStart payload, and
+                `CURSOR_VERSION` set each exit 0 without connecting, with
+                `$REMUX_PANE` set so that the filter is what stops them; the
+                plain SessionStart payload does connect.
+redaction       server.log and client.log carry the summary line with the id's
+                byte count and never the id.
 no_panic        server.log has no `panicked at`.
 
 Run: python3 tests/frame/agent_session.py   (RMX_RUNDIR overrides the run dir)
 """
 import os
+import re
 import socket
+import subprocess
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import Server, Client, name_of  # noqa: E402
+from harness import BIN, Server, Client, name_of  # noqa: E402
 
 RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-agentsess")
 UUID = "7f3c2a9e-51d4-4b8e-9a61-0c2f5d8e4b17"
 OTHER = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+CLI_ID = "c11a77e1-9d0b-4c3a-8e2f-6b5a4d3c2b1a"
+FIXTURES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "fixtures", "agent_session")
 
 failures = []
 
@@ -111,6 +128,97 @@ def code(reply):
     return None
 
 
+def read(path):
+    return open(path).read() if os.path.exists(path) else ""
+
+
+def connections(rig):
+    """How many connections the server has accepted, by the identity line it
+    writes for each one at accept."""
+    return len(set(re.findall(r"identity: client_id=(\d+) peer=", rig.srv.log())))
+
+
+def cli(rig, args, env_extra=None, drop=(), stdin=None):
+    env = {k: v for k, v in rig.srv.env.items() if k not in drop}
+    env.update(env_extra or {})
+    return subprocess.run([BIN, "agent", "session", *args], env=env, input=stdin,
+                          capture_output=True, timeout=20)
+
+
+def wait_log(rig, pattern, timeout=6.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        m = re.search(pattern, rig.srv.log())
+        if m:
+            return m
+        time.sleep(0.1)
+    return None
+
+
+def cli_attributed(rig):
+    before = rig.srv.log().count("AgentSession caller -> pane")
+    pane = rig.spawn([BIN, "agent", "session", "claude", "--id", CLI_ID, "--source", "startup"])
+    check(pane is not None, f"cli_attributed: the pane was spawned (got {pane})")
+    found = wait_log(rig, rf"agent session: pane %{pane} \"claude\" id 36 bytes "
+                          rf"source=\"startup\" -> Stored")
+    check(found is not None, f"cli_attributed: the report from inside %{pane} was Stored")
+    callers = re.findall(r"AgentSession caller -> pane %(\d+) by (\w+)", rig.srv.log())[before:]
+    check(callers == [(str(pane), "Sid")] or callers == [(str(pane), "Walk")],
+          f"cli_attributed: the server attributed the caller to %{pane} (got {callers})")
+
+
+def cli_stdout(rig):
+    pane = rig.spawn()
+    first = cli(rig, ["claude", "--id", CLI_ID, "--pane", f"%{pane}"], drop=("REMUX_PANE",))
+    again = cli(rig, ["claude", "--id", CLI_ID, "--pane", f"%{pane}"], drop=("REMUX_PANE",))
+    held = cli(rig, ["claude", "--id", OTHER, "--pane", f"%{pane}"], drop=("REMUX_PANE",))
+    for label, run in (("Stored", first), ("Unchanged", again), ("session_held", held)):
+        check(run.returncode == 0, f"cli_stdout: {label} exits 0 (got {run.returncode})")
+        check(run.stdout == b"", f"cli_stdout: {label} prints nothing on stdout (got {run.stdout!r})")
+    check(first.stderr == b"" and again.stderr == b"",
+          f"cli_stdout: a success writes no stderr (got {first.stderr!r}, {again.stderr!r})")
+    lines = held.stderr.decode(errors="replace").splitlines()
+    check(len(lines) == 1 and "session_held" in lines[0],
+          f"cli_stdout: a refusal writes one stderr line naming it (got {lines})")
+
+
+def cli_outside(rig):
+    before = connections(rig)
+    run = cli(rig, ["claude", "--id", CLI_ID], drop=("REMUX_PANE",))
+    time.sleep(0.3)
+    check(run.returncode == 0 and run.stdout == b"" and run.stderr == b"",
+          f"cli_outside: exit 0 and no output (got {run.returncode}, {run.stdout!r}, {run.stderr!r})")
+    check(connections(rig) == before, "cli_outside: no connection reached the server")
+
+
+def cli_filters(rig):
+    pane = rig.spawn()
+    in_pane = {"REMUX_PANE": f"%{pane}"}
+    for label, fixture, extra in (
+            ("a subagent payload", "claude_subagent.json", {}),
+            ("a UserPromptSubmit payload", "claude_prompt_submit.json", {}),
+            ("CURSOR_VERSION set", "claude_startup.json", {"CURSOR_VERSION": "1.2.3"})):
+        before = connections(rig)
+        payload = open(os.path.join(FIXTURES, fixture), "rb").read()
+        run = cli(rig, ["claude", "--hook"], env_extra={**in_pane, **extra},
+                  drop=("CURSOR_VERSION",), stdin=payload)
+        time.sleep(0.3)
+        check(run.returncode == 0 and run.stdout == b"" and run.stderr == b"",
+              f"cli_filters: {label} exits 0 silently "
+              f"(got {run.returncode}, {run.stdout!r}, {run.stderr!r})")
+        check(connections(rig) == before, f"cli_filters: {label} never connects")
+    before = connections(rig)
+    payload = open(os.path.join(FIXTURES, "claude_startup.json"), "rb").read()
+    run = cli(rig, ["claude", "--hook"], env_extra=in_pane, drop=("CURSOR_VERSION",), stdin=payload)
+    time.sleep(0.3)
+    check(connections(rig) == before + 1,
+          "cli_filters: the plain SessionStart payload does connect, so the filters are what "
+          "stopped the others")
+    check(run.returncode == 0 and run.stdout == b"" and b"not_in_pane" in run.stderr,
+          f"cli_filters: from outside every pane it is refused not_in_pane on stderr "
+          f"(got {run.returncode}, {run.stdout!r}, {run.stderr!r})")
+
+
 def main():
     rig = Rig(RUNDIR)
     try:
@@ -144,11 +252,22 @@ def main():
         r = report(rig, None, "claude", {"Id": UUID})
         check(code(r) == "not_in_pane", f"not_in_pane: an outside caller naming no pane (got {r})")
 
+        cli_attributed(rig)
+        cli_stdout(rig)
+        cli_outside(rig)
+        cli_filters(rig)
+
         log = rig.srv.log()
+        client_log = read(f"{rig.srv.rundir}/state/remux/client.log")
         check("AgentSession(agent=\"claude\", id, 36 bytes" in log,
               "redaction: server.log has the summary line with the byte count")
-        check(UUID not in log and OTHER not in log, "redaction: server.log never holds an id")
+        check("AgentSession(agent=\"claude\", id, 36 bytes" in client_log,
+              "redaction: client.log has the summary line with the byte count")
+        for name, text in (("server.log", log), ("client.log", client_log)):
+            check(all(v not in text for v in (UUID, OTHER, CLI_ID)),
+                  f"redaction: {name} never holds an id")
         check("panicked at" not in log, "no_panic: server.log has no panic")
+        check("panicked at" not in client_log, "no_panic: client.log has no panic")
     finally:
         rig.cli.close()
         rig.srv.kill()

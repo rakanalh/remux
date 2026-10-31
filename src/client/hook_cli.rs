@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use crate::client::cli_common::{ask, escape, pane_hint, CliError};
 use crate::client::msg_cli::{render_context, render_mark};
-use crate::protocol::{ClientMessage, Message, PaneId, ServerMessage};
+use crate::protocol::{AgentSessionRef, ClientMessage, Message, PaneId, ServerMessage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum HookEvent {
@@ -72,13 +72,20 @@ const PAYLOAD_WAIT: Duration = Duration::from_millis(1500);
 /// past this the mail waits for the user's next prompt.
 pub const MAX_CONTINUATIONS: u32 = 3;
 
-/// The two fields kept from Claude's payload. The rest is dropped by the parse
-/// and never held, logged or quoted.
+/// The fields kept from an agent's hook payload. The rest is dropped by the
+/// parse and never held, logged or quoted.
 #[derive(Debug, serde::Deserialize)]
 struct Payload {
     hook_event_name: String,
     #[serde(default)]
     stop_hook_active: bool,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    /// Set when the session is a subagent's, which shares its parent's pane.
+    #[serde(default)]
+    agent_id: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -481,6 +488,100 @@ fn render(messages: &[Message]) -> Option<String> {
     Some(render_context(messages, &render_mark()?))
 }
 
+/// What `remux agent session` reports: the agent's hook payload, or a
+/// reference a plugin passed on the command line.
+pub enum SessionInput {
+    Hook,
+    Id(String),
+    Path(String),
+}
+
+/// Why a hook payload is not this pane's agent's own session start, so that
+/// nothing is reported. `cursor` is whether `CURSOR_VERSION` is set: Cursor
+/// runs Claude's hooks for its own agent.
+fn not_reported(agent: &str, payload: &Payload, cursor: bool) -> Option<&'static str> {
+    if payload.hook_event_name != "SessionStart" {
+        return Some("not a SessionStart payload");
+    }
+    if agent == "claude" && payload.agent_id.is_some() {
+        return Some("a subagent's session");
+    }
+    if agent == "claude" && cursor {
+        return Some("Cursor, not Claude Code");
+    }
+    None
+}
+
+/// `remux agent session`. Outside every pane there is nothing to report, so
+/// it returns without reading the payload or connecting: Claude runs its
+/// hooks in every terminal, not only in remux.
+pub async fn run_session(
+    agent: String,
+    input: SessionInput,
+    source: Option<String>,
+    pane: Option<PaneId>,
+) {
+    if pane.is_none() && std::env::var_os("REMUX_PANE").is_none() {
+        return;
+    }
+    match report_session(agent, input, source, pane).await {
+        Ok(()) => {}
+        Err(Some(why)) => eprintln!("remux: agent session: {}", escape(&why)),
+        Err(None) => {}
+    }
+}
+
+/// `Err(None)` is a payload that is not this agent's session start, which is
+/// no failure and prints nothing.
+async fn report_session(
+    agent: String,
+    input: SessionInput,
+    source: Option<String>,
+    pane: Option<PaneId>,
+) -> Result<(), Option<String>> {
+    let (reference, source) = match input {
+        SessionInput::Id(id) => (AgentSessionRef::Id(id), source),
+        SessionInput::Path(path) => (AgentSessionRef::Path(path), source),
+        SessionInput::Hook => {
+            let payload = read_payload().map_err(|e| Some(e.to_string()))?;
+            let cursor = std::env::var_os("CURSOR_VERSION").is_some();
+            if let Some(why) = not_reported(&agent, &payload, cursor) {
+                log::debug!("cmd: agent session {}: not reported, {why}", escape(&agent));
+                return Err(None);
+            }
+            let id = payload
+                .session_id
+                .ok_or_else(|| Some("the payload has no session_id".to_string()))?;
+            (AgentSessionRef::Id(id), payload.source.or(source))
+        }
+    };
+    let answer = ask(
+        ClientMessage::AgentSession {
+            agent,
+            reference,
+            source,
+            pane,
+            pane_hint: pane_hint(),
+        },
+        HOOK_REPLY_DEADLINE,
+    )
+    .await
+    .map_err(|e| {
+        let line = e.stderr();
+        Some(
+            line.strip_prefix("remux: ")
+                .map_or(line.clone(), str::to_string),
+        )
+    })?;
+    match answer {
+        ServerMessage::AgentSessionStored { pane, outcome } => {
+            log::debug!("cmd: agent session answered %{pane} {outcome:?}");
+            Ok(())
+        }
+        other => Err(Some(format!("unexpected {} answer", other.variant_name()))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn the_payload_keeps_two_fields_and_drops_the_rest() {
+    fn the_payload_keeps_its_fields_and_drops_the_rest() {
         let raw = br#"{"session_id":"s","transcript_path":"/x","hook_event_name":"Stop",
             "stop_hook_active":true,"last_assistant_message":"a secret"}"#;
         let payload = parse_payload(raw).unwrap();
@@ -710,5 +811,35 @@ mod tests {
             worst + Duration::from_secs(1) <= HOOK_TIMEOUT,
             "{worst:?} leaves under a second of {HOOK_TIMEOUT:?}"
         );
+    }
+
+    fn fixture(name: &str) -> Payload {
+        let raw = match name {
+            "startup" => include_str!("../../tests/fixtures/agent_session/claude_startup.json"),
+            "subagent" => include_str!("../../tests/fixtures/agent_session/claude_subagent.json"),
+            "prompt" => {
+                include_str!("../../tests/fixtures/agent_session/claude_prompt_submit.json")
+            }
+            _ => unreachable!(),
+        };
+        parse_payload(raw.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn a_claude_session_start_is_reported_with_its_id_and_source() {
+        let payload = fixture("startup");
+        assert_eq!(not_reported("claude", &payload, false), None);
+        assert_eq!(
+            payload.session_id.as_deref(),
+            Some("7f3c2a9e-51d4-4b8e-9a61-0c2f5d8e4b17")
+        );
+        assert_eq!(payload.source.as_deref(), Some("startup"));
+    }
+
+    #[test]
+    fn a_subagent_another_event_and_cursor_are_not_reported() {
+        assert!(not_reported("claude", &fixture("subagent"), false).is_some());
+        assert!(not_reported("claude", &fixture("prompt"), false).is_some());
+        assert!(not_reported("claude", &fixture("startup"), true).is_some());
     }
 }

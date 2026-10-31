@@ -12,6 +12,7 @@ use crate::client::cli_common::{
     ask, escape, forward_deadline, json_line, pane_hint, parse_pane, parse_wait, run_verb,
     unexpected, CliError, REPLY_DEADLINE,
 };
+use crate::client::hook_cli::{run_session, SessionInput};
 use crate::protocol::{
     valid_name, Address, AgentState, ClientMessage, PaneId, PaneStatusEntry, ServerMessage,
 };
@@ -70,6 +71,33 @@ pub enum AgentCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Report the session this pane's agent is running, so that a restore
+    /// resumes it. Run by an agent's hook or plugin, never by hand: a report
+    /// typed at the prompt is refused. Always exits 0 and prints nothing on
+    /// stdout; outside a pane it does nothing at all.
+    #[command(group(
+        clap::ArgGroup::new("reference").required(true).args(["hook", "id", "path"])
+    ))]
+    Session {
+        /// claude, codex, opencode, pi or omp
+        agent: String,
+        /// Read the agent's hook payload from standard input
+        #[arg(long)]
+        hook: bool,
+        /// The session's id
+        #[arg(long)]
+        id: Option<String>,
+        /// The session file's absolute path
+        #[arg(long)]
+        path: Option<String>,
+        /// How the session started: startup, resume, clear, compact, fork,
+        /// new or select. Read from the payload with --hook
+        #[arg(long)]
+        source: Option<String>,
+        /// Another pane, `%N`: only from outside every pane
+        #[arg(long, value_parser = parse_pane)]
+        pane: Option<PaneId>,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -93,6 +121,12 @@ impl From<StateArg> for AgentState {
 
 /// Run one `remux agent` verb, and the exit code for it.
 pub async fn run_agent(cmd: AgentCmd) -> u8 {
+    // An agent's hook runs this, and a hook must never fail its agent, so no
+    // outcome maps to a non-zero exit.
+    if matches!(cmd, AgentCmd::Session { .. }) {
+        let _ = run(cmd).await;
+        return 0;
+    }
     let json = matches!(
         cmd,
         AgentCmd::Ls { json: true }
@@ -137,6 +171,22 @@ async fn run(cmd: AgentCmd) -> Result<(), CliError> {
                 }
                 other => Err(unexpected(&other)),
             }
+        }
+        AgentCmd::Session {
+            agent,
+            hook: _,
+            id,
+            path,
+            source,
+            pane,
+        } => {
+            let input = match (id, path) {
+                (Some(id), _) => SessionInput::Id(id),
+                (None, Some(path)) => SessionInput::Path(path),
+                (None, None) => SessionInput::Hook,
+            };
+            run_session(agent, input, source, pane).await;
+            Ok(())
         }
         AgentCmd::Ls { json } => status(None, json).await,
         AgentCmd::Status { target, json } => {
