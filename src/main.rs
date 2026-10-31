@@ -19,8 +19,8 @@ use futures::StreamExt;
 
 use crate::client::editor::copy_to_clipboard;
 use crate::client::input::{
-    AgentSwitchOverlay, FolderSelectOverlay, InputAction, InputHandler, LayoutSwitchOverlay, Mode,
-    RenameTarget, SessionSwitchOverlay, SidebarIntent, TabPickerOverlay, TabPickerTree,
+    AgentSwitchOverlay, FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget,
+    SessionSwitchOverlay, SidebarIntent, TabPickerOverlay, TabPickerTree,
 };
 use crate::client::registry::{ConnId, ConnectionManager, Incoming, RemoteState};
 use crate::client::renderer::Renderer;
@@ -5181,13 +5181,14 @@ async fn run_client_loop(
                                     mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                 } else {
                                     let conn = mgr.foreground().clone();
-                                    mgr.send(&conn, ClientMessage::ListLayouts).await?;
-                                    let switcher = LayoutSwitchOverlay::new(conn);
-                                    let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
-                                    renderer.render_whichkey_overlay(&switcher.render(c, r, &theme))?;
-                                    renderer.flush()?;
-                                    input.layout_switch = Some(switcher);
+                                    let request = input.open_layout_switch(conn.clone());
+                                    mgr.send(&conn, ClientMessage::ListLayouts { request }).await?;
+                                    if let Some(ref ls) = input.layout_switch {
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        renderer.clear_overlay(c, r)?;
+                                        renderer.render_whichkey_overlay(&ls.render(c, r, &theme))?;
+                                        renderer.flush()?;
+                                    }
                                     mgr.send_foreground(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
                                 }
                             }
@@ -7368,12 +7369,12 @@ async fn run_client_loop(
                         // the message vanishing into a catch-all.
                         log::debug!("srv: CliSpawned pane_id={pane_id} (unexpected here)");
                     }
-                    Some(ServerMessage::LayoutList { layouts, current }) => {
+                    Some(ServerMessage::LayoutList { request, layouts, current }) => {
                         log::debug!(
-                            "srv: LayoutList src={src:?} layouts={layouts:?} current={current}"
+                            "srv: LayoutList src={src:?} request={request} layouts={layouts:?} current={current}"
                         );
                         if let Some(ls) = input.layout_switch.as_mut() {
-                            if ls.apply_from(&src, layouts, current) {
+                            if ls.apply_from(&src, request, layouts, current) {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 renderer.render_whichkey_overlay(&ls.render(c, r, &theme))?;

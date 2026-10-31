@@ -349,7 +349,14 @@ pub enum ClientMessage {
     /// The server answers because `[layouts]` is SERVER config: a client-side
     /// list would offer a layout the server refuses, and on a remote it would
     /// describe the wrong machine's config.
-    ListLayouts,
+    ///
+    /// `request` is echoed in the reply. A switcher closed and reopened before
+    /// the first reply arrives has two requests in flight, and only the id
+    /// tells it which reply belongs to the open it is showing.
+    ListLayouts {
+        #[serde(default)]
+        request: u64,
+    },
     /// How this client wants panes named: its `[appearance] pane_title`
     /// template, and the name it knows this server by.
     ///
@@ -830,7 +837,11 @@ pub enum ServerMessage {
     /// `layouts` holds the automatic layouts `[layouts]` enables, then
     /// `"custom"` when the tab is Custom or has a restorable Custom layout.
     /// Both are empty when the requester has no session or no active tab.
+    ///
+    /// `request` is the id the [`ClientMessage::ListLayouts`] carried.
     LayoutList {
+        #[serde(default)]
+        request: u64,
         layouts: Vec<String>,
         current: String,
     },

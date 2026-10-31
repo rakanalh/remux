@@ -1984,7 +1984,7 @@ async fn handle_client_message(
             }
             Ok(())
         }
-        ClientMessage::ListLayouts => {
+        ClientMessage::ListLayouts { request } => {
             // `clients` is released before `state` is taken, for the lock-order
             // reason given in `RequestScrollbackInfo` below.
             let session_name = {
@@ -2009,9 +2009,11 @@ async fn handle_client_message(
             };
             let cls = clients.lock().await;
             if let Some(client) = cls.get(&client_id) {
-                let _ = client
-                    .tx
-                    .send(ServerMessage::LayoutList { layouts, current });
+                let _ = client.tx.send(ServerMessage::LayoutList {
+                    request,
+                    layouts,
+                    current,
+                });
             }
             Ok(())
         }

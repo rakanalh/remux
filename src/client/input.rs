@@ -625,6 +625,8 @@ pub struct InputHandler {
     pub tab_picker: Option<TabPickerOverlay>,
     /// The layout switcher, while it is open.
     pub layout_switch: Option<LayoutSwitchOverlay>,
+    /// The id of the last `ListLayouts` sent. See [`LayoutSwitchOverlay`].
+    layout_request: u64,
     /// Whether we are waiting for scrollback content to open in an editor.
     pub pending_editor_open: bool,
 }
@@ -1531,6 +1533,9 @@ impl TabPickerOverlay {
 #[derive(Debug)]
 pub struct LayoutSwitchOverlay {
     conn: ConnId,
+    /// The id of the `ListLayouts` this open sent. A reply carrying any other
+    /// id answers an earlier open of the switcher.
+    request: u64,
     /// `None` until the server answers.
     layouts: Option<Vec<String>>,
     current: String,
@@ -1538,9 +1543,10 @@ pub struct LayoutSwitchOverlay {
 }
 
 impl LayoutSwitchOverlay {
-    pub fn new(conn: ConnId) -> Self {
+    pub fn new(conn: ConnId, request: u64) -> Self {
         Self {
             conn,
+            request,
             layouts: None,
             current: String::new(),
             nav: crate::client::sidebar::nav::NavList::new(),
@@ -1551,10 +1557,17 @@ impl LayoutSwitchOverlay {
         &self.conn
     }
 
-    /// Take the server's list if `src` is the pinned connection, and start the
-    /// highlight on the current layout. Returns whether the list was taken.
-    pub fn apply_from(&mut self, src: &ConnId, layouts: Vec<String>, current: String) -> bool {
-        if *src != self.conn {
+    /// Take the server's list if it answers this open's request on the pinned
+    /// connection, and start the highlight on the current layout. Returns
+    /// whether the list was taken.
+    pub fn apply_from(
+        &mut self,
+        src: &ConnId,
+        request: u64,
+        layouts: Vec<String>,
+        current: String,
+    ) -> bool {
+        if *src != self.conn || request != self.request {
             return false;
         }
         let start = layouts.iter().position(|l| *l == current).unwrap_or(0);
@@ -1814,8 +1827,17 @@ impl InputHandler {
             view_picker: None,
             tab_picker: None,
             layout_switch: None,
+            layout_request: 0,
             pending_editor_open: false,
         }
+    }
+
+    /// Open the layout switcher pinned to `conn`, and return the id the
+    /// `ListLayouts` sent for it must carry.
+    pub fn open_layout_switch(&mut self, conn: ConnId) -> u64 {
+        self.layout_request += 1;
+        self.layout_switch = Some(LayoutSwitchOverlay::new(conn, self.layout_request));
+        self.layout_request
     }
 
     /// Create a new `InputHandler` with defaults (Ctrl-a as leader, default
@@ -6506,11 +6528,19 @@ mod tests {
     fn layout_switch_handler() -> InputHandler {
         let mut handler = InputHandler::with_defaults();
         handler.mode = Mode::Command;
-        let mut overlay = LayoutSwitchOverlay::new(ConnId::Local);
-        let names = ["bsp", "master", "monocle"].map(String::from).to_vec();
-        assert!(overlay.apply_from(&ConnId::Local, names, "master".to_string()));
-        handler.layout_switch = Some(overlay);
+        let request = handler.open_layout_switch(ConnId::Local);
+        let overlay = handler.layout_switch.as_mut().expect("opened");
+        assert!(overlay.apply_from(
+            &ConnId::Local,
+            request,
+            layout_names(),
+            "master".to_string()
+        ));
         handler
+    }
+
+    fn layout_names() -> Vec<String> {
+        ["bsp", "master", "monocle"].map(String::from).to_vec()
     }
 
     #[test]
@@ -6533,9 +6563,10 @@ mod tests {
 
     #[test]
     fn the_layout_switcher_ignores_another_connections_list() {
-        let mut overlay = LayoutSwitchOverlay::new(ConnId::Local);
+        let mut overlay = LayoutSwitchOverlay::new(ConnId::Local, 1);
         assert!(!overlay.apply_from(
             &ConnId::Remote("mini".to_string()),
+            1,
             vec!["grid".to_string()],
             "grid".to_string()
         ));
@@ -6546,12 +6577,51 @@ mod tests {
     fn enter_before_the_list_arrives_closes_the_layout_switcher() {
         let mut handler = InputHandler::with_defaults();
         handler.mode = Mode::Command;
-        handler.layout_switch = Some(LayoutSwitchOverlay::new(ConnId::Local));
+        handler.open_layout_switch(ConnId::Local);
         assert_eq!(
             handler.handle_key(make_key(KeyCode::Enter, KeyModifiers::NONE)),
             InputAction::LayoutSwitchClose
         );
         assert!(handler.layout_switch.is_none());
+    }
+
+    /// Alt-g, Esc, Alt-g sends two `ListLayouts` before either reply arrives.
+    /// The first reply answers the closed open: taking it would reset the
+    /// highlight, so Enter would apply a layout the user did not pick.
+    #[test]
+    fn the_layout_switcher_takes_only_the_reply_to_its_own_open() {
+        let mut handler = InputHandler::with_defaults();
+        let alt_g = make_key(KeyCode::Char('g'), KeyModifiers::ALT);
+        assert_eq!(handler.handle_key(alt_g), InputAction::LayoutSwitchOpen);
+        let first = handler.open_layout_switch(ConnId::Local);
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Esc, KeyModifiers::NONE)),
+            InputAction::LayoutSwitchClose
+        );
+        assert_eq!(handler.handle_key(alt_g), InputAction::LayoutSwitchOpen);
+        let second = handler.open_layout_switch(ConnId::Local);
+        assert_ne!(first, second);
+
+        let reply = |handler: &mut InputHandler, request: u64| {
+            handler.layout_switch.as_mut().expect("open").apply_from(
+                &ConnId::Local,
+                request,
+                layout_names(),
+                "bsp".to_string(),
+            )
+        };
+        assert!(!reply(&mut handler, first), "the first reply is stale");
+        assert_eq!(handler.layout_switch.as_ref().expect("open").choice(), None);
+        assert!(reply(&mut handler, second));
+        handler.handle_key(make_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(!reply(&mut handler, first), "a late stale reply");
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::LayoutSwitchConfirm {
+                conn: ConnId::Local,
+                name: "master".to_string()
+            }
+        );
     }
 
     #[test]
