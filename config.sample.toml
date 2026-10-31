@@ -133,7 +133,8 @@
 # -----------------------------------------------------------------------------
 # Which automatic layouts `LayoutNext` (Alt+Space / Ctrl-a Space) cycles
 # through, for tabs and Views alike, and which ones the layout switcher
-# (`LayoutQuickSwitch`, Alt-g / Ctrl-a L) offers. The order is fixed:
+# (`LayoutQuickSwitch`, Alt-g / Ctrl-a L) offers for a tab. The switcher
+# serves tabs only: in a View it offers nothing. The order is fixed:
 # bsp -> master -> monocle -> grid -> columns -> rows. A missing key means
 # enabled. Custom is manual and always reachable by splitting.
 #
@@ -663,7 +664,7 @@
 #                                     master, monocle, grid, columns, rows, custom);
 #                                     refused when [layouts] disables it
 #   LayoutQuickSwitch               — Open the layout switcher (the layouts LayoutNext
-#                                     visits; Enter applies one)
+#                                     visits; Enter or l applies one; tabs only)
 #   SetMaster                       — Set the focused pane as the master pane
 #
 # Remote commands:

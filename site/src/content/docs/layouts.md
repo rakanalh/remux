@@ -15,7 +15,9 @@ Every tab has a layout mode that decides where its panes go. Six are **automatic
 
 The cycle runs **Bsp → Master → Monocle → Grid → Columns → Rows** and back to Bsp. If the tab was in Custom when you started cycling, Remux remembers that arrangement: after the last automatic layout the cycle returns to it instead of wrapping to Bsp. That only happens while the tab still has exactly the panes the arrangement was made for; open or close a pane in between and the cycle stays automatic.
 
-The layout switcher lists the same layouts the cycle visits, in cycle order, with the current one marked: the enabled automatic layouts, then Custom when the tab is in it or has a remembered arrangement. `j`/`k` move, `Enter` applies, `Esc` closes. The list comes from the server, so a layout turned off under `[layouts]` is never offered.
+The layout switcher lists the same layouts the cycle visits, in cycle order, with the current one marked: the enabled automatic layouts, then Custom when the tab is in it or has a remembered arrangement. `j`/`k` move, `Enter` or `l` applies, `Esc` closes. The list comes from the server, so a layout turned off under `[layouts]` is never offered.
+
+The switcher works on tabs only. In a View, which cycles its own layout with `Alt-Space`, it opens with nothing to pick and says so; it does the same while the popup terminal is open, because the server does not change the layout under the popup. `Enter` then just closes it.
 
 Cycling or switching a layout releases a zoomed pane.
 
@@ -83,7 +85,7 @@ The moment you arrange panes by hand, the tab switches to Custom and Remux stops
 default_layout = "grid"   # bsp (default) | master | monocle | grid | columns | rows | custom
 ```
 
-The `[layouts]` section turns automatic layouts on and off. Every layout is enabled by default; setting one to `false` drops it from the cycle for tabs and Views alike, without changing the order of the rest.
+The `[layouts]` section turns automatic layouts on and off. Every layout is enabled by default; setting one to `false` drops it from the cycle for tabs and Views alike, and from the layout switcher for tabs, without changing the order of the rest.
 
 ```toml
 [layouts]
