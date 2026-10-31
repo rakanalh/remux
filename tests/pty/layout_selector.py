@@ -24,6 +24,11 @@ What it covers:
      a marker its own shell printed (`printf 'P%s' B` typed, `PB` searched),
      so the typed command cannot fake it
   7  the client is alive and neither log has a panic
+  8  with the popup terminal open (`Alt-p`) the server offers no layouts, the
+     switcher says why, and Enter closes it without changing the layout; once
+     the popup is closed the list comes back
+  9  in a View the switcher says it is unavailable there instead of doing
+     nothing, Enter closes it, and the client stays alive
 
 Run from the repo root:
     python3 tests/pty/layout_selector.py [-v]
@@ -32,12 +37,13 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import PROTOCOL_VERSION, Tui  # noqa: E402
+from pty_harness import PROTOCOL_VERSION, Tui, sm_compose_view  # noqa: E402
 
 RUN = "/tmp/rmx-lsel"
 VERBOSE = "-v" in sys.argv
 
 OPEN = b"\x1bg"
+POPUP_TOGGLE = b"\x1bp"
 
 
 def encodings(letter):
@@ -259,6 +265,78 @@ def move_section():
     check_logs(t, "moves")
 
 
+def popup_section():
+    t = Tui(RUN, config=CONFIG).start()
+    try:
+        before = status_layout(t)
+        t.send(POPUP_TOGGLE, 1.2)
+        t.send(OPEN, 1.0)
+        items = popup_rows(t)
+        if VERBOSE:
+            t.dump("switcher over the popup")
+        check("popup open: the switcher says why it offers nothing",
+              items == ["  no layouts: popup open"],
+              items if items is not None else "\n".join(t.rows_text()))
+        # `j` first, so a list that did arrive would move the highlight off the
+        # current layout and Enter would name a different one.
+        t.send(b"j", 0.2)
+        t.send(b"\r", 1.0)
+        check("popup open: Enter closes the switcher", popup_rows(t) is None,
+              "\n".join(t.rows_text()))
+        check("popup open: the layout is unchanged", status_layout(t) == before,
+              t.rows_text()[-1])
+
+        t.send(POPUP_TOGGLE, 1.2)
+        t.send(OPEN, 1.0)
+        items = popup_rows(t) or []
+        check("popup closed: the list comes back",
+              [i[2:] for i in items] == EXPECTED, items)
+        t.send(b"\x1b", 0.6)
+        check("client is alive after the popup checks", t.alive())
+    finally:
+        t.kill()
+    check_logs(t, "popup")
+
+
+def view_section():
+    t = Tui(RUN, config=CONFIG).start()
+    try:
+        t.send(b"printf 'P%s\\n' A\r", 0.5)
+        t.prefix(b"pv", 0.8)
+        t.send(b"printf 'P%s\\n' B\r", 0.5)
+        # A background tab, so the composed cells are not session-visible.
+        t.send(b"\x1bt", 0.8)
+        sm_compose_view(t, panes=(0, 1), settle=1.2)
+        in_view = t.has("View 1")
+        check("a view is displayed", in_view, "\n".join(t.rows_text()))
+        if not in_view:
+            return
+        screen = "\n".join(t.rows_text())
+        check("view: the cells show both panes", "PA" in screen and "PB" in screen, screen)
+        before = t.rows_text()[-1]
+        t.send(OPEN, 1.0)
+        items = popup_rows(t)
+        if VERBOSE:
+            t.dump("switcher in a view")
+        check("view: the switcher says it is unavailable",
+              items == ["  no layouts: in a view"],
+              items if items is not None else "\n".join(t.rows_text()))
+        t.send(b"\r", 1.0)
+        check("view: Enter closes the switcher", popup_rows(t) is None,
+              "\n".join(t.rows_text()))
+        check("view: still in the view, status bar unchanged",
+              t.rows_text()[-1] == before, f"{before!r} -> {t.rows_text()[-1]!r}")
+        # The cells alias the first tab's panes while the session shows the
+        # second, so the markers are on screen only if the View was repainted.
+        screen = "\n".join(t.rows_text())
+        check("view: the cells are repainted after the switcher closes",
+              "PA" in screen and "PB" in screen, screen)
+        check("client is alive after the view checks", t.alive())
+    finally:
+        t.kill()
+    check_logs(t, "view")
+
+
 def check_logs(t, label):
     for which in ("client", "server"):
         body = t.log(which)
@@ -271,6 +349,8 @@ def main():
     print(f"layout_selector (protocol {PROTOCOL_VERSION})")
     switcher_section()
     move_section()
+    popup_section()
+    view_section()
 
     if FAILURES:
         print(f"\nFAILED: {len(FAILURES)}")
