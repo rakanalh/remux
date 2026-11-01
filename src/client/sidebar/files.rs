@@ -50,11 +50,12 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
-use super::nav::{self, NavKey, NavList, HEADER_ROWS};
+use super::nav::{self, NavKey, NavList};
 use super::{
-    blank_grid, draw_text, shorten_path, tilde_path, PluginAction, PluginEvent, PluginRequest,
-    SidebarPlugin,
+    blank_grid, draw_text, draw_text_with, shorten_path, tilde_path, PluginAction, PluginEvent,
+    PluginRequest, SidebarPlugin,
 };
+use crate::client::context_menu::{MenuAction, MenuItem};
 use crate::client::registry::ConnId;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, DirEntry, RenderCell};
@@ -187,7 +188,11 @@ impl FilesPlugin {
             pending: None,
             pending_select: None,
             last_request: None,
-            nav: NavList::new(),
+            nav: {
+                let mut nav = NavList::new();
+                nav.set_layout(nav::ListLayout::new(1));
+                nav
+            },
             requests: Vec::new(),
         }
     }
@@ -391,7 +396,7 @@ impl SidebarPlugin for FilesPlugin {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        (8, 3)
+        (8, self.nav.layout().header_rows as u16 + 2)
     }
 
     /// Yes -- indirectly. This panel never reads a `SessionTree`, but
@@ -418,10 +423,18 @@ impl SidebarPlugin for FilesPlugin {
             // Substituted BEFORE truncating: `~` is worth ten or more columns
             // here, and they go to the end of the path -- the part that says
             // which directory this is.
-            Some(cwd) => shorten_path(&tilde_path(cwd, self.home.as_deref()), cols as usize),
+            Some(cwd) => shorten_path(
+                &tilde_path(cwd, self.home.as_deref()),
+                cols.saturating_sub(self.nav.layout().pad()) as usize,
+            ),
             None => self.title().to_string(),
         };
-        nav::draw_header(&mut grid, &header, focused, theme, &bg);
+        let layout = self.nav.layout();
+        let header_rows = layout.header_rows;
+        let pad = layout.pad();
+        // The path is the header here, so it is not lowercased the way a fixed
+        // panel name is.
+        nav::draw_header_bar(&mut grid, pad, &header, focused, theme);
 
         // The same budget rule the agents panel arrived at: at most half the
         // rows when there is a list to crowd out, all of them when there is not.
@@ -440,7 +453,7 @@ impl SidebarPlugin for FilesPlugin {
         // The agents panel does not have this bug despite the shared rule: its
         // note appears only when it has no rows, so the halving never binds
         // there. That is why this floor lives here and not in `nav`.
-        let capacity = (rows as usize).saturating_sub(HEADER_ROWS);
+        let capacity = (rows as usize).saturating_sub(header_rows);
         let all_notes = self.notes();
         let budget = if self.rows.is_empty() {
             capacity
@@ -462,8 +475,8 @@ impl SidebarPlugin for FilesPlugin {
             };
             draw_text(
                 &mut grid,
-                0,
-                HEADER_ROWS as u16,
+                pad,
+                header_rows as u16,
                 msg,
                 theme.status_bar_fg.clone(),
                 bg,
@@ -478,28 +491,28 @@ impl SidebarPlugin for FilesPlugin {
         // and `nav`'s hit test records the smaller painted window.
         let note_rows = notes.len();
         let list_height = rows.saturating_sub(note_rows as u16);
-        let list_capacity = (list_height as usize).saturating_sub(HEADER_ROWS);
+        let list_capacity = layout.visible(list_height);
 
         let top = self.nav.top_for(list_height, self.rows.len());
         for i in 0..list_capacity {
             let Some(entry) = self.rows.get(top + i) else {
                 break;
             };
-            let y = (HEADER_ROWS + i) as u16;
+            let y = layout.row_of(i);
             let selected = top + i == self.nav.selected();
-            let (fg, row_bg) = nav::row_colors(theme, focused, selected, &bg);
+            let (fg, row_bg, bold) = nav::row_colors(theme, focused, selected, &bg);
             if selected {
                 nav::fill_row(&mut grid, y, cols, &fg, &row_bg);
             }
-            draw_text(&mut grid, 0, y, &Self::label(entry), fg, row_bg);
+            draw_text_with(&mut grid, pad, y, &Self::label(entry), fg, row_bg, bold);
         }
 
         let painted = self.rows.len().saturating_sub(top).min(list_capacity);
         for (n, note) in notes.iter().enumerate() {
-            let y = (HEADER_ROWS + painted + n) as u16;
+            let y = (header_rows + painted + n) as u16;
             draw_text(
                 &mut grid,
-                0,
+                pad,
                 y,
                 note,
                 theme.status_bar_fg.clone(),
@@ -561,6 +574,39 @@ impl SidebarPlugin for FilesPlugin {
             nav::HitOutcome::Moved => PluginAction::Redraw,
             nav::HitOutcome::Activate => self.activate(),
         }
+    }
+
+    fn context_menu(&mut self, _x: u16, y: u16) -> Vec<MenuItem> {
+        let Some(entry) = self
+            .nav
+            .pick(y, self.rows.len())
+            .and_then(|i| self.rows.get(i))
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let Some(path) = self.child_path(&entry.name) else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        if !entry.is_dir {
+            if let Some(conn) = self.conn.clone() {
+                items.push(
+                    MenuItem::new(
+                        "Open in split",
+                        MenuAction::Request(PluginRequest::OpenInSplit {
+                            conn,
+                            path: path.clone(),
+                            command: self.editor.clone(),
+                            vertical: true,
+                        }),
+                    )
+                    .hint(Some("Enter".into())),
+                );
+            }
+        }
+        items.push(MenuItem::new("Copy path", MenuAction::CopyText(path)));
+        items
     }
 
     fn on_event(&mut self, ev: &PluginEvent) {
@@ -733,19 +779,27 @@ mod tests {
         }
     }
 
-    /// The panel's visible rows, from a real render.
+    /// The panel as a list of lines: the header at index 0 and the list rows
+    /// from index 1, each without its padding column.
+    ///
+    /// A real render of a panel one row taller than `rows`, because the header
+    /// is followed by a blank row that these tests do not index. That row is
+    /// dropped, so `rows` is still the number of lines the caller sees.
     fn painted(p: &FilesPlugin, cols: u16, rows: u16) -> Vec<String> {
         let theme = CompositorTheme::default();
-        p.render(cols, rows, true, &theme)
+        let mut lines: Vec<String> = p
+            .render(cols, rows + 1, true, &theme)
             .iter()
             .map(|row| {
-                row.iter()
-                    .map(|c| c.c)
-                    .collect::<String>()
+                let text: String = row.iter().map(|c| c.c).collect();
+                text.strip_prefix(' ')
+                    .unwrap_or(&text)
                     .trim_end()
                     .to_string()
             })
-            .collect()
+            .collect();
+        lines.remove(1);
+        lines
     }
 
     /// Drive a panel to a listed directory, returning it ready to navigate.
@@ -1347,13 +1401,44 @@ mod tests {
         });
         let _ = painted(&p, 24, 4);
         let down = MouseEventKind::Down(MouseButton::Left);
-        // Rows are painted at y=1..2; the notice is at y=3.
-        assert_eq!(p.on_mouse(0, 2, down), PluginAction::Redraw);
+        // The two-row header leaves rows at y=2..3; the notice is at y=4.
+        assert_eq!(p.on_mouse(0, 3, down), PluginAction::Redraw);
         assert_eq!(
-            p.on_mouse(0, 3, down),
+            p.on_mouse(0, 4, down),
             PluginAction::None,
             "the notice is not a row, however many rows exist below the fold"
         );
+    }
+
+    #[test]
+    fn a_file_row_offers_open_in_split_and_copy_path() {
+        let mut p = at("/w", vec![entry("a", false), entry("b", false)]);
+        let _ = painted(&p, 24, 5);
+        let items = p.context_menu(0, 3);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Open in split", "Copy path"]);
+        assert_eq!(
+            items[0].action,
+            MenuAction::Request(PluginRequest::OpenInSplit {
+                conn: ConnId::Local,
+                path: "/w/b".to_string(),
+                command: None,
+                vertical: true,
+            })
+        );
+        assert_eq!(items[1].action, MenuAction::CopyText("/w/b".to_string()));
+        assert_eq!(p.nav.selected(), 1);
+        assert!(p.take_requests().is_empty(), "choosing is the menu's job");
+    }
+
+    #[test]
+    fn a_directory_row_offers_only_copy_path() {
+        let mut p = at("/w", vec![entry("sub", true)]);
+        let _ = painted(&p, 24, 5);
+        let items = p.context_menu(0, 2);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Copy path"]);
+        assert_eq!(items[0].action, MenuAction::CopyText("/w/sub".to_string()));
     }
 
     #[test]
@@ -1361,8 +1446,8 @@ mod tests {
         let mut p = at("/w", vec![entry("a", false), entry("b", false)]);
         let _ = painted(&p, 24, 5);
         let down = MouseEventKind::Down(MouseButton::Left);
-        assert_eq!(p.on_mouse(0, 2, down), PluginAction::Redraw);
-        assert_eq!(p.on_mouse(0, 2, down), PluginAction::Leave);
+        assert_eq!(p.on_mouse(0, 3, down), PluginAction::Redraw);
+        assert_eq!(p.on_mouse(0, 3, down), PluginAction::Leave);
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::OpenInSplit {
@@ -1373,6 +1458,7 @@ mod tests {
             }]
         );
         assert_eq!(p.on_mouse(0, 0, down), PluginAction::None, "not the header");
+        assert_eq!(p.on_mouse(0, 1, down), PluginAction::None, "not the gap");
     }
 
     // -- Ruling 5: following the focused pane, and knowing when to stop -------
@@ -1579,6 +1665,30 @@ mod tests {
     #[test]
     fn the_header_keeps_the_end_of_a_path_too_long_to_fit() {
         let p = at("/home/me/a/very/deep/place", vec![entry("f", false)]);
-        assert_eq!(painted(&p, 8, 3)[0], "…p/place");
+        assert_eq!(painted(&p, 8, 3)[0], "…/place");
+    }
+
+    #[test]
+    fn the_header_takes_the_active_colour_only_while_the_panel_has_focus() {
+        let p = at("/w", vec![entry("a", false)]);
+        let theme = CompositorTheme::default();
+        assert_eq!(
+            p.render(20, 5, true, &theme)[0][1].fg,
+            theme.sidebar_header_active_fg
+        );
+        assert_eq!(
+            p.render(20, 5, false, &theme)[0][1].fg,
+            theme.sidebar_dim_fg
+        );
+    }
+
+    #[test]
+    fn the_header_is_a_bar_whose_colours_follow_focus() {
+        let p = at("/w", vec![entry("a", false)]);
+        let theme = CompositorTheme::default();
+        for focused in [false, true] {
+            let grid = p.render(20, 5, focused, &theme);
+            nav::assert_header_bar(&grid, focused, &theme);
+        }
     }
 }

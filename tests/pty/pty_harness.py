@@ -4,7 +4,13 @@ Drives the actual client binary through a pseudo-terminal (pexpect) and reads
 the rendered screen with pyte. Spins up an isolated throwaway server (the client
 auto-spawns it) with its own XDG dirs and a short socket path.
 """
-import atexit, os, shutil, signal, subprocess, time, pexpect, pyte
+import atexit, os, shutil, signal, subprocess, sys, time, pexpect, pyte
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import home_guard  # noqa: E402,F401  (installs the real-HOME refusal)
+import standin  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
+from harness import guard_rundir, kill_relays, reap_rundir  # noqa: E402,F401
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 PREFIX = b"\x01"  # Ctrl-a
@@ -33,6 +39,48 @@ def _protocol_version():
 PROTOCOL_VERSION = _protocol_version()
 
 
+def install_notify_shims(bindir):
+    """Put stand-in `osascript` and `notify-send` in `bindir`, and return the
+    log they append their arguments to.
+
+    The client sends a desktop notification whenever an agent in a pane needs
+    input, finishes or exits, and notifications are on by default, so a test
+    that runs a stand-in agent would otherwise pop real notifications on the
+    machine running the suite. The client runs the notifier itself, with the
+    client's own `PATH`, so `bindir` must be first on the CLIENT's `PATH`. A
+    pane's login shell reordering its own `PATH` does not matter here.
+    """
+    os.makedirs(bindir, exist_ok=True)
+    log = os.path.join(bindir, "notifications.log")
+    for name in ("osascript", "notify-send"):
+        path = os.path.join(bindir, name)
+        with open(path, "w") as f:
+            f.write(f"#!/bin/sh\nprintf '%s\\n' \"{name} $*\" >> \"{log}\"\n")
+        os.chmod(path, 0o755)
+    return log
+
+
+def install_agent_standin(bin_dir, name, script_body):
+    """Install a stand-in agent called `name` in `bin_dir`.
+
+    `script_body` is a `#!/bin/sh` script. It is written as `<name>.sh` and
+    `<name>` is a compiled wrapper that runs it (`tests/standin.py`), so
+    process detection sees the agent's name on macOS as well as Linux.
+    `bin_dir` is closed to 0700, and refused if it or an ancestor is open to
+    other users, so it must be the caller's own directory.
+    """
+    os.makedirs(bin_dir, exist_ok=True)
+    script = os.path.join(bin_dir, f"{name}.sh")
+    target = os.path.join(bin_dir, name)
+
+    def script_only():
+        shutil.copyfile(script, target)
+        os.chmod(target, 0o755)
+
+    standin.install_wrapper(target, ["/bin/sh", script], {script: script_body}, script_only)
+    return target
+
+
 class Tui:
     def __init__(self, rundir, cols=120, rows=40, config=None, extra_env=None):
         self.rundir = rundir
@@ -50,18 +98,25 @@ class Tui:
         self.config = config
 
     def start(self):
+        # `kill()` runs `remux stop` against this rundir, and the reaper kills
+        # under it; a relative one would resolve against whatever directory
+        # the harness runs from.
+        assert os.path.isabs(self.rundir), f"rundir must be absolute: {self.rundir}"
+        # Before `atexit.register(self.kill)`: atexit runs last-registered
+        # first, so `kill()`'s graceful `remux stop` runs before the reaper
+        # SIGKILLs whatever survived it.
+        guard_rundir(self.rundir)
         # The client auto-spawns a server that outlives it, so a harness that
         # exits without reaching `kill()` (an uncaught exception, an early
         # `sys.exit`) would leave that server running. `atexit` covers both.
         if not self._cleanup_registered:
             atexit.register(self.kill)
             self._cleanup_registered = True
-        # `kill()` runs `remux stop` against this rundir; a relative one would
-        # resolve against whatever directory the harness runs from.
-        assert os.path.isabs(self.rundir), f"rundir must be absolute: {self.rundir}"
         shutil.rmtree(self.rundir, ignore_errors=True)
-        for s in ("run", "state", "data", "config"):
+        for s in ("run", "state", "data", "config", "home"):
             os.makedirs(f"{self.rundir}/{s}", exist_ok=True)
+        shims = f"{self.rundir}/notify-bin"
+        self.notify_log = install_notify_shims(shims)
         if self.config is not None:
             os.makedirs(f"{self.rundir}/config/remux", exist_ok=True)
             with open(f"{self.rundir}/config/remux/config.toml", "w") as f:
@@ -75,12 +130,20 @@ class Tui:
             "TERM": "xterm-256color",
             "PS1": "$ ",
             "REMUX_ALLOW_NESTED": "1",
+            # The server reads the platform data dir under HOME when the XDG
+            # data dir is empty, so HOME must be throwaway too. A caller may
+            # still override it through `extra_env`; `home_guard` rejects the
+            # real home.
+            "HOME": f"{self.rundir}/home",
             **self.extra_env,
             "XDG_RUNTIME_DIR": f"{self.rundir}/run",
             "XDG_STATE_HOME": f"{self.rundir}/state",
             "XDG_DATA_HOME": f"{self.rundir}/data",
             "XDG_CONFIG_HOME": f"{self.rundir}/config",
         }
+        # Prepended AFTER `extra_env` for the same reason: no caller's `PATH`
+        # can put a real notifier ahead of the stand-ins.
+        env["PATH"] = f"{shims}:" + env.get("PATH", "")
         self.env = env
         self.screen = pyte.Screen(self.cols, self.rows)
         self.stream = pyte.ByteStream(self.screen)
@@ -293,12 +356,34 @@ def sm_title(t):
     raise AssertionError("session manager is not on screen")
 
 
+def sm_settled(t, read, timeout=4.0):
+    """`read(t)`, retried while it raises, for up to `timeout` seconds.
+
+    The client paints a server frame and then the overlay over it, so a screen
+    read between the two sees the popup half drawn or gone. On a slow machine
+    that window is wide enough to hit. A popup that is really missing, or a
+    tree that really has no single highlight, still raises after the timeout.
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            return read(t)
+        except AssertionError:
+            if time.time() >= deadline:
+                raise
+            t.pump(0.1)
+
+
 def sm_tree(t):
     """Every tree row the manager is currently painting, top to bottom.
 
     The popup is found by its title line, its columns by that line's corners --
     so this is immune to the popup moving or resizing with the terminal.
     """
+    return sm_settled(t, _sm_tree_once)
+
+
+def _sm_tree_once(t):
     rows = t.rows_text()
     title_y = None
     for i, r in enumerate(rows):
@@ -328,7 +413,11 @@ def sm_tree(t):
 
 def sm_selected(t):
     """The highlighted tree row. Raises unless exactly one row is highlighted."""
-    tree = sm_tree(t)
+    return sm_settled(t, _sm_selected_once)
+
+
+def _sm_selected_once(t):
+    tree = _sm_tree_once(t)
     hits = [r for r in tree if r.selected]
     if len(hits) != 1:
         raise AssertionError(

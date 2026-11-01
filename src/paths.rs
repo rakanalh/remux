@@ -12,6 +12,11 @@
 //! platform. `socket_path` is left as it is: it consults `dirs::runtime_dir()`
 //! first, which reads `XDG_RUNTIME_DIR` on Linux and is `None` on macOS, so it
 //! already lands on the variable on both.
+//!
+//! Under `cfg(test)` none of this is consulted: every resolver answers with a
+//! directory in `mod sandbox`, so setting `XDG_DATA_HOME` in a unit test does
+//! not move `data_home()`. The `configured_*` functions still hold the real
+//! resolution, and the tests below exercise it directly.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -37,6 +42,13 @@ fn resolve(env_value: Option<OsString>, platform: Option<PathBuf>) -> Option<Pat
 
 /// `$XDG_DATA_HOME`: the directory holding saved sessions.
 pub fn data_home() -> PathBuf {
+    #[cfg(test)]
+    return sandbox::dir("data");
+    #[cfg(not(test))]
+    configured_data_home()
+}
+
+fn configured_data_home() -> PathBuf {
     resolve(std::env::var_os("XDG_DATA_HOME"), dirs::data_dir())
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
@@ -46,12 +58,26 @@ pub fn data_home() -> PathBuf {
 /// One caller, `persistence::load_state`, which uses it to find a `state.json`
 /// written before remux honoured `XDG_DATA_HOME` on macOS. Nothing else should
 /// read it: for every other purpose the answer wanted is [`data_home`].
+///
+/// `None` under test. With [`data_home`] in the sandbox, the platform
+/// directory would otherwise differ from it on Linux too, and `load_state`
+/// would read the user's real `state.json` as a legacy file.
 pub fn platform_data_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    return None;
+    #[cfg(not(test))]
     dirs::data_dir()
 }
 
 /// `$XDG_STATE_HOME`: the directory holding the logs and the sidebar layout.
 pub fn state_home() -> PathBuf {
+    #[cfg(test)]
+    return sandbox::dir("state");
+    #[cfg(not(test))]
+    configured_state_home()
+}
+
+fn configured_state_home() -> PathBuf {
     resolve(std::env::var_os("XDG_STATE_HOME"), dirs::state_dir())
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -64,6 +90,13 @@ pub fn state_home() -> PathBuf {
 /// `/tmp` fallback would instead have remux read its configuration out of a
 /// world-writable directory.
 pub fn config_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    return Some(sandbox::dir("config"));
+    #[cfg(not(test))]
+    configured_config_home()
+}
+
+fn configured_config_home() -> Option<PathBuf> {
     resolve(std::env::var_os("XDG_CONFIG_HOME"), dirs::config_dir())
 }
 
@@ -71,6 +104,106 @@ pub fn config_home() -> Option<PathBuf> {
 /// cannot disagree about which file is the config.
 pub fn config_file() -> Option<PathBuf> {
     config_home().map(|d| d.join("remux").join("config.toml"))
+}
+
+/// Where the unit tests' files go instead of the user's directories.
+///
+/// The writers (`persistence::save_state`, the mailbox, `sidebar.json`, the
+/// hook counters) take no path parameter. They resolve their path through this
+/// module, so a test that drives a real handler writes wherever these
+/// functions point. The environment does not point anywhere safe: `cargo test`
+/// run from an ordinary shell inherits the user's own directories, and the
+/// server tests that save through a handler overwrote the user's `state.json`.
+///
+/// One directory per test PROCESS, not per test. The writers are global, and a
+/// per-thread directory would separate a test from the tokio worker threads
+/// that save on its behalf. The directory is never removed, because a `static`
+/// is never dropped.
+///
+/// `cfg(test)` is set only in the crate's own unit-test binary. A Rust
+/// integration test under `tests/*.rs` would link the normal build, skip this
+/// sandbox, and write to the user's directories again.
+#[cfg(test)]
+pub(crate) mod sandbox {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+    pub(super) fn dir(kind: &str) -> PathBuf {
+        ROOT.get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("remux-test-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .expect("create the test sandbox")
+                .keep()
+        })
+        .join(kind)
+    }
+
+    /// A sandbox directory that exists, for a variable a pane's programs use
+    /// as soon as they start: a shell whose `HOME` does not exist cannot
+    /// write its history, and `TMPDIR` must exist to be used at all.
+    fn made(kind: &str) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = dir(kind);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&path)
+            .expect("create a sandbox directory");
+        path
+    }
+
+    /// `HOME` for every process a unit test spawns in a pane.
+    pub(crate) fn home() -> PathBuf {
+        made("home")
+    }
+
+    /// Whether a pane spawned by a unit test inherits `key` from the test
+    /// process. Everything else is dropped.
+    ///
+    /// An allow-list, not a deny-list, because the variables that make a shell
+    /// run the user's code have no common name: `PROMPT_COMMAND`, `PS1` and
+    /// `PS4` command substitutions, exported `BASH_FUNC_*%%` functions, and
+    /// whatever the next shell reads. The kept ones only locate programs and
+    /// describe the terminal and locale.
+    pub(crate) fn pane_inherits(key: &std::ffi::OsStr) -> bool {
+        let key = key.to_string_lossy();
+        matches!(&*key, "PATH" | "TERM" | "LANG" | "USER" | "LOGNAME") || key.starts_with("LC_")
+    }
+
+    /// The variables a pane spawned by a unit test gets on top of what
+    /// [`pane_inherits`] keeps.
+    ///
+    /// A pane's shell is a login shell, so with the user's `HOME` it sources
+    /// the user's profile and rc files, and it appends the test's commands to
+    /// the user's history file when it exits. `HISTFILE` and `ZDOTDIR` are set
+    /// explicitly so that a shell never falls back to a default outside the
+    /// sandbox. `ENV` and `BASH_ENV` name the startup file `sh` and
+    /// non-interactive `bash` read. The XDG variables keep a `remux` or other
+    /// program run in a pane out of the user's directories, as
+    /// [`super::data_home`] does for this process, and `XDG_RUNTIME_DIR` in
+    /// particular keeps it away from the socket of the user's running server.
+    pub(crate) fn pane_env() -> Vec<(&'static str, String)> {
+        let home = home();
+        let text = |p: PathBuf| p.to_string_lossy().into_owned();
+        vec![
+            ("HOME", text(home.clone())),
+            ("ZDOTDIR", text(home.clone())),
+            ("HISTFILE", text(home.join(".sh_history"))),
+            ("SHELL", "/bin/sh".to_string()),
+            ("ENV", "/dev/null".to_string()),
+            ("BASH_ENV", "/dev/null".to_string()),
+            ("XDG_CONFIG_HOME", text(dir("config"))),
+            ("XDG_DATA_HOME", text(dir("data"))),
+            ("XDG_STATE_HOME", text(dir("state"))),
+            ("XDG_RUNTIME_DIR", text(made("run"))),
+            ("TMPDIR", text(made("tmp"))),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -123,12 +256,12 @@ mod tests {
     /// running `cargo test` may have set it.
     ///
     /// `XDG_DATA_HOME` is deliberately NOT touched here, and that is not an
-    /// oversight. `persistence::tests::test_load_state_no_file` calls the global
-    /// `load_state()`, which resolves through [`data_home`]; moving the variable
-    /// under it from another test thread would change which file it reads
-    /// mid-test, and the false red would look exactly like a bug in this module.
-    /// `resolve` above covers every branch [`data_home`] has, and its two lines
-    /// are the same two lines as [`state_home`]'s.
+    /// oversight. `daemon`'s `a_command_saves_the_session_state_into_the_test_sandbox`
+    /// reads it to name the directory a test must never write; moving the
+    /// variable under it from another test thread would point that check at the
+    /// wrong directory. `resolve` above covers every branch
+    /// [`configured_data_home`] has, and its two lines are the same two lines as
+    /// [`configured_state_home`]'s.
     #[test]
     fn the_resolvers_read_the_environment() {
         let saved: Vec<(&str, Option<OsString>)> = ["XDG_STATE_HOME", "XDG_CONFIG_HOME"]
@@ -138,17 +271,16 @@ mod tests {
 
         std::env::set_var("XDG_STATE_HOME", "/tmp/rmx-paths/state");
         std::env::set_var("XDG_CONFIG_HOME", "/tmp/rmx-paths/config");
-        assert_eq!(state_home(), Path::new("/tmp/rmx-paths/state"));
-        assert_eq!(config_home(), Some(PathBuf::from("/tmp/rmx-paths/config")));
+        assert_eq!(configured_state_home(), Path::new("/tmp/rmx-paths/state"));
         assert_eq!(
-            config_file(),
-            Some(PathBuf::from("/tmp/rmx-paths/config/remux/config.toml"))
+            configured_config_home(),
+            Some(PathBuf::from("/tmp/rmx-paths/config"))
         );
 
         for (key, _) in &saved {
             std::env::remove_var(key);
         }
-        assert_eq!(config_home(), dirs::config_dir());
+        assert_eq!(configured_config_home(), dirs::config_dir());
 
         for (key, value) in saved {
             match value {
@@ -156,5 +288,23 @@ mod tests {
                 None => std::env::remove_var(key),
             }
         }
+    }
+
+    #[test]
+    fn under_test_every_directory_is_in_one_sandbox_and_none_is_configured() {
+        let root = data_home().parent().expect("sandbox root").to_path_buf();
+        assert!(root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("remux-test-")));
+        assert_eq!(data_home(), root.join("data"));
+        assert_eq!(state_home(), root.join("state"));
+        assert_eq!(config_home(), Some(root.join("config")));
+        assert_eq!(
+            config_file(),
+            Some(root.join("config").join("remux").join("config.toml"))
+        );
+        assert_eq!(platform_data_home(), None);
+        assert_ne!(data_home(), configured_data_home());
     }
 }

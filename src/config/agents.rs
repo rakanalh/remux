@@ -118,9 +118,10 @@ impl Default for AgentsConfig {
 /// **Two grades of evidence sit in this list, and the split does NOT run along
 /// agent lines.** `claude-select`, `omp-allow` and the two `opencode` patterns
 /// were matched against a real pane, blocked and then answered, so both that
-/// they FIRE and that they STOP are observed. `claude-proceed` and the two
-/// `codex` patterns come from `strings` over the shipped binary: the wordings
-/// are real, but no one here has watched one of those prompts appear or clear.
+/// they FIRE and that they STOP are observed. `claude-proceed`,
+/// `claude-decline` and the two `codex` patterns come from `strings` over the
+/// shipped binary: the wordings are real, but no one here has watched one of
+/// those prompts appear or clear.
 ///
 /// `claude-proceed` is on the weaker side of that line and it is easy to miss,
 /// because it sits next to `claude-select` and they name the same agent. Do not
@@ -169,21 +170,44 @@ fn default_patterns() -> Vec<AgentPattern> {
     };
     vec![
         // Claude Code's permission/approval prompts. The alternation is
-        // MEASURED, not guessed: `strings` over the installed 2.1.251 binary
+        // MEASURED, not guessed: `strings` over the installed 2.1.296 binary
         // reports "Do you want to proceed?" (x6), "...to continue?",
         // "...to allow this connection?", "...to allow Claude to fetch this
-        // content?" and "...to use this API key?". An earlier version of this
-        // pattern listed `create` and `make`, neither of which appears anywhere
-        // in the binary.
+        // content?" and "...to use this API key?".
         //
         // The binary also carries a bare "Do you want to " prefix, completed at
-        // render time. It is deliberately NOT matched on the prefix alone: an
-        // agent's own prose can contain that phrase, and a false `NeedsInput`
-        // cries wolf on a panel whose whole value is that red means red.
+        // render time as "Do you want to <verbPhrase> <file>?" by its file
+        // dialogs. The verb phrases are in the binary too: "make this edit
+        // to", "create", "overwrite", "write to", "insert this cell into" and
+        // "delete this cell from". Missing them is not a grey panel only: a
+        // submit reads the pane Idle, and its Enter picks the dialog's default
+        // "Yes", approving the edit.
+        //
+        // The prefix is deliberately NOT matched alone: an agent's own prose
+        // can contain that phrase, and a false `NeedsInput` cries wolf on a
+        // panel whose whole value is that red means red. For the same reason
+        // the file verbs are matched only in the dialog's shape, a single file
+        // name and the line's last `?`: "Do you want to create a PR?" is
+        // prose an agent writes. A file name with a space in it is missed
+        // here and left to `claude-decline`.
+        //
+        // Also in the binary, and anchored the same way: "Would you like to
+        // proceed?" (its plan dialog), "Would you like to install ...?" and
+        // "Are you sure you want to delete ...?".
         p(
             "claude-proceed",
             "claude",
-            r"(?i)do you want to (proceed|continue|allow|use this api key)",
+            r"(?i)do you want to (proceed|continue|allow|use this api key|(make this edit to|create|overwrite|write to|insert this cell into|delete this cell from) \S+\?\s*$)|(would you like to (proceed|install)|are you sure you want to delete)\b[^?]*\?\s*$",
+        ),
+        // The option every Claude Code approval dialog draws to refuse
+        // ("No, and tell Claude what to do differently (esc)", or "Deny, and
+        // ..."), in the binary. It catches a dialog whose question has left
+        // the `scan_rows` window or whose wording the pattern above does not
+        // know, as `codex-decline` does for codex.
+        p(
+            "claude-decline",
+            "claude",
+            r"(?i)tell claude what to do differently",
         ),
         // Claude Code's QUESTION menu -- its `AskUserQuestion` selector, which
         // asks something rather than asking permission and so matches none of

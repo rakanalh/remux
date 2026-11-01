@@ -1,0 +1,1 @@
+{"session_id":"0b6c4f3e-hook-fixture","transcript_path":"/tmp/rmx-msghook/transcript.jsonl","cwd":"/tmp","permission_mode":"default","hook_event_name":"Stop","stop_hook_active":true,"last_assistant_message":"FIXTURE-LAST-ASSISTANT-MESSAGE: the hook must never hold or log this"}

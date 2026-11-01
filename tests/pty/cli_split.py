@@ -84,7 +84,7 @@ def check(cond, label):
 
 def make_env(config=None):
     shutil.rmtree(RUNDIR, ignore_errors=True)
-    for sub in ("run", "state", "data", "config"):
+    for sub in ("run", "state", "data", "config", "home"):
         os.makedirs(f"{RUNDIR}/{sub}", exist_ok=True)
     if config is not None:
         os.makedirs(f"{RUNDIR}/config/remux", exist_ok=True)
@@ -106,6 +106,7 @@ def make_env(config=None):
     os.chmod(RUNNER, 0o755)
     env = dict(os.environ)
     env.update(
+        HOME=f"{RUNDIR}/home",
         XDG_RUNTIME_DIR=f"{RUNDIR}/run",
         XDG_STATE_HOME=f"{RUNDIR}/state",
         XDG_DATA_HOME=f"{RUNDIR}/data",

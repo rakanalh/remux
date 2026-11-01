@@ -9,7 +9,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 
 use crate::config::theme::TabStyle;
 use crate::config::Config;
@@ -86,6 +86,7 @@ impl RemuxClient {
 
     /// Connect to the local server over the Unix domain socket.
     pub async fn connect_local() -> Result<Self> {
+        crate::server::daemon::prepare_runtime_dir()?;
         let path = socket_path();
         log::debug!("terminal: connect_local socket_path={}", path.display());
         let stream = UnixStream::connect(&path)
@@ -96,9 +97,16 @@ impl RemuxClient {
         let (reader, writer) = stream.into_split();
         let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(reader);
         let mut writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(writer);
-        let server_version = handshake(&mut reader, &mut writer)
-            .await
-            .context("handshake with local server")?;
+        let server_version = handshake(&mut reader, &mut writer).await.map_err(|e| {
+            if e.is::<ProtocolSkew>() {
+                e.context(
+                    "the running server is from another remux build; `remux restart` \
+                     replaces it, saving and restoring its sessions",
+                )
+            } else {
+                e.context("handshake with local server")
+            }
+        })?;
         Ok(Self {
             reader,
             writer,
@@ -128,18 +136,16 @@ impl RemuxClient {
         );
         // stderr is inherited so ssh host-key / password prompts are visible;
         // this runs before the terminal enters raw mode.
-        let mut cmd = Command::new("ssh");
-        if let Some(port) = port {
-            cmd.arg("-p").arg(port.to_string());
-        }
-        if let Some(identity) = identity {
-            cmd.arg("-i").arg(identity);
-        }
-        cmd.args(extra_args)
-            .arg(dest)
-            .arg(remux_path)
-            .arg("relay")
-            .stdin(Stdio::piped())
+        let remote = crate::config::RemoteConfig {
+            ssh: dest.to_string(),
+            port,
+            identity: identity.map(str::to_string),
+            remux_path: remux_path.to_string(),
+            extra_args: extra_args.to_vec(),
+            ..crate::config::RemoteConfig::default()
+        };
+        let mut cmd = remote.ssh_command(false);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
@@ -299,7 +305,7 @@ impl Look {
 /// message helpers, before any `ClientMessage`/`ServerMessage` traffic. On
 /// success returns the server's reported `remux_version` so callers can detect
 /// build skew against this binary's own [`crate::protocol::build_version`].
-async fn handshake<R, W>(reader: &mut R, writer: &mut W) -> Result<String>
+pub(crate) async fn handshake<R, W>(reader: &mut R, writer: &mut W) -> Result<String>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -316,22 +322,50 @@ where
         .await
         .context("reading Welcome")?
         .context("server closed connection during handshake")?;
+    // The far side writes the stamp, and this function also runs inside the
+    // server for a peer link: raw, a newline in it forges a line in
+    // server.log and an ESC reaches whatever terminal shows that log.
+    let shown = crate::client::cli_common::escape_bounded(&welcome.remux_version, STAMP_MAX);
     log::info!(
-        "terminal: handshake peer remux {} protocol v{}",
-        welcome.remux_version,
+        "terminal: handshake peer remux {shown} protocol v{}",
         welcome.protocol_version
     );
 
     if welcome.protocol_version != PROTOCOL_VERSION {
-        anyhow::bail!(
-            "incompatible remux: remote protocol v{}, local v{} (remote remux {})",
-            welcome.protocol_version,
-            PROTOCOL_VERSION,
-            welcome.remux_version
-        );
+        return Err(ProtocolSkew {
+            remote: welcome.protocol_version,
+            remote_version: shown,
+        }
+        .into());
     }
-    Ok(welcome.remux_version)
+    Ok(welcome.remux_version.chars().take(STAMP_MAX).collect())
 }
+
+/// The most of a peer's build stamp that is kept or shown. A real stamp is a
+/// version and a short git hash, far shorter than this.
+const STAMP_MAX: usize = 64;
+
+/// The peer answered the handshake with another protocol version: a server is
+/// running, and it is not this build's. A type of its own so that a caller can
+/// tell it from "nothing is listening".
+#[derive(Debug)]
+pub struct ProtocolSkew {
+    pub remote: u32,
+    /// The peer's build stamp, already escaped and bounded for display.
+    pub remote_version: String,
+}
+
+impl std::fmt::Display for ProtocolSkew {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "incompatible remux: remote protocol v{}, local v{} (remote remux {})",
+            self.remote, PROTOCOL_VERSION, self.remote_version
+        )
+    }
+}
+
+impl std::error::Error for ProtocolSkew {}
 
 /// Produce a concise summary of a `ClientMessage` for debug logging.
 fn client_message_summary(msg: &ClientMessage) -> String {
@@ -359,6 +393,63 @@ fn client_message_summary(msg: &ClientMessage) -> String {
             argv.first(),
             argv.len().saturating_sub(1),
             if cwd.is_some() { "set" } else { "none" }
+        ),
+        // A message body is user content. Every field is named so that a
+        // field added later cannot fall through to the catch-all.
+        ClientMessage::MsgSend {
+            to,
+            body,
+            deliver,
+            reply_to,
+            pane_hint,
+            defer,
+            timeout_ms,
+            wait,
+            origin,
+            req,
+        } => format!(
+            "MsgSend(to={:?}, deliver={deliver:?}, {} bytes, reply_to={:?}, pane_hint={pane_hint:?}, \
+             defer={defer}, timeout={timeout_ms:?}, wait={wait}, origin={:?}, req={req:?})",
+            to.to_string(),
+            body.len(),
+            reply_to.as_ref().map(|r| r.id),
+            origin.as_ref().map(|o| format!("{}:%{}", o.host, o.pane_id))
+        ),
+        ClientMessage::MsgAck {
+            pane,
+            ids,
+            all,
+            pane_hint,
+        } => format!(
+            "MsgAck(pane={pane:?}, {} id(s), all={all}, pane_hint={pane_hint:?})",
+            ids.len()
+        ),
+        ClientMessage::AgentName {
+            name,
+            pane,
+            pane_hint,
+        } => format!("AgentName(name={name:?}, pane={pane:?}, pane_hint={pane_hint:?})"),
+        ClientMessage::AgentStatus { target, req } => format!(
+            "AgentStatus(target={:?}, req={req:?})",
+            target.as_ref().map(|t| t.to_string())
+        ),
+        ClientMessage::AgentWait {
+            target,
+            state,
+            timeout_ms,
+            req,
+        } => format!(
+            "AgentWait(target={:?}, state={state:?}, timeout={timeout_ms:?}, req={req:?})",
+            target.to_string()
+        ),
+        ClientMessage::MsgRead {
+            pane,
+            all,
+            peek,
+            wait_ms,
+            pane_hint,
+        } => format!(
+            "MsgRead(pane={pane:?}, all={all}, peek={peek}, wait_ms={wait_ms:?}, pane_hint={pane_hint:?})"
         ),
         other => format!("{:?}", other),
     }
@@ -426,6 +517,29 @@ mod tests {
         assert!(s.contains("pane=Some(7)"), "and the caller's pane id: {s}");
     }
 
+    #[test]
+    fn msg_send_names_the_target_but_not_the_body() {
+        let s = client_message_summary(&ClientMessage::MsgSend {
+            origin: None,
+            req: None,
+            to: "beta".parse().unwrap(),
+            body: "the token is hunter2-BODY".to_string(),
+            deliver: crate::protocol::Deliver::Auto,
+            reply_to: None,
+            pane_hint: Some(3),
+            defer: true,
+            timeout_ms: Some(1500),
+            wait: true,
+        });
+        assert!(!s.contains("hunter2"), "the body must not appear: {s}");
+        assert!(s.contains("beta"), "but the target must: {s}");
+        assert!(s.contains("25 bytes"), "and the body's size: {s}");
+        assert!(
+            s.contains("defer=true, timeout=Some(1500), wait=true"),
+            "and the flags: {s}"
+        );
+    }
+
     /// Drive [`handshake`] against a scripted peer that answers with `welcome`.
     /// The client's Hello is read (and returned) so the test can also assert
     /// what this binary announces.
@@ -469,12 +583,41 @@ mod tests {
             remux_version: "0.1.0+old".to_string(),
         })
         .await;
-        let err = result
-            .expect_err("a skewed peer must be rejected")
-            .to_string();
+        let err = result.expect_err("a skewed peer must be rejected");
+        assert!(
+            err.is::<ProtocolSkew>(),
+            "typed, so a caller can tell it apart"
+        );
+        let err = err.to_string();
         assert!(
             err.contains("incompatible remux") && err.contains("0.1.0+old"),
             "the rejection must name the peer it refused: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_peer_stamp_is_escaped_and_bounded_in_the_rejection() {
+        let stamp = format!("forged\nINFO line\u{1b}[31m{}", "x".repeat(500));
+        let (_, result) = handshake_against(Welcome {
+            protocol_version: PROTOCOL_VERSION - 1,
+            remux_version: stamp,
+        })
+        .await;
+        let err = result.expect_err("a skewed peer is rejected").to_string();
+        assert!(
+            !err.contains('\n') && !err.contains('\u{1b}') && err.contains("forged\\x0aINFO"),
+            "{err:?}"
+        );
+        assert!(err.len() < 200, "the far stamp is cut: {} bytes", err.len());
+    }
+
+    #[tokio::test]
+    async fn a_peer_stamp_is_returned_cut() {
+        let (_, result) = handshake_against(Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            remux_version: "é".repeat(500),
+        })
+        .await;
+        assert_eq!(result.unwrap(), "é".repeat(STAMP_MAX));
     }
 }

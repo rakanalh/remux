@@ -293,10 +293,10 @@ def main():
         check(t5 is not None and t6 == t5, "nothing changed")
 
         print("the move is refused while the popup is open")
-        cmd(cli, "PopupToggle")
+        cmd(cli, {"PopupToggle": None})
         move(cli, tab2)
         move(cli, None)
-        cmd(cli, "PopupToggle")
+        cmd(cli, {"PopupToggle": None})
         t7 = tree(cli, "main")
         check(t6 is not None and t7 == t6, "nothing changed")
 

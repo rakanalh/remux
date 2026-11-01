@@ -25,10 +25,15 @@ Server-side. Needs `remux restart`.
 | `border_style` | `"zellij_style"` \| `"tmux_style"` | `"zellij_style"` | restart | Boxed panes with names in the border, or minimal tmux-style dividers. `Ctrl-a g` toggles it at runtime. |
 | `default_layout` | `"bsp"` \| `"master"` \| `"monocle"` \| `"grid"` \| `"columns"` \| `"rows"` \| `"custom"` | `"bsp"` | restart | Layout every new tab starts in. If `[layouts]` disables it, new tabs use the first enabled layout. |
 | `which_key_position` | `"anchored"` \| `"centered"` \| `"full_width"` | `"anchored"` | live | Where the which-key popup is drawn. |
-| `popup_width_pct` | integer | `80` | restart | Width of the popup terminal, as a percentage of the content area. Clamped to 20–100. |
-| `popup_height_pct` | integer | `80` | restart | Height of the popup terminal, as a percentage of the content area. Clamped to 20–100. |
+| `popup_position` | `"float"` \| `"left"` \| `"right"` \| `"top"` \| `"bottom"` | `"float"` | live | Where the popup terminal sits. `float` is a framed box centred on the whole window, drawn over every sidebar. `top` and `bottom` dock a drawer across the window's full width, over the sidebars; `left` and `right` dock one beside the sidebars. A drawer leaves its outer edge open. The status bar row is never covered. A key bound to `PopupToggle <position> [size]` opens the popup at that position, and size, instead (see [Popup keys](/remux/keybindings/#popup-keys)). |
+| `popup_width_pct` | integer | `80` | live | Width of the popup terminal, as a percentage of the window's columns for `float`, or of the content area (the window minus the sidebars) for `left` and `right`. Ignored by `top` and `bottom`, which span the window. Clamped to 20–100. A `PopupToggle <position> <size>` key overrides it for the popups it opens. |
+| `popup_height_pct` | integer | `80` | live | Height of the popup terminal, as a percentage of the window's rows minus the status bar row, for `float`, `top` and `bottom`. Ignored by `left` and `right`, which run the full content height. Clamped to 20–100. A `PopupToggle <position> <size>` key overrides it for the popups it opens. |
 | `pane_title` | string | unset | live | Template pane names are drawn from. Placeholders: `{title}`, `{command}`, `{session}`, `{tab}`, `{cwd}`, `{host}`. Unset shows the pane's title if it has one, else its command. |
 | `status_bar_position` | `"top"` \| `"bottom"` | `"bottom"` | — | **Has no effect.** The status bar is always drawn on the bottom row. |
+
+The popup keys are client settings too. Saving the file moves and resizes an open popup at once, and a runtime resize with the pane-resize keys (`Ctrl-a p R h/j/k/l`) is dropped when any of the three keys changes. The resize keys adjust the popup on the axis its position uses and ignore the other one. A runtime resize belongs to the position it was made at: widening a right drawer leaves the float as it was. Two tabs whose popups are open at different positions share one popup terminal size, so switching between them resizes the popups (programs inside redraw, as on any terminal resize).
+
+Each tab has its own popup. The first `Alt-p` in a tab starts a shell in the directory of that tab's focused pane, and a popup stays open while you work in other tabs. The popup's terminal is as large as the smallest popup any client attached to the session asks for, so a second, smaller client shrinks it for everyone.
 
 `pane_title` is a client setting: your client sends it to every server it views, remotes included, and each one names panes with it. A name set with `PaneRename` always wins over the template.
 
@@ -65,6 +70,11 @@ Defaults are the Catppuccin Mocha palette. Colours for pane frames, tab chips an
 | `layout_indicator_fg` / `layout_indicator_bg` | `{ ansi = 0 }` / `{ ansi = 245 }` |
 | `search_count_fg` / `search_count_bg` | `{ ansi = 0 }` / `{ ansi = 11 }` |
 | `sidebar_current_bg` | `"#3e385e"` |
+| `sidebar_divider_fg` / `sidebar_selection_bg` | `"#313244"` / `"#313244"` |
+| `sidebar_dim_fg` / `sidebar_name_selected_fg` | `"#6c7086"` / `"#cdd6f4"` |
+| `sidebar_header_bg` | `"#181825"` |
+| `sidebar_header_active_bg` / `sidebar_header_active_fg` | `"#89b4fa"` / `"#1e1e2e"` |
+| `sidebar_button_bg` / `sidebar_strip_bg` | `"#45475a"` / `"#313244"` |
 | `whichkey_fg` / `whichkey_bg` / `whichkey_key_fg` | `"#cdd6f4"` / `"#181825"` / `"#a6e3a1"` |
 | `separator_fg` | `"#6c7086"` |
 | `pane_label_fg` / `pane_label_bg` | unset / unset (the border's colour, on the terminal's background) |
@@ -73,6 +83,18 @@ Defaults are the Catppuccin Mocha palette. Colours for pane frames, tab chips an
 | `search_current_fg` / `search_current_bg` | `"#1e1e2e"` / `"#fab387"` |
 
 `rounded` and `slanted` tab styles draw Powerline glyphs and need a Nerd Font. `square` works in any font.
+
+## `[zoom]`
+
+How `PaneToggleZoom` zooms the focused pane. Server-side, needs `remux restart`. See [Float zoom](/remux/layouts/#float-zoom).
+
+| Option | Type | Default |
+|---|---|---|
+| `mode` | `"fullscreen"` \| `"float"` | `"fullscreen"` |
+| `width` | integer, percent | `90` |
+| `height` | integer, percent | `90` |
+
+`fullscreen` fills the tab with the pane. `float` draws it in a framed, centred box over a layout that keeps its shape. `width` and `height` size the float as a percentage of the area the tab's layout fills (the window minus sidebars and the status bar), clamped to 20 to 100 like the popup's. They have no effect in `fullscreen` mode. `PaneToggleZoomFloat` always float-zooms and `PaneToggleZoomFullscreen` always fills the tab, whatever `mode` is.
 
 ## `[layouts]`
 
@@ -146,9 +168,11 @@ A sidebar docked to one edge of the terminal. There are none by default. Declare
 |---|---|---|---|
 | `edge` | `"left"` \| `"right"` \| `"bottom"` | none (required) | Edge to dock to. An unknown value is a parse error. |
 | `size` | integer | none (required) | Starting thickness: columns for `left`/`right`, rows for `bottom`. The frame is drawn inside it. |
-| `visible` | bool | `true` | Whether it starts open. |
+| `visible` | bool | `true` | Whether it starts open. `false` starts it collapsed to a strip (unless `collapse_to_strip` is `false`). |
+| `style` | `"boxed"` \| `"flat"` | `"boxed"` | The edge against the panes: `"boxed"` frames the sidebar in the pane border style, `"flat"` draws one divider column (row, for `bottom`) in `sidebar_divider_fg`. The inside looks the same either way. An unknown value is a parse error. |
+| `collapse_to_strip` | bool | `true` | Collapsing (the chip, or `Ctrl-a b h`/`l`/`j`) leaves a one-cell clickable strip along the edge. `false` hides the sidebar entirely. |
 
-Once you toggle or resize a sidebar, its size, visibility and panel weights are saved to `$XDG_STATE_HOME/remux/sidebar.json` and take precedence over `size` and `visible` on later starts.
+Once you collapse or resize a sidebar, its size, collapsed state and panel weights are saved to `$XDG_STATE_HOME/remux/sidebar.json` and take precedence over `size` and `visible` on later starts.
 
 ### `[[sidebar.panel]]`
 
@@ -210,6 +234,18 @@ The built-in patterns:
 | `opencode-allow` | `opencode` | `(?i)allow once\s+allow always\s+reject` |
 
 In TOML, double the backslashes inside a basic string (`"allow once\\s+allow always"`) or use a literal string (`'allow once\s+allow always'`).
+
+## `[notifications]`
+
+Desktop notifications for agents on every connected server. Client-side, applies on save. See [Agents](/remux/agents/#desktop-notifications).
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Send desktop notifications at all. |
+| `needs_input` | boolean | `true` | Notify when an agent starts waiting on an approval, question or permission prompt. |
+| `finished` | boolean | `true` | Notify when an agent stops working: 3 s of quiet after at least 3 s of work. |
+| `exited` | boolean | `true` | Notify when an agent leaves its pane. |
+| `command` | array of strings | unset | Run this instead of `osascript` (macOS) or `notify-send` (Linux). An argument that is exactly `{title}` or `{body}` is replaced by that text. No shell is used. |
 
 ## Related
 

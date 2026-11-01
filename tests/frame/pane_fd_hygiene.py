@@ -15,6 +15,12 @@ master of its OWN pane in the forked child, so pane 1 is clean even on a leaking
 build. Pane 2 holds one stale master and pane 3 holds two. A run that is red on
 only pane 3 means the count is wrong, not that the leak is half fixed.
 
+The same goes for the pidfd the server takes of every connecting client
+(`SO_PEERPIDFD`): the panes here are created while the attached client's pidfd
+is open, so a pidfd without `FD_CLOEXEC` would be in every pane shell. That is
+a capability leak: any process in the pane could signal the client through it,
+SIGKILL included.
+
 `/dev/pts` devices are counted as DISTINCT DEVICES rather than as descriptors,
 because `/bin/sh` is bash on some distributions and bash keeps its own fd 255 on
 the pane's tty alongside stdin, stdout and stderr. Four descriptors, one device,
@@ -92,7 +98,14 @@ def main():
                 continue
             masters = sorted(fd for fd, t in table.items() if t == "/dev/ptmx")
             ptys = sorted({t for t in table.values() if t.startswith("/dev/pts/")})
-            print(f"pane {n} shell (pid {pid}): ptmx={masters or 'none'} pts={ptys}")
+            pidfds = sorted(fd for fd, t in table.items() if t == "anon_inode:[pidfd]")
+            print(f"pane {n} shell (pid {pid}): ptmx={masters or 'none'} pts={ptys} "
+                  f"pidfd={pidfds or 'none'}")
+            if pidfds:
+                fails.append(
+                    f"pane {n} shell holds {len(pidfds)} pidfd(s) on fd "
+                    f"{', '.join(pidfds)}; a pane shell must hold none"
+                )
             if masters:
                 fails.append(
                     f"pane {n} shell holds {len(masters)} PTY master(s) on fd "
@@ -122,8 +135,8 @@ def main():
         for f in fails:
             print("  -", f)
         return 1
-    print(f"RESULT: PASS (each of {PANES} pane shells holds its own pts and no PTY "
-          f"master)")
+    print(f"RESULT: PASS (each of {PANES} pane shells holds its own pts, no PTY "
+          f"master and no pidfd)")
     return 0
 
 

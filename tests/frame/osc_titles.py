@@ -345,15 +345,22 @@ def run_default(c, v):
     # loops on half the cores. The limit is set so that a rate of 0.3 still
     # passes about 998 harness runs in 1000 (binomial, 16 runs), while the bug
     # this guards, adopting a job's expired title as the shell's, adopts 16/16.
+    #
+    # macOS adopts in about 2/3 of runs (measured 61/96 and 78/112) against
+    # about 19% on Linux, so 16 runs with a limit of 10 would sit on its mean.
+    # darwin takes 32 runs with a limit of 29: a rate of 0.72 passes about 997
+    # runs in 1000, and the bug still adopts 32/32. A weaker regression is
+    # caught less often there than on Linux.
+    samples, limit = (32, 29) if sys.platform == "darwin" else (16, 10)
     runs = []
-    for i in range(16):
+    for i in range(samples):
         set_shell_title(c, v, "Ho", f"me{i}")
         typed(c, "sh -c 'printf \"\\033]2;%s%s\\007\" Ex it'\r")
         time.sleep(1.6)
         runs.append(pane_name(c, v))
     adopted = runs.count("Exit")
     print(f"     9: the exiting title was adopted in {adopted}/{len(runs)} runs")
-    check(adopted <= 10, f"9 an exiting program's title is not adopted as the shell's ({runs})")
+    check(adopted <= limit, f"9 an exiting program's title is not adopted as the shell's ({runs})")
 
     # 6. a user-set name wins.
     c.send({"Command": {"PaneRename": "mine"}})

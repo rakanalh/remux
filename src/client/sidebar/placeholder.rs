@@ -49,17 +49,13 @@ impl SidebarPlugin for PlaceholderPlugin {
         if grid.is_empty() {
             return grid;
         }
-        // A panel's header tracks focus with the SAME theme roles its frame
-        // does -- that is why they match on screen -- so it asks the same rule
-        // rather than restating the choice.
-        let header_fg = crate::server::compositor::border_fg(theme, focused);
-        draw_text(&mut grid, 0, 0, self.title(), header_fg, bg.clone());
-        if rows > 1 {
+        super::nav::draw_header(&mut grid, self.title(), focused, theme);
+        if rows > super::nav::LIST_HEADER_ROWS as u16 {
             let marker = if focused { "focused" } else { "idle" };
             draw_text(
                 &mut grid,
-                0,
                 1,
+                super::nav::LIST_HEADER_ROWS as u16,
                 &format!("{marker} {}", self.counter),
                 theme.status_bar_fg.clone(),
                 bg,
@@ -132,9 +128,10 @@ mod tests {
         let theme = CompositorTheme::default();
         let grid = p.render(24, 4, false, &theme);
         let row: String = grid[0].iter().map(|c| c.c).collect();
+        assert_eq!(row.trim_end(), " placeholder");
         assert!(
-            row.contains(p.title()),
-            "title missing from header row: {row:?}"
+            grid[1].iter().all(|c| c.c == ' '),
+            "the row under the header is blank"
         );
     }
 

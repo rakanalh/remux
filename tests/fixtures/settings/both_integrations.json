@@ -1,0 +1,49 @@
+{
+  "model": "sonnet",
+  "hooks": {
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "remux agent-pane open --harness claude --from-hook || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "remux agent-pane close --harness claude --from-hook || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "remux msg hook claude-stop || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "remux msg hook claude-prompt || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

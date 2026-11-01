@@ -23,7 +23,7 @@ scrollback and would poison a shared one -- and is asserted twice:
 
 Run: python3 tests/frame/scrolled_client_commands.py
 """
-import os, re, sys, time
+import os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Server, Client, name_of, only
@@ -282,41 +282,44 @@ def run_popup_negative():
     """A command the popup guard REFUSES must not cost the user their scrollback.
 
     While the popup terminal is up it is the input target, and the guard in
-    `handle_command` turns every layout command into a no-op. Snapping for one
-    of those would yank a scrolled reader to the tail for a command that then
-    does nothing, so the snap sits below the guard.
+    `handle_command` turns every layout command and every `Resize*` into a
+    no-op. Each case below is classified `returns_to_live_tail`, so snapping
+    for it would yank a scrolled reader to the tail for a command that then
+    does nothing. The snap therefore sits below the guard.
 
     The popup is opened BEFORE the scroll on purpose: `PopupToggle` is itself
     classified `returns_to_live_tail`, so opening it while scrolled legitimately
     snaps, and a case built the other way round would test nothing.
     """
-    s = build(f"{RUNDIR_BASE}/popup")
-    try:
-        s.command("PopupToggle")
-        s.settle()
-        assert "spawned popup pane_id" in s.srv.log(), \
-            "popup/PaneFocusRight: the popup never opened -- the case would be vacuous"
-        # The popup pane is now the input target, so this history (and the
-        # scroll below) belong to the popup, which is where the guard applies.
-        fill_history(s)
-        scroll_back(s)
+    for label, cmd in (("PaneSplitVertical", "PaneSplitVertical"),
+                       ("ResizeRight", {"ResizeRight": 2})):
+        s = build(f"{RUNDIR_BASE}/popup-{label}")
+        try:
+            s.command({"PopupToggle": None})
+            s.settle()
+            assert "spawned popup pane_id" in s.srv.log(), \
+                f"popup/{label}: the popup never opened -- the case would be vacuous"
+            # The popup pane is now the input target, so this history (and the
+            # scroll below) belong to the popup, which is where the guard applies.
+            fill_history(s)
+            scroll_back(s)
 
-        mark = len(s.srv.log())
-        s.command("PaneFocusRight")
-        s.pump(0.8)
-        assert "is a no-op while the popup is open" in s.srv.log()[mark:], \
-            "popup/PaneFocusRight: the guard did not refuse the command"
+            mark = len(s.srv.log())
+            s.command(cmd)
+            s.pump(0.8)
+            assert "is a no-op while the popup is open" in s.srv.log()[mark:], \
+                f"popup/{label}: the guard did not refuse the command"
 
-        s.c.send({"ScrollDelta": {"delta": 1}})
-        _, r = s.pump(0.8)
-        assert r, "popup/PaneFocusRight: the follow-up scroll produced no render"
-        assert r[-1][1] == SCROLL_BY + 1, (
-            f"popup/PaneFocusRight: scroll_offset={r[-1][1]}, expected "
-            f"{SCROLL_BY + 1} -- the client was snapped to the tail for a "
-            "command the popup guard then refused")
-    finally:
-        s.close()
-    print("PASS PaneFocusRight/scrolled+popup (refused, so not snapped)")
+            s.c.send({"ScrollDelta": {"delta": 1}})
+            _, r = s.pump(0.8)
+            assert r, f"popup/{label}: the follow-up scroll produced no render"
+            assert r[-1][1] == SCROLL_BY + 1, (
+                f"popup/{label}: scroll_offset={r[-1][1]}, expected "
+                f"{SCROLL_BY + 1} -- the client was snapped to the tail for a "
+                "command the popup guard then refused")
+        finally:
+            s.close()
+        print(f"PASS {label}/scrolled+popup (refused, so not snapped)")
 
 
 def session_tree(s):
@@ -417,60 +420,6 @@ def run_own_session_positive():
     finally:
         s.close()
     print("PASS PaneCloseById/scrolled+own-session (snapped)")
-
-
-POPUP_RESIZE = re.compile(r"popup resize -> \((\d+), (\d+)\)")
-
-
-def run_popup_resize_positive():
-    """The popup guard's REROUTE arm renders, so it must snap too.
-
-    `Resize*` is the one command that gets past the guard and is handled inside
-    it: the arm resizes the popup, broadcasts and returns, never reaching the
-    snap below `match cmd`. A scrolled client is filtered out of that broadcast,
-    so without a snap in the arm the popup resizes and the user sees nothing --
-    the reported defect, reached by the only route the guard lets through.
-
-    Vacuity guard: `resize_popup` logs the size it produced, so the case
-    compares the size logged before the scroll with the one logged after. A
-    frame that arrived without the reroute having run would leave only one such
-    line, and an arm that ran but clamped would log the same size twice --
-    neither passes. Checking for a frame alone would not distinguish them.
-    """
-    s = build(f"{RUNDIR_BASE}/popupresize")
-    try:
-        s.command("PopupToggle")
-        s.settle()
-        assert "spawned popup pane_id" in s.srv.log(), \
-            "popup/ResizeRight: the popup never opened -- the case would be vacuous"
-        # The popup pane is the input target, so this gives it the scrollback
-        # the scroll below needs.
-        fill_history(s)
-
-        s.command({"ResizeRight": 2})
-        s.pump(0.8)
-        sizes = POPUP_RESIZE.findall(s.srv.log())
-        assert len(sizes) == 1, \
-            f"popup/ResizeRight: expected one popup resize before the scroll, got {sizes}"
-
-        scroll_back(s)
-        s.command({"ResizeRight": 2})
-        _, r = s.pump(1.2)
-
-        sizes = POPUP_RESIZE.findall(s.srv.log())
-        assert len(sizes) == 2, (
-            f"popup/ResizeRight: the reroute arm did not run while scrolled "
-            f"(popup resize lines: {sizes})")
-        assert sizes[1] != sizes[0], (
-            f"popup/ResizeRight: the popup did not actually resize "
-            f"({sizes[0]} -> {sizes[1]}) -- the case proves nothing")
-        assert r, ("popup/ResizeRight: SILENT -- the popup resized and no frame "
-                   "reached this client")
-        assert r[-1][1] == 0, \
-            f"popup/ResizeRight: client left at scroll_offset={r[-1][1]}, not at the live tail"
-    finally:
-        s.close()
-    print("PASS ResizeRight/scrolled+popup (rerouted, so snapped)")
 
 
 def tab_count(tree, name):
@@ -608,7 +557,7 @@ def main():
                 print(f"FAIL {e}")
     for probe in (run_negative, run_focus_move_negative,
                   run_tab_move_negative, run_stack_move_negative,
-                  run_popup_negative, run_popup_resize_positive,
+                  run_popup_negative,
                   run_cross_session_negative, run_own_session_positive,
                   run_tab_new_other_session_negative,
                   run_tab_new_own_session_positive,

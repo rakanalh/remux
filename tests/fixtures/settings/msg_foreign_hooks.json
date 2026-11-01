@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "remux msg hook claude-stop --json || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/bin/log-and-run remux msg hook claude-prompt"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": []
+  }
+}

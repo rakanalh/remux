@@ -33,6 +33,7 @@ export default defineConfig({
 						{ label: 'Remotes over SSH', slug: 'remotes' },
 						{ label: 'Sidebars', slug: 'sidebars' },
 						{ label: 'Agents', slug: 'agents' },
+						{ label: 'Agent messaging', slug: 'messaging' },
 						{ label: 'Sessions & persistence', slug: 'sessions' },
 					],
 				},

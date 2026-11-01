@@ -39,7 +39,7 @@ You don't have to memorise the tree. Press `Ctrl-a`, read the popup, press the n
 | Split top and bottom | `Ctrl-a p s` |
 | New pane, placed by the layout | `Ctrl-a p n` |
 | Move focus left / down / up / right | `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` |
-| Zoom the focused pane | `Alt-z` |
+| Zoom the focused pane | `Alt-z` or `Ctrl-a z` |
 | Close the focused pane | `Ctrl-a p x` |
 
 Exiting the shell in a pane also closes it.

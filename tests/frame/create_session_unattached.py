@@ -47,10 +47,11 @@ as well as FAIL, so a run says whether the probe pane inherited the descriptors
 a churned pane gave back. The field pane held 38/39, released by a pane that had
 exited 40 seconds earlier; `--wait 40` matches that gap.
 
-`$HOME` is left alone, so the shell under test sources the real user's rc files
-and its output is whatever they print -- with a plugin manager that bootstraps
-itself, the first "content" seen is that bootstrap rather than a prompt, which
-still answers the question being asked.
+`$HOME` is a throwaway `{rundir}/home`. The server reads the platform data
+directory under `$HOME` when the isolated XDG data directory is empty, so the
+real home would load the user's real sessions. The shell under test therefore
+does not source the user's rc files, and a macOS server's fallback log lands
+under the rundir where `log_path` finds it first.
 
 Self-contained on purpose: it imports nothing from this repo, so it can be
 copied to a machine that has only the remux binary and python3. There it needs
@@ -132,10 +133,11 @@ class Server:
         if os.path.exists(self.fallback):
             self.fallback_offset = os.path.getsize(self.fallback)
         shutil.rmtree(self.rundir, ignore_errors=True)
-        for s in ("run", "state", "data", "config"):
+        for s in ("run", "state", "data", "config", "home"):
             os.makedirs(f"{self.rundir}/{s}", exist_ok=True)
         env = {
             **os.environ,
+            "HOME": f"{self.rundir}/home",
             "XDG_RUNTIME_DIR": f"{self.rundir}/run",
             "XDG_STATE_HOME": f"{self.rundir}/state",
             "XDG_DATA_HOME": f"{self.rundir}/data",

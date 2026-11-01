@@ -65,8 +65,27 @@ impl Listing {
 /// A non-UTF-8 home is also `None`: the wire is JSON, and a lossy conversion
 /// would be a path that does not exist. The panel loses the shortening, not
 /// correctness.
+///
+/// Blocking: it reads the filesystem, so call it off the executor.
 pub fn home_dir() -> Option<String> {
-    dirs::home_dir().and_then(|h| h.to_str().map(str::to_string))
+    resolved_home(dirs::home_dir())
+}
+
+/// `home` with its symlinks resolved, or verbatim when it cannot be.
+///
+/// The panel shortens a path to `~` only when the home is a whole-component
+/// prefix of it, and the paths it shows come from a pane's cwd, which the
+/// kernel reports PHYSICALLY. A home that goes through a symlink, such as
+/// Fedora Silverblue's `/home` -> `/var/home`, would otherwise never prefix
+/// them. The verbatim fallback (a home that does not exist, or cannot be read)
+/// keeps the answer remux gave before. So does a resolved path that is not
+/// UTF-8 when `$HOME` itself is, because the wire cannot carry the first.
+fn resolved_home(home: Option<std::path::PathBuf>) -> Option<String> {
+    let home = home?;
+    std::fs::canonicalize(&home)
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .or_else(|| home.to_str().map(str::to_string))
 }
 
 /// List `path`, sorted directories-first then by name.
@@ -395,5 +414,53 @@ mod tests {
             Some(v) => std::env::set_var("EDITOR", v),
             None => std::env::remove_var("EDITOR"),
         }
+    }
+
+    #[test]
+    fn a_home_reached_through_a_symlink_is_reported_resolved() {
+        let tmp = Tmp::new("home-link");
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).expect("real");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let want = std::fs::canonicalize(&real).expect("canonical");
+        assert_eq!(resolved_home(Some(link)), want.to_str().map(str::to_string));
+    }
+
+    #[test]
+    fn a_home_without_symlinks_is_reported_byte_identical() {
+        let tmp = Tmp::new("home-plain");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonical");
+        assert_eq!(
+            resolved_home(Some(home.clone())),
+            home.to_str().map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn a_home_that_cannot_be_resolved_is_reported_verbatim() {
+        let tmp = Tmp::new("home-gone");
+        let gone = tmp.path().join("no-such-home");
+        assert_eq!(
+            resolved_home(Some(gone.clone())),
+            gone.to_str().map(str::to_string)
+        );
+        assert_eq!(resolved_home(None), None);
+    }
+
+    /// Linux only, because APFS refuses a file name that is not UTF-8.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_home_that_resolves_to_a_non_utf8_path_is_reported_as_spelled() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = Tmp::new("home-bytes");
+        let real = tmp.path().join(std::ffi::OsStr::from_bytes(b"real-\xff"));
+        std::fs::create_dir(&real).expect("real");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        assert_eq!(
+            resolved_home(Some(link.clone())),
+            link.to_str().map(str::to_string)
+        );
     }
 }

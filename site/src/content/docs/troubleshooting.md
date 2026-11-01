@@ -21,6 +21,8 @@ Debug logging is always on; there is no `RUST_LOG` or verbosity switch to set. P
 tail -f ~/.local/state/remux/server.log
 ```
 
+When the log directory cannot be written, for example from inside an AI agent's sandboxed shell, CLI commands such as `remux msg send` still run, without a log and without saying so. The server and the relay do not: they exit at once with `cannot open its log` and the path.
+
 ## Where files live
 
 Every location honours its XDG variable first, when it is set to an absolute path.
@@ -40,7 +42,7 @@ On a Mac the config is **not** read from `~/.config` unless you export `XDG_CONF
 
 ## A config change did nothing
 
-The client watches `config.toml` and applies its own settings when you save: keybindings, remotes, sidebars, `pane_title`, `tab_style`, `which_key_position` and the colours of what it draws. Settings the **server** reads, such as `[general]`, `[layouts]`, `[agents]`, `default_layout`, `border_style` and the colours of pane borders, tab strips and the status bar, are only picked up when it starts. [Configuration](/remux/configuration/#client-settings-and-server-settings) has the full list, and [Theme](/remux/theme/#when-changes-apply) the appearance settings.
+The client watches `config.toml` and applies its own settings when you save: keybindings, remotes, sidebars, `pane_title`, `tab_style`, `which_key_position` and the colours of what it draws. Settings the **server** reads, such as `[general]`, `[layouts]`, `[zoom]`, `[agents]`, `default_layout`, `border_style` and the colours of pane borders, tab strips and the status bar, are only picked up when it starts. [Configuration](/remux/configuration/#client-settings-and-server-settings) has the full list, and [Theme](/remux/theme/#when-changes-apply) the appearance settings.
 
 ```sh
 remux restart

@@ -7,7 +7,7 @@ description: Every remux subcommand and flag.
 remux [COMMAND]
 ```
 
-With no command, `remux` attaches you to a session. The other commands manage sessions and the server from a shell, and `split` and `new-tab` open panes from a script running inside Remux.
+With no command, `remux` attaches you to a session. The other commands manage sessions and the server from a shell, `split` and `new-tab` open panes from a script running inside Remux, and `msg`, `agent` and `integrate` are for [agent messaging](/remux/messaging/).
 
 | Command | Does |
 |---|---|
@@ -21,6 +21,9 @@ With no command, `remux` attaches you to a session. The other commands manage se
 | [`remux restart`](#remux-restart) | Stop the server and start a new one |
 | [`remux split`](#remux-split) | Split the focused pane (from inside a pane) |
 | [`remux new-tab`](#remux-new-tab) | Open a new tab (from inside a pane) |
+| [`remux msg`](#remux-msg) | Leave messages for other panes and read your own |
+| [`remux agent`](#remux-agent) | Name panes and list the ones that can be sent to |
+| [`remux integrate`](#remux-integrate) | Install, check or remove a coding agent's hooks for messaging |
 
 Every command takes `-h`/`--help`. `remux -V` (or `--version`) prints the version.
 
@@ -150,6 +153,74 @@ Both commands are meant to be run **from inside a Remux pane**, by you or by a s
 - The pane that gets split is that session's **currently focused** pane in its active tab, not necessarily the pane the command ran in. `$REMUX_PANE` picks the session, never the spot.
 - If no server is running on this machine, the command exits non-zero. It does not start a server.
 - On success it prints nothing and exits 0. Errors go to stderr with a non-zero exit, so scripts can check `$?`.
+
+## `remux msg`
+
+```shell
+remux msg send [OPTIONS] <TARGET> <TEXT | --stdin | --file <FILE>>
+remux msg read [OPTIONS]
+remux msg ack [--pane <PANE>] <IDS... | --all>
+```
+
+Leave a message in a pane's mailbox, read your own, or mark messages read. Run them from inside a pane: a send's sender is the pane the command runs in. See [Agent messaging](/remux/messaging/).
+
+`<TARGET>` is `%N`, a name, or either one after `host:` for a pane on a [remote](/remux/remotes/).
+
+| `msg send` flag | Meaning |
+|---|---|
+| `--stdin` | Read the message from standard input, which must be a pipe or a file |
+| `-f`, `--file <FILE>` | Read the message from a regular file |
+| `--deliver <MODE>` | `auto` (default), `submit` or `mailbox`. See [Delivery](/remux/messaging/#delivery). |
+| `--defer` | While the agent is waiting on its user, keep the message queued until it is not |
+| `--wait` | Once the message is typed, wait for the agent's turn to end and say how it ended |
+| `--timeout <DUR>` | How long `--defer` and `--wait` may take together: `30`, `30s`, `2m`, at most `1h`. Default: `10m`. |
+| `--reply-to <ID>` | The id of the message this one answers |
+| `--json` | Print the answer as JSON |
+
+| `msg read` flag | Meaning |
+|---|---|
+| `--pane <PANE>` | Read another pane's mailbox, `%N`. This marks nothing read. |
+| `--all` | Include messages already read |
+| `--peek` | Do not mark anything read |
+| `--wait <DUR>` | Wait this long for mail when there is none. Exits 0 with no output if nothing arrives. |
+| `--format <FORMAT>` | `text` (default), `json`, or `context`: one block per message for an agent's context |
+
+`msg ack` takes message ids, or `--all` for every unread message, and `--pane <PANE>` for another pane's mailbox.
+
+`remux msg hook` is run by an agent's hooks, never by hand. [`remux integrate`](#remux-integrate) installs it.
+
+## `remux agent`
+
+```shell
+remux agent ls [--json]
+remux agent status [TARGET] [--json]
+remux agent name <NAME | --clear> [--pane <PANE>]
+remux agent wait <TARGET> --state <idle|working|blocked> [--timeout <DUR>] [--json]
+```
+
+| Command | Does |
+|---|---|
+| `ls` | List every agent, named pane and pane with mail. With `--json`, `tab_index` counts from 0; the table's `TAB` counts from 1. |
+| `status` | Show one pane, or every pane worth listing |
+| `name` | Give this pane the name other panes send to (`[a-z][a-z0-9_-]{0,31}`), or remove it with `--clear`. `--pane %N` names another pane, and only works from outside every pane. |
+| `wait` | Wait until a pane's agent is idle, working or blocked (waiting on its user). Exits 0 when it is, and also when the time runs out, saying so. `--timeout` defaults to `10m`. |
+
+## `remux integrate`
+
+```shell
+remux integrate [OPTIONS] claude-messaging
+```
+
+Install, check or remove what a coding agent needs in its own files to use Remux messaging. `claude-messaging` is Claude Code's `Stop` and `UserPromptSubmit` hooks in `~/.claude/settings.json`, and the remux-messaging skill. Run it on the machine the agent runs on, as the user it runs as. With no flag, it installs.
+
+| Flag | Meaning |
+|---|---|
+| `--status` | Report whether the integration is installed, stale or absent |
+| `--dry-run` | Print what an install would change, and change nothing |
+| `--uninstall` | Remove remux's hooks, and nothing of yours |
+| `--allow-dev-path` | Write hooks that run this binary even though it is a cargo build output (under a `target/` directory). Only for running a Remux built from source under `target/`; an installed binary never needs it. |
+
+See [Claude Code hooks](/remux/messaging/#claude-code-hooks).
 
 ## Environment variables
 

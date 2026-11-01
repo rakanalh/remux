@@ -10,6 +10,7 @@ use std::time::Duration;
 use crossterm::event::{KeyEvent, MouseEventKind};
 use unicode_width::UnicodeWidthChar;
 
+use crate::client::context_menu::MenuItem;
 use crate::client::registry::ConnId;
 use crate::client::tree_model::JumpTarget;
 use crate::config::sidebar::PanelConfig;
@@ -218,6 +219,13 @@ pub trait SidebarPlugin: Send {
     /// Handle a mouse event at panel-local coordinates.
     fn on_mouse(&mut self, x: u16, y: u16, kind: MouseEventKind) -> PluginAction;
 
+    /// The rows of the context menu for a right press at panel-local `(x, y)`.
+    /// The panel moves its own cursor onto the row it lands on, as a left press
+    /// does. Empty when nothing there has a menu, which is the default.
+    fn context_menu(&mut self, _x: u16, _y: u16) -> Vec<MenuItem> {
+        Vec::new()
+    }
+
     /// Receive pushed data. Called regardless of focus.
     fn on_event(&mut self, ev: &PluginEvent);
 
@@ -386,6 +394,19 @@ pub fn draw_text(
     fg: CellColor,
     bg: CellColor,
 ) {
+    draw_text_with(grid, x, y, text, fg, bg, false);
+}
+
+/// [`draw_text`] with the bold attribute chosen by the caller.
+pub fn draw_text_with(
+    grid: &mut [Vec<RenderCell>],
+    x: u16,
+    y: u16,
+    text: &str,
+    fg: CellColor,
+    bg: CellColor,
+    bold: bool,
+) {
     let Some(row) = grid.get_mut(y as usize) else {
         return;
     };
@@ -414,7 +435,7 @@ pub fn draw_text(
             c: ch,
             fg: fg.clone(),
             bg: bg.clone(),
-            bold: false,
+            bold,
             italic: false,
             underline: false,
             width: w as u8,

@@ -1,8 +1,8 @@
 """Issue #6 (PTY, only if reproducible): in a view with a CUSTOM cell layout,
-Prefix+f zoom then Prefix+f again must EXIT zoom and restore both cells.
+Prefix+z zoom then Prefix+z again must EXIT zoom and restore both cells.
 
-Build a 2-cell view, make a custom arrangement (move a cell), zoom (Prefix f) ->
-only the focused cell shows; unzoom (Prefix f) -> BOTH cells show again.
+Build a 2-cell view, make a custom arrangement (move a cell), zoom (Prefix z) ->
+only the focused cell shows; unzoom (Prefix z) -> BOTH cells show again.
 """
 import os
 import shutil
@@ -50,13 +50,13 @@ def run(t):
     print(f"custom layout: A={a0} B={b0} (status has 'custom': {t.has('custom')})")
 
     # Zoom the focused cell.
-    t.prefix(b"f", 0.6)
+    t.prefix(b"z", 0.6)
     az, bz = both_visible(t)
     zoomed_flag = t.has(" Z") or t.has("Z ")
     print(f"after zoom: A={az} B={bz} (only one visible expected)")
 
     # Unzoom -- must exit and restore both cells.
-    t.prefix(b"f", 0.6)
+    t.prefix(b"z", 0.6)
     au, bu = both_visible(t)
     print(f"after unzoom: A={au} B={bu} (both expected)")
 
@@ -69,7 +69,7 @@ def run(t):
     unzoom_restored = au and bu
     print(f"zoom_hid_one={zoom_hid_one} unzoom_restored={unzoom_restored} alive={alive} panic={panic}")
     if unzoom_restored and alive and not panic:
-        print("PASS: Prefix+f zoom toggles correctly in a custom-layout view")
+        print("PASS: Prefix+z zoom toggles correctly in a custom-layout view")
         sys.exit(0)
     print("FAIL: zoom did not exit / restore both cells")
     sys.exit(1)

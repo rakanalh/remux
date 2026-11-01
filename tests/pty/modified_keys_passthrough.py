@@ -14,7 +14,11 @@ from pty_harness import Tui
 
 RUNDIR = "/tmp/rmx-modkeys"
 
-# (label, bytes we feed the client, what `cat -vT` must print in the pane)
+# BSD `cat` has no `-T`. Its `-t` shows tabs and implies `-v`, which is what
+# GNU's `-vT` does.
+CAT = "cat -vt" if sys.platform == "darwin" else "cat -vT"
+
+# (label, bytes we feed the client, what `cat -v` must print in the pane)
 CASES = [
     ("Ctrl+Right", b"\x1b[1;5C", "^[[1;5C"),
     ("Shift+Down", b"\x1b[1;2B", "^[[1;2B"),
@@ -24,7 +28,7 @@ CASES = [
 ]
 
 t = Tui(RUNDIR).start()
-t.send("stty raw -echo; cat -vT\r", t=1.0)
+t.send(f"stty raw -echo; {CAT}\r", t=1.0)
 
 results = []
 for label, sent, want in CASES:

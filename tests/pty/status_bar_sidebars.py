@@ -95,6 +95,7 @@ def stop(t):
     t.kill()
     env = {
         **os.environ,
+        "HOME": f"{t.rundir}/home",
         "XDG_RUNTIME_DIR": f"{t.rundir}/run",
         "XDG_STATE_HOME": f"{t.rundir}/state",
         "XDG_DATA_HOME": f"{t.rundir}/data",

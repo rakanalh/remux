@@ -82,11 +82,11 @@ def main():
         cli.send({"Attach": {"session_name": "gone"}})
         cli.send({"Resize": {"cols": 100, "rows": 30}})
         cli.drain(0.8)
-        cli.send({"Command": "PopupToggle"})
+        cli.send({"Command": {"PopupToggle": None}})
         cli.drain(0.6)
-        cli.send({"Command": "PopupToggle"})
+        cli.send({"Command": {"PopupToggle": None}})
         cli.drain(0.6)
-        popups = re.findall(r'PopupToggle session="gone" spawned popup pane_id=(\d+)', srv.log())
+        popups = re.findall(r'PopupToggle session="gone" tab=\d+ spawned popup pane_id=(\d+)', srv.log())
         check(len(popups) == 1, f"setup: one popup was spawned for gone ({popups})")
         popup = int(popups[0]) if popups else None
         if popup is not None:

@@ -128,6 +128,14 @@ struct RemoteEntry {
 
 type BoxWriter = Box<dyn AsyncWrite + Unpin + Send>;
 
+/// A failed remote connect as it is logged and shown: escaped and bounded,
+/// because a handshake or decode error quotes bytes the far side chose.
+fn remote_error(msg: &str) -> String {
+    crate::client::cli_common::escape_bounded(msg, REMOTE_ERROR_MAX)
+}
+
+const REMOTE_ERROR_MAX: usize = 300;
+
 /// Owns every open connection and the shared incoming-message channel.
 pub struct ConnectionManager {
     /// Per-connection writer, keyed by connection id.
@@ -394,7 +402,7 @@ impl ConnectionManager {
                 Ok(())
             }
             Ok(Err(e)) => {
-                let msg = format!("{e:#}");
+                let msg = remote_error(&format!("{e:#}"));
                 log::warn!("registry: remote '{name}' failed: {msg}");
                 self.fail_remote(name, msg.clone());
                 Err(e)
@@ -517,6 +525,7 @@ impl ConnectionManager {
                 true
             }
             Err(msg) => {
+                let msg = remote_error(&msg);
                 log::warn!("registry: background connect to remote '{name}' failed: {msg}");
                 self.fail_remote(name, msg);
                 false
@@ -1250,6 +1259,23 @@ mod tests {
         // an error about a connection they cancelled is noise.
         assert!(!mgr.finish_remote_dial("alpha", Err("connection timed out".to_string())));
         assert_eq!(mgr.remote_state("alpha"), RemoteState::Disconnected);
+    }
+
+    #[test]
+    fn a_failed_dial_is_recorded_escaped_and_bounded() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        mgr.set_state("alpha", RemoteState::Connecting);
+        let far = format!("remote remux x\n\u{1b}[31m{}", "z".repeat(1000));
+        assert!(!mgr.finish_remote_dial("alpha", Err(far)));
+        let RemoteState::Failed(msg) = mgr.remote_state("alpha") else {
+            panic!("a failed dial is Failed");
+        };
+        assert!(
+            msg.starts_with("remote remux x\\x0a\\x1b[31m")
+                && msg.chars().count() <= REMOTE_ERROR_MAX
+                && !msg.contains('\n'),
+            "{msg:?}"
+        );
     }
 
     /// The View subscribe pass runs on every layout/focus change, so the lazy

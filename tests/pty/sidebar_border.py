@@ -75,13 +75,14 @@ visible = true
 
 def make_env(config: str) -> dict:
     shutil.rmtree(RUNDIR, ignore_errors=True)
-    for sub in ("run", "state", "data", "config"):
+    for sub in ("run", "state", "data", "config", "home"):
         os.makedirs(f"{RUNDIR}/{sub}", exist_ok=True)
     os.makedirs(f"{RUNDIR}/config/remux", exist_ok=True)
     with open(f"{RUNDIR}/config/remux/config.toml", "w") as fh:
         fh.write(config)
     env = dict(os.environ)
     env.update(
+        HOME=f"{RUNDIR}/home",
         XDG_RUNTIME_DIR=f"{RUNDIR}/run",
         XDG_STATE_HOME=f"{RUNDIR}/state",
         XDG_DATA_HOME=f"{RUNDIR}/data",
@@ -242,7 +243,7 @@ def test_the_panel_interior_shrank_by_the_frame():
     A 10-column sidebar has an 8-column interior under the zellij box, so the
     placeholder's title is clipped to 8 characters and the frame's right edge
     follows immediately. Had the panel still been handed the full bar, the same
-    row would read `Placehold` from column 0 -- so this fails on a frame that is
+    row would read ` placehol` from column 0 -- so this fails on a frame that is
     merely painted over a panel that never shrank.
     """
     name = "test_the_panel_interior_shrank_by_the_frame"
@@ -250,7 +251,7 @@ def test_the_panel_interior_shrank_by_the_frame():
     child, screen, pump = spawn(env)
     pump(1.5)
     got = screen.display[1][:10]
-    want = VERT + "Placehol" + VERT
+    want = VERT + " placeho" + VERT
     if got != want:
         fail(name, f"panel row is {got!r}, expected {want!r}", screen)
     else:
@@ -276,8 +277,8 @@ def test_tmux_style_draws_a_seam_and_no_box():
         bad.append(f"a left edge was drawn on rows {boxed[:5]} -- tmux has no box")
     # The interior is 9 columns, one more than zellij's, and it starts at
     # column 0: the seam is the only cell the frame took.
-    if rows[0][:10] != "Placehold" + VERT:
-        bad.append(f"panel row is {rows[0][:10]!r}, expected 'Placehold' + the seam")
+    if rows[0][:10] != " placehol" + VERT:
+        bad.append(f"panel row is {rows[0][:10]!r}, expected ' placehol' + the seam")
     if str(screen.buffer[5][9].fg) != FRAME_FG:
         bad.append(
             f"the seam is {screen.buffer[5][9].fg}, not frame_fg -- tmux pane "
@@ -295,8 +296,8 @@ def test_toggle_style_reframes_the_sidebar_with_the_panes():
     """One keystroke must move both, or the sidebar contradicts the panes."""
     name = "test_toggle_style_reframes_the_sidebar_with_the_panes"
     # size=10 so the panel's own content proves which frame is in force: the
-    # zellij box leaves an 8-column interior ("Placehol"), the tmux seam a
-    # 9-column one ("Placehold"). Asserting only on corner/seam GLYPHS would
+    # zellij box leaves an 8-column interior (" placeho"), the tmux seam a
+    # 9-column one (" placehol"). Asserting only on corner/seam GLYPHS would
     # pass on a build that flipped the frame and kept the old interior -- the
     # frame-right-content-wrong shape this branch keeps producing.
     env = make_env(cfg("zellij_style", size=10))
@@ -309,7 +310,7 @@ def test_toggle_style_reframes_the_sidebar_with_the_panes():
     if rows[0][10] != TL:
         bad.append(f"the pane did not start framed: {rows[0][10:][:12]!r}")
     # The zellij interior: 8 columns, then the box's right edge.
-    if rows[1][:10] != VERT + "Placehol" + VERT:
+    if rows[1][:10] != VERT + " placeho" + VERT:
         bad.append(f"zellij interior wrong before the toggle: {rows[1][:10]!r}")
 
     child.send(b"\x01")
@@ -327,10 +328,10 @@ def test_toggle_style_reframes_the_sidebar_with_the_panes():
         bad.append("the panes kept their box after the toggle")
     # ...and the INTERIOR really moved with the frame: 9 columns now, starting
     # at column 0. This is the assertion a frame-only test would miss.
-    if rows[0][:10] != "Placehold" + VERT:
+    if rows[0][:10] != " placehol" + VERT:
         bad.append(
             f"the panel interior did not follow the toggle: {rows[0][:10]!r}, "
-            f"expected 'Placehold' + the seam"
+            f"expected ' placehol' + the seam"
         )
 
     # ... and back again, in one keystroke.
@@ -343,7 +344,7 @@ def test_toggle_style_reframes_the_sidebar_with_the_panes():
         bad.append(f"the sidebar did not come back framed: {rows[0][:10]!r}")
     if rows[0][10] != TL:
         bad.append("the panes did not come back framed")
-    if rows[1][:10] != VERT + "Placehol" + VERT:
+    if rows[1][:10] != VERT + " placeho" + VERT:
         bad.append(f"the interior did not come back with it: {rows[1][:10]!r}")
 
     if bad:
@@ -424,7 +425,7 @@ def test_a_sidebar_too_small_to_frame_degrades_to_unframed():
     drawn = [y for y in range(ROWS) if rows[y][0] in BOX or rows[y][1] in BOX]
     if drawn:
         bad.append(f"a broken box was drawn on rows {drawn[:5]}: {rows[0][:4]!r}")
-    if rows[0][:2] != "Pl":
+    if rows[0][:2] != " p":
         bad.append(f"the panel did not render unframed: {rows[0][:4]!r}")
     if rows[0][2] != TL:
         bad.append(f"the content rect did not start at column 2: {rows[0][:6]!r}")
@@ -534,7 +535,7 @@ def test_a_config_reload_keeps_the_toggled_style():
     # ...and the INTERIOR is the tmux one at the NEW size: 25 columns of panel
     # then the seam, with no box column at 0. Glyph-only assertions would pass
     # on a build that kept the zellij interior behind a tmux-looking seam.
-    if rows[0][:narrower] != "Placeholder".ljust(narrower - 1) + VERT:
+    if rows[0][:narrower] != " placeholder".ljust(narrower - 1) + VERT:
         bad.append(
             f"the panel interior is not the tmux one at the new size: "
             f"{rows[0][:narrower]!r}"
@@ -602,7 +603,7 @@ def test_a_reattach_resyncs_the_style_the_server_is_drawing():
             f"while the panes are in the session's: {rows[0][:12]!r}"
         )
     # The interior moved with it: tmux leaves 9 columns then the seam.
-    if rows[0][:10] != "Placehold" + VERT:
+    if rows[0][:10] != " placehol" + VERT:
         bad.append(
             f"the panel interior is not the tmux one after the reattach: "
             f"{rows[0][:10]!r}"

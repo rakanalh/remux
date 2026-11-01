@@ -9,8 +9,12 @@ from pty_harness import Tui
 
 RUNDIR = "/tmp/rmx-stab"
 
+# BSD `cat` has no `-T`. Its `-t` shows tabs and implies `-v`, which is what
+# GNU's `-vT` does.
+CAT = "cat -vt" if sys.platform == "darwin" else "cat -vT"
+
 t = Tui(RUNDIR).start()
-t.send("stty raw -echo; cat -vT\r", t=1.0)
+t.send(f"stty raw -echo; {CAT}\r", t=1.0)
 
 t.send(b"\t", t=0.6)
 after_tab = "".join(t.rows_text())

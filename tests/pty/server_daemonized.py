@@ -37,6 +37,7 @@ import os
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import time
 
@@ -68,6 +69,8 @@ def proc_stat(pid):
     fields are split from after the LAST ')' -- splitting on whitespace from
     the left mis-parses any process whose name has a space in it.
     """
+    if sys.platform == "darwin":
+        return darwin_proc_stat(pid)
     try:
         with open(f"/proc/{pid}/stat") as f:
             raw = f.read()
@@ -80,6 +83,31 @@ def proc_stat(pid):
         "pgrp": int(rest[2]),
         "session": int(rest[3]),
         "tty_nr": int(rest[4]),
+    }
+
+
+def darwin_proc_stat(pid):
+    """`proc_stat` for macOS, which has no `/proc`.
+
+    The session and group come from `getsid`/`getpgid`, which answer for any
+    process. `ps` reports `??` for a process with no controlling terminal,
+    which stands for Linux's `tty_nr == 0`; any other value is reported as 1.
+    """
+    r = subprocess.run(["ps", "-o", "stat=,ppid=,tty=", "-p", str(pid)],
+                       capture_output=True, text=True)
+    fields = r.stdout.split()
+    if r.returncode != 0 or len(fields) != 3:
+        return None
+    try:
+        sid, pgrp = os.getsid(pid), os.getpgid(pid)
+    except ProcessLookupError:
+        return None
+    return {
+        "state": fields[0][0],
+        "ppid": int(fields[1]),
+        "pgrp": pgrp,
+        "session": sid,
+        "tty_nr": 0 if fields[2] == "??" else 1,
     }
 
 
@@ -222,7 +250,7 @@ def main():
         cs, ss = proc_stat(cli), proc_stat(srv)
         if cs is None or ss is None:
             check("client and server are both running", False, f"client={cs} server={ss}")
-            return
+            raise SystemExit(1)
         print(f"      client {cli}: {cs}")
         print(f"      server {srv}: {ss}")
 

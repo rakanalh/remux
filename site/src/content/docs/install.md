@@ -47,7 +47,7 @@ cp config.sample.toml ~/.config/remux/config.toml
 ```
 
 :::note
-On macOS the default config location is `~/Library/Application Support/remux/config.toml` rather than `~/.config/remux/`. If `XDG_CONFIG_HOME` is set to an absolute path, Remux reads `$XDG_CONFIG_HOME/remux/config.toml` on either platform.
+That is the Linux location. On macOS the default is `~/Library/Application Support/remux/config.toml`, so copy the sample there instead. If `XDG_CONFIG_HOME` is set to an absolute path, Remux reads `$XDG_CONFIG_HOME/remux/config.toml` on either platform.
 :::
 
 See [Configuration](/remux/configuration/) for how the file is organised and which settings apply live.

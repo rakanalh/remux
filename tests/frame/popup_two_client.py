@@ -113,7 +113,7 @@ def main():
     for m in a.drain(0.6):
         ga.apply(m)
 
-    a.send({"Command": "PopupToggle"})
+    a.send({"Command": {"PopupToggle": None}})
     time.sleep(1.0)
     for m in a.drain(0.8):
         ga.apply(m)
@@ -191,7 +191,7 @@ def main():
 
     # -- 5. Toggling from B hides it for A as well. ------------------------
     print("\n[5] toggling from B hides the popup for BOTH clients")
-    b.send({"Command": "PopupToggle"})
+    b.send({"Command": {"PopupToggle": None}})
     time.sleep(1.0)
     for m in b.drain(0.9):
         gb.apply(m)

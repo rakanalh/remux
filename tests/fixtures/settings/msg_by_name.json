@@ -1,0 +1,27 @@
+{
+  "model": "sonnet",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "remux msg hook claude-stop || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "remux msg hook claude-prompt || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

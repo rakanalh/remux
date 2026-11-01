@@ -24,8 +24,13 @@ With `$XDG_CONFIG_HOME` unset, a Mac keeps the config under `~/Library/Applicati
 The repository ships `config.sample.toml`, which lists every option commented out at its default value. Copy it into place and uncomment what you want to change:
 
 ```shell
+# Linux
 mkdir -p ~/.config/remux
 cp config.sample.toml ~/.config/remux/config.toml
+
+# macOS, with XDG_CONFIG_HOME unset
+mkdir -p ~/Library/Application\ Support/remux
+cp config.sample.toml ~/Library/Application\ Support/remux/config.toml
 ```
 
 A minimal config is usually a handful of lines:
@@ -48,20 +53,23 @@ In TOML, a table's own keys must come before any of its sub-tables. Put `leader`
 
 Remux is two processes. The **server** owns the sessions, panes and PTYs, and it draws the pane frames, tab strips and status bar. The **client** is the program in your terminal. It draws the overlays, the which-key popup, sidebars and Views, and it handles every key you press. Both read the same `config.toml`, but each one only uses the settings it owns, and the two reload differently.
 
-**The client reloads live.** It watches the config file, so saving the file applies these settings straight away:
+**The client reloads live.** It watches the config file, so saving the file applies these settings straight away. The file may be a symlink, such as one into a dotfiles checkout: Remux watches the real file's directory too, and picks up a link whose target only appears later.
 
 - `[keybindings.command]` (the leader, the command tree and the Alt shortcuts) and `[keybindings.session_manager]`
 - `appearance.which_key_position`
+- `appearance.popup_position`, `popup_width_pct` and `popup_height_pct`
 - `appearance.pane_title` and `appearance.theme.tab_style`, which the client sends to every server it views
 - `[appearance.theme]` colours for what the client draws: the which-key popup, the session manager and other overlays, sidebars, View cells and their status bar, and search highlights
 - `[remotes.*]`
 - `[[sidebar]]`
+- `[notifications]`
 
 **The server reads the file once, at startup.** Run `remux restart` after changing any of these:
 
 - everything under `[general]`
-- `appearance.border_style`, `default_layout`, `popup_width_pct`, `popup_height_pct`
+- `appearance.border_style`, `default_layout`
 - `[layouts]`
+- `[zoom]`
 - `[agents]`
 - `[appearance.theme]` colours for what the server draws: pane frames, tab chips and the status bar
 

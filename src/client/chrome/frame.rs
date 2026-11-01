@@ -90,6 +90,109 @@ pub fn draw_sidebar_frame(
     }
 }
 
+/// Draw a flat sidebar's divider and panel rules into `grid`.
+///
+/// The divider takes the seam cells `frame_for` reserved. A rule stops short of
+/// the divider and leaves it unbroken, with no tee glyph, so the divider reads
+/// as one line down the whole sidebar. Both are `sidebar_divider_fg`, and focus
+/// does not change them.
+pub fn draw_flat_frame(
+    grid: &mut [Vec<RenderCell>],
+    edge: SidebarEdge,
+    rules: &[u16],
+    theme: &CompositorTheme,
+) {
+    let h = grid.len();
+    if h == 0 || grid[0].is_empty() {
+        return;
+    }
+    let w = grid[0].len();
+    let fg = &theme.sidebar_divider_fg;
+    match edge {
+        SidebarEdge::Left | SidebarEdge::Right => {
+            if w < 2 {
+                return;
+            }
+            let (seam, x0, x1) = match edge {
+                SidebarEdge::Right => (0, 1, w),
+                _ => (w - 1, 0, w - 1),
+            };
+            draw_divider_column(grid, seam, 0, h, fg, theme);
+            for &r in rules {
+                draw_divider_row(grid, r as usize, x0, x1, fg, theme);
+            }
+        }
+        SidebarEdge::Bottom => {
+            if h < 2 {
+                return;
+            }
+            draw_divider_row(grid, 0, 0, w, fg, theme);
+            for &r in rules {
+                draw_divider_column(grid, r as usize, 1, h, fg, theme);
+            }
+        }
+    }
+}
+
+/// Fill `rect` (bar-local) with the button background and put `glyph` in its
+/// middle cell, bold in the bright sidebar text colour.
+///
+/// Used for the collapse button on an expanded sidebar and for the chip on a
+/// collapsed strip. A one-cell rect is the glyph alone.
+///
+/// `on_active_bar` is for a chip sitting on a focused panel's header bar. It is
+/// drawn inverted there, with the bar's title colour as its background and the
+/// bar's own colour as the glyph. `sidebar_button_bg` is a separate token that
+/// a theme can set to any colour, including the bar's, so only a rule built
+/// from the bar's own two colours keeps the chip visible on it.
+pub fn draw_chip(
+    grid: &mut [Vec<RenderCell>],
+    rect: Rect,
+    glyph: char,
+    on_active_bar: bool,
+    theme: &CompositorTheme,
+) {
+    let (fg, bg) = if on_active_bar {
+        (
+            &theme.sidebar_header_active_bg,
+            &theme.sidebar_header_active_fg,
+        )
+    } else {
+        (&theme.sidebar_name_selected_fg, &theme.sidebar_button_bg)
+    };
+    for dy in 0..rect.height {
+        for dx in 0..rect.width {
+            let mut cell = border_cell(' ', fg, theme);
+            cell.bg = bg.clone();
+            if dx == rect.width / 2 && dy == rect.height / 2 {
+                cell.c = glyph;
+                cell.bold = true;
+            }
+            put_cell(grid, (rect.y + dy) as usize, (rect.x + dx) as usize, cell);
+        }
+    }
+}
+
+/// Draw a collapsed sidebar's strip into `grid`, which is the strip itself: the
+/// whole strip on the strip background, with the expand chip (bar-local
+/// `chip`, and the glyph that goes in it) on top.
+pub fn draw_strip(
+    grid: &mut [Vec<RenderCell>],
+    chip: Option<(Rect, char)>,
+    theme: &CompositorTheme,
+) {
+    for row in grid.iter_mut() {
+        for cell in row.iter_mut() {
+            let mut blank = border_cell(' ', &theme.sidebar_dim_fg, theme);
+            blank.bg = theme.sidebar_strip_bg.clone();
+            *cell = blank;
+        }
+    }
+    if let Some((rect, glyph)) = chip {
+        draw_chip(grid, rect, glyph, false, theme);
+    }
+}
+
 /// The `├───┤` (or `┬ │ ┴`) rules between a framed sidebar's stacked panels.
 ///
 /// The run itself is the shared divider primitive; only the two junction
@@ -360,5 +463,95 @@ mod tests {
             &t,
         );
         assert_eq!(g[0][3].fg, t.frame_fg);
+    }
+
+    #[test]
+    fn a_flat_frame_is_one_divider_and_rules_that_stop_short_of_it() {
+        let t = theme();
+        let mut g = blank_grid(6, 5, CellColor::Default);
+        draw_flat_frame(&mut g, SidebarEdge::Left, &[2], &t);
+        assert_eq!(
+            chars(&g),
+            vec!["     │", "     │", "─────│", "     │", "     │"]
+        );
+        for row in &g {
+            assert_eq!(row[5].fg, t.sidebar_divider_fg);
+        }
+        assert_eq!(g[2][0].fg, t.sidebar_divider_fg);
+
+        let mut g = blank_grid(6, 3, CellColor::Default);
+        draw_flat_frame(&mut g, SidebarEdge::Right, &[1], &t);
+        assert_eq!(chars(&g), vec!["│     ", "│─────", "│     "]);
+    }
+
+    #[test]
+    fn a_strip_is_filled_with_a_chip_in_it() {
+        let t = theme();
+        let mut g = blank_grid(1, 7, CellColor::Default);
+        let chip = Rect {
+            x: 0,
+            y: 2,
+            width: 1,
+            height: 3,
+        };
+        draw_strip(&mut g, Some((chip, '\u{25B6}')), &t);
+        for (y, row) in g.iter().enumerate() {
+            let in_chip = (2..5).contains(&y);
+            let want = if in_chip {
+                &t.sidebar_button_bg
+            } else {
+                &t.sidebar_strip_bg
+            };
+            assert_eq!(&row[0].bg, want, "row {y}");
+        }
+        assert_eq!(chars(&g)[3], "\u{25B6}");
+        assert!(g[3][0].bold);
+        assert_eq!(g[3][0].fg, t.sidebar_name_selected_fg);
+        assert_eq!(chars(&g)[2], " ");
+        assert!(!g[2][0].bold);
+    }
+
+    #[test]
+    fn a_chip_is_space_glyph_space_on_the_button_background() {
+        let t = theme();
+        let mut g = blank_grid(8, 2, CellColor::Default);
+        let chip = Rect {
+            x: 4,
+            y: 1,
+            width: 3,
+            height: 1,
+        };
+        draw_chip(&mut g, chip, '\u{25C0}', false, &t);
+        assert_eq!(chars(&g)[1], "    \u{20}\u{25C0}\u{20} ");
+        for cell in &g[1][4..7] {
+            assert_eq!(cell.bg, t.sidebar_button_bg);
+        }
+        assert_eq!(g[1][3].bg, CellColor::Default);
+        assert_eq!(g[1][5].fg, t.sidebar_name_selected_fg);
+        assert!(g[1][5].bold);
+    }
+
+    #[test]
+    fn a_chip_on_a_focused_header_bar_is_inverted_against_the_bar() {
+        let t = theme();
+        let mut g = blank_grid(8, 2, CellColor::Default);
+        for cell in &mut g[1] {
+            cell.bg = t.sidebar_header_active_bg.clone();
+        }
+        let chip = Rect {
+            x: 4,
+            y: 1,
+            width: 3,
+            height: 1,
+        };
+        draw_chip(&mut g, chip, '\u{25BC}', true, &t);
+        for cell in &g[1][4..7] {
+            assert_eq!(cell.bg, t.sidebar_header_active_fg);
+            assert_ne!(cell.bg, g[1][3].bg, "the chip must differ from the bar");
+        }
+        assert_eq!(g[1][5].c, '\u{25BC}');
+        assert_eq!(g[1][5].fg, t.sidebar_header_active_bg);
+        assert_ne!(g[1][5].fg, g[1][5].bg);
+        assert!(g[1][5].bold);
     }
 }

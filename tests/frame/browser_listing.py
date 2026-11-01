@@ -28,6 +28,11 @@ What it covers:
  10  every listing carries the SERVER's own `$HOME`, which is what lets the panel
      header render `~/Work` rather than the full path -- and it is the server's,
      not the harness's, so a client-side substitution could not fake it
+ 11  when `$HOME` goes through a symlink (Fedora Silverblue's /home ->
+     /var/home, macOS's /tmp -> /private/tmp), the home is sent RESOLVED. The
+     paths the panel lists come from a pane's cwd, which the kernel reports
+     physically, so a home sent verbatim never prefixes them and the header
+     never shows `~`
 
 Run from the repo root:
     python3 tests/frame/browser_listing.py [-v]
@@ -48,6 +53,9 @@ BIGDIR = f"{RUN}/big"
 # environment would pass on a client-side substitution -- the exact mistake the
 # field exists to prevent.
 FAKE_HOME = f"{RUN}/home"
+# FAKE_HOME again, reached through a symlink: the shape of a home under
+# Silverblue's /home -> /var/home.
+LINKED_HOME = f"{RUN}/homelink"
 VERBOSE = "-v" in sys.argv
 FAILURES = []
 
@@ -88,6 +96,8 @@ def build_fixture():
     link = f"{FIX}/dirlink"
     if not os.path.lexists(link):
         os.symlink(f"{FIX}/real", link)
+    if not os.path.lexists(LINKED_HOME):
+        os.symlink(FAKE_HOME, LINKED_HOME)
     with open(f"{RUN}/outside/faraway.txt", "w") as fh:
         fh.write("x\n")
     for name, tag in (("cfg-editor", "EDITING"), ("env-editor", "ENVEDIT")):
@@ -230,9 +240,11 @@ def listing_cases(srv):
     # different username, and on macOS a different layout entirely. `.get`, not
     # `[...]`, so a server that never sends the field FAILS this check instead of
     # raising and taking the rest of the run with it.
+    # `realpath`, because the server resolves symlinks in the home (case 11)
+    # and on macOS `/tmp` is one. On Linux it is FAKE_HOME unchanged.
     check("10 the listing carries the SERVER's own home directory",
-          got.get("home") == FAKE_HOME, {"home": got.get("home"),
-                                         "expected": FAKE_HOME})
+          got.get("home") == os.path.realpath(FAKE_HOME),
+          {"home": got.get("home"), "expected": os.path.realpath(FAKE_HOME)})
     check("10 and it is not this process's home, so a client-side $HOME "
           "could not have produced it",
           got.get("home") != os.environ.get("HOME"),
@@ -240,7 +252,17 @@ def listing_cases(srv):
     # Every listing carries it, including one that failed: the panel keeps its
     # header up while it reports the error.
     check("10 a failed listing carries it too",
-          gone.get("home") == FAKE_HOME, gone.get("home"))
+          gone.get("home") == os.path.realpath(FAKE_HOME), gone.get("home"))
+    c.close()
+
+
+def symlinked_home_case(srv):
+    c, _ = attached(srv)
+    got = listing(c, FIX)
+    want = os.path.realpath(LINKED_HOME)
+    check("11 a home reached through a symlink is sent resolved, so it "
+          "prefixes the physical paths the panel lists",
+          got.get("home") == want, {"home": got.get("home"), "expected": want})
     c.close()
 
 
@@ -349,6 +371,22 @@ def scenario():
           any('program="vi"' in l for l in opens), opens[-3:])
     check("no panic in the fallback server's log", "panicked at" not in body,
           body[-1500:])
+
+    # A server whose `$HOME` is the symlink, restored the same way as above.
+    real_home = os.environ.get("HOME")
+    os.environ["HOME"] = LINKED_HOME
+    srv4 = Server(f"{RUN}/srv4")
+    srv4.start()
+    if real_home is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = real_home
+    try:
+        symlinked_home_case(srv4)
+    finally:
+        srv4.kill()
+    check("no panic in the symlinked-home server's log",
+          "panicked at" not in srv4.log(), srv4.log()[-1500:])
 
 
 def main():

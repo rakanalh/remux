@@ -230,7 +230,11 @@ def main():
         # Pin the cursor to column 0 first (`h` clamps there) so the yank starts
         # at the beginning of the line and the expected text is exact -- the
         # cursor opens wherever the cell's shell cursor is, which is not column 0.
-        for _ in range(15):
+        #
+        # 15 presses cover the pinned `$ ` prompt. macOS's /etc/profile replaces
+        # it with `\h:\W \u\$ `, which is longer than 15 columns, so there the
+        # cursor is walked across the whole cell instead.
+        for _ in range(tx1 - tx0 + 1 if sys.platform == "darwin" else 15):
             t.send("h", 0.12)
         t.send("v", 0.4)                            # start a char selection
         for _ in range(len(target)):

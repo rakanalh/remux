@@ -13,14 +13,16 @@ futures = "0.3"
 # buffer is a `Vec` that holds the whole sequence. Removes the arrayvec dep and
 # adds none.
 vte = { version = "0.13", default-features = false }
-nix = { version = "0.29", features = ["term", "signal", "process", "fs"] }
+nix = { version = "0.29", features = ["term", "signal", "process", "fs", "user"] }
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }
 interprocess = { version = "2.2", features = ["tokio"] }
 crossbeam = "0.8"
 cassowary = "0.3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order`: `remux integrate` rewrites a user's settings file, and
+# must keep their keys in the order they wrote them.
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 signal-hook = "0.3"
@@ -39,6 +41,10 @@ notify = "7"
 # pattern language at runtime. Already in the lock file via `env_logger`, so
 # promoting it to a direct dependency adds no new crate to the build.
 regex = "1"
+
+[dev-dependencies]
+# `start_paused` for tests that cross a timeout without waiting it out.
+tokio = { version = "1", features = ["test-util"] }
 
 # macOS has no /proc, so we read a foreign process's cwd via sysinfo. Scoped to
 # macOS targets only so Linux builds don't pull it in.

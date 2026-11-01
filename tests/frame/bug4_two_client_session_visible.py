@@ -30,9 +30,9 @@ SOCK = f"{RUNDIR}/run/remux.sock"
 
 def start_server():
     shutil.rmtree(RUNDIR, ignore_errors=True)
-    for s in ("run", "state", "data", "config"):
+    for s in ("run", "state", "data", "config", "home"):
         os.makedirs(f"{RUNDIR}/{s}", exist_ok=True)
-    env = {**os.environ, "XDG_RUNTIME_DIR": f"{RUNDIR}/run", "XDG_STATE_HOME": f"{RUNDIR}/state",
+    env = {**os.environ, "HOME": f"{RUNDIR}/home", "XDG_RUNTIME_DIR": f"{RUNDIR}/run", "XDG_STATE_HOME": f"{RUNDIR}/state",
            "XDG_DATA_HOME": f"{RUNDIR}/data", "XDG_CONFIG_HOME": f"{RUNDIR}/config",
            "SHELL": "/bin/sh", "ENV": "/dev/null", "TERM": "xterm-256color"}
     p = subprocess.Popen([BIN, "server"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

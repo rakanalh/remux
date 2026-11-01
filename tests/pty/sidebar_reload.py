@@ -134,6 +134,9 @@ CFG_SESSIONS_WIDER_TOUCHED = CFG_SESSIONS_WIDER + """
 [appearance.unused_marker_section]
 """
 
+# The sessions panel's header, as the client paints it: lowercase.
+SESSIONS_HEADER = "sessions"
+
 STTY_RE = re.compile(r"\b(\d+) (\d+)\b")
 
 
@@ -213,13 +216,13 @@ def test_a_sidebar_added_to_the_config_appears_without_a_restart():
     fails = []
     t.pump(1.0)
 
-    if t.has("Sessions"):
+    if t.has(SESSIONS_HEADER):
         fails.append("a panel was painted before the config declared one")
     before = stty_cols(t)
 
     write_config(t, CFG_SESSIONS)
 
-    if not t.has("Sessions"):
+    if not t.has(SESSIONS_HEADER):
         fails.append("the panel never appeared after the config reload")
         t.dump("after reload")
     # The frame is not enough: an empty panel means the tree subscription was
@@ -246,13 +249,13 @@ def test_a_sidebar_removed_from_the_config_goes_away_without_a_restart():
     fails = []
     t.pump(1.0)
 
-    if not t.has("Sessions"):
+    if not t.has(SESSIONS_HEADER):
         fails.append("the configured panel did not paint at startup")
     before = stty_cols(t)
 
     write_config(t, CFG_NONE)
 
-    if t.has("Sessions"):
+    if t.has(SESSIONS_HEADER):
         fails.append("the panel survived its removal from the config")
         t.dump("after removal")
     after = stty_cols(t)
@@ -304,7 +307,7 @@ def test_a_reload_keeps_the_width_the_user_set_by_hand():
     after = stty_cols(t)
     # Both `None` compares equal, so this needs its own guard too.
     check_width(fails, widened, after, widened, "an unrelated config edit")
-    if not t.has("Sessions"):
+    if not t.has(SESSIONS_HEADER):
         fails.append("the panel vanished across the reload")
     # The panel that was already there is rebuilt too, so its plugin starts
     # with NO tree. `wants_session_tree` was already true, so the loop-top
@@ -357,7 +360,7 @@ def test_a_size_typed_into_the_config_beats_the_persisted_one():
 
     after = stty_cols(t)
     check_width(fails, dragged, after, COLS - WIDER_W - 2, "a retyped size")
-    if not t.has("Sessions"):
+    if not t.has(SESSIONS_HEADER):
         fails.append("the panel vanished across the reload")
 
     # Second reload, and the reason the client has to ADVANCE its old-config
@@ -397,16 +400,16 @@ def test_a_visible_flip_typed_into_the_config_beats_the_persisted_one():
     # Close and reopen it, so `sidebar.json` carries `visible = true` for this
     # edge -- state that would otherwise mask the config edit below.
     t.prefix(b"bh", 1.2)
-    if t.has("Sessions"):
+    if t.has(SESSIONS_HEADER):
         fails.append("the toggle did not close the sidebar")
     t.prefix(b"bh", 1.2)
-    if not t.has("Sessions"):
+    if not t.has(SESSIONS_HEADER):
         fails.append("the toggle did not reopen the sidebar")
     open_cols = stty_cols(t)
 
     write_config(t, CFG_SESSIONS_HIDDEN)
 
-    if t.has("Sessions"):
+    if t.has(SESSIONS_HEADER):
         fails.append("`visible = false` in the config was masked by the saved state")
         t.dump("after the visible flip")
     after = stty_cols(t)
@@ -414,7 +417,9 @@ def test_a_visible_flip_typed_into_the_config_beats_the_persisted_one():
         fails,
         open_cols,
         after,
-        None if open_cols is None else open_cols + SIDEBAR_W,
+        # `visible = false` collapses to a one-cell strip by default, so the
+        # pane regains the sidebar's width minus that cell.
+        None if open_cols is None else open_cols + SIDEBAR_W - 1,
         "a retyped visible = false",
     )
 
@@ -448,7 +453,7 @@ def test_one_save_is_one_reload():
     else:
         print(f"  three writes in one window produced {reloads} reload")
     # ...and it still has to actually take effect.
-    if not t.has("Sessions"):
+    if not t.has(SESSIONS_HEADER):
         fails.append("the coalesced reload did not apply the config")
 
     return finish(t, name, fails)

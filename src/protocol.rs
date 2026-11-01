@@ -130,10 +130,85 @@ pub enum ConnDescriptor {
 /// to another session. The failure is a new pane in the wrong session, not a
 /// dropped connection, so only the handshake can catch it.
 ///
-/// 17 -> 18: the layout switcher. Adds [`ClientMessage::ListLayouts`],
+/// 17 -> 18: client-placed popup terminal. Adds [`ClientMessage::PopupSize`],
+/// the interior the client wants for its foreground session's popups. An old
+/// server cannot decode it and would drop the connection, so the bump turns that
+/// into a refused handshake.
+///
+/// 18 also carries three `#[serde(default)]` riders, added without a bump of
+/// their own because they decode both ways: `popup` on
+/// [`ServerMessage::FullRender`] and [`ServerMessage::RenderDiff`] (the popup
+/// layer, [`PopupCells`]), and `popup` on [`ClientMessage::MouseClick`],
+/// [`ClientMessage::MouseDrag`] and [`ClientMessage::MouseScroll`]
+/// (interior-local coordinates). They are self-gating: a server sends a layer
+/// only to a client that has sent `PopupSize`, and a client sets the mouse flag
+/// only while it holds a layer, so an old client on a new server never sees
+/// either. The layer itself carries `pane_id`, and both frames carry
+/// `live_popups`, the session's popup panes, both also `#[serde(default)]`.
+///
+/// Within 18, before any release, [`RemuxCommand::PopupToggle`] became a
+/// newtype variant carrying an optional placement (a position and an optional
+/// size), so its JSON changed from the bare `"PopupToggle"`. A client always
+/// sends it with `None`, so the placement never crosses the wire. 18 also added
+/// [`SessionEvent::SessionRenamed`], so a client keys its popup state by the
+/// session's current name.
+///
+/// 18 also carries [`RemuxCommand::PaneToggleZoomFloat`] and
+/// [`RemuxCommand::PaneToggleZoomFullscreen`], added without a bump
+/// like the 13 commands above. An old server cannot decode it and drops the
+/// connection, but a client sends one only when the user runs that action. The
+/// zoom mode of a tab stays on the server (`Tab::zoom_mode`, `#[serde(default)]`)
+/// and never crosses the wire.
+///
+/// 18 -> 19: the right-click context menu. Adds [`ClientMessage::RightClick`]
+/// and [`ServerMessage::ContextMenu`]. Neither decodes on a 18 peer, and the
+/// decode error ends the connection, so the bump turns that into a refused
+/// handshake. The server alone decides whether a right press goes to the pane's
+/// application or opens the menu, so a client cannot fall back to sending the
+/// press as a left click on an old server.
+///
+/// 19 -> 20: agent messaging, developed as 17 -> 18 beside the popup and
+/// context-menu bumps and renumbered when the two lines merged. So a
+/// messaging build from before the merge and a popup build from master both
+/// report 18 while speaking different protocols, and the handshake cannot
+/// tell them apart: every machine must be rebuilt from the merged branch, not
+/// only the ones that run messaging. Adds
+/// [`ClientMessage::MsgSend`] and [`ClientMessage::MsgRead`] with their replies [`ServerMessage::MsgSent`] and
+/// [`ServerMessage::MsgList`], [`ClientMessage::MsgAck`] with
+/// [`ServerMessage::MsgAcked`], [`ClientMessage::AgentName`] with
+/// [`ServerMessage::AgentNamed`], [`ClientMessage::AgentStatus`] with
+/// [`ServerMessage::AgentStatusList`], and the additive `code` on
+/// [`ServerMessage::Error`]. An old server cannot decode any of
+/// them and would drop the connection. Later on the same branch, while it
+/// was numbered 18 and before any release, `MsgSend` gained `defer`,
+/// `timeout_ms` and `wait`, and `MsgSent` gained `timed_out` and
+/// `final_state`, all `#[serde(default)]`, so an older build of that line and
+/// a newer one still decode each other, as do [`AgentEntry`]'s `name` and
+/// `unread`. [`ClientMessage::AgentWait`] and [`ServerMessage::AgentWaited`]
+/// were added the same way while it was 18, with no bump: a messaging server
+/// built before them cannot decode an `AgentWait` and drops that connection,
+/// which is the skew 13 describes. Every build that reports 20 has all of
+/// them. Remote messaging extended the line the same way, also at 18:
+/// [`ClientMessage::PeerLink`] and [`ClientMessage::Ping`] with
+/// [`ServerMessage::Pong`], [`ServerMessage::MsgInbound`] with
+/// [`ClientMessage::MsgInboundAck`], and `MsgSend`'s `origin` and `req`,
+/// `MsgSent`'s and `Error`'s `req`, and [`Message`]'s `origin`, all
+/// `#[serde(default)]`. So did asking about a pane on another server: the
+/// `req` of `AgentStatus`, `AgentWait`, `AgentStatusList` and `AgentWaited`,
+/// and [`PaneStatusEntry`]'s `host`, also `#[serde(default)]`.
+///
+/// 20 -> 21: the layout switcher. Adds [`ClientMessage::ListLayouts`],
 /// [`ServerMessage::LayoutList`] and [`RemuxCommand::LayoutSet`]. An old
 /// server cannot decode the first or the last and would drop the connection.
-pub const PROTOCOL_VERSION: u32 = 18;
+/// Developed as 17 -> 18 and renumbered when it merged after the popup,
+/// context-menu and messaging bumps.
+///
+/// 21 also carries `request` on `ListLayouts` and `LayoutList` and
+/// `popup_open` on `LayoutList`, all `#[serde(default)]` and present in every
+/// build that reports 21. `request` is the id that lets a switcher apply only
+/// the reply to the open it is showing; `popup_open` lets it say why the list
+/// is empty.
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -232,6 +307,30 @@ pub enum CliPlacement {
     NewTab,
 }
 
+/// What a right-click landed on, with the facts the client needs to decide
+/// which menu items apply. The server has already moved focus to the pane or
+/// tab, so the menu's commands act on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextTarget {
+    /// A pane, by content or by border.
+    Pane {
+        pane_id: PaneId,
+        /// Whether the tab has a zoomed pane.
+        zoomed: bool,
+        /// The server's `[zoom] mode`, which `PaneToggleZoom` follows.
+        zoom_mode: crate::config::ZoomMode,
+        /// Whether the tab's layout is Monocle, where a fullscreen zoom is
+        /// refused because every pane is already full-area.
+        monocle: bool,
+    },
+    /// A tab label in the status bar.
+    Tab {
+        tab_id: u64,
+        index: usize,
+        count: usize,
+    },
+}
+
 /// Messages sent from a Remux client to the server over the Unix socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -276,6 +375,25 @@ pub enum ClientMessage {
         pane_id: Option<PaneId>,
         #[serde(default)]
         release: bool,
+        /// `x`/`y` are interior-local to the popup layer the client holds, so
+        /// the server targets the active tab's popup with no hit test. Only a
+        /// client that was sent a [`PopupCells`] layer sets it.
+        #[serde(default)]
+        popup: bool,
+    },
+    /// A right-button press (`release: false`) or release at screen
+    /// coordinates in the client's foreground session.
+    ///
+    /// The server routes it: a pane whose application asked for the mouse gets
+    /// the button-2 report, and anything else answers the press with
+    /// [`ServerMessage::ContextMenu`]. `popup` is as
+    /// [`ClientMessage::MouseClick::popup`].
+    RightClick {
+        x: u16,
+        y: u16,
+        release: bool,
+        #[serde(default)]
+        popup: bool,
     },
     /// A mouse drag selection from start to end coordinates.
     ///
@@ -301,11 +419,21 @@ pub enum ClientMessage {
         is_final: bool,
         #[serde(default)]
         pane_id: Option<PaneId>,
+        /// As [`ClientMessage::MouseClick::popup`].
+        #[serde(default)]
+        popup: bool,
     },
     /// A mouse wheel event at the given full-screen 0-based coordinates.
     /// `up` is true for wheel-up, false for wheel-down. The server decides
     /// whether to forward it to the pane's application or scroll remux.
-    MouseScroll { x: u16, y: u16, up: bool },
+    /// `popup` is as [`ClientMessage::MouseClick::popup`].
+    MouseScroll {
+        x: u16,
+        y: u16,
+        up: bool,
+        #[serde(default)]
+        popup: bool,
+    },
     /// Request the scrollback content for the active pane (for search).
     RequestScrollback,
     /// Send search match info to the server for status bar display.
@@ -381,6 +509,16 @@ pub enum ClientMessage {
     TabStyle {
         style: crate::config::theme::TabStyle,
     },
+    /// The interior, in cells, this client wants for its foreground session's
+    /// popup terminals.
+    ///
+    /// The client places and frames the popup itself, so the server only needs
+    /// the size of the terminal inside it. The popup PTY is sized to the
+    /// smallest interior any attached client asks for. Sending this also tells
+    /// the server to deliver the popup as a [`PopupCells`] layer instead of
+    /// drawing it into the frame. The answer is always a full render, because a
+    /// client whose box moved has stale content under the old box.
+    PopupSize { cols: u16, rows: u16 },
     /// Materialize a dormant (saved-but-not-live) session into a live session
     /// by name, reusing the startup restore path. Only meaningful when the
     /// server was started with `save_sessions = true` and
@@ -587,6 +725,180 @@ pub enum ClientMessage {
         cell_id: CellId,
         dir: FocusDirection,
     },
+    /// Leave a message in a pane's mailbox. Nothing here names the sender:
+    /// the server attributes it to the pane the connecting process runs in,
+    /// and refuses the send (`sender_unverified`) when it cannot.
+    ///
+    /// Answered with [`ServerMessage::MsgSent`], or [`ServerMessage::Error`]
+    /// carrying a `code`.
+    MsgSend {
+        to: Address,
+        body: String,
+        deliver: Deliver,
+        #[serde(default)]
+        reply_to: Option<MsgRef>,
+        /// The caller's `$REMUX_PANE`. Logged when it disagrees with the
+        /// attribution and never used for anything else: a stale or
+        /// overridden variable is exactly how a message arrives from the
+        /// wrong pane.
+        #[serde(default)]
+        pane_hint: Option<PaneId>,
+        /// For `Submit` and `Auto`: while the agent is waiting on its user,
+        /// keep the message queued until it is not, rather than answering
+        /// `agent_blocked` at once. Bounded by `timeout_ms`.
+        #[serde(default)]
+        defer: bool,
+        /// How long a deferred submit may wait, and how long `wait` watches,
+        /// in milliseconds from when the message is sent. `None` is the
+        /// server's default; the server caps it.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// For `Submit` and `Auto`: once the message is submitted, answer
+        /// only when the agent's turn has ended, with the state it ended in
+        /// (`MsgSent::final_state`), or `agent_prompt_stalled` when the agent
+        /// shows no sign of taking it up.
+        #[serde(default)]
+        wait: bool,
+        /// The sender on the server that forwarded this message. Honoured on
+        /// a [`ClientMessage::PeerLink`] connection only, and refused
+        /// `origin_not_allowed` on any other.
+        #[serde(default)]
+        origin: Option<Origin>,
+        /// A correlation id the answer echoes, for a connection that has
+        /// several sends in flight at once.
+        #[serde(default)]
+        req: Option<u64>,
+    },
+    /// Read a mailbox: `pane`'s, or the caller's own when `pane` is `None`.
+    /// A mailbox that is not the caller's own is only peeked, whatever `peek`
+    /// says, so that looking at a teammate's mail never marks it read.
+    ///
+    /// Answered with [`ServerMessage::MsgList`], or [`ServerMessage::Error`].
+    MsgRead {
+        #[serde(default)]
+        pane: Option<PaneId>,
+        #[serde(default)]
+        all: bool,
+        #[serde(default)]
+        peek: bool,
+        #[serde(default)]
+        wait_ms: Option<u64>,
+        /// See [`ClientMessage::MsgSend::pane_hint`].
+        #[serde(default)]
+        pane_hint: Option<PaneId>,
+    },
+    /// Mark messages Read without returning their bodies, in `pane`'s
+    /// mailbox or the caller's own: the messages named by `ids`, or every
+    /// Queued one when `all` is set. Naming nothing marks nothing, so a
+    /// dropped argument never clears a mailbox, and `all` with `ids` is
+    /// refused `bad_request`. Unlike a read, naming another pane DOES mark:
+    /// this is the one explicit way to clear mail that is not yours.
+    ///
+    /// Answered with [`ServerMessage::MsgAcked`], or [`ServerMessage::Error`].
+    MsgAck {
+        #[serde(default)]
+        pane: Option<PaneId>,
+        #[serde(default)]
+        ids: Vec<MsgId>,
+        #[serde(default)]
+        all: bool,
+        /// See [`ClientMessage::MsgSend::pane_hint`].
+        #[serde(default)]
+        pane_hint: Option<PaneId>,
+    },
+    /// Give a pane an agent name, the address other panes send to; `None`
+    /// clears it. The caller's own pane, or `pane` for a caller outside any
+    /// pane. A pane naming ANOTHER pane is refused `bad_address`: a name is
+    /// how mail finds an agent, and one agent renaming another would redirect
+    /// its mail.
+    ///
+    /// Answered with [`ServerMessage::AgentNamed`], or [`ServerMessage::Error`].
+    AgentName {
+        name: Option<String>,
+        #[serde(default)]
+        pane: Option<PaneId>,
+        /// See [`ClientMessage::MsgSend::pane_hint`].
+        #[serde(default)]
+        pane_hint: Option<PaneId>,
+    },
+    /// The panes worth listing: every agent, every named pane and every pane
+    /// with mail, or only `target`.
+    ///
+    /// Answered with [`ServerMessage::AgentStatusList`], or
+    /// [`ServerMessage::Error`].
+    AgentStatus {
+        #[serde(default)]
+        target: Option<Address>,
+        /// Set by a server forwarding the request over a peer link, and
+        /// echoed in the answer, as [`ClientMessage::MsgSend`]'s is.
+        #[serde(default)]
+        req: Option<u64>,
+    },
+    /// Wait until `target`'s agent is in `state`, for at most `timeout_ms`
+    /// (`None` is the server's default; the server caps it).
+    ///
+    /// Answered with [`ServerMessage::AgentWaited`] at once when the agent is
+    /// already in `state`, else when it gets there or the time runs out; or
+    /// with [`ServerMessage::Error`]: `agent_not_ready` when the target is
+    /// not running an agent, or stops running one, and `no_such_target` when
+    /// it is not a live pane, or closes.
+    AgentWait {
+        target: Address,
+        state: AgentState,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// As [`ClientMessage::AgentStatus`]'s `req`.
+        #[serde(default)]
+        req: Option<u64>,
+    },
+    /// Declare this connection a link from the server named `name`, which
+    /// forwards its panes' messages with their [`Origin`]. Accepted only from
+    /// a relay under a root-owned sshd; a refusal is an [`ServerMessage::Error`]
+    /// and the connection stays an ordinary one. `ping_ms` is how often the
+    /// declaring server pings.
+    PeerLink {
+        name: String,
+        #[serde(default = "default_ping_ms")]
+        ping_ms: u64,
+    },
+    /// Answered with [`ServerMessage::Pong`] carrying the same `nonce`. Since
+    /// a connection is answered in order, a pong also says that every request
+    /// sent before the ping has been answered.
+    Ping { nonce: u64 },
+    /// The answer to a [`ServerMessage::MsgInbound`] with the same `req`,
+    /// from the server that dialled the link: the id it stored the message
+    /// under and the pane it went to, or the `code` and `message` it was
+    /// refused with. `pane_id` because only the receiver can say which pane a
+    /// name meant.
+    MsgInboundAck {
+        req: u64,
+        #[serde(default)]
+        id: Option<MsgId>,
+        #[serde(default)]
+        pane_id: Option<PaneId>,
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+    },
+}
+
+fn default_ping_ms() -> u64 {
+    15_000
+}
+
+/// Who sent a message, as the server that forwarded it saw them. The
+/// receiving server stores the sender under the name the LINK declared,
+/// never `host`, which it only checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    pub host: String,
+    pub pane_id: PaneId,
+    pub name: Option<String>,
+    pub session: String,
+    /// The forwarding server's id for the message, which a reply names in
+    /// its `reply_to`.
+    pub id: MsgId,
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +956,23 @@ pub enum ServerMessage {
         /// reasoning `DirectoryListing::home` records for being added at 11.
         #[serde(default)]
         status: Option<StatusInfo>,
+        /// The popup terminal's layer, for a client that sent
+        /// [`ClientMessage::PopupSize`]; `None` when no popup is visible.
+        /// Boxed so the frame variants stay small enough for the client's
+        /// `Incoming` queue; the wire encoding is the same as unboxed.
+        #[serde(default)]
+        popup: Option<Box<PopupCells>>,
+        /// The pane ids of every popup the session has, visible or hidden, so
+        /// a client can forget what it keeps about a popup that is gone.
+        #[serde(default)]
+        live_popups: Vec<PaneId>,
+        /// Whether the active tab shows a float zoom. The server draws the box
+        /// into the frame, so the client cannot see it there; it needs the flag
+        /// to treat a press it answers itself (a sidebar, the bar's tail) as
+        /// outside the box, as it does for a popup. An older server sends none,
+        /// which reads as no float.
+        #[serde(default)]
+        float_zoom: bool,
     },
     /// Incremental render update (diff from previous frame).
     RenderDiff {
@@ -688,6 +1017,20 @@ pub enum ServerMessage {
         /// As [`ServerMessage::FullRender::status`].
         #[serde(default)]
         status: Option<StatusInfo>,
+        /// As [`ServerMessage::FullRender::popup`].
+        #[serde(default)]
+        popup: Option<Box<PopupCells>>,
+        /// The pane ids of every popup the session has, visible or hidden, so
+        /// a client can forget what it keeps about a popup that is gone.
+        #[serde(default)]
+        live_popups: Vec<PaneId>,
+        /// Whether the active tab shows a float zoom. The server draws the box
+        /// into the frame, so the client cannot see it there; it needs the flag
+        /// to treat a press it answers itself (a sidebar, the bar's tail) as
+        /// outside the box, as it does for a popup. An older server sends none,
+        /// which reads as no float.
+        #[serde(default)]
+        float_zoom: bool,
     },
     /// Optimized scroll render: shift content within a pane rect and render
     /// only the new rows that appeared.
@@ -739,12 +1082,29 @@ pub enum ServerMessage {
     },
     /// Response to a `ListSessions` request.
     SessionList { sessions: Vec<SessionListEntry> },
-    /// An error response.
-    Error { message: String },
+    /// An error response. `code` is a stable, machine-readable name for the
+    /// failure (`no_such_target`, `sender_unverified`, ...); `message` is for
+    /// people. `None` from an older server and from the errors that predate
+    /// codes.
+    Error {
+        message: String,
+        #[serde(default)]
+        code: Option<String>,
+        /// The `req` of the request this answers, when it carried one.
+        #[serde(default)]
+        req: Option<u64>,
+    },
     /// Asynchronous session event notification.
     Event(SessionEvent),
     /// Request the client to copy data to the system clipboard via OSC 52.
     CopyToClipboard { data: String },
+    /// Answer to a [`ClientMessage::RightClick`] that opens a context menu.
+    /// `x`/`y` are the screen coordinates of the press, as the client sent them.
+    ContextMenu {
+        x: u16,
+        y: u16,
+        target: ContextTarget,
+    },
     /// Response to a `RequestScrollback` request with the pane's text content.
     ScrollbackContent { lines: Vec<String> },
     /// Response to a `RequestScrollbackInfo` request with the total line count.
@@ -777,6 +1137,79 @@ pub enum ServerMessage {
     /// "which pane did I just get?" a wire change rather than a client change,
     /// and a script that wants to send the new pane input needs the answer.
     CliSpawned { pane_id: PaneId },
+    /// The answer to a [`ClientMessage::MsgSend`] that was stored.
+    MsgSent {
+        id: MsgId,
+        to: Resolved,
+        delivery: Delivery,
+        /// Why `delivery` is not what was asked for, when it is not.
+        #[serde(default)]
+        reason: Option<String>,
+        /// The submit ran out of time before it could be typed, and `reason`
+        /// is what it was waiting on. For a submitted message sent with
+        /// `wait`: the wait ran out of time, and `final_state` is the agent's
+        /// state then.
+        #[serde(default)]
+        timed_out: bool,
+        /// For a submitted message sent with `wait`: the state the agent's
+        /// turn ended in, or its state when the wait timed out. `None` when
+        /// nothing was waited on.
+        #[serde(default)]
+        final_state: Option<AgentState>,
+        /// The `req` of the send this answers, when it carried one.
+        #[serde(default)]
+        req: Option<u64>,
+    },
+    /// The answer to a [`ClientMessage::MsgRead`]: the listed messages,
+    /// oldest first.
+    MsgList {
+        pane: PaneId,
+        messages: Vec<Message>,
+        #[serde(default)]
+        timed_out: bool,
+        /// Whether this read marks what it lists Read. Only a pane reading
+        /// its own mailbox without `peek` does, and only the server knows
+        /// which pane the caller is.
+        #[serde(default)]
+        marked: bool,
+    },
+    /// The answer to a [`ClientMessage::MsgAck`]: how many messages it marked.
+    MsgAcked { pane: PaneId, count: usize },
+    /// The answer to a [`ClientMessage::AgentName`]: the pane's name now.
+    AgentNamed { pane: PaneId, name: Option<String> },
+    /// The answer to a [`ClientMessage::AgentStatus`], sorted by pane id.
+    AgentStatusList {
+        panes: Vec<PaneStatusEntry>,
+        /// The request's `req`, echoed.
+        #[serde(default)]
+        req: Option<u64>,
+    },
+    /// The answer to a [`ClientMessage::AgentWait`]: the agent's state, which
+    /// is the one waited for unless `timed_out`.
+    AgentWaited {
+        target: Resolved,
+        state: Option<AgentState>,
+        #[serde(default)]
+        timed_out: bool,
+        /// The request's `req`, echoed.
+        #[serde(default)]
+        req: Option<u64>,
+    },
+    /// The answer to a [`ClientMessage::Ping`].
+    Pong { nonce: u64 },
+    /// A message for a pane on the server that dialled this link, pushed to
+    /// that link's connection alone: a reply going back the way the message
+    /// it answers came. A request, not a stored [`Message`], since only the
+    /// receiver can resolve `to`. Answered with
+    /// [`ClientMessage::MsgInboundAck`] carrying the same `req`.
+    MsgInbound {
+        to: Target,
+        body: String,
+        deliver: Deliver,
+        reply_to: Option<MsgRef>,
+        origin: Origin,
+        req: u64,
+    },
     /// The answer to a [`ClientMessage::ListDirectory`].
     ///
     /// `path` is the requested path echoed back unchanged -- the panel matches
@@ -827,6 +1260,14 @@ pub enum ServerMessage {
         /// cannot be resolved at all; the panel then shows the full path, which
         /// is the behaviour it had before this existed. That graceful `None` is
         /// what keeps the addition off [`PROTOCOL_VERSION`].
+        ///
+        /// Sent with its symlinks resolved, because the paths it is matched
+        /// against come from a pane's cwd and are physical. A home under a
+        /// symlink (Silverblue's `/home` -> `/var/home`) sent as `$HOME` spells
+        /// it would never prefix them. An older server sends `$HOME` verbatim,
+        /// which only loses the `~` on such a machine. A path that did not come
+        /// from a cwd, such as one a user typed, has to be resolved the same way
+        /// before it is matched against this.
         #[serde(default)]
         home: Option<String>,
     },
@@ -840,7 +1281,7 @@ pub enum ServerMessage {
     ///
     /// `request` is the id the [`ClientMessage::ListLayouts`] carried.
     ///
-    /// `layouts` is also empty while the session's popup is open, and
+    /// `layouts` is also empty while the active tab's popup is open, and
     /// `popup_open` says so. The server ignores `LayoutSet` then, because
     /// the popup is the input target and a layout switch would act on it.
     LayoutList {
@@ -1054,6 +1495,489 @@ pub struct AgentEntry {
     /// client's `pane_title` template.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The pane's messaging name: the address other panes send to.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// How many messages in the pane's mailbox are unread.
+    #[serde(default)]
+    pub unread: usize,
+    /// Whether some client attached to this server has the pane in front of it:
+    /// the input target of a session at least one client is attached to. A
+    /// client's desktop notifications skip such a pane, because a person is
+    /// already looking at it.
+    ///
+    /// Any client, not only the recipient, because a notification for an agent
+    /// the user is watching on another terminal is noise. No `PROTOCOL_VERSION`
+    /// bump: an older server omits the field, which decodes as `false`, and the
+    /// client then falls back to its own knowledge of where the user is.
+    #[serde(default)]
+    pub focused: bool,
+}
+
+/// A message's id: minted by one server, monotonic, never reused.
+pub type MsgId = u64;
+
+/// What an [`Address`] names on its server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Target {
+    Name(String),
+    Pane(PaneId),
+}
+
+/// `[<host>:](<name> | %<pane_id>)`. `%` is the pane sigil because it is inert
+/// in every shell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Address {
+    pub host: Option<String>,
+    pub target: Target,
+}
+
+impl std::str::FromStr for Address {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (host, rest) = match s.split_once(':') {
+            Some((host, rest)) => (Some(host), rest),
+            None => (None, s),
+        };
+        if let Some(host) = host {
+            if !valid_host(host) {
+                return Err(format!("bad host in address {s:?}"));
+            }
+        }
+        let target = match rest.strip_prefix('%') {
+            Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+                Target::Pane(
+                    digits
+                        .parse()
+                        .map_err(|_| format!("pane id out of range in {s:?}"))?,
+                )
+            }
+            Some(_) => return Err(format!("bad pane id in address {s:?}")),
+            None if valid_name(rest) => Target::Name(rest.to_string()),
+            None => return Err(format!("bad name in address {s:?}")),
+        };
+        Ok(Address {
+            host: host.map(str::to_string),
+            target,
+        })
+    }
+}
+
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(host) = &self.host {
+            write!(f, "{host}:")?;
+        }
+        match &self.target {
+            Target::Name(name) => f.write_str(name),
+            Target::Pane(id) => write!(f, "%{id}"),
+        }
+    }
+}
+
+/// A remote's name as an address spells it: `[A-Za-z0-9._-]+`, not starting
+/// with `.` or `-`, so it cannot read as an option where it is printed into a
+/// command line. Checked on the server too, because the wire carries any string
+/// and a host is written to the log.
+///
+/// A host any of whose `-`/`_` parts is a reserved word is refused as a name
+/// is (see [`reserved_part`]): `From: user:%1` would read as a message from the
+/// user. Compared without case, because a host keeps its capitals.
+pub fn valid_host(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('.')
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && reserved_part(&s.to_ascii_lowercase()).is_none()
+}
+
+/// A character that is not shown itself but can change how the text around
+/// it is shown: Unicode's Default_Ignorable_Code_Point (DerivedCoreProperties
+/// 17.0.0, which covers bidirectional controls, zero-width characters,
+/// variation selectors, fillers and tag characters), plus the line and
+/// paragraph separators, the interlinear annotation characters, and the
+/// format characters (Cf) that property leaves out: the prepended
+/// concatenation marks and the Egyptian hieroglyph format controls. With
+/// those, every assigned Cf character in Unicode 17.0 is in the set.
+/// Unassigned code points outside the listed ranges are not, because that
+/// would take the whole character table. Text holding one can display as
+/// text it does not contain, and a tag character is read by a model while a
+/// person sees nothing.
+///
+/// Whether one is allowed where it stands is [`hidden_chars`]'s question.
+pub fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// A character a joiner or a variation selector can attach to: one that is
+/// there, is not a control character and is not [`is_invisible`].
+fn is_base(c: Option<char>) -> bool {
+    c.is_some_and(|c| !c.is_control() && !is_invisible(c))
+}
+
+/// A [`is_base`] character outside ASCII. Joiners and variation selectors
+/// attach only to these, so plain ASCII text admits no invisible character
+/// at all.
+fn is_wide_base(c: Option<char>) -> bool {
+    is_base(c) && c.is_some_and(|c| !c.is_ascii())
+}
+
+/// Whether the invisible character at `at` is allowed among its neighbours.
+/// Emoji, Persian and Indic text and hyphenation need a few of them, so
+/// those are allowed one at a time and only where the text they belong to
+/// needs them:
+///
+/// - a zero width joiner or non-joiner between two non-ASCII base
+///   characters;
+/// - a soft hyphen between two non-ASCII letters;
+/// - a text or emoji variation selector after a non-ASCII base character
+///   that is not a letter (emoji are symbols), or U+FE0F in a keycap (`#`,
+///   `*` or a digit, U+FE0F, U+20E3);
+/// - a variation selector then a zero width joiner, between two non-ASCII
+///   base characters, because the emoji sequences for the rainbow flag or
+///   the heart on fire need it.
+///
+/// So plain ASCII text hides nothing. Between two non-ASCII characters at
+/// most 3 bits can hide: a ZWJ or ZWNJ, alone or after a selector. Combining
+/// marks, private-use and unassigned code points count as base characters,
+/// so they can anchor a chain of such characters, but each one takes a
+/// visible cell.
+fn allowed_invisible(chars: &[char], at: usize) -> bool {
+    let near = |offset: isize| {
+        at.checked_add_signed(offset)
+            .and_then(|i| chars.get(i).copied())
+    };
+    let selector = |c: Option<char>| matches!(c, Some('\u{FE0E}' | '\u{FE0F}'));
+    let letter = |c: Option<char>| is_wide_base(c) && c.is_some_and(char::is_alphabetic);
+    let symbol = |c: Option<char>| is_wide_base(c) && !c.is_some_and(char::is_alphabetic);
+    match chars[at] {
+        '\u{200D}' => {
+            is_wide_base(near(1))
+                && (is_wide_base(near(-1)) || (selector(near(-1)) && is_wide_base(near(-2))))
+        }
+        '\u{200C}' => is_wide_base(near(-1)) && is_wide_base(near(1)),
+        '\u{00AD}' => letter(near(-1)) && letter(near(1)),
+        '\u{FE0F}'
+            if matches!(near(-1), Some('0'..='9' | '#' | '*')) && near(1) == Some('\u{20E3}') =>
+        {
+            true
+        }
+        '\u{FE0E}' | '\u{FE0F}' => {
+            symbol(near(-1))
+                && (!near(1).is_some_and(is_invisible)
+                    || (near(1) == Some('\u{200D}') && is_wide_base(near(2))))
+        }
+        _ => false,
+    }
+}
+
+/// The byte offset of every [`is_invisible`] character in `s` that is not
+/// allowed where it stands. The server refuses a body or label holding one,
+/// and the CLI shows each one as an escape. Both walk the whole string, so
+/// they judge each character by the same neighbours.
+pub fn hidden_chars(s: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    let chars: Vec<char> = s.chars().collect();
+    s.char_indices()
+        .enumerate()
+        .filter(move |&(i, (_, c))| is_invisible(c) && !allowed_invisible(&chars, i))
+        .map(|(_, found)| found)
+}
+
+/// Words no pane's name may be, or contain as a part. Mail is rendered
+/// `From: <name> (%N)`, and a pane named `user`, or `claude-user`, would forge
+/// the one sender a model trusts most. A part is what `-` and `_` separate, so
+/// `user1` and `users` are names and `my-user` is not.
+pub const RESERVED_NAMES: [&str; 9] = [
+    "user",
+    "system",
+    "claude",
+    "remux",
+    "human",
+    "assistant",
+    "anthropic",
+    "operator",
+    "developer",
+];
+
+/// The first part of `s` that is a reserved word, if any.
+pub fn reserved_part(s: &str) -> Option<&str> {
+    s.split(['-', '_'])
+        .find(|part| RESERVED_NAMES.contains(part))
+}
+
+/// An agent name: `[a-z][a-z0-9_-]{0,31}`, and not one of [`RESERVED_NAMES`].
+/// A grammar rather than free text, because a name is an address and must
+/// survive a shell unquoted.
+pub fn valid_name(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+        && s.len() <= 32
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        && reserved_part(s).is_none()
+}
+
+/// Why `s` is not a name, for a refusal: a reserved word, or not the grammar.
+pub fn bad_name_reason(s: &str) -> String {
+    match reserved_part(s) {
+        Some(word) => format!(
+            "\"{word}\" is reserved: {} cannot be names or parts of names",
+            RESERVED_NAMES.join(", ")
+        ),
+        None => "use [a-z][a-z0-9_-]{0,31}".to_string(),
+    }
+}
+
+/// The message a reply answers. `host` is `None` for this server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgRef {
+    pub host: Option<String>,
+    pub id: MsgId,
+}
+
+/// `Submitted` is not `Read`: a submitted message was typed into the pane, and
+/// whether the agent processed it is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MsgState {
+    Queued,
+    Submitted,
+    Read,
+}
+
+/// Who sent a message, as the SERVER established it. Never client-supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sender {
+    /// A pane on this server, verified from the connecting process.
+    Pane {
+        pane_id: PaneId,
+        name: Option<String>,
+        session: String,
+    },
+    /// A pane on another server, as that server asserted it over a peer link.
+    Remote {
+        host: String,
+        pane_id: PaneId,
+        name: Option<String>,
+    },
+}
+
+impl ClientMessage {
+    /// Name this request `req`, for a link carrying many to match each
+    /// answer to its request. A message that is no request keeps no `req`.
+    pub fn set_req(&mut self, req: u64) {
+        if let ClientMessage::MsgSend { req: slot, .. }
+        | ClientMessage::AgentStatus { req: slot, .. }
+        | ClientMessage::AgentWait { req: slot, .. } = self
+        {
+            *slot = Some(req);
+        }
+    }
+}
+
+impl ServerMessage {
+    /// An [`ServerMessage::Error`] with a machine-readable `code`.
+    pub fn refused(code: &str, message: impl Into<String>) -> Self {
+        ServerMessage::Error {
+            message: message.into(),
+            code: Some(code.to_string()),
+            req: None,
+        }
+    }
+
+    /// This answer to the request `req` named, echoing it so a link carrying
+    /// many requests can match the answer to its request. `None` leaves the
+    /// answer as it is, which is every answer to a local client.
+    pub fn with_req(mut self, req: Option<u64>) -> Self {
+        if let Some(req) = req {
+            if let ServerMessage::MsgSent { req: slot, .. }
+            | ServerMessage::Error { req: slot, .. }
+            | ServerMessage::AgentStatusList { req: slot, .. }
+            | ServerMessage::AgentWaited { req: slot, .. } = &mut self
+            {
+                *slot = Some(req);
+            }
+        }
+        self
+    }
+
+    /// The `req` an answer echoes, for a link matching it to its request.
+    pub fn req(&self) -> Option<u64> {
+        match self {
+            ServerMessage::MsgSent { req, .. }
+            | ServerMessage::Error { req, .. }
+            | ServerMessage::AgentStatusList { req, .. }
+            | ServerMessage::AgentWaited { req, .. } => *req,
+            _ => None,
+        }
+    }
+
+    /// The variant's name, for a log line or an error about a reply nobody
+    /// expected. Never the contents: a reply can carry message bodies,
+    /// clipboard data and screen text.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            ServerMessage::FullRender { .. } => "FullRender",
+            ServerMessage::RenderDiff { .. } => "RenderDiff",
+            ServerMessage::ScrollRender { .. } => "ScrollRender",
+            ServerMessage::SessionList { .. } => "SessionList",
+            ServerMessage::Error { .. } => "Error",
+            ServerMessage::Event(..) => "Event",
+            ServerMessage::CopyToClipboard { .. } => "CopyToClipboard",
+            ServerMessage::ScrollbackContent { .. } => "ScrollbackContent",
+            ServerMessage::ScrollbackInfo { .. } => "ScrollbackInfo",
+            ServerMessage::SessionBorderStyle { .. } => "SessionBorderStyle",
+            ServerMessage::CliSpawned { .. } => "CliSpawned",
+            ServerMessage::MsgSent { .. } => "MsgSent",
+            ServerMessage::MsgList { .. } => "MsgList",
+            ServerMessage::MsgAcked { .. } => "MsgAcked",
+            ServerMessage::AgentNamed { .. } => "AgentNamed",
+            ServerMessage::AgentStatusList { .. } => "AgentStatusList",
+            ServerMessage::AgentWaited { .. } => "AgentWaited",
+            ServerMessage::Pong { .. } => "Pong",
+            ServerMessage::MsgInbound { .. } => "MsgInbound",
+            ServerMessage::DirectoryListing { .. } => "DirectoryListing",
+            ServerMessage::AgentList { .. } => "AgentList",
+            ServerMessage::SessionTree { .. } => "SessionTree",
+            ServerMessage::PaneContent { .. } => "PaneContent",
+            ServerMessage::ViewCreated { .. } => "ViewCreated",
+            ServerMessage::ViewList { .. } => "ViewList",
+            ServerMessage::ContextMenu { .. } => "ContextMenu",
+            ServerMessage::LayoutList { .. } => "LayoutList",
+        }
+    }
+
+    /// Whether the server sends this unasked to a connection that never
+    /// subscribed to anything: a broadcast or a frame. A one-shot request
+    /// skips these while it waits for its answer, because any connection can
+    /// receive a broadcast such as `Event(SessionCreated)` at any moment.
+    ///
+    /// The subscription messages are not treated alike. `AgentList` is only
+    /// ever pushed, so it counts as a push. `SessionTree` also answers
+    /// `ListSessionTree`, so it counts as an answer, which is wrong for a
+    /// connection that sent `SubscribeSessionTree`. A verb that subscribes
+    /// must revisit this.
+    pub fn is_push(&self) -> bool {
+        match self {
+            ServerMessage::FullRender { .. }
+            | ServerMessage::RenderDiff { .. }
+            | ServerMessage::ScrollRender { .. }
+            | ServerMessage::Event(..)
+            | ServerMessage::CopyToClipboard { .. }
+            | ServerMessage::SessionBorderStyle { .. }
+            | ServerMessage::AgentList { .. }
+            | ServerMessage::PaneContent { .. }
+            | ServerMessage::ViewList { .. }
+            | ServerMessage::MsgInbound { .. } => true,
+            ServerMessage::SessionList { .. }
+            | ServerMessage::Error { .. }
+            | ServerMessage::ScrollbackContent { .. }
+            | ServerMessage::ScrollbackInfo { .. }
+            | ServerMessage::CliSpawned { .. }
+            | ServerMessage::MsgSent { .. }
+            | ServerMessage::MsgList { .. }
+            | ServerMessage::MsgAcked { .. }
+            | ServerMessage::AgentNamed { .. }
+            | ServerMessage::AgentStatusList { .. }
+            | ServerMessage::AgentWaited { .. }
+            | ServerMessage::Pong { .. }
+            | ServerMessage::DirectoryListing { .. }
+            | ServerMessage::ContextMenu { .. }
+            | ServerMessage::LayoutList { .. }
+            | ServerMessage::SessionTree { .. }
+            | ServerMessage::ViewCreated { .. } => false,
+        }
+    }
+}
+
+/// How the sender wants a message delivered. Every message is stored in the
+/// mailbox whatever this says; `Submit` and `Auto` also ask for it to be typed
+/// into the pane, which a later release adds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Deliver {
+    Mailbox,
+    Submit,
+    Auto,
+}
+
+/// How a message was actually delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Delivery {
+    Mailbox,
+    Submitted,
+    Forwarded,
+}
+
+/// One pane as `remux agent ls` and `remux agent status` show it. Its own
+/// type rather than [`AgentEntry`], whose `command` is a configured agent by
+/// construction: a named shell pane, or one holding mail, belongs here too,
+/// with `command` and `state` both `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneStatusEntry {
+    pub pane_id: PaneId,
+    pub session: String,
+    pub tab_index: usize,
+    pub command: Option<String>,
+    pub state: Option<AgentState>,
+    pub name: Option<String>,
+    /// Queued messages, not counting expired ones.
+    pub unread: usize,
+    /// The server the pane is on, as this one names it in `[remotes]`:
+    /// `None` for a pane on the server that answered.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+/// The pane an [`Address`] named, as the server resolved it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolved {
+    pub host: Option<String>,
+    pub pane_id: PaneId,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Message {
+    pub id: MsgId,
+    pub from: Sender,
+    pub to: PaneId,
+    pub body: String,
+    /// Unix milliseconds on the server's clock.
+    pub created_ms: u64,
+    pub expires_ms: u64,
+    pub state: MsgState,
+    pub reply_to: Option<MsgRef>,
+    /// For a message that came over a link: the forwarding server, as this
+    /// server names that link, and its id for the message.
+    #[serde(default)]
+    pub origin: Option<MsgRef>,
 }
 
 /// What a client needs to name a pane with its own `[appearance] pane_title`
@@ -1191,6 +2115,30 @@ impl Default for RenderCell {
             hyperlink: None,
         }
     }
+}
+
+/// The popup terminal's contents and cursor, interior-local.
+///
+/// While a client holds one, the frame's `focused_pane_rect` is `None` and its
+/// `cursor_visible` is `false`, because this layer owns both. `cells` is set on
+/// a full layer and `changes` on a diff against the layer the client already
+/// holds; a client treats a set `cells` as a replacement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PopupCells {
+    /// The popup's pane. One popup per tab, so this tells a client which tab's
+    /// popup the layer is, to keep the position a key opened it at.
+    #[serde(default)]
+    pub pane_id: PaneId,
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub cursor_visible: bool,
+    pub cursor_style: u8,
+    #[serde(default)]
+    pub cells: Option<Vec<Vec<RenderCell>>>,
+    #[serde(default)]
+    pub changes: Vec<CellChange>,
 }
 
 /// A single changed cell for diff-based rendering.
@@ -1340,12 +2288,26 @@ pub enum RemuxCommand {
         session: Option<String>,
     },
     PaneRename(String),
+    /// Zoom the focused pane the way `[zoom] mode` says, or release a zoom of
+    /// either mode.
     PaneToggleZoom,
-    /// Show/hide the session's popup terminal -- a floating, centered pane drawn
-    /// on top of the layout. One popup per session, shared by every attached
-    /// client; the pane is spawned lazily on the first toggle and its shell keeps
-    /// running while hidden.
-    PopupToggle,
+    /// Zoom the focused pane to fill the tab whatever `[zoom] mode` says, or
+    /// release a zoom of either mode. Refused in Monocle, which already fills
+    /// the tab.
+    PaneToggleZoomFullscreen,
+    /// Zoom the focused pane as a centred float over the layout whatever
+    /// `[zoom] mode` says, or release a zoom of either mode.
+    PaneToggleZoomFloat,
+    /// Show/hide the active tab's popup terminal, drawn over the layout. One
+    /// popup per tab, shared by every attached client; the pane is spawned
+    /// lazily on the tab's first toggle and its shell keeps running while
+    /// hidden.
+    ///
+    /// The placement is where, and how big, the CLIENT opens the popup (`None`:
+    /// its configured `popup_position` and percentages). Placement is
+    /// client-side, so a client forwards this with `None` and the server
+    /// ignores the field.
+    PopupToggle(Option<crate::config::PopupPlacement>),
 
     // -- Resize commands ----------------------------------------------------
     ResizeLeft(u16),
@@ -1480,6 +2442,38 @@ pub enum RemuxCommand {
         tab_index: usize,
         delta: i32,
     },
+    /// Run `command` on the pane `pane_id` of the requester's attached session:
+    /// focus it first, so a command that acts on the focused pane acts on this
+    /// one. A no-op when the pane is gone, so a menu opened on a pane that has
+    /// since closed cannot act on whatever is focused now.
+    OnPane {
+        pane_id: PaneId,
+        command: Box<RemuxCommand>,
+    },
+    /// [`RemuxCommand::OnPane`] for a tab, by its id. The tab becomes the active
+    /// one before `command` runs.
+    OnTab {
+        tab_id: u64,
+        command: Box<RemuxCommand>,
+    },
+    /// Close a tab of `session` by id, as [`RemuxCommand::TabCloseByIndex`] does
+    /// by index. A no-op when the tab is gone.
+    TabCloseById {
+        session: String,
+        tab_id: u64,
+    },
+    /// Rename a tab of `session` by id. A no-op when the tab is gone.
+    TabRenameById {
+        session: String,
+        tab_id: u64,
+        name: String,
+    },
+    /// Move the active tab `delta` places, stopping at either end.
+    TabMoveBy(i32),
+    /// Zoom the focused pane in the configured mode, and do nothing when the
+    /// tab is already zoomed. Unlike [`RemuxCommand::PaneToggleZoom`] it never
+    /// releases a zoom.
+    PaneEnsureZoom,
 }
 
 impl RemuxCommand {
@@ -1530,7 +2524,9 @@ impl RemuxCommand {
             | RemuxCommand::PaneUnstackDown
             | RemuxCommand::PaneMoveToTabTarget { .. }
             | RemuxCommand::PaneToggleZoom
-            | RemuxCommand::PopupToggle
+            | RemuxCommand::PaneToggleZoomFullscreen
+            | RemuxCommand::PaneToggleZoomFloat
+            | RemuxCommand::PopupToggle(_)
             | RemuxCommand::ResizeLeft(_)
             | RemuxCommand::ResizeRight(_)
             | RemuxCommand::ResizeUp(_)
@@ -1551,7 +2547,12 @@ impl RemuxCommand {
             // so snapping it would cost the user their place in the scrollback
             // for a change they cannot see. An unattached requester compares
             // against "", which matches no real session -- also correctly false.
+            RemuxCommand::OnPane { command, .. } | RemuxCommand::OnTab { command, .. } => {
+                command.returns_to_live_tail(attached_session)
+            }
+            RemuxCommand::TabMoveBy(_) | RemuxCommand::PaneEnsureZoom => true,
             RemuxCommand::TabCloseByIndex { session, .. }
+            | RemuxCommand::TabCloseById { session, .. }
             | RemuxCommand::TabMoveByIndex { session, .. }
             | RemuxCommand::PaneCloseById { session, .. }
             | RemuxCommand::PaneNewInTab { session, .. }
@@ -1597,6 +2598,7 @@ impl RemuxCommand {
             // deliberately. Do not extend the rule to them.
             RemuxCommand::TabRename(_)
             | RemuxCommand::TabRenameByIndex { .. }
+            | RemuxCommand::TabRenameById { .. }
             | RemuxCommand::PaneRename(_)
             | RemuxCommand::PaneRenameById { .. }
             | RemuxCommand::SessionNew { .. }
@@ -1803,6 +2805,7 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("TabNext"),
             ActionSpec::server("TabPrev"),
             ActionSpec::server("TabMove").arg("<index>", "1"),
+            ActionSpec::server("TabMoveBy").arg("<delta>", "-1"),
             ActionSpec::server("PaneNew"),
             ActionSpec::server("PaneClose"),
             ActionSpec::server("PaneSplitVertical"),
@@ -1828,7 +2831,9 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("PaneUnstackDown"),
             ActionSpec::server("PaneRename").arg("<name>", "shell"),
             ActionSpec::server("PaneToggleZoom"),
-            ActionSpec::server("PopupToggle"),
+            ActionSpec::server("PaneToggleZoomFullscreen"),
+            ActionSpec::server("PaneToggleZoomFloat"),
+            ActionSpec::server("PopupToggle").arg("[float|left|right|top|bottom] [size]", "right"),
             ActionSpec::server("ResizeLeft").arg("<amount>", "5"),
             ActionSpec::server("ResizeRight").arg("<amount>", "5"),
             ActionSpec::server("ResizeUp").arg("<amount>", "5"),
@@ -1926,7 +2931,16 @@ pub fn command_names() -> Vec<(&'static str, Option<&'static str>)> {
 pub enum SessionEvent {
     SessionCreated(String),
     SessionDeleted(String),
-    PaneExited { pane_id: PaneId, exit_code: i32 },
+    /// A session was renamed. Sent to every client, so one that names the
+    /// session anywhere (the attached session, the last one) can follow it.
+    SessionRenamed {
+        old: String,
+        new: String,
+    },
+    PaneExited {
+        pane_id: PaneId,
+        exit_code: i32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1946,6 +2960,20 @@ pub fn encode_message<T: Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// The largest frame either side reads, from a client, a server or a relay.
+///
+/// A header is a bare `u32` from a peer that may be garbage or hostile, and
+/// without a bound one frame could make a reader hold 4 GiB. The payload is
+/// read as it arrives, so the cap bounds what a peer that really sends the
+/// bytes can make the reader hold, not what it reserves. It sits far above
+/// every real frame: a `FullRender` of a 500x200 terminal in truecolour is about 11 MiB,
+/// and 22 MiB if every cell carries a 100-byte hyperlink; a mailbox read is at
+/// most 4 MiB of bodies; a paste travels as one `Input` whose JSON byte array
+/// costs about 3.6 bytes per pasted byte, so the cap still admits a 64 MiB
+/// paste. It is also 0x1000_0000, so any header whose first byte is 0x10 or
+/// more is refused, which covers text written into the socket by mistake.
+pub const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
 /// Read the payload length from a 4-byte big-endian header.
 pub fn decode_message_length(header: &[u8; 4]) -> usize {
     let len = u32::from_be_bytes(*header) as usize;
@@ -1960,6 +2988,675 @@ pub fn decode_message_length(header: &[u8; 4]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reserved_word_as_any_part_is_not_a_valid_host() {
+        for host in [
+            "user",
+            "system-reminder",
+            "my_claude",
+            "operator_2",
+            "developer",
+            "USER",
+        ] {
+            assert!(!valid_host(host), "{host}");
+        }
+        for host in [
+            "users",
+            "userland",
+            "claudette",
+            "lab-2",
+            "lab-2.local",
+            "mini",
+        ] {
+            assert!(valid_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn valid_name_and_valid_host_share_one_reserved_rule() {
+        for word in RESERVED_NAMES {
+            for spelled in [word.to_string(), format!("x-{word}"), format!("{word}_2")] {
+                assert!(!valid_name(&spelled) && !valid_host(&spelled), "{spelled}");
+                assert!(reserved_part(&spelled).is_some(), "{spelled}");
+            }
+        }
+    }
+
+    #[test]
+    fn agent_entry_decodes_without_the_messaging_fields() {
+        let entry: AgentEntry = serde_json::from_str(
+            r#"{"pane_id":4,"session":"main","tab_index":0,"command":"claude","state":"Idle"}"#,
+        )
+        .unwrap();
+        assert_eq!((entry.name, entry.unread), (None, 0));
+    }
+
+    #[test]
+    fn reserved_names_are_not_valid_names() {
+        for word in RESERVED_NAMES {
+            assert!(!valid_name(word), "{word}");
+            assert!(bad_name_reason(word).contains("reserved"), "{word}");
+        }
+        for name in ["my-user", "claude-2", "dev_operator", "a-anthropic-b"] {
+            assert!(!valid_name(name), "a reserved part: {name}");
+            assert!(bad_name_reason(name).contains("reserved"), "{name}");
+        }
+        for name in ["user1", "users", "claudes", "alpha", "dev-ops"] {
+            assert!(valid_name(name), "whole parts, not prefixes: {name}");
+        }
+        assert!(bad_name_reason("Alpha").contains("[a-z]"));
+    }
+
+    fn hidden(s: &str) -> Vec<char> {
+        hidden_chars(s).map(|(_, c)| c).collect()
+    }
+
+    #[test]
+    fn the_invisible_set_is_default_ignorable_plus_the_separators() {
+        for c in [
+            '\u{AD}',
+            '\u{34F}',
+            '\u{61C}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{17B4}',
+            '\u{17B5}',
+            '\u{180B}',
+            '\u{180F}',
+            '\u{200B}',
+            '\u{200D}',
+            '\u{200F}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{202A}',
+            '\u{202E}',
+            '\u{2060}',
+            '\u{2065}',
+            '\u{206F}',
+            '\u{3164}',
+            '\u{FE00}',
+            '\u{FE0F}',
+            '\u{FEFF}',
+            '\u{FFA0}',
+            '\u{FFF0}',
+            '\u{FFF8}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{1BCA0}',
+            '\u{1BCA3}',
+            '\u{1D173}',
+            '\u{1D17A}',
+            '\u{E0000}',
+            '\u{E0041}',
+            '\u{E007F}',
+            '\u{E0100}',
+            '\u{E0FFF}',
+            '\u{600}',
+            '\u{605}',
+            '\u{6DD}',
+            '\u{70F}',
+            '\u{890}',
+            '\u{891}',
+            '\u{8E2}',
+            '\u{110BD}',
+            '\u{110CD}',
+            '\u{13430}',
+            '\u{1343F}',
+        ] {
+            assert!(is_invisible(c), "{c:?}");
+        }
+        for c in [
+            'a',
+            ' ',
+            '\u{606}',
+            '\u{6DE}',
+            '\u{892}',
+            '\u{8E3}',
+            '\u{13440}',
+            '\u{1342F}',
+            '\u{AC}',
+            '\u{AE}',
+            '\u{34E}',
+            '\u{350}',
+            '\u{1161}',
+            '\u{180A}',
+            '\u{200A}',
+            '\u{2010}',
+            '\u{2027}',
+            '\u{202F}',
+            '\u{205F}',
+            '\u{2070}',
+            '\u{3165}',
+            '\u{FDFF}',
+            '\u{FE10}',
+            '\u{FFFC}',
+            '\u{FFFD}',
+            '\u{1D172}',
+            '\u{1D17B}',
+            '\u{DFFFF}',
+            '\u{E1000}',
+            '\u{1F469}',
+        ] {
+            assert!(!is_invisible(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn a_joiner_or_selector_is_allowed_singly_where_it_attaches() {
+        for ok in [
+            "love \u{2764}\u{FE0F}",
+            "\u{2764}\u{FE0F} after",
+            "\u{2764}\u{FE0E}\n",
+            "dev \u{1F469}\u{200D}\u{1F4BB}",
+            "family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "\u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}",
+            "\u{43F}\u{435}\u{440}\u{435}\u{AD}\u{43D}\u{43E}\u{441}",
+        ] {
+            assert_eq!(hidden(ok), Vec::<char>::new(), "{ok:?}");
+        }
+        for (bad, want) in [
+            ("\u{200D}lead", vec!['\u{200D}']),
+            ("trail\u{200D}", vec!['\u{200D}']),
+            ("a\u{200D}\u{200D}b", vec!['\u{200D}', '\u{200D}']),
+            ("a \u{200C}\n", vec!['\u{200C}']),
+            ("\u{FE0F}", vec!['\u{FE0F}']),
+            ("a\u{FE0F}\u{FE0F}", vec!['\u{FE0F}', '\u{FE0F}']),
+            ("a\t\u{AD}b", vec!['\u{AD}']),
+            ("a\u{200B}b", vec!['\u{200B}']),
+            ("a\u{202E}b", vec!['\u{202E}']),
+            ("a\u{E0041}", vec!['\u{E0041}']),
+        ] {
+            assert_eq!(hidden(bad), want, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn plain_ascii_admits_no_invisible_character() {
+        for (bad, want) in [
+            ("a\u{200D}b", vec!['\u{200D}']),
+            ("a\u{200C}b", vec!['\u{200C}']),
+            ("a\u{FE0F}", vec!['\u{FE0F}']),
+            ("a\u{FE0E}b", vec!['\u{FE0E}']),
+            ("a \u{AD} b", vec!['\u{AD}']),
+            ("1\u{FE0F}", vec!['\u{FE0F}']),
+            ("x\u{FE0F}\u{20E3}", vec!['\u{FE0F}']),
+            ("Silben\u{AD}trennung", vec!['\u{AD}']),
+        ] {
+            assert_eq!(hidden(bad), want, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_text_that_needs_one_keeps_it() {
+        for ok in [
+            "#\u{FE0F}\u{20E3} and 1\u{FE0F}\u{20E3}",
+            "\u{1F1FA}\u{1F1F8}",
+            "\u{1F926}\u{200D}\u{2642}\u{FE0F}",
+            "\u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}",
+            "\u{43F}\u{435}\u{440}\u{435}\u{AD}\u{43D}\u{43E}\u{441}",
+            "\u{2764}\u{FE0F}",
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",
+        ] {
+            assert_eq!(hidden(ok), Vec::<char>::new(), "{ok:?}");
+        }
+        assert_eq!(hidden("\u{4E2D}\u{FE0F}\u{6587}"), ['\u{FE0F}']);
+        assert_eq!(hidden("\u{645}\u{FE0E}\u{6CC}"), ['\u{FE0E}']);
+        assert_eq!(hidden("\u{13000}\u{13430}\u{13001}"), ['\u{13430}']);
+        assert_eq!(hidden("\u{600}12"), ['\u{600}']);
+    }
+
+    #[test]
+    fn a_selector_then_a_joiner_between_bases_is_allowed() {
+        for ok in [
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",
+            "\u{2764}\u{FE0F}\u{200D}\u{1F525}",
+            "\u{1F926}\u{200D}\u{2642}\u{FE0F}",
+            "x \u{1F3F3}\u{FE0E}\u{200D}\u{1F308} y",
+        ] {
+            assert_eq!(hidden(ok), Vec::<char>::new(), "{ok:?}");
+        }
+        for (bad, want) in [
+            ("a\u{FE0F}\u{200D}", vec!['\u{FE0F}', '\u{200D}']),
+            ("\u{FE0F}\u{200D}b", vec!['\u{FE0F}', '\u{200D}']),
+            (
+                "a\u{FE0F}\u{200D}\u{200D}b",
+                vec!['\u{FE0F}', '\u{200D}', '\u{200D}'],
+            ),
+            (
+                "a\u{FE0F}\u{FE0F}\u{200D}b",
+                vec!['\u{FE0F}', '\u{FE0F}', '\u{200D}'],
+            ),
+            ("a\u{FE0F}\u{200C}b", vec!['\u{FE0F}', '\u{200C}']),
+        ] {
+            assert_eq!(hidden(bad), want, "{bad:?}");
+        }
+    }
+
+    fn addr(host: Option<&str>, target: Target) -> Address {
+        Address {
+            host: host.map(str::to_string),
+            target,
+        }
+    }
+
+    #[test]
+    fn an_error_code_is_optional_on_the_wire_and_survives_a_round_trip() {
+        let old: ServerMessage = serde_json::from_str(r#"{"Error":{"message":"x"}}"#).unwrap();
+        assert!(matches!(old, ServerMessage::Error { code: None, .. }));
+        let refused = ServerMessage::refused("no_such_target", "no such target: %9");
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&refused).unwrap()).unwrap();
+        match back {
+            ServerMessage::Error { message, code, .. } => {
+                assert_eq!(code.as_deref(), Some("no_such_target"));
+                assert_eq!(message, "no such target: %9");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_inbound_message_round_trips_and_is_a_push() {
+        let inbound = ServerMessage::MsgInbound {
+            to: Target::Name("lead".into()),
+            body: "RE:one".into(),
+            deliver: Deliver::Mailbox,
+            reply_to: Some(MsgRef {
+                host: Some("laptop".into()),
+                id: 4,
+            }),
+            origin: Origin {
+                host: "mini".into(),
+                pane_id: 2,
+                name: Some("beta".into()),
+                session: "main".into(),
+                id: 9,
+            },
+            req: 3,
+        };
+        let json = serde_json::to_value(&inbound).unwrap();
+        let back: ServerMessage = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+        assert!(
+            back.is_push(),
+            "a reader waiting for an answer must skip it"
+        );
+        assert_eq!(back.variant_name(), "MsgInbound");
+    }
+
+    #[test]
+    fn an_inbound_ack_needs_only_its_req() {
+        let ack: ClientMessage = serde_json::from_str(r#"{"MsgInboundAck":{"req":3}}"#).unwrap();
+        assert!(matches!(
+            ack,
+            ClientMessage::MsgInboundAck {
+                req: 3,
+                id: None,
+                pane_id: None,
+                code: None,
+                message: None
+            }
+        ));
+        let stored = ClientMessage::MsgInboundAck {
+            req: 3,
+            id: Some(12),
+            pane_id: Some(1),
+            code: None,
+            message: None,
+        };
+        let json = serde_json::to_value(&stored).unwrap();
+        let back: ClientMessage = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn the_messaging_frames_round_trip_and_default_their_optional_fields() {
+        let send: ClientMessage = serde_json::from_str(
+            r#"{"MsgSend":{"to":{"host":null,"target":{"Pane":7}},"body":"hi","deliver":"Auto"}}"#,
+        )
+        .unwrap();
+        match send {
+            ClientMessage::MsgSend {
+                to,
+                deliver,
+                reply_to,
+                pane_hint,
+                defer,
+                timeout_ms,
+                wait,
+                ..
+            } => {
+                assert_eq!(to.to_string(), "%7");
+                assert_eq!(deliver, Deliver::Auto);
+                assert_eq!((reply_to, pane_hint), (None, None));
+                assert_eq!((defer, timeout_ms, wait), (false, None, false));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let read: ClientMessage = serde_json::from_str(r#"{"MsgRead":{}}"#).unwrap();
+        assert!(matches!(
+            read,
+            ClientMessage::MsgRead {
+                pane: None,
+                all: false,
+                peek: false,
+                wait_ms: None,
+                pane_hint: None
+            }
+        ));
+        let sent = ServerMessage::MsgSent {
+            req: None,
+            id: 1,
+            to: Resolved {
+                host: None,
+                pane_id: 7,
+                name: Some("beta".into()),
+            },
+            delivery: Delivery::Mailbox,
+            reason: Some("agent_blocked".into()),
+            timed_out: true,
+            final_state: None,
+        };
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&sent).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::MsgSent {
+                id: 1,
+                delivery: Delivery::Mailbox,
+                timed_out: true,
+                ..
+            }
+        ));
+        let old_sent: ServerMessage = serde_json::from_str(
+            r#"{"MsgSent":{"id":2,"to":{"host":null,"pane_id":7,"name":null},"delivery":"Submitted"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old_sent,
+            ServerMessage::MsgSent {
+                id: 2,
+                timed_out: false,
+                final_state: None,
+                ..
+            }
+        ));
+        let waited = ServerMessage::MsgSent {
+            req: None,
+            id: 3,
+            to: Resolved {
+                host: None,
+                pane_id: 7,
+                name: None,
+            },
+            delivery: Delivery::Submitted,
+            reason: None,
+            timed_out: false,
+            final_state: Some(AgentState::NeedsInput),
+        };
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&waited).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::MsgSent {
+                id: 3,
+                final_state: Some(AgentState::NeedsInput),
+                ..
+            }
+        ));
+        let deferred: ClientMessage = serde_json::from_str(
+            r#"{"MsgSend":{"to":{"host":null,"target":{"Pane":7}},"body":"hi","deliver":"Submit","defer":true,"timeout_ms":1500}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            deferred,
+            ClientMessage::MsgSend {
+                defer: true,
+                timeout_ms: Some(1500),
+                wait: false,
+                ..
+            }
+        ));
+        let waiting: ClientMessage = serde_json::from_str(
+            r#"{"MsgSend":{"to":{"host":null,"target":{"Pane":7}},"body":"hi","deliver":"Submit","wait":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            waiting,
+            ClientMessage::MsgSend {
+                wait: true,
+                defer: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn msg_ack_defaults_to_naming_nothing_in_the_callers_own_mailbox() {
+        let ack: ClientMessage = serde_json::from_str(r#"{"MsgAck":{}}"#).unwrap();
+        assert!(matches!(
+            ack,
+            ClientMessage::MsgAck {
+                pane: None,
+                ref ids,
+                all: false,
+                pane_hint: None
+            } if ids.is_empty()
+        ));
+        let acked = ServerMessage::MsgAcked { pane: 4, count: 2 };
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&acked).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::MsgAcked { pane: 4, count: 2 }
+        ));
+    }
+
+    #[test]
+    fn agent_name_decodes_without_a_pane_and_a_status_entry_round_trips() {
+        let named: ClientMessage =
+            serde_json::from_str(r#"{"AgentName":{"name":"alpha"}}"#).unwrap();
+        assert!(matches!(
+            named,
+            ClientMessage::AgentName {
+                ref name,
+                pane: None,
+                pane_hint: None
+            } if name.as_deref() == Some("alpha")
+        ));
+        let wait: ClientMessage = serde_json::from_str(
+            r#"{"AgentWait":{"target":{"host":null,"target":{"Pane":7}},"state":"NeedsInput"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            wait,
+            ClientMessage::AgentWait {
+                state: AgentState::NeedsInput,
+                timeout_ms: None,
+                ..
+            }
+        ));
+        let waited = ServerMessage::AgentWaited {
+            target: Resolved {
+                host: None,
+                pane_id: 7,
+                name: None,
+            },
+            state: Some(AgentState::Working),
+            timed_out: true,
+            req: None,
+        };
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&waited).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::AgentWaited {
+                state: Some(AgentState::Working),
+                timed_out: true,
+                ..
+            }
+        ));
+        assert!(
+            !back.is_push(),
+            "an answer, so a one-shot request waits for it"
+        );
+        let status: ClientMessage = serde_json::from_str(r#"{"AgentStatus":{}}"#).unwrap();
+        assert!(matches!(
+            status,
+            ClientMessage::AgentStatus {
+                target: None,
+                req: None
+            }
+        ));
+        let entry = PaneStatusEntry {
+            pane_id: 4,
+            session: "main".into(),
+            tab_index: 1,
+            command: Some("claude".into()),
+            state: Some(AgentState::Working),
+            name: Some("alpha".into()),
+            unread: 2,
+            host: None,
+        };
+        let list = ServerMessage::AgentStatusList {
+            panes: vec![entry.clone()],
+            req: None,
+        };
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&list).unwrap()).unwrap();
+        match back {
+            ServerMessage::AgentStatusList { panes, .. } => assert_eq!(panes, vec![entry]),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_agent_request_carries_a_req_over_a_link_and_none_without() {
+        let target = Some(Address {
+            host: None,
+            target: Target::Pane(7),
+        });
+        let mut status = ClientMessage::AgentStatus { target, req: None };
+        status.set_req(3);
+        let back: ClientMessage =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            ClientMessage::AgentStatus { req: Some(3), .. }
+        ));
+        let mut ping = ClientMessage::Ping { nonce: 1 };
+        ping.set_req(3);
+        assert!(matches!(ping, ClientMessage::Ping { nonce: 1 }));
+
+        let answer = ServerMessage::AgentStatusList {
+            panes: vec![],
+            req: None,
+        }
+        .with_req(Some(3));
+        assert_eq!(answer.req(), Some(3));
+        let waited = ServerMessage::AgentWaited {
+            target: Resolved {
+                host: None,
+                pane_id: 7,
+                name: None,
+            },
+            state: None,
+            timed_out: false,
+            req: None,
+        };
+        assert_eq!(waited.with_req(Some(4)).req(), Some(4));
+        assert_eq!(ServerMessage::Pong { nonce: 1 }.req(), None);
+    }
+
+    #[test]
+    fn a_status_entry_from_an_older_server_has_no_host() {
+        let entry: PaneStatusEntry = serde_json::from_str(
+            r#"{"pane_id":4,"session":"main","tab_index":0,"command":null,"state":null,"name":null,"unread":0}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.host, None);
+    }
+
+    #[test]
+    fn address_parses_every_spelling() {
+        let name = || Target::Name("alpha".into());
+        assert_eq!("alpha".parse(), Ok(addr(None, name())));
+        assert_eq!("%7".parse(), Ok(addr(None, Target::Pane(7))));
+        assert_eq!("mini:alpha".parse(), Ok(addr(Some("mini"), name())));
+        assert_eq!("mini:%7".parse(), Ok(addr(Some("mini"), Target::Pane(7))));
+        assert_eq!(
+            "a-b_9".parse(),
+            Ok(addr(None, Target::Name("a-b_9".into())))
+        );
+    }
+
+    #[test]
+    fn address_rejects_the_malformed() {
+        let too_long = format!("a{}", "b".repeat(32));
+        for bad in [
+            "",
+            "%x",
+            "%",
+            "%-1",
+            "a:b:c",
+            "Alpha",
+            "-a",
+            "9a",
+            "a b",
+            &too_long,
+            "mini:",
+            ":alpha",
+            "mi ni:alpha",
+            ".mini:alpha",
+            "-mini:alpha",
+            "-oProxyCommand:%1",
+            "..:%1",
+        ] {
+            assert!(bad.parse::<Address>().is_err(), "{bad:?} parsed");
+        }
+        assert!(format!("a{}", "b".repeat(31)).parse::<Address>().is_ok());
+    }
+
+    #[test]
+    fn address_display_is_the_inverse_of_parse() {
+        for s in ["alpha", "%7", "mini:alpha", "mini:%7", "lab-2.local:%0"] {
+            assert_eq!(s.parse::<Address>().unwrap().to_string(), s);
+        }
+    }
+
+    #[test]
+    fn a_message_round_trips_through_json_from_either_sender() {
+        for from in [
+            Sender::Pane {
+                pane_id: 3,
+                name: Some("lead".into()),
+                session: "main".into(),
+            },
+            Sender::Remote {
+                host: "mini".into(),
+                pane_id: 9,
+                name: None,
+            },
+        ] {
+            let msg = Message {
+                origin: None,
+                id: 42,
+                from,
+                to: 7,
+                body: "hello\nworld".into(),
+                created_ms: 1_000,
+                expires_ms: 2_000,
+                state: MsgState::Submitted,
+                reply_to: Some(MsgRef {
+                    host: Some("mini".into()),
+                    id: 5,
+                }),
+            };
+            let json = serde_json::to_string(&msg).unwrap();
+            assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);
+        }
+    }
 
     #[test]
     fn round_trip_client_message() {
@@ -1978,13 +3675,15 @@ mod tests {
     #[test]
     fn round_trip_server_message() {
         let msg = ServerMessage::Error {
+            req: None,
             message: "not found".into(),
+            code: None,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
         let decoded: ServerMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
         match decoded {
-            ServerMessage::Error { message } => assert_eq!(message, "not found"),
+            ServerMessage::Error { message, .. } => assert_eq!(message, "not found"),
             other => panic!("unexpected variant: {other:?}"),
         }
     }
@@ -2022,6 +3721,9 @@ mod tests {
             viewport_top: 0,
             scroll_offset: 0,
             status: Some(info.clone()),
+            popup: None,
+            live_popups: Vec::new(),
+            float_zoom: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {
@@ -2186,6 +3888,7 @@ mod tests {
             y: 10,
             pane_id: None,
             release: false,
+            popup: false,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
@@ -2196,7 +3899,9 @@ mod tests {
                 y,
                 pane_id,
                 release,
+                popup,
             } => {
+                assert!(!popup);
                 assert_eq!(x, 42);
                 assert_eq!(y, 10);
                 assert_eq!(pane_id, None);
@@ -2217,6 +3922,7 @@ mod tests {
             y: 5,
             pane_id: Some(9),
             release: true,
+            popup: false,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
@@ -2308,6 +4014,7 @@ mod tests {
             end_y: 4,
             is_final: true,
             pane_id: Some(77),
+            popup: false,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
@@ -2406,6 +4113,7 @@ mod tests {
             end_y: 7,
             is_final: false,
             pane_id: None,
+            popup: false,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
@@ -2746,6 +4454,7 @@ mod tests {
             RemuxCommand::TabNext => Some("TabNext"),
             RemuxCommand::TabPrev => Some("TabPrev"),
             RemuxCommand::TabMove(_) => Some("TabMove"),
+            RemuxCommand::TabMoveBy(_) => Some("TabMoveBy"),
             RemuxCommand::PaneNew => Some("PaneNew"),
             RemuxCommand::PaneClose => Some("PaneClose"),
             RemuxCommand::PaneSplitVertical => Some("PaneSplitVertical"),
@@ -2771,7 +4480,9 @@ mod tests {
             RemuxCommand::PaneUnstackDown => Some("PaneUnstackDown"),
             RemuxCommand::PaneRename(_) => Some("PaneRename"),
             RemuxCommand::PaneToggleZoom => Some("PaneToggleZoom"),
-            RemuxCommand::PopupToggle => Some("PopupToggle"),
+            RemuxCommand::PaneToggleZoomFullscreen => Some("PaneToggleZoomFullscreen"),
+            RemuxCommand::PaneToggleZoomFloat => Some("PaneToggleZoomFloat"),
+            RemuxCommand::PopupToggle(_) => Some("PopupToggle"),
             RemuxCommand::ResizeLeft(_) => Some("ResizeLeft"),
             RemuxCommand::ResizeRight(_) => Some("ResizeRight"),
             RemuxCommand::ResizeUp(_) => Some("ResizeUp"),
@@ -2807,6 +4518,11 @@ mod tests {
             RemuxCommand::SessionSwitchTab { .. }
             | RemuxCommand::SessionSwitchPane { .. }
             | RemuxCommand::TabCloseByIndex { .. }
+            | RemuxCommand::TabCloseById { .. }
+            | RemuxCommand::TabRenameById { .. }
+            | RemuxCommand::OnPane { .. }
+            | RemuxCommand::OnTab { .. }
+            | RemuxCommand::PaneEnsureZoom
             | RemuxCommand::SessionRenameByName { .. }
             | RemuxCommand::FolderRename { .. }
             | RemuxCommand::TabNewInSession { .. }
@@ -2841,13 +4557,268 @@ mod tests {
         }
     }
 
+    fn decode_client(msg: &ClientMessage) -> ClientMessage {
+        let encoded = encode_message(msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        serde_json::from_slice(&encoded[4..4 + len]).unwrap()
+    }
+
+    /// 19 introduced `RightClick` and `ContextMenu`, 20 agent messaging, and
+    /// 21 the layout switcher; a peer on 20 cannot decode `ListLayouts`, so the
+    /// handshake has to refuse that pairing.
+    #[test]
+    fn protocol_version_is_21_for_the_layout_switcher() {
+        assert_eq!(PROTOCOL_VERSION, 21);
+    }
+
+    #[test]
+    fn right_click_and_context_menu_round_trip() {
+        match decode_client(&ClientMessage::RightClick {
+            x: 4,
+            y: 9,
+            release: true,
+            popup: false,
+        }) {
+            ClientMessage::RightClick {
+                x,
+                y,
+                release,
+                popup,
+            } => assert_eq!((x, y, release, popup), (4, 9, true, false)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let legacy = br#"{"RightClick":{"x":1,"y":2,"release":false}}"#;
+        match serde_json::from_slice::<ClientMessage>(legacy).unwrap() {
+            ClientMessage::RightClick { popup, .. } => assert!(!popup),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let menu = ServerMessage::ContextMenu {
+            x: 3,
+            y: 4,
+            target: ContextTarget::Pane {
+                pane_id: 7,
+                zoomed: true,
+                zoom_mode: crate::config::ZoomMode::Float,
+                monocle: false,
+            },
+        };
+        let encoded = encode_message(&menu).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        match serde_json::from_slice::<ServerMessage>(&encoded[4..4 + len]).unwrap() {
+            ServerMessage::ContextMenu { x, y, target } => {
+                assert_eq!((x, y), (3, 4));
+                assert!(matches!(
+                    target,
+                    ContextTarget::Pane {
+                        pane_id: 7,
+                        zoomed: true,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn popup_size_round_trips() {
+        match decode_client(&ClientMessage::PopupSize {
+            cols: 126,
+            rows: 35,
+        }) {
+            ClientMessage::PopupSize { cols, rows } => assert_eq!((cols, rows), (126, 35)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// The three mouse riders and the frame layer are `#[serde(default)]`, so a
+    /// payload from a peer that predates them decodes to `false`/`None`.
+    #[test]
+    fn popup_riders_default_when_absent() {
+        let click = br#"{"MouseClick":{"x":1,"y":2,"pane_id":null,"release":false}}"#;
+        match serde_json::from_slice::<ClientMessage>(click).unwrap() {
+            ClientMessage::MouseClick { popup, .. } => assert!(!popup),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let drag =
+            br#"{"MouseDrag":{"start_x":0,"start_y":0,"end_x":1,"end_y":1,"is_final":true}}"#;
+        match serde_json::from_slice::<ClientMessage>(drag).unwrap() {
+            ClientMessage::MouseDrag { popup, .. } => assert!(!popup),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let scroll = br#"{"MouseScroll":{"x":1,"y":2,"up":true}}"#;
+        match serde_json::from_slice::<ClientMessage>(scroll).unwrap() {
+            ClientMessage::MouseScroll { popup, .. } => assert!(!popup),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let full = r#"{"FullRender":{"cells":[],"cursor_x":0,"cursor_y":0,"cursor_visible":true,"cursor_style":0,"focused_pane_rect":null}}"#;
+        match serde_json::from_str::<ServerMessage>(full).unwrap() {
+            ServerMessage::FullRender {
+                popup, live_popups, ..
+            } => {
+                assert_eq!(popup, None);
+                assert!(live_popups.is_empty());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let diff = r#"{"RenderDiff":{"changes":[],"cursor_x":0,"cursor_y":0,"cursor_visible":true,"cursor_style":0,"focused_pane_rect":null}}"#;
+        match serde_json::from_str::<ServerMessage>(diff).unwrap() {
+            ServerMessage::RenderDiff {
+                popup, live_popups, ..
+            } => {
+                assert_eq!(popup, None);
+                assert!(live_popups.is_empty());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// The client places the popup, so it forwards `PopupToggle` without the
+    /// position its key named.
+    #[test]
+    fn popup_toggle_round_trips_with_and_without_a_position() {
+        for cmd in [
+            RemuxCommand::PopupToggle(None),
+            RemuxCommand::PopupToggle(Some(crate::config::PopupPosition::Bottom.into())),
+        ] {
+            let msg = ClientMessage::Command(cmd.clone());
+            let json = serde_json::to_string(&msg).unwrap();
+            match serde_json::from_str::<ClientMessage>(&json).unwrap() {
+                ClientMessage::Command(back) => assert_eq!(back, cmd, "{json}"),
+                other => panic!("unexpected variant: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_commands_round_trip_and_are_registered_actions() {
+        for (cmd, name) in [
+            (RemuxCommand::PaneToggleZoom, "PaneToggleZoom"),
+            (
+                RemuxCommand::PaneToggleZoomFullscreen,
+                "PaneToggleZoomFullscreen",
+            ),
+            (RemuxCommand::PaneToggleZoomFloat, "PaneToggleZoomFloat"),
+        ] {
+            let json = serde_json::to_string(&ClientMessage::Command(cmd.clone())).unwrap();
+            match serde_json::from_str::<ClientMessage>(&json).unwrap() {
+                ClientMessage::Command(back) => assert_eq!(back, cmd, "{json}"),
+                other => panic!("unexpected variant: {other:?}"),
+            }
+            assert_eq!(registry_name(&cmd), Some(name));
+            assert!(
+                action_specs().iter().any(|spec| spec.name == name),
+                "{name} is in the action list"
+            );
+        }
+    }
+
+    #[test]
+    fn popup_mouse_flag_round_trips() {
+        let click = ClientMessage::MouseClick {
+            x: 3,
+            y: 4,
+            pane_id: None,
+            release: false,
+            popup: true,
+        };
+        match decode_client(&click) {
+            ClientMessage::MouseClick { popup, x, y, .. } => assert!(popup && x == 3 && y == 4),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let drag = ClientMessage::MouseDrag {
+            start_x: 0,
+            start_y: 1,
+            end_x: 2,
+            end_y: 3,
+            is_final: false,
+            pane_id: None,
+            popup: true,
+        };
+        match decode_client(&drag) {
+            ClientMessage::MouseDrag { popup, .. } => assert!(popup),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let scroll = ClientMessage::MouseScroll {
+            x: 1,
+            y: 1,
+            up: false,
+            popup: true,
+        };
+        match decode_client(&scroll) {
+            ClientMessage::MouseScroll { popup, .. } => assert!(popup),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn popup_cells_round_trip_on_both_frames() {
+        let layer = PopupCells {
+            pane_id: 7,
+            cols: 2,
+            rows: 1,
+            cursor_x: 1,
+            cursor_y: 0,
+            cursor_visible: true,
+            cursor_style: 2,
+            cells: Some(vec![vec![RenderCell::default(), RenderCell::default()]]),
+            changes: vec![CellChange {
+                x: 0,
+                y: 0,
+                cell: RenderCell::default(),
+            }],
+        };
+        let full = ServerMessage::FullRender {
+            cells: Vec::new(),
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: false,
+            cursor_style: 0,
+            focused_pane_rect: None,
+            application_cursor_keys: false,
+            bracketed_paste: true,
+            viewport_top: 0,
+            scroll_offset: 0,
+            status: None,
+            popup: Some(Box::new(layer.clone())),
+            live_popups: vec![7],
+            float_zoom: false,
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::FullRender { popup, .. } => assert_eq!(popup.as_deref(), Some(&layer)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let diff = ServerMessage::RenderDiff {
+            changes: Vec::new(),
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: false,
+            cursor_style: 0,
+            focused_pane_rect: None,
+            application_cursor_keys: false,
+            bracketed_paste: true,
+            viewport_top: 0,
+            scroll_offset: 0,
+            status: None,
+            popup: Some(Box::new(layer.clone())),
+            live_popups: vec![7],
+            float_zoom: false,
+        };
+        let json = serde_json::to_string(&diff).unwrap();
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::RenderDiff { popup, .. } => assert_eq!(popup.as_deref(), Some(&layer)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
     /// Nothing bindable is missing from the registry: a variant classified as
     /// bindable must be listed.
     #[test]
     fn classified_names_are_registry_names() {
         for cmd in [
             RemuxCommand::EnterSearchMode,
-            RemuxCommand::PopupToggle,
+            RemuxCommand::PopupToggle(None),
             RemuxCommand::SendKey(vec![1]),
             RemuxCommand::SessionSwitchLast,
         ] {
