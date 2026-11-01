@@ -86,6 +86,9 @@ struct Payload {
     /// Set when the session is a subagent's, which shares its parent's pane.
     #[serde(default)]
     agent_id: Option<String>,
+    /// Codex writes one for every session a user can resume.
+    #[serde(default)]
+    transcript_path: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -496,18 +499,51 @@ pub enum SessionInput {
     Path(String),
 }
 
+/// What in the hook's environment says who is running it.
+struct HookEnv {
+    /// `CURSOR_VERSION` is set: Cursor runs Claude's hooks for its own agent.
+    cursor: bool,
+    /// `CODEX_THREAD_ID`: Codex exports its session to every child, so a
+    /// nested `codex exec` sees the OUTER session's id here.
+    codex_thread: Option<String>,
+}
+
+impl HookEnv {
+    fn read() -> Self {
+        Self {
+            cursor: std::env::var_os("CURSOR_VERSION").is_some(),
+            codex_thread: std::env::var("CODEX_THREAD_ID").ok(),
+        }
+    }
+}
+
 /// Why a hook payload is not this pane's agent's own session start, so that
-/// nothing is reported. `cursor` is whether `CURSOR_VERSION` is set: Cursor
-/// runs Claude's hooks for its own agent.
-fn not_reported(agent: &str, payload: &Payload, cursor: bool) -> Option<&'static str> {
+/// nothing is reported.
+///
+/// For codex these two are the whole defence against a nested run: codex
+/// allows `startup` to replace a held session, so a `codex exec` run from
+/// inside the pane's codex would otherwise take the pane over.
+fn not_reported(agent: &str, payload: &Payload, env: &HookEnv) -> Option<&'static str> {
     if payload.hook_event_name != "SessionStart" {
         return Some("not a SessionStart payload");
     }
     if agent == "claude" && payload.agent_id.is_some() {
         return Some("a subagent's session");
     }
-    if agent == "claude" && cursor {
+    if agent == "claude" && env.cursor {
         return Some("Cursor, not Claude Code");
+    }
+    if agent == "codex" {
+        if env
+            .codex_thread
+            .as_deref()
+            .is_some_and(|outer| Some(outer) != payload.session_id.as_deref())
+        {
+            return Some("a codex run nested in another codex session");
+        }
+        if payload.transcript_path.is_none() {
+            return Some("a codex session with no transcript to resume");
+        }
     }
     None
 }
@@ -544,8 +580,7 @@ async fn report_session(
         SessionInput::Path(path) => (AgentSessionRef::Path(path), source),
         SessionInput::Hook => {
             let payload = read_payload().map_err(|e| Some(e.to_string()))?;
-            let cursor = std::env::var_os("CURSOR_VERSION").is_some();
-            if let Some(why) = not_reported(&agent, &payload, cursor) {
+            if let Some(why) = not_reported(&agent, &payload, &HookEnv::read()) {
                 log::debug!("cmd: agent session {}: not reported, {why}", escape(&agent));
                 return Err(None);
             }
@@ -825,10 +860,17 @@ mod tests {
         parse_payload(raw.as_bytes()).unwrap()
     }
 
+    fn plain() -> HookEnv {
+        HookEnv {
+            cursor: false,
+            codex_thread: None,
+        }
+    }
+
     #[test]
     fn a_claude_session_start_is_reported_with_its_id_and_source() {
         let payload = fixture("startup");
-        assert_eq!(not_reported("claude", &payload, false), None);
+        assert_eq!(not_reported("claude", &payload, &plain()), None);
         assert_eq!(
             payload.session_id.as_deref(),
             Some("7f3c2a9e-51d4-4b8e-9a61-0c2f5d8e4b17")
@@ -838,8 +880,32 @@ mod tests {
 
     #[test]
     fn a_subagent_another_event_and_cursor_are_not_reported() {
-        assert!(not_reported("claude", &fixture("subagent"), false).is_some());
-        assert!(not_reported("claude", &fixture("prompt"), false).is_some());
-        assert!(not_reported("claude", &fixture("startup"), true).is_some());
+        let cursor = HookEnv {
+            cursor: true,
+            ..plain()
+        };
+        assert!(not_reported("claude", &fixture("subagent"), &plain()).is_some());
+        assert!(not_reported("claude", &fixture("prompt"), &plain()).is_some());
+        assert!(not_reported("claude", &fixture("startup"), &cursor).is_some());
+    }
+
+    #[test]
+    fn codex_reports_only_its_own_session_with_a_transcript() {
+        let payload = |raw: &str| parse_payload(raw.as_bytes()).unwrap();
+        let startup = payload(include_str!(
+            "../../tests/fixtures/agent_session/codex_startup.json"
+        ));
+        let thread = |id: &str| HookEnv {
+            codex_thread: Some(id.to_string()),
+            ..plain()
+        };
+        let own = startup.session_id.clone().unwrap();
+        assert_eq!(not_reported("codex", &startup, &plain()), None);
+        assert_eq!(not_reported("codex", &startup, &thread(&own)), None);
+        assert!(not_reported("codex", &startup, &thread("an-outer-session")).is_some());
+        let bare = payload(include_str!(
+            "../../tests/fixtures/agent_session/codex_no_transcript.json"
+        ));
+        assert!(not_reported("codex", &bare, &plain()).is_some());
     }
 }

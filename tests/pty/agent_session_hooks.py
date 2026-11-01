@@ -21,7 +21,17 @@ claude (the stub is `fakeclaude.py`, a compiled leader named `claude`):
   h7  a hook killed by its agent at the timeout leaves the pane running the
       stub and the server answering
 
-Run: python3 tests/pty/agent_session_hooks.py [claude ...]
+codex (the same stub, pointed at the installed `$CODEX_HOME/hooks.json`):
+  k1  startup with no CODEX_THREAD_ID -> Stored
+  k2  CODEX_THREAD_ID equal to the payload's session_id -> passes the filter
+      (Unchanged, the same session)
+  k3  CODEX_THREAD_ID naming ANOTHER session (a nested `codex exec`) -> no
+      connection, no output
+  k4  a payload with no transcript_path -> no connection, no output
+  k5  in a pane whose claude session is held, codex's startup is refused
+      session_held: one stderr line, rc 0, nothing on stdout
+
+Run: python3 tests/pty/agent_session_hooks.py [claude codex ...]
 """
 import json
 import os
@@ -134,6 +144,65 @@ class FakeClaude:
         return [e for e in self.entries()[start:] if e.get("event") == "start"]
 
 
+def runner(rig, fake):
+    """Run the stub's SessionStart hooks once with a fixture and check the
+    run, then the server's verdict for the stub's pane (or that it never
+    connected)."""
+    def run(label, fixture, want, connects=True, stderr=""):
+        before_conn, before = rig.connections(), len(rig.verdicts(fake.pane))
+        runs = fake.tell(f"start={FIXTURES}/{fixture}")
+        time.sleep(0.3)
+        check(len(runs) == 1 and runs[0]["rc"] == 0 and runs[0]["stdout"] == ""
+              and (runs[0]["stderr"] == "" if not stderr else
+                   len(runs[0]["stderr"].splitlines()) == 1 and stderr in runs[0]["stderr"]),
+              f"{label}: the hook exits 0, nothing on stdout, stderr {stderr or 'empty'} (got {runs})")
+        got = rig.verdicts(fake.pane)[before:]
+        if connects:
+            check(got == [want], f"{label}: the server answered {want} (got {got})")
+        else:
+            check(rig.connections() == before_conn and got == [],
+                  f"{label}: the hook never connected ({rig.connections() - before_conn} new)")
+    return run
+
+
+def codex():
+    os.makedirs(BINDIR, exist_ok=True)
+    fakeclaude.install(f"{BINDIR}/claude")
+    rig = Rig("codex")
+    try:
+        codex_home = f"{rig.home}/.codex"
+        os.makedirs(codex_home)
+        os.makedirs(f"{rig.home}/.claude")
+        for harness in ("codex-resume", "claude-resume"):
+            rc, err = rig.integrate(harness)
+            check(rc == 0, f"setup: {harness} installs into the throwaway HOME (rc={rc}, err={err!r})")
+        fake = FakeClaude(rig)
+        fake.tell(f"env:HOOKS_FILE={codex_home}/hooks.json")
+        run = runner(rig, fake)
+        session = json.load(open(f"{FIXTURES}/codex_startup.json"))["session_id"]
+        run("k1 startup", "codex_startup.json", "Stored")
+        fake.tell(f"env:CODEX_THREAD_ID={session}")
+        run("k2 CODEX_THREAD_ID is this session", "codex_startup.json", "Unchanged")
+        run("k3 CODEX_THREAD_ID is another session", "codex_nested.json", None, connects=False)
+        fake.tell("unenv:CODEX_THREAD_ID")
+        run("k4 no transcript_path", "codex_no_transcript.json", None, connects=False)
+
+        held = FakeClaude.__new__(FakeClaude)
+        held.ctl, held.log = f"{rig.srv.rundir}/held.ctl", f"{rig.srv.rundir}/held.log"
+        held.pane = rig.spawn([f"{BINDIR}/claude", held.ctl, held.log, FIXTURES, BIN])
+        end = time.time() + 8
+        while time.time() < end and not os.path.exists(held.log):
+            time.sleep(0.05)
+        run = runner(rig, held)
+        run("k5 setup: claude startup", "claude_startup.json", "Stored")
+        held.tell(f"env:HOOKS_FILE={codex_home}/hooks.json")
+        run("k5 codex startup over claude", "codex_startup.json", "session_held",
+            stderr="session_held")
+        check("panicked at" not in rig.srv.log(), "codex: no panic in server.log")
+    finally:
+        rig.close()
+
+
 def claude():
     os.makedirs(BINDIR, exist_ok=True)
     fakeclaude.install(f"{BINDIR}/claude")
@@ -145,19 +214,7 @@ def claude():
         fake = FakeClaude(rig)
         check(fake.pane is not None and fake.entries() is not None, f"setup: the stub runs in %{fake.pane}")
 
-        def run(label, fixture, want, connects=True):
-            before_conn, before = rig.connections(), len(rig.verdicts(fake.pane))
-            runs = fake.tell(f"start={FIXTURES}/{fixture}")
-            time.sleep(0.3)
-            check(len(runs) == 1 and runs[0]["rc"] == 0 and runs[0]["stdout"] == ""
-                  and runs[0]["stderr"] == "",
-                  f"{label}: the hook exits 0 with no output (got {runs})")
-            got = rig.verdicts(fake.pane)[before:]
-            if connects:
-                check(got == [want], f"{label}: the server answered {want} (got {got})")
-            else:
-                check(rig.connections() == before_conn and got == [],
-                      f"{label}: the hook never connected ({rig.connections() - before_conn} new)")
+        run = runner(rig, fake)
 
         run("h1 startup", "claude_startup.json", "Stored")
         run("h2 resume, same id", "claude_resume.json", "Unchanged")
@@ -182,7 +239,7 @@ def claude():
         rig.close()
 
 
-MODES = {"claude": claude}
+MODES = {"claude": claude, "codex": codex}
 
 
 def main():

@@ -7,7 +7,8 @@ as it would the real one, on macOS as well as Linux.
 
 Run as `claude <control> <log> <fixtures dir> <remux binary>`. It reads the
 hook commands from `$HOME/.claude/settings.json` on every run, the way Claude
-Code reads them, and runs each through `sh -c` with a payload on stdin,
+Code reads them (or from `$HOOKS_FILE` once `env:HOOKS_FILE=<path>` sets it,
+which is how it stands in for Codex and its `hooks.json`), and runs each through `sh -c` with a payload on stdin,
 recording `{"event", "rc", "stdout", "stderr"}` as one JSON line in `<log>`
 and `HOOK:<event> rc=<rc>` on the pane.
 
@@ -80,7 +81,7 @@ def main():
         sys.stdout.flush()
 
     def commands(event):
-        path = os.path.join(env.get("HOME", ""), ".claude", "settings.json")
+        path = env.get("HOOKS_FILE") or os.path.join(env.get("HOME", ""), ".claude", "settings.json")
         try:
             with open(path) as f:
                 settings = json.load(f)
