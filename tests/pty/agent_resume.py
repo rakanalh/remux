@@ -508,12 +508,19 @@ def impostor_resumed(rig, mode, runs_as):
     check(rig.wait(lambda: not no_record(rig)), f"{mode}: state.json holds the record")
     sleeper = shutil.which("sleep")
     if runs_as != "sleep":
-        shutil.copy(sleeper, f"{rig.bin}/{runs_as}")
-        sleeper = f"{rig.bin}/{runs_as}"
+        # A wrapper binary under that name, leading a sleep: macOS kills a
+        # copy of a signed system binary such as /bin/sleep at exec.
+        named = f"{rig.bin}/{runs_as}"
+
+        def unavailable():
+            raise SystemExit("no cc to build the wrapper")
+        standin.install_wrapper(named, [sleeper, "600"], {}, unavailable)
+        sleeper = named
     impostor = f"{rig.bin}/claude"
     os.remove(impostor)
     with open(impostor, "w") as f:
-        f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{rig.argv_dir}/claude.$$"\nexec "{sleeper}" 600\n')
+        args = "" if runs_as != "sleep" else " 600"
+        f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{rig.argv_dir}/claude.$$"\nexec "{sleeper}"{args}\n')
     os.chmod(impostor, 0o755)
     first = restart_and_collect(rig, wait=8.0)
     time.sleep(3.0)
