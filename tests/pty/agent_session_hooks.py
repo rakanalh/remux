@@ -86,15 +86,28 @@ session. Prints `SMOKE` lines: whether a report reached the server, or why it
 was skipped. A sha256 of every file under the real `~/.omp` is taken before
 and after and must not change; a change is the one thing reported as FAIL.
 
-opencode_real (OPTIONAL, never a failure, not in the default run): the REAL
-`~/.opencode/bin/opencode --mini`, started as a job at a shell pane's prompt
-under `unshare -rn` (no network, so no model call) and the throwaway HOME and
-XDG dirs, with the integration installed. `--mini` creates a session at
-startup, so the installed server plugin should report it, once OpenCode's
-first-start bootstrap is done; offline, that bootstrap can stop first, and the
-smoke then says so rather than claiming anything about the plugins. Prints `SMOKE`
-lines; a change under the real `~/.config/opencode`, `~/.local/state/opencode`
-or `~/.local/share/opencode` is the one thing reported as FAIL.
+opencode_real (OPTIONAL, not in the default run): the REAL OpenCode
+($REMUX_OPENCODE_BIN, else `opencode` on PATH, else `~/.opencode/bin/opencode`)
+under the throwaway HOME and XDG dirs, with the integration installed, started
+as a job at a shell pane's prompt. Its `--version` picks the runs:
+  opencode_real_mini, 1.x only: `opencode --mini` (under `unshare -rn`, no
+       network, unless REMUX_SMOKE_NETWORK=1). `--mini` creates a session at
+       startup, so the installed SERVER plugin should report it once
+       OpenCode's first-start bootstrap is done; offline, that bootstrap can
+       stop first, and the smoke then says so rather than claiming anything
+       about the plugins.
+  opencode_real, 1.x and 2.x: the full TUI, which reports only from the TUI
+       plugin and only for a session on screen, so a test-only plugin beside
+       remux's (`plugins/remux-smoke-helper/tui.js`, also listed in tui.json
+       for 1.x) creates a session and a child of it through the TUI's own
+       client and opens the CHILD, with no prompt and so no model call. Once the helper has done that, the installed TUI
+       plugin must report, with source=select, and state.json must hold the
+       ROOT; no report, or one naming any other id, is a FAIL.
+Both write `service.json` with a free port into the throwaway config dir, so a
+2.x background service can never meet a real one on its default port, and set
+OPENCODE_DISABLE_AUTOUPDATE=1. Prints `SMOKE` lines; a change under the real
+`~/.config/opencode`, `~/.local/state/opencode` or `~/.local/share/opencode`
+is a FAIL.
 
 Run: python3 tests/pty/agent_session_hooks.py [claude codex pi omp opencode omp_real opencode_real ...]
 """
@@ -590,7 +603,7 @@ def screen_of(rig, pane):
     return [r for r in rows if r.strip()]
 
 
-def real_smoke(name, agent, argv, prepare, real_paths, wait_s=30, env_line=""):
+def real_smoke(name, agent, argv, prepare, real_paths, wait_s=30, env_line="", after=None):
     """Start the REAL `argv` as a job at a shell pane's prompt, with remux's
     integration installed by `prepare(rig)` under the throwaway HOME, and say
     whether its report reached the server. Never a failure, except a change to
@@ -632,6 +645,8 @@ def real_smoke(name, agent, argv, prepare, real_paths, wait_s=30, env_line=""):
                   f"(server lines for the pane: {refused[:2]}); the pane shows:")
             for row in screen[-12:]:
                 print(f"SMOKE {name}:   | {row[:100]}")
+        if after:
+            after(rig, pane, found)
         return rig, pane, found
     finally:
         rig.close()
@@ -727,32 +742,135 @@ def omp_real():
                ["~/.omp"], wait_s=25)
 
 
+OPENCODE_HELPER = """import { writeFileSync } from "node:fs";
+const IDS = __IDS__;
+const idOf = (made) => made?.data?.id ?? made?.id;
+export default {
+  id: "remux-smoke-helper",
+  tui: async (api) => {
+    const timer = setTimeout(async () => {
+      try {
+        const root = idOf(await api.client.session.create({}));
+        const child = idOf(await api.client.session.create({ parentID: root }));
+        writeFileSync(IDS, JSON.stringify({ root, child }));
+        api.route.navigate("session", { sessionID: child });
+      } catch (e) {
+        writeFileSync(IDS, JSON.stringify({ error: String(e) }));
+      }
+    }, 3000);
+    api.lifecycle?.onDispose?.(() => clearTimeout(timer));
+  },
+  setup: (ctx) => {
+    const timer = setTimeout(async () => {
+      try {
+        const root = await ctx.client.session.create({});
+        const child = await ctx.client.session.create({ parentID: root.id });
+        writeFileSync(IDS, JSON.stringify({ root: root.id, child: child.id }));
+        ctx.ui.router.navigate({ type: "session", sessionID: child.id });
+      } catch (e) {
+        writeFileSync(IDS, JSON.stringify({ error: String(e) }));
+      }
+    }, 3000);
+    return () => clearTimeout(timer);
+  },
+};
+"""
+
+
+def opencode_major(argv):
+    """The major version `argv --version` prints, run under a throwaway HOME."""
+    scratch = f"{RUNDIR}-ocversion"
+    shutil.rmtree(scratch, ignore_errors=True)
+    os.makedirs(scratch)
+    env = {"PATH": "/usr/bin:/bin", "HOME": scratch, "OPENCODE_DISABLE_AUTOUPDATE": "1",
+           **{k: f"{scratch}/{k.lower()}" for k in ("XDG_CONFIG_HOME", "XDG_STATE_HOME",
+                                                     "XDG_DATA_HOME", "XDG_CACHE_HOME")}}
+    try:
+        out = subprocess.run([*argv, "--version"], env=env, capture_output=True, timeout=60).stdout
+    finally:
+        end_processes_with_home("opencode --version", scratch)
+        shutil.rmtree(scratch, ignore_errors=True)
+    found = re.search(rb"(\d+)\.\d+\.\d+", out)
+    return int(found.group(1)) if found else None
+
+
+def free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def opencode_real():
-    """`--mini` creates a session at startup, so the server plugin reports it
-    once OpenCode's first-start bootstrap (which downloads @opencode-ai/plugin
-    into the throwaway config dir) is done. Under `unshare -rn` (Linux, no
-    network) that bootstrap cannot finish; where unshare is absent (macOS) it
-    runs with the network, as a first start does."""
-    # REMUX_OPENCODE_BIN picks a version installed in a throwaway npm prefix:
-    # the integration targets OpenCode 1.18, and a machine's own may be newer.
+    # REMUX_OPENCODE_BIN picks a version installed in a throwaway prefix or
+    # unpacked from a release, so each major can be smoked on one machine.
     binary = (os.environ.get("REMUX_OPENCODE_BIN") or dev_which("opencode")
               or f"{REAL_HOME}/.opencode/bin/opencode")
-    # REMUX_SMOKE_NETWORK=1 lets the bootstrap reach the network, as on a
-    # machine with no unshare; by default Linux runs it offline.
-    unshare = None if os.environ.get("REMUX_SMOKE_NETWORK") == "1" else shutil.which("unshare")
     base = launcher(binary) if os.path.exists(binary) else None
-    if not base:
-        argv = None
-    elif unshare:
-        argv = [unshare, "-rn", *base, "--mini"]
-    else:
-        argv = [*base, "--mini"]
+    major = opencode_major(base) if base else None
+    print(f"SMOKE opencode_real: {binary} is major version {major}")
+    if major is not None and major < 2:
+        # REMUX_SMOKE_NETWORK=1 lets the first-start bootstrap reach the
+        # network, as on a machine with no unshare; by default Linux runs
+        # --mini offline.
+        unshare = None if os.environ.get("REMUX_SMOKE_NETWORK") == "1" else shutil.which("unshare")
+        opencode_smoke("opencode_real_mini", [unshare, "-rn", *base, "--mini"] if unshare
+                       else [*base, "--mini"], helper=False)
+    opencode_smoke("opencode_real", base, helper=True)
+
+
+def opencode_smoke(name, argv, helper):
+    ids = f"{RUNDIR}-{name}-ids.json"
+    if os.path.exists(ids):
+        os.remove(ids)
 
     def prepare(rig):
-        return needs_dir(rig, f"{rig.env['XDG_CONFIG_HOME']}/opencode", "opencode-resume")
-    real_smoke("opencode_real", "opencode", argv, prepare,
+        d = f"{rig.env['XDG_CONFIG_HOME']}/opencode"
+        why = needs_dir(rig, d, "opencode-resume")
+        if why:
+            return why
+        with open(f"{d}/service.json", "w") as f:
+            json.dump({"port": free_port()}, f)
+        if helper:
+            entry = f"{d}/plugins/remux-smoke-helper/tui.js"
+            os.makedirs(os.path.dirname(entry))
+            with open(entry, "w") as f:
+                f.write(OPENCODE_HELPER.replace("__IDS__", json.dumps(ids)))
+            # 1.x loads a TUI plugin only from tui.json; 2.x finds the
+            # directory and skips a file entry.
+            with open(f"{d}/tui.json") as f:
+                doc = json.load(f)
+            doc["plugin"].append(entry)
+            with open(f"{d}/tui.json", "w") as f:
+                json.dump(doc, f)
+        return None
+
+    def after(rig, pane, found):
+        if not helper:
+            return
+        made = json.load(open(ids)) if os.path.exists(ids) else None
+        print(f"SMOKE {name}: the helper made {made}")
+        # The helper put a session on screen, so OpenCode's bootstrap is done
+        # and its TUI loaded plugins: a missing report is remux's failure.
+        if made is not None and "root" in made:
+            check(found is not None, f"{name}: the TUI plugin reported the session the helper opened")
+        if not found:
+            return
+        check(found.group(3).strip('"') == "select",
+              f"{name}: the report came from the TUI plugin (source={found.group(3)})")
+        time.sleep(1.0)
+        try:
+            with open(f"{rig.srv.rundir}/data/remux/state.json") as f:
+                stored = json.load(f).get("agent_sessions", {}).get(str(pane))
+        except (OSError, ValueError):
+            stored = None
+        check(made is not None and "root" in made and stored is not None
+              and stored.get("value") == made["root"] and made["root"] != made["child"],
+              f"{name}: state.json holds the ROOT the helper made, not the child on screen "
+              f"(stored {stored}, made {made})")
+    real_smoke(name, "opencode", argv, prepare,
                ["~/.config/opencode", "~/.local/state/opencode", "~/.local/share/opencode"],
-               wait_s=60)
+               wait_s=60, env_line="OPENCODE_DISABLE_AUTOUPDATE=1 ", after=after)
 
 
 def claude():
