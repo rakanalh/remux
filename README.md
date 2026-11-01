@@ -382,22 +382,25 @@ remux integrate codex-resume      # SessionStart hook in $CODEX_HOME/hooks.json 
                                   #   [features] hooks = true in its config.toml
 remux integrate pi-resume         # extension in $PI_CODING_AGENT_DIR/extensions (~/.pi/agent)
 remux integrate omp-resume        # extension in ~/$PI_CONFIG_DIR/agent/extensions (~/.omp/agent)
-remux integrate opencode-resume   # server plugin in plugins/ and a TUI plugin in tui.json(c),
-                                  #   in $OPENCODE_CONFIG_DIR (~/.config/opencode)
+remux integrate opencode-resume   # server and TUI plugins in plugins/, the TUI one also in
+                                  #   tui.json(c), in $OPENCODE_CONFIG_DIR (~/.config/opencode)
 ```
 
 Each takes `--status`, `--dry-run` and `--uninstall`, like `claude-messaging`, and refuses an agent config dir that does not exist yet: run the agent once first. `claude-resume` and `claude-messaging` share one `settings.json`. Uninstalling `codex-resume` leaves `hooks = true` in place, since other hooks may rely on it. pi and omp both honour `$PI_CODING_AGENT_DIR`, so with it set they resolve to one directory and both installs are refused.
 
 | Agent | Typed after a restart |
 |---|---|
-| claude | `claude --resume <id>` |
-| codex | `codex resume <id>` |
+| claude | `claude --resume=<id>` |
+| codex | `codex resume -- <id>` |
 | pi | `pi --session <file>` |
 | omp | `omp --resume=<file>` |
-| opencode | `opencode --session <id>` |
+| opencode | `opencode --session=<id>` |
+
+The value is joined to its flag, or put after `--`, so that a stored value can never be read as another option of the agent. pi's parser does not take a joined value, and its value is always an absolute path, so it is passed as a separate word.
 
 `[general] resume_agents = false` turns it all off: reports are refused and nothing is stored or typed. `resume_agent_delay_ms` (default 100) spaces the typed commands out. Both are read by the server, so they need `remux restart`.
 
+- **OpenCode 1.x and 2.x** — one install serves both, so upgrading OpenCode needs no reinstall. 2.x finds the TUI plugin's directory by itself, and 1.x reads the `tui.json(c)` entry. Under 2.x only the full TUI reports, because 2.x runs server plugins in one background service that every TUI on the machine shares: an `opencode mini` or `opencode run` session is not resumed, and neither is a TUI started with `--server`, whose session is on another machine. Under 1.x, `opencode --mini` and `opencode run` report as well. 2.x copies `tui.json` into a new `cli.json` the first time it starts, so `--uninstall` also takes Remux's entry out of `cli.json`.
 - **Only the agent in the pane** — a report typed at the prompt is refused, and so is a nested run: a `claude -p` or a subagent inside the pane's Claude, a `codex exec` inside its Codex, an omp started from omp's own shell tool. Another agent's session in a pane is never replaced while it runs.
 - **Quitting forgets it** — the moment the pane's shell takes the foreground back, the session is forgotten, so a pane where you quit the agent comes back as a plain shell. Suspending the agent with `^Z` hands the foreground back too, and forgets it as well.
 - **A slow `.zshrc` forgets it until the agent reports again** — zsh runs `.zshrc` with job control on, so any external command there (`starship init`, `zoxide init`, a `sleep`) takes the foreground and gives it back before the typed resume line runs, which forgets the session on every restore. The resumed agent reports it again as soon as it starts, so this only matters if the server is restarted again before that. bash, including `/bin/sh` on most Linux systems, runs its rc without job control and is not affected.
