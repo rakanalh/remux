@@ -91,6 +91,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -565,7 +566,53 @@ def real_smoke(name, agent, argv, prepare, real_paths, wait_s=30, env_line=""):
         return rig, pane, found
     finally:
         rig.close()
+        end_processes_with_home(name, rig.home)
         real.verify()
+
+
+def processes_with_home(home):
+    """Every process whose environment has HOME=`home`: what a real agent
+    left running under a throwaway HOME (Codex detaches an app-server daemon
+    that outlives its pane)."""
+    found = []
+    if os.path.isdir("/proc"):
+        for pid in filter(str.isdigit, os.listdir("/proc")):
+            try:
+                with open(f"/proc/{pid}/environ", "rb") as f:
+                    env = f.read().split(b"\0")
+            except OSError:
+                continue
+            if f"HOME={home}".encode() in env:
+                found.append(int(pid))
+    else:
+        out = subprocess.run(["ps", "-axE", "-o", "pid=,command="], capture_output=True,
+                             timeout=20).stdout.decode("utf-8", "replace")
+        for line in out.splitlines():
+            pid, _, rest = line.strip().partition(" ")
+            # The harness's own HOME is the throwaway while a Rig is up, so
+            # this `ps` inherits it and lists itself.
+            if rest.startswith("ps -axE"):
+                continue
+            if pid.isdigit() and f" HOME={home} " in f" {rest} ":
+                found.append(int(pid))
+    return [p for p in found if p != os.getpid()]
+
+
+def end_processes_with_home(name, home):
+    left = processes_with_home(home)
+    for pid in left:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(0.5)
+    for pid in processes_with_home(home):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    check(processes_with_home(home) == [],
+          f"{name}: nothing the real agent started is left running ({len(left)} ended)")
 
 
 def needs_dir(rig, path, harness):
@@ -575,7 +622,7 @@ def needs_dir(rig, path, harness):
 
 
 def claude_real():
-    binary = os.path.expanduser("~/.local/bin/claude")
+    binary = f"{REAL_HOME}/.local/bin/claude"
     real_smoke("claude_real", "claude", launcher(binary) if os.path.exists(binary) else None,
                lambda rig: needs_dir(rig, f"{rig.home}/.claude", "claude-resume"),
                ["~/.claude/settings.json", "~/.claude/settings.local.json", "~/.claude/CLAUDE.md"])
@@ -605,7 +652,7 @@ def pi_real():
 
 
 def omp_real():
-    binary = dev_which("omp") or os.path.expanduser("~/.bun/bin/omp")
+    binary = dev_which("omp") or f"{REAL_HOME}/.bun/bin/omp"
     real_smoke("omp_real", "omp", launcher(binary) if os.path.exists(binary) else None,
                lambda rig: needs_dir(rig, f"{rig.home}/.omp/agent", "omp-resume"),
                ["~/.omp"], wait_s=25)
@@ -620,7 +667,7 @@ def opencode_real():
     # REMUX_OPENCODE_BIN picks a version installed in a throwaway npm prefix:
     # the integration targets OpenCode 1.18, and a machine's own may be newer.
     binary = (os.environ.get("REMUX_OPENCODE_BIN") or dev_which("opencode")
-              or os.path.expanduser("~/.opencode/bin/opencode"))
+              or f"{REAL_HOME}/.opencode/bin/opencode")
     # REMUX_SMOKE_NETWORK=1 lets the bootstrap reach the network, as on a
     # machine with no unshare; by default Linux runs it offline.
     unshare = None if os.environ.get("REMUX_SMOKE_NETWORK") == "1" else shutil.which("unshare")
