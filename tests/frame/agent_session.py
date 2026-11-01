@@ -475,6 +475,8 @@ def persist(rig):
     held = (rig.state_json() or {}).get("agent_sessions", {}).get(str(pane))
     check(held == {"agent": "claude", "kind": "Id", "value": RESTORE_ID},
           f"persist: state.json holds the record at once (got {held})")
+    mode = os.stat(f"{rig.srv.rundir}/data/remux/state.json").st_mode & 0o777
+    check(mode == 0o600, f"persist: state.json, which now holds ids, is 0600 (got {oct(mode)})")
     return pane
 
 

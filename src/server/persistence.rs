@@ -145,15 +145,34 @@ fn legacy_state_path() -> Option<PathBuf> {
 /// The state is first written to a temporary file, then renamed into place
 /// to avoid corruption from partial writes.
 pub fn save_state(state: &PersistedState) -> Result<()> {
-    let dir = data_dir();
+    save_state_in(&data_dir(), state)
+}
+
+/// [`save_state`] into `dir`.
+pub fn save_state_in(dir: &Path, state: &PersistedState) -> Result<()> {
+    let dir = dir.to_path_buf();
     create_private_dir(&dir)?;
 
     let state_path = dir.join("state.json");
     log::debug!("persistence: save_state path={:?}", state_path);
     let tmp_path = dir.join("state.json.tmp");
 
+    // 0600 whatever the umask: the file holds agent session ids, which name
+    // transcripts on disk. The temp file is created fresh, so a link planted
+    // at its name cannot redirect the write, and the rename closes up a file
+    // an older build left 0644.
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let json = serde_json::to_string_pretty(state)?;
-    std::fs::write(&tmp_path, json)?;
+    let _ = std::fs::remove_file(&tmp_path);
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp_path)?;
+    out.write_all(json.as_bytes())?;
+    drop(out);
     std::fs::rename(&tmp_path, &state_path)?;
     Ok(())
 }
@@ -579,6 +598,32 @@ mod tests {
 
         assert!(loaded.state.sessions.contains_key("test"));
         assert_eq!(loaded.pane_cwds.get(&1).unwrap(), "/home/user");
+    }
+
+    /// `state.json` holds agent session ids, so it is the user's alone,
+    /// whatever the umask, and a file an older build left 0644 is closed up
+    /// by the next save.
+    #[test]
+    fn state_json_is_written_0600_and_an_existing_file_is_closed_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let state =
+            PersistedState::from_server(&ServerState::new(), &HashMap::new(), &HashMap::new())
+                .unwrap();
+        save_state_in(dir.path(), &state).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+        let fresh = tempfile::tempdir().unwrap();
+        save_state_in(fresh.path(), &state).unwrap();
+        let mode = std::fs::metadata(fresh.path().join("state.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
     }
 
     #[test]
