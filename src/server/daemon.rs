@@ -4154,7 +4154,8 @@ async fn handle_agent_session(
         let Some(pd) = ps.get_mut(&pane).filter(|pd| !pd.exited) else {
             return Ok(None);
         };
-        let outcome = agent_session::decide(pd.agent_session.as_ref(), &record)?;
+        let outcome =
+            agent_session::decide(pd.agent_session.as_ref(), &record, report.source.as_deref())?;
         pd.agent_session = Some(record);
         Ok(Some(outcome))
     }
@@ -4176,9 +4177,12 @@ async fn handle_agent_session(
         Ok(None) => ServerMessage::refused("no_such_target", format!("no such target: %{pane}")),
         Err(refusal) => {
             log::info!(
-                "agent session: pane %{pane} {} {kind} {bytes} bytes source={source} -> {}",
+                "agent session: pane %{pane} {} {kind} {bytes} bytes source={source} -> {}{}",
                 loggable(&report.agent),
-                refusal.code()
+                refusal.code(),
+                refusal
+                    .reason()
+                    .map_or(String::new(), |why| format!(" ({why})"))
             );
             ServerMessage::refused(refusal.code(), refusal.message())
         }

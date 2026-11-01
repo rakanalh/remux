@@ -29,6 +29,14 @@ forget_on_exit  an agent JOB at a shell pane's prompt reports and exits; the
                 state.json within about a second, and a new report is Stored.
 keep_while_running  the same job staying in the foreground keeps its record:
                 Unchanged on a repeat, still in state.json after 2 s.
+held_startup    claude held, a claude `startup` with a new id is session_held:
+                a nested `claude -p` starts with `startup`.
+replace_clear   claude held, a claude `clear` with a new id is Replaced, and
+                state.json holds the new id.
+cross_agent_held  claude held, a codex `startup` is session_held, though codex
+                allowlists `startup`: claude's Bash tool running `codex exec`.
+cross_agent_after_forget  the claude job exits, its record is forgotten, and
+                then the codex `startup` is Stored.
 persist         state.json holds the record right after the report, before any
                 structural change; a report that hangs (a lock-order deadlock
                 in the save) is a timeout red here.
@@ -325,6 +333,38 @@ def keep_while_running(rig):
     check(outcome(r) == "Unchanged", f"keep_while_running: a repeat is Unchanged (got {r})")
 
 
+def replacement(rig):
+    pane = rig.spawn()
+    first, second = "aaaa0000-1111-4222-8333-944445555001", "aaaa0000-1111-4222-8333-944445555002"
+    check(outcome(report(rig, pane, "claude", {"Id": first}, source="startup")) == "Stored",
+          "held_startup: setup, the first id is Stored")
+    r = report(rig, pane, "claude", {"Id": second}, source="startup")
+    check(code(r) == "session_held", f"held_startup: a new id with startup is session_held (got {r})")
+    r = report(rig, pane, "claude", {"Id": second}, source="clear")
+    check(outcome(r) == "Replaced", f"replace_clear: a new id with clear is Replaced (got {r})")
+    held = held_in_state(rig, pane)
+    check(held == {"agent": "claude", "kind": "Id", "value": second},
+          f"replace_clear: state.json holds the new id (got {held})")
+    r = report(rig, pane, "codex", {"Id": first}, source="startup")
+    check(code(r) == "session_held", f"cross_agent_held: codex startup over claude is session_held (got {r})")
+    r = report(rig, pane, "codex", {"Id": first}, source="resume")
+    check(code(r) == "session_held", f"cross_agent_held: and so is codex resume (got {r})")
+
+
+def cross_agent_after_forget(rig):
+    pane = rig.spawn()
+    time.sleep(0.5)
+    claude_id, codex_id = "bbbb0000-1111-4222-8333-944445555001", "bbbb0000-1111-4222-8333-944445555002"
+    got = run_job(rig, pane, "exit", ["claude", "--id", claude_id, "--source", "startup"])
+    check(got is not None and got["rc"] == 0 and got["stderr"] == "",
+          f"cross_agent_after_forget: the claude job reported (got {got})")
+    end = time.time() + 2.5
+    while time.time() < end and held_in_state(rig, pane) is not None:
+        time.sleep(0.05)
+    r = report(rig, pane, "codex", {"Id": codex_id}, source="startup")
+    check(outcome(r) == "Stored", f"cross_agent_after_forget: codex startup is Stored (got {r})")
+
+
 def persist(rig):
     pane = rig.spawn()
     before = rig.state_json() or {}
@@ -407,6 +447,8 @@ def main():
         cli_filters(rig)
         forget_on_exit(rig)
         keep_while_running(rig)
+        replacement(rig)
+        cross_agent_after_forget(rig)
         restored = persist(rig)
         restart_types(rig, restored)
 

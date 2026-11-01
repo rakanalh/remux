@@ -33,7 +33,17 @@ impl AgentSessionRecord {
 pub enum Refusal {
     BadAgent,
     BadReference(&'static str),
-    SessionHeld,
+    SessionHeld(Held),
+}
+
+/// What a pane holds that a `session_held` report could not replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    /// A different session of the same agent, and the report's source is not
+    /// one that agent starts a new session in this pane with.
+    DifferentId,
+    /// Another agent's session.
+    OtherAgent,
 }
 
 impl Refusal {
@@ -41,7 +51,7 @@ impl Refusal {
         match self {
             Refusal::BadAgent => "bad_agent",
             Refusal::BadReference(_) => "bad_reference",
-            Refusal::SessionHeld => "session_held",
+            Refusal::SessionHeld(_) => "session_held",
         }
     }
 
@@ -51,7 +61,21 @@ impl Refusal {
                 "unknown agent: expected claude, codex, opencode, pi or omp".into()
             }
             Refusal::BadReference(why) => format!("bad session reference: {why}"),
-            Refusal::SessionHeld => "the pane already holds a different agent session".into(),
+            Refusal::SessionHeld(Held::DifferentId) => {
+                "the pane already holds a different session of this agent".into()
+            }
+            Refusal::SessionHeld(Held::OtherAgent) => {
+                "the pane already holds another agent's session".into()
+            }
+        }
+    }
+
+    /// Why, for the log: which of two refusals with one code it was.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Refusal::SessionHeld(Held::DifferentId) => Some("holds a different id"),
+            Refusal::SessionHeld(Held::OtherAgent) => Some("held by another agent"),
+            _ => None,
         }
     }
 }
@@ -100,15 +124,37 @@ pub fn validate(agent: &str, reference: &AgentSessionRef) -> Result<(), Refusal>
     }
 }
 
-/// What a valid report does to a pane that holds `held`.
+/// Whether `agent` starts a NEW session in the same pane with `source`, so a
+/// report of it replaces the session the pane holds. Anything else, `startup`
+/// for claude above all, may be a nested run: Claude Code's Bash tool running
+/// `claude -p` reports `startup` from the same pane, with an id of its own.
+pub fn allows_replace(agent: &str, source: Option<&str>) -> bool {
+    let allowed: &[&str] = match agent {
+        "claude" => &["clear", "resume", "compact", "fork"],
+        "codex" => &["startup", "clear", "resume", "compact"],
+        "opencode" => &["select"],
+        "pi" => &["new", "resume", "fork"],
+        "omp" => &["startup", "new", "resume", "fork"],
+        _ => &[],
+    };
+    source.is_some_and(|source| allowed.contains(&source))
+}
+
+/// What a valid report does to a pane that holds `held`. Another agent's
+/// record is never replaced, whatever the source: claude's Bash tool running
+/// `codex exec` reports codex's `startup`, which codex allows. That pane's
+/// record goes when claude exits and the shell takes the foreground back.
 pub fn decide(
     held: Option<&AgentSessionRecord>,
     report: &AgentSessionRecord,
+    source: Option<&str>,
 ) -> Result<AgentSessionOutcome, Refusal> {
     match held {
         None => Ok(AgentSessionOutcome::Stored),
         Some(held) if held == report => Ok(AgentSessionOutcome::Unchanged),
-        Some(_) => Err(Refusal::SessionHeld),
+        Some(held) if held.agent != report.agent => Err(Refusal::SessionHeld(Held::OtherAgent)),
+        Some(_) if allows_replace(&report.agent, source) => Ok(AgentSessionOutcome::Replaced),
+        Some(_) => Err(Refusal::SessionHeld(Held::DifferentId)),
     }
 }
 
@@ -207,14 +253,70 @@ mod tests {
     }
 
     #[test]
-    fn decide_stores_on_an_empty_pane_and_refuses_any_other_held_record() {
+    fn decide_stores_replaces_only_an_allowlisted_same_agent_report() {
         let a = AgentSessionRecord::new("claude", &id(UUID));
         let b = AgentSessionRecord::new("claude", &id("other"));
-        let c = AgentSessionRecord::new("codex", &id(UUID));
-        assert_eq!(decide(None, &a), Ok(AgentSessionOutcome::Stored));
-        assert_eq!(decide(Some(&a), &a), Ok(AgentSessionOutcome::Unchanged));
-        assert_eq!(decide(Some(&a), &b), Err(Refusal::SessionHeld));
-        assert_eq!(decide(Some(&a), &c), Err(Refusal::SessionHeld));
+        assert_eq!(decide(None, &a, None), Ok(AgentSessionOutcome::Stored));
+        assert_eq!(
+            decide(Some(&a), &a, None),
+            Ok(AgentSessionOutcome::Unchanged)
+        );
+        assert_eq!(
+            decide(Some(&a), &b, Some("startup")),
+            Err(Refusal::SessionHeld(Held::DifferentId))
+        );
+        assert_eq!(
+            decide(Some(&a), &b, Some("clear")),
+            Ok(AgentSessionOutcome::Replaced)
+        );
+        assert_eq!(
+            decide(Some(&a), &b, None),
+            Err(Refusal::SessionHeld(Held::DifferentId))
+        );
+    }
+
+    #[test]
+    fn another_agents_record_is_never_replaced_whatever_the_source() {
+        let claude = AgentSessionRecord::new("claude", &id(UUID));
+        let codex = AgentSessionRecord::new("codex", &id("other"));
+        for source in [
+            None,
+            Some("startup"),
+            Some("clear"),
+            Some("resume"),
+            Some("compact"),
+        ] {
+            assert_eq!(
+                decide(Some(&claude), &codex, source),
+                Err(Refusal::SessionHeld(Held::OtherAgent)),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_replace_matches_the_table_row_by_row() {
+        let sources = [
+            "startup", "resume", "clear", "compact", "fork", "new", "select", "bogus",
+        ];
+        let table = [
+            ("claude", &["resume", "clear", "compact", "fork"][..]),
+            ("codex", &["startup", "resume", "clear", "compact"][..]),
+            ("opencode", &["select"][..]),
+            ("pi", &["resume", "fork", "new"][..]),
+            ("omp", &["startup", "resume", "fork", "new"][..]),
+            ("vim", &[][..]),
+        ];
+        for (agent, allowed) in table {
+            for source in sources {
+                assert_eq!(
+                    allows_replace(agent, Some(source)),
+                    allowed.contains(&source),
+                    "({agent}, {source})"
+                );
+            }
+            assert!(!allows_replace(agent, None), "({agent}, None)");
+        }
     }
 
     fn record(agent: &str, reference: AgentSessionRef) -> AgentSessionRecord {
