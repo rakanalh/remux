@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use super::hooks_file::{effective_uid, home_and_binary, shown, write_atomically};
-use super::jsonc_file::{add_plugin, has_plugin, new_tui_json, remove_plugin};
+use super::jsonc_file::{add_plugin, has_plugin, new_tui_json, remove_plugin, TUI_KEY};
 use super::plugin_file::{js_string, read_for_edit, render, PluginFile};
 use super::require_dir;
 use super::{Change, Integration, IntegrationStatus};
@@ -98,7 +98,7 @@ impl OpencodeResume {
     fn registration(&self) -> Result<Option<Change>> {
         let read = read_for_edit(&self.tui_config(), self.euid)?;
         let after = match &read.text {
-            Some(text) => add_plugin(text, &self.entry())
+            Some(text) => add_plugin(text, TUI_KEY, &self.entry())
                 .with_context(|| format!("editing {}", shown(&read.path)))?,
             None => Some(new_tui_json(&self.entry())),
         };
@@ -113,7 +113,7 @@ impl OpencodeResume {
         let path = self.tui_config();
         super::hooks_file::check_regular(&path)?;
         match std::fs::read_to_string(&path) {
-            Ok(text) => has_plugin(&text, &self.entry())
+            Ok(text) => has_plugin(&text, TUI_KEY, &self.entry())
                 .with_context(|| format!("reading {}", shown(&path))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
@@ -196,7 +196,7 @@ impl Integration for OpencodeResume {
     fn uninstall(&self) -> Result<Vec<String>> {
         let read = read_for_edit(&self.tui_config(), self.euid)?;
         if let Some(text) = &read.text {
-            if let Some(after) = remove_plugin(text, &self.entry())
+            if let Some(after) = remove_plugin(text, TUI_KEY, &self.entry())
                 .with_context(|| format!("editing {}", shown(&read.path)))?
             {
                 write_atomically(&read.path, &after, read.fingerprint, None)?;
