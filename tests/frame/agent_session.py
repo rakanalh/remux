@@ -55,11 +55,27 @@ stagger         two panes in two SESSIONS holding different ids: the second
                 stub runs at least 1.4 s after the first, so the delay
                 counter spans sessions.
 
+On a server of its own, restarted once:
+dedupe          two panes in two SESSIONS hold the same id; the restart runs the
+                stub once for it, in the lower pane.
+missing_cwd     a pane whose directory is removed while the server is stopped
+                is typed nothing, and the next save (the shutdown's) holds no
+                record for it.
+edited_state_bad_id  a 129-byte id written into state.json while the server is
+                stopped is typed nothing, the drop is logged, and the next save
+                holds no record for it.
+
+On a server of its own with `automatic_restore = false`, so sessions come back
+dormant:
+resurrect_dedupes_against_live  two sessions' panes hold the same id;
+                resurrecting the first types it, resurrecting the second types
+                nothing for its pane, because a live pane already runs it.
+
 redaction       server.log and client.log carry the summary line with the id's
                 byte count and never the id.
 no_panic        server.log has no `panicked at`.
 
-Run: python3 tests/frame/agent_session.py [main|disabled|stagger ...]
+Run: python3 tests/frame/agent_session.py [main|disabled|stagger|hardening|resurrect ...]
      (RMX_RUNDIR overrides the run dir)
 """
 import json
@@ -129,9 +145,13 @@ class Rig:
         self.cli.send({"Resize": {"cols": 160, "rows": 50}})
         self.cli.drain(0.8)
 
-    def restart(self):
+    def restart(self, between=None):
+        """`remux restart`, running `between()` while the server is down."""
         self.cli.close()
-        self.srv.restart()
+        self.srv.stop()
+        if between:
+            between()
+        self.srv.start_again()
         self.attach()
 
     def state_json(self):
@@ -160,10 +180,10 @@ class Rig:
         time.sleep(0.5)
         return self.argv_runs(agent)
 
-    def spawn(self, argv=None, session="main"):
+    def spawn(self, argv=None, session="main", cwd=None):
         c = Client(self.srv.sock)
         c.hello()
-        body = {"session": session, "placement": "SplitRight"}
+        body = {"session": session, "placement": "SplitRight", "cwd": cwd}
         if argv is not None:
             body["argv"] = argv
         c.send({"CliSpawn": body})
@@ -464,6 +484,93 @@ def stagger(rig):
         check(gap >= 1.4, f"stagger: the second session's pane ran {gap:.2f}s after the first")
 
 
+def runs_naming(rig, value):
+    return [argv for _, argv in rig.argv_runs("claude") if value in argv]
+
+
+def hardening(rig):
+    rig.cli.send({"CreateSession": {"name": "other", "folder": None}})
+    rig.cli.drain(0.5)
+    dup = "eeee0000-1111-4222-8333-944445555001"
+    gone_id = "eeee0000-1111-4222-8333-944445555002"
+    bad_id = "eeee0000-1111-4222-8333-944445555003"
+    low = rig.spawn(session="main")
+    high = rig.spawn(session="other")
+    for pane in (low, high):
+        r = report(rig, pane, "claude", {"Id": dup}, source="startup")
+        check(outcome(r) == "Stored", f"dedupe: setup, %{pane} Stored (got {r})")
+    gone_dir = f"{rig.srv.rundir}/gone"
+    os.makedirs(gone_dir)
+    gone = rig.spawn(cwd=gone_dir)
+    check(outcome(report(rig, gone, "claude", {"Id": gone_id}, source="startup")) == "Stored",
+          f"missing_cwd: setup, %{gone} Stored")
+    bad = rig.spawn()
+    check(outcome(report(rig, bad, "claude", {"Id": bad_id}, source="startup")) == "Stored",
+          f"edited_state_bad_id: setup, %{bad} Stored")
+    path = f"{rig.srv.rundir}/data/remux/state.json"
+
+    def edit():
+        os.rmdir(gone_dir)
+        with open(path) as f:
+            text = f.read()
+        assert text.count(bad_id) == 1, "the bad-id probe must replace exactly one value"
+        with open(path, "w") as f:
+            f.write(text.replace(bad_id, "a" * 129))
+
+    rig.restart(between=edit)
+    rig.wait_runs("claude", 1, timeout=6.0)
+    got = runs_naming(rig, dup)
+    check(len(got) == 1, f"dedupe: the stub ran once for the shared id (got {got})")
+    log = rig.srv.log()
+    check(re.search(rf"typed resume for pane %{low} ", log) is not None
+          and re.search(rf"typed resume for pane %{high} ", log) is None,
+          f"dedupe: the lower pane %{low} was typed, not %{high}")
+    check(runs_naming(rig, gone_id) == [], "missing_cwd: nothing was typed for the gone directory")
+    check(not any("a" * 129 in argv for _, argv in rig.argv_runs("claude")),
+          "edited_state_bad_id: nothing was typed for the 129-byte id")
+    check(re.search(rf"agent session: pane %{bad} .*dropped", log) is not None,
+          f"edited_state_bad_id: the drop of %{bad}'s record is logged")
+    # The shutdown save is the next save: a `CliSpawn` pane triggers none.
+    rig.cli.close()
+    rig.srv.stop()
+    sessions = (rig.state_json() or {}).get("agent_sessions", {})
+    check(str(gone) not in sessions, f"missing_cwd: the next save holds no record for %{gone}")
+    check(str(bad) not in sessions, f"edited_state_bad_id: the next save holds no record for %{bad}")
+    check(str(low) in sessions and str(high) not in sessions,
+          f"dedupe: the next save holds the winner %{low} only (got {sorted(sessions)})")
+    check("a" * 129 not in log, "edited_state_bad_id: the log never holds the edited value")
+
+
+def resurrect(rig):
+    rig.cli.send({"CreateSession": {"name": "other", "folder": None}})
+    rig.cli.drain(0.5)
+    shared = "ffff0000-1111-4222-8333-944445555001"
+    first = rig.spawn(session="main")
+    second = rig.spawn(session="other")
+    for pane in (first, second):
+        check(outcome(report(rig, pane, "claude", {"Id": shared}, source="startup")) == "Stored",
+              f"resurrect: setup, %{pane} Stored")
+    rig.cli.close()
+    rig.srv.stop()
+    rig.srv.start_again()
+    rig.cli = Client(rig.srv.sock)
+    rig.cli.hello()
+    rig.cli.send({"CreateSession": {"name": "scratch", "folder": None}})
+    rig.cli.send({"Attach": {"session_name": "scratch"}})
+    rig.cli.drain(0.8)
+    check(rig.argv_runs("claude") == [], "resurrect: dormant sessions are typed nothing at start")
+    rig.cli.send({"ResurrectSession": {"name": "main"}})
+    rig.wait_runs("claude", 1, timeout=6.0)
+    check(len(runs_naming(rig, shared)) == 1, "resurrect: resurrecting main typed the id once")
+    rig.cli.send({"ResurrectSession": {"name": "other"}})
+    time.sleep(2.0)
+    check(len(runs_naming(rig, shared)) == 1,
+          f"resurrect_dedupes_against_live: resurrecting other typed nothing more "
+          f"(got {runs_naming(rig, shared)})")
+    check(re.search(rf"typed resume for pane %{second} ", rig.srv.log()) is None,
+          f"resurrect_dedupes_against_live: %{second} was not typed")
+
+
 def default_stagger(rig):
     typed = len(re.findall(r"typed resume for pane", rig.srv.log()))
     runs = sorted(rig.argv_runs("claude") + rig.argv_runs("codex"))
@@ -474,8 +581,8 @@ def default_stagger(rig):
         check(spread < 1.0, f"default_stagger: {len(runs)} panes ran within {spread:.2f}s")
 
 
-def on_own_server(suffix, config, case):
-    rig = Rig(f"{RUNDIR}-{suffix}", CONFIG + config)
+def on_own_server(suffix, config, case, base=CONFIG):
+    rig = Rig(f"{RUNDIR}-{suffix}", base + config)
     try:
         case(rig)
         check("panicked at" not in rig.srv.log(), f"{suffix}: no panic in server.log")
@@ -485,13 +592,18 @@ def on_own_server(suffix, config, case):
 
 
 def main():
-    groups = sys.argv[1:] or ["main", "disabled", "stagger"]
+    groups = sys.argv[1:] or ["main", "disabled", "stagger", "hardening", "resurrect"]
     if "main" in groups:
         main_server()
     if "disabled" in groups:
         on_own_server("disabled", "resume_agents = false\n", disabled)
     if "stagger" in groups:
         on_own_server("stagger", "resume_agent_delay_ms = 1500\n", stagger)
+    if "hardening" in groups:
+        on_own_server("hardening", "", hardening)
+    if "resurrect" in groups:
+        on_own_server("resurrect", "", resurrect, base=CONFIG.replace(
+            "automatic_restore = true", "automatic_restore = false"))
 
     if failures:
         print(f"\n{len(failures)} FAILED")

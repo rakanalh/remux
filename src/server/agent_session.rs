@@ -5,6 +5,8 @@
 //! applies them under the `panes` lock and the restore path can apply them
 //! again to a record read back from an edited `state.json`.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{AgentSessionOutcome, AgentSessionRef, RefKind};
@@ -25,6 +27,19 @@ impl AgentSessionRecord {
             kind: reference.kind(),
             value: reference.value().to_string(),
         }
+    }
+
+    pub fn reference(&self) -> AgentSessionRef {
+        match self.kind {
+            RefKind::Id => AgentSessionRef::Id(self.value.clone()),
+            RefKind::Path => AgentSessionRef::Path(self.value.clone()),
+        }
+    }
+
+    /// [`validate`] for a record read back from disk, which may have been
+    /// edited since it was stored.
+    pub fn validate(&self) -> Result<(), Refusal> {
+        validate(&self.agent, &self.reference())
     }
 }
 
@@ -156,6 +171,28 @@ pub fn decide(
         Some(_) if allows_replace(&report.agent, source) => Ok(AgentSessionOutcome::Replaced),
         Some(_) => Err(Refusal::SessionHeld(Held::DifferentId)),
     }
+}
+
+/// The records a restore may resume: one pane per session, the lowest pane
+/// id, so that two panes holding the same session never run it twice. A
+/// session one of the `live` panes already holds is resumed by none of
+/// `records`, because that pane is running it.
+pub fn dedupe(
+    records: &HashMap<u64, AgentSessionRecord>,
+    live: &[&AgentSessionRecord],
+) -> HashMap<u64, AgentSessionRecord> {
+    let mut ids: Vec<u64> = records.keys().copied().collect();
+    ids.sort_unstable();
+    let mut seen: Vec<&AgentSessionRecord> = live.to_vec();
+    let mut winners = HashMap::new();
+    for id in ids {
+        let record = &records[&id];
+        if !seen.contains(&record) {
+            seen.push(record);
+            winners.insert(id, record.clone());
+        }
+    }
+    winners
 }
 
 /// The command that resumes `record`'s session, one argv word each. `None`
@@ -374,5 +411,32 @@ mod tests {
             typed_line(&record("omp", path("/home/u/a b.jsonl"))).as_deref(),
             Some(" omp '--resume=/home/u/a b.jsonl'\r")
         );
+    }
+
+    #[test]
+    fn dedupe_keeps_the_lowest_pane_per_session() {
+        let a = AgentSessionRecord::new("claude", &id(UUID));
+        let b = AgentSessionRecord::new("claude", &id("other"));
+        let a_by_codex = AgentSessionRecord::new("codex", &id(UUID));
+        let records = HashMap::from([
+            (9, a.clone()),
+            (3, a.clone()),
+            (5, b.clone()),
+            (7, a_by_codex.clone()),
+        ]);
+        let winners = dedupe(&records, &[]);
+        let mut kept: Vec<u64> = winners.keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![3, 5, 7]);
+        assert_eq!(winners[&3], a);
+    }
+
+    #[test]
+    fn dedupe_drops_what_a_live_pane_already_holds() {
+        let a = AgentSessionRecord::new("claude", &id(UUID));
+        let b = AgentSessionRecord::new("claude", &id("other"));
+        let records = HashMap::from([(2, a.clone()), (4, b.clone())]);
+        let winners = dedupe(&records, &[&a]);
+        assert_eq!(winners, HashMap::from([(4, b)]));
     }
 }

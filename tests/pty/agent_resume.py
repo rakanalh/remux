@@ -20,6 +20,8 @@ is echoed by the shell whether or not anything ran.
 fast      the report is stored (state.json names the pane), the hook printed
           nothing on stdout and exited 0, and after `remux restart` the stub's
           argv file holds `--resume` and the id as two separate lines.
+duplicate the stub runs in two panes with the same recorded session: both
+          reports are stored, and the restart resumes it once.
 disabled  with `resume_agents = false` the hook's report is refused
           `disabled` (one stderr line, exit 0, nothing on stdout), state.json
           holds no record, and the restart runs no stub.
@@ -28,7 +30,7 @@ disabled  with `resume_agents = false` the hook's report is refused
 `CLAUDE_CONFIG_DIR` unset and writes the settings file there by hand. HOME is
 the throwaway tree.
 
-Run: python3 tests/pty/agent_resume.py [fast|disabled ...]   (RMX_RUNDIR overrides the run dir)
+Run: python3 tests/pty/agent_resume.py [fast|duplicate|disabled ...]   (RMX_RUNDIR overrides the run dir)
 """
 import json
 import os
@@ -232,7 +234,27 @@ def disabled(rig):
     check(runs == [], f"disabled: the restart ran no stub (got {runs})")
 
 
-MODES = {"fast": fast, "disabled": (disabled, "resume_agents = false\n")}
+def duplicate(rig):
+    t = rig.t
+    check(rig.wait(lambda: t.has("$ ")), "duplicate: the pane shows a prompt")
+    t.send(f"'{BIN}' split\r", 1.5)
+    t.send("claude\r", 0.5)
+    check(rig.wait(lambda: len(rig.hook_runs()) == 1), "duplicate: the stub ran in the new pane")
+    t.send("\x1bk", 0.6)
+    t.send("claude\r", 0.5)
+    check(rig.wait(lambda: len(rig.hook_runs()) == 2), "duplicate: and in the first pane")
+    runs = rig.hook_runs()
+    check(all(r["rc"] == 0 and r["stdout"] == "" and r["stderr"] == "" for r in runs),
+          f"duplicate: both reports were accepted silently (got {runs})")
+    check(rig.wait(lambda: len((rig.state() or {}).get("agent_sessions", {})) == 2),
+          f"duplicate: state.json holds both panes (got {(rig.state() or {}).get('agent_sessions')})")
+    runs = restart_and_collect(rig, wait=8.0)
+    time.sleep(1.0)
+    runs = rig.argv_runs()
+    check(runs == [["--resume", SESSION_ID, ""]], f"duplicate: the restart resumed it once (got {runs})")
+
+
+MODES = {"fast": fast, "duplicate": duplicate, "disabled": (disabled, "resume_agents = false\n")}
 
 
 def main():

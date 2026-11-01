@@ -17401,6 +17401,10 @@ async fn materialize_session(
         let record = agent_sessions
             .get(pane_id)
             .filter(|_| config.general.resume_agents);
+        let record = match record {
+            Some(record) => resumable(*pane_id, record, cwd.as_deref()).await,
+            None => None,
+        };
         if let Some(record) = record {
             if *typed > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(
@@ -17428,6 +17432,51 @@ async fn materialize_session(
     }
 
     Ok(())
+}
+
+/// `record` when a restore may type it into `pane_id`, else `None` with the
+/// drop logged. A record off disk is checked again because `state.json` may
+/// have been edited. The cwd must still be a directory: `Pty::spawn` falls
+/// back to `$HOME` when it is not, and the agent would resume somewhere else.
+async fn resumable<'a>(
+    pane_id: PaneId,
+    record: &'a AgentSessionRecord,
+    cwd: Option<&str>,
+) -> Option<&'a AgentSessionRecord> {
+    let agent = loggable(&record.agent);
+    if let Err(refusal) = record.validate() {
+        log::warn!(
+            "agent session: pane %{pane_id} {agent} record dropped on restore ({})",
+            refusal.code()
+        );
+        return None;
+    }
+    let is_dir = match cwd {
+        Some(cwd) => tokio::fs::metadata(cwd).await.is_ok_and(|m| m.is_dir()),
+        None => false,
+    };
+    if !is_dir {
+        log::info!(
+            "agent session: pane %{pane_id} {agent} record dropped on restore (its directory is gone)"
+        );
+        return None;
+    }
+    Some(record)
+}
+
+/// Log the records [`agent_session::dedupe`] left out of a restore.
+fn log_duplicates(
+    all: &HashMap<u64, AgentSessionRecord>,
+    winners: &HashMap<u64, AgentSessionRecord>,
+) {
+    for (pane_id, record) in all {
+        if !winners.contains_key(pane_id) {
+            log::info!(
+                "agent session: pane %{pane_id} {} record dropped on restore (another pane runs it)",
+                loggable(&record.agent)
+            );
+        }
+    }
 }
 
 /// Type `record`'s resume command into the freshly spawned shell of `pane_id`
@@ -17486,12 +17535,14 @@ async fn restore_state(
         *st = restored_state;
     }
 
+    let agent_sessions = crate::server::agent_session::dedupe(&persisted.agent_sessions, &[]);
+    log_duplicates(&persisted.agent_sessions, &agent_sessions);
     let mut typed = 0;
     for session_name in &session_names {
         materialize_session(
             session_name,
             &persisted.pane_cwds,
-            &persisted.agent_sessions,
+            &agent_sessions,
             &mut typed,
             &server.state,
             &server.panes,
@@ -17603,11 +17654,20 @@ async fn handle_resurrect_session(
         }
     };
 
+    let winners = {
+        let ps = panes.lock().await;
+        let live: Vec<&AgentSessionRecord> = ps
+            .values()
+            .filter_map(|pd| pd.agent_session.as_ref())
+            .collect();
+        crate::server::agent_session::dedupe(&agent_sessions, &live)
+    };
+    log_duplicates(&agent_sessions, &winners);
     log::info!("resurrecting dormant session '{name}'");
     materialize_session(
         name,
         &cwds,
-        &agent_sessions,
+        &winners,
         &mut 0,
         state,
         panes,
