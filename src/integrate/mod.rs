@@ -5,6 +5,7 @@
 //! non-zero rather than following the hooks' exit-0 contract.
 
 pub mod claude_messaging;
+pub mod claude_resume;
 pub mod env;
 pub mod hooks_file;
 

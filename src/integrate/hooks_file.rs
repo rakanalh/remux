@@ -515,6 +515,7 @@ impl HooksFile {
     }
 
     fn read(&self, path: PathBuf) -> Result<Loaded> {
+        check_regular(&path)?;
         let mut file = match std::fs::File::open(&path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -552,6 +553,7 @@ impl HooksFile {
         let path = self.target()?;
         check_owner(&path, self.euid)?;
         check_directory(&path, self.euid)?;
+        check_plain_file(&path)?;
         let read = self.read(path)?;
         let mut after = read.value.clone();
         let notes = edit(&mut after, &self.hooks);
@@ -817,6 +819,40 @@ pub fn uninstall_hooks(settings: &mut Value, hooks_for: &Hooks) -> Vec<String> {
     notes
 }
 
+/// Refuse to read `path` unless it is absent or a regular file: a FIFO or a
+/// device would block the read, or answer it with something else's bytes.
+pub fn check_regular(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    anyhow::ensure!(
+        meta.is_file(),
+        "{} is not a regular file; nothing was read or written",
+        path.display()
+    );
+    Ok(Some(meta))
+}
+
+/// Refuse to replace `path` unless it is absent or one regular file. A file
+/// with a second hard link would be detached from it by the rename, leaving
+/// the other name holding the old content.
+pub fn check_plain_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(meta) = check_regular(path)? else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        meta.nlink() == 1,
+        "{} has {} hard links; replacing it would detach the others, so nothing was \
+         written",
+        path.display(),
+        meta.nlink()
+    );
+    Ok(())
+}
+
 /// Replace `path` with `text` in one rename, keeping its permissions, so a
 /// crash leaves either the old file or the new one, never half of either. Only
 /// if `path` is still what was read (`read`, or absent for None) just before
@@ -830,6 +866,7 @@ pub fn write_atomically(
     mode_if_new: Option<u32>,
 ) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    check_plain_file(path)?;
     let dir = path
         .parent()
         .with_context(|| format!("{} has no directory", path.display()))?;

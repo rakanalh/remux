@@ -57,8 +57,12 @@ struct Cli {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum IntegrateHarness {
     /// Claude Code: the Stop and UserPromptSubmit hooks in
-    /// ~/.claude/settings.json, and the remux-messaging skill
+    /// $CLAUDE_CONFIG_DIR/settings.json (~/.claude by default), and the
+    /// remux-messaging skill
     ClaudeMessaging,
+    /// Claude Code: the SessionStart hook that reports the session for
+    /// restore after `remux restart`, in the same settings.json
+    ClaudeResume,
 }
 
 #[derive(Subcommand)]
@@ -853,6 +857,9 @@ fn run_integrate(
     let integration: Box<dyn Integration> = match harness {
         IntegrateHarness::ClaudeMessaging => Box::new(
             integrate::claude_messaging::ClaudeMessaging::from_env(allow_dev_path)?,
+        ),
+        IntegrateHarness::ClaudeResume => Box::new(
+            integrate::claude_resume::ClaudeResume::from_env(allow_dev_path)?,
         ),
     };
     let name = integration.name();

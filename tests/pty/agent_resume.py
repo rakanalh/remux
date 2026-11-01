@@ -50,9 +50,9 @@ disabled  with `resume_agents = false` the hook's report is refused
           `disabled` (one stderr line, exit 0, nothing on stdout), state.json
           holds no record, and the restart runs no stub.
 
-`fakeclaude.py` reads `$HOME/.claude/settings.json` too, so this harness leaves
-`CLAUDE_CONFIG_DIR` unset and writes the settings file there by hand. HOME is
-the throwaway tree.
+The hook is installed by `remux integrate claude-resume`, with
+`CLAUDE_CONFIG_DIR` unset so that it lands in `$HOME/.claude/settings.json`,
+where the stub (like `fakeclaude.py`) reads it. HOME is the throwaway tree.
 
 Every mode but fast, duplicate and the slow_rc pair ends in "no argv file
 after the restart". The argv FILE is read, never the screen. The pane's PATH
@@ -170,10 +170,12 @@ class Rig:
             os.chmod(path, 0o755)
 
         standin.install_wrapper(path, [sys.executable, script], {script: source}, shebang)
-        command = f"'{BIN}' agent session claude --hook || true"
-        with open(f"{RUNDIR}/home/.claude/settings.json", "w") as f:
-            json.dump({"hooks": {"SessionStart": [
-                {"matcher": "startup", "hooks": [{"type": "command", "command": command}]}]}}, f)
+        # The hook goes in the way a user puts it there. CLAUDE_CONFIG_DIR is
+        # unset, so it lands in the throwaway HOME's .claude, where the stub
+        # reads it.
+        done = subprocess.run([BIN, "integrate", "claude-resume", "--allow-dev-path"],
+                              env=self.t.env, capture_output=True, timeout=20)
+        assert done.returncode == 0, done.stderr
 
     def state(self):
         try:
