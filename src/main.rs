@@ -10,6 +10,7 @@ mod protocol;
 mod relay;
 mod screen;
 mod server;
+mod shell_word;
 
 use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};

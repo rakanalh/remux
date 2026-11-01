@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use super::claude_resume::require_dir;
 use super::hooks_file::{effective_uid, home_and_binary};
 use super::plugin_file::{js_string, render, PluginFile};
+use super::require_dir;
 use super::{Change, Integration, IntegrationStatus};
 
 pub const TEMPLATE: &str = include_str!("../../integrations/remux-agent-session.ts");

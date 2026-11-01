@@ -240,7 +240,7 @@ pub fn plan(record: &AgentSessionRecord) -> Option<Vec<String>> {
 pub fn typed_line(record: &AgentSessionRecord) -> Option<String> {
     let words: Vec<String> = plan(record)?
         .iter()
-        .map(|w| crate::integrate::hooks_file::sh_word(w))
+        .map(|w| crate::shell_word::sh_word(w))
         .collect();
     Some(format!(" {}\r", words.join(" ")))
 }

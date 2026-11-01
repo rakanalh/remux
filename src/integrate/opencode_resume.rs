@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::claude_resume::require_dir;
 use super::hooks_file::{effective_uid, home_and_binary, shown, write_atomically};
 use super::jsonc_file::{add_plugin, has_plugin, new_tui_json, remove_plugin};
 use super::plugin_file::{js_string, read_for_edit, render, PluginFile};
+use super::require_dir;
 use super::{Change, Integration, IntegrationStatus};
 
 pub const SERVER_PLUGIN: &str = include_str!("../../integrations/opencode/remux-agent-session.js");

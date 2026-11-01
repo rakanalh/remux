@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::claude_resume::require_dir;
 use super::hooks_file::{
     effective_uid, home_and_binary, write_atomically, HookSet, Hooks, HooksFile,
 };
 use super::plugin_file::{read_for_edit, ForEdit};
+use super::require_dir;
 use super::{Change, Integration, IntegrationStatus};
 
 pub static RESUME_CODEX: HookSet = HookSet {

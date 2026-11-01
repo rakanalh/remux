@@ -51,6 +51,12 @@ pub fn read_for_edit(path: &Path, euid: u32) -> Result<ForEdit> {
     check_owner(&path, euid)?;
     check_directory(&path, euid)?;
     check_plain_file(&path)?;
+    read_resolved(path)
+}
+
+/// Read `path`, already resolved and checked, with the fingerprint a write
+/// compares against. Absent is no text and no fingerprint.
+fn read_resolved(path: PathBuf) -> Result<ForEdit> {
     let mut file = match std::fs::File::open(&path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -117,12 +123,6 @@ pub struct PluginFile {
     euid: u32,
 }
 
-struct OnDiskFile {
-    path: PathBuf,
-    text: Option<String>,
-    fingerprint: Option<Fingerprint>,
-}
-
 impl PluginFile {
     pub fn new(
         path: PathBuf,
@@ -150,29 +150,11 @@ impl PluginFile {
         resolve(&self.path)
     }
 
-    fn read(&self) -> Result<OnDiskFile> {
+    /// For `--status`, which may read but writes nothing.
+    fn read(&self) -> Result<ForEdit> {
         let path = self.target()?;
         check_regular(&path)?;
-        let mut file = match std::fs::File::open(&path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(OnDiskFile {
-                    path,
-                    text: None,
-                    fingerprint: None,
-                })
-            }
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-        };
-        let fingerprint = Fingerprint::of(&file.metadata()?);
-        let mut text = String::new();
-        file.read_to_string(&mut text)
-            .with_context(|| format!("reading {}", path.display()))?;
-        Ok(OnDiskFile {
-            path,
-            text: Some(text),
-            fingerprint: Some(fingerprint),
-        })
+        read_resolved(path)
     }
 
     fn on_disk(&self, text: Option<&str>) -> OnDisk {
@@ -228,12 +210,8 @@ impl PluginFile {
         })
     }
 
-    fn checked_read(&self) -> Result<OnDiskFile> {
-        let path = self.target()?;
-        check_owner(&path, self.euid)?;
-        check_directory(&path, self.euid)?;
-        check_plain_file(&path)?;
-        self.read()
+    fn checked_read(&self) -> Result<ForEdit> {
+        read_for_edit(&self.path, self.euid)
     }
 
     pub fn install(&self) -> Result<()> {

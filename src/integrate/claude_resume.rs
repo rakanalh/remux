@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use super::hooks_file::{effective_uid, home_and_binary, HookSet, Hooks, HooksFile};
-use super::{Change, Integration, IntegrationStatus};
+use super::{require_dir, Change, Integration, IntegrationStatus};
 
 pub static RESUME_CLAUDE: HookSet = HookSet {
     events: &[("SessionStart", "claude")],
@@ -50,18 +50,6 @@ impl ClaudeResume {
             ),
         }
     }
-}
-
-/// Refuse an install into an agent's config dir that is not there: the agent
-/// creates it on its first run, and a dir remux made would say the agent is
-/// set up when it is not.
-pub fn require_dir(dir: &Path, agent: &str, variable: &str) -> Result<()> {
-    anyhow::ensure!(
-        dir.is_dir(),
-        "{} does not exist: run {agent} once first, or point ${variable} at its config dir",
-        dir.display()
-    );
-    Ok(())
 }
 
 impl Integration for ClaudeResume {
