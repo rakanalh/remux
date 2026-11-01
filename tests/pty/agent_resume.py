@@ -47,9 +47,19 @@ slow_rc_zsh  the same under zsh, whose `.zshrc` runs with job control on:
           and state.json holds NO record once the stub has run. That is the race SPEC 1.7 step 5 accepts
           (the resumed agent's own hook re-stores it), pinned as understood.
           It also proves the typed line survives zsh's line editor starting.
-never_reported  the resumed stub stays running but never reports its session:
+never_reported  the typed resume runs something that is not the agent and stays
+          in the foreground (`claude` on PATH replaced by a script that execs
+          `sleep`): nothing reports and the foreground never becomes claude, so
           the restart after that does not type it again, and says why (a
           resume that did not take is not retried for ever)
+foreground_confirmed  the resumed stub stays in the foreground and never
+          reports again (codex runs no SessionStart for `codex resume`): the
+          foreground being claude confirms it, logged once with no id, and the
+          second restart types it again
+other_agent  as never_reported, with the foreground process named `codex`, a
+          configured agent but not this record's: it is not confirmed
+foreground_argv0  the same with `claude` a link to a binary named `2.1.251`:
+          on macOS only argv[0] names it claude, and it is still confirmed
 re_reported  the resumed stub reports `resume` with its session: the restart
           after that types it again
 disabled  with `resume_agents = false` the hook's report is refused
@@ -488,14 +498,79 @@ def restart_twice(rig, mark):
     return first, second
 
 
-def never_reported(rig):
-    first, second = restart_twice(rig, "resumed-stays")
-    check(first == [[f"--resume={SESSION_ID}", ""]], f"never_reported: the first restart resumed it (got {first})")
+def impostor_resumed(rig, mode, runs_as):
+    """The typed line runs something that is NOT the agent and stays in the
+    foreground: `claude` on PATH is now a script that records its argv and
+    execs `runs_as` (a sleep under that name). Nothing reports, the foreground
+    is never claude, and the shell never takes it back, so only the pending
+    rule can drop it."""
+    start_agent(rig)
+    check(rig.wait(lambda: not no_record(rig)), f"{mode}: state.json holds the record")
+    sleeper = shutil.which("sleep")
+    if runs_as != "sleep":
+        shutil.copy(sleeper, f"{rig.bin}/{runs_as}")
+        sleeper = f"{rig.bin}/{runs_as}"
+    impostor = f"{rig.bin}/claude"
+    os.remove(impostor)
+    with open(impostor, "w") as f:
+        f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{rig.argv_dir}/claude.$$"\nexec "{sleeper}" 600\n')
+    os.chmod(impostor, 0o755)
+    first = restart_and_collect(rig, wait=8.0)
+    time.sleep(3.0)
+    second = restart_and_collect(rig, wait=4.0)
+    check(first == [[f"--resume={SESSION_ID}", ""]], f"{mode}: the first restart typed it (got {first})")
     check(second == first,
-          f"never_reported: a session typed and never reported again is not typed again "
+          f"{mode}: a session whose resume never put claude in the foreground is not typed again "
           f"(got {len(second)} run(s))")
-    check(re.search(r"record dropped on restore \(typed last time and never reported again\)",
-                    rig.t.log("server")) is not None, "never_reported: the drop is logged")
+    log = rig.t.log("server")
+    check(re.search(r"record dropped on restore \(typed last time and never reported again\)", log)
+          is not None, f"{mode}: the drop is logged")
+    check("typed resume confirmed by foreground" not in log,
+          f"{mode}: {runs_as} in the foreground never confirmed the claude resume")
+
+
+def never_reported(rig):
+    impostor_resumed(rig, "never_reported", "sleep")
+
+
+def other_agent(rig):
+    """Another configured agent's name in the foreground (`codex`, in the
+    default [agents] list) does not confirm a claude record."""
+    impostor_resumed(rig, "other_agent", "codex")
+
+
+def foreground_confirmed(rig):
+    """The resumed agent stays in the foreground and never reports again, as
+    codex does after `codex resume`: the foreground alone confirms it, so the
+    session survives a second restart."""
+    first, second = restart_twice(rig, "resumed-stays")
+    check(first == [[f"--resume={SESSION_ID}", ""]],
+          f"foreground_confirmed: the first restart resumed it (got {first})")
+    check(len(rig.hook_runs()) == 1, f"foreground_confirmed: the resumed stub never reported "
+                                     f"(hook runs {len(rig.hook_runs())})")
+    check(len(second) == 2 and second[1] == first[0],
+          f"foreground_confirmed: the second restart typed it again (got {len(second)} run(s))")
+    log = rig.t.log("server")
+    confirmed = re.findall(r"agent session: pane %\d+ \"claude\" typed resume confirmed by foreground", log)
+    check(len(confirmed) >= 1, f"foreground_confirmed: server.log says the foreground confirmed it "
+                               f"({len(confirmed)} line(s))")
+    check("record dropped on restore" not in log, "foreground_confirmed: nothing was dropped")
+    check(SESSION_ID not in log, "foreground_confirmed: the confirmation line holds no id")
+
+
+def foreground_argv0(rig):
+    """`claude` is a link to a binary whose own name is `2.1.251`, as Claude
+    Code's installer lays it out. macOS names a process after its executable,
+    so there only argv[0] says claude; the resume must still be confirmed."""
+    versions = f"{rig.bin}/versions"
+    os.makedirs(versions, exist_ok=True)
+    os.rename(f"{rig.bin}/claude", f"{versions}/2.1.251")
+    os.symlink(f"{versions}/2.1.251", f"{rig.bin}/claude")
+    first, second = restart_twice(rig, "resumed-stays")
+    check(first == [[f"--resume={SESSION_ID}", ""]], f"foreground_argv0: the first restart resumed it (got {first})")
+    check(len(second) == 2, f"foreground_argv0: the second restart typed it again (got {len(second)} run(s))")
+    check(re.search(r"typed resume confirmed by foreground", rig.t.log("server")) is not None,
+          "foreground_argv0: server.log says the foreground confirmed it")
 
 
 def re_reported(rig):
@@ -541,6 +616,8 @@ def duplicate(rig):
 
 
 MODES = {"fast": fast, "duplicate": duplicate, "never_reported": never_reported,
+         "foreground_confirmed": foreground_confirmed, "foreground_argv0": foreground_argv0,
+         "other_agent": other_agent,
          "re_reported": re_reported, "typed_at_prompt": typed_at_prompt,
          "stub_exited": stub_exited, "bad_id": bad_id, "pane_unset": pane_unset,
          "setsid": setsid,

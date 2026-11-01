@@ -538,6 +538,18 @@ impl AgentRules {
         }
     }
 
+    /// Rules that know `command` alone and no patterns, whatever
+    /// `[agents] commands` lists: for asking whether that one agent holds a
+    /// pane's foreground, where any other agent, or the shell, must not count.
+    pub fn only(command: &str) -> Self {
+        Self {
+            commands: vec![command.to_string()],
+            patterns: Vec::new(),
+            working: Duration::ZERO,
+            scan_rows: 0,
+        }
+    }
+
     /// The configured command this process is running, if any.
     ///
     /// `name` is what the OS calls the process and `argv0` is its `argv[0]`, and
@@ -1793,5 +1805,23 @@ mod tests {
         });
         assert!(first_match(&r, candidates).is_some());
         assert_eq!(reads.get(), 1, "the walk stopped at the first hit");
+    }
+
+    #[test]
+    fn rules_for_one_agent_match_that_agent_alone() {
+        let codex = AgentRules::only("codex");
+        assert_eq!(codex.match_command("codex", None), Some("codex"));
+        assert_eq!(
+            codex.match_command("node", Some("/opt/homebrew/bin/codex")),
+            Some("codex")
+        );
+        assert_eq!(codex.match_command("claude", None), None);
+        assert_eq!(codex.match_command("zsh", Some("-zsh")), None);
+        let claude = AgentRules::only("claude");
+        assert_eq!(
+            claude.match_command("2.1.251", Some("claude")),
+            Some("claude")
+        );
+        assert_eq!(claude.match_command("codex", Some("codex")), None);
     }
 }

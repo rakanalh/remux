@@ -17421,6 +17421,7 @@ async fn materialize_session(
                 tokio::time::sleep(resume_gap(config.general.resume_agent_delay_ms)).await;
             }
             type_resume(*pane_id, record, panes).await;
+            confirm_resume_by_foreground(*pane_id, record.clone(), state, panes, config, dormant);
             *typed += 1;
         }
     }
@@ -17505,6 +17506,93 @@ const MAX_RESUME_GAP_MS: u64 = 2000;
 /// The wait between two typed resumes for a configured `ms`.
 fn resume_gap(ms: u64) -> std::time::Duration {
     std::time::Duration::from_millis(ms.min(MAX_RESUME_GAP_MS))
+}
+
+/// How often, and for how long after the typing, a typed resume is checked
+/// for its agent in the pane's foreground.
+const RESUME_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+const RESUME_CONFIRM_FOR: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Clear the `pending` mark of the resume typed into `pane_id` once the pane's
+/// foreground job is `record`'s own agent.
+///
+/// Some agents never report a resumed session (codex runs no SessionStart for
+/// `codex resume`), so with the re-report as the only confirmation their
+/// records stayed pending, and the next restore dropped a session that had
+/// resumed. The shell holds the foreground while it echoes the typed line and
+/// runs its rc, and a forked child carries the shell's name until it execs, so
+/// a match means the agent itself is running. Detection is the agents panel's
+/// (`foreground_agent`: process name, then argv[0], then the job under a
+/// launcher), with rules naming this agent alone, so neither the shell nor
+/// another agent can confirm it. A resume that fails back to the prompt is
+/// forgotten by the shell-foreground rule, and that ends this watch too.
+///
+/// As in `collect_agents`, the PTY master is dup'd under `panes` and read with
+/// no lock held, and `panes` is released before `save_if_enabled` takes
+/// `state` then `panes`.
+fn confirm_resume_by_foreground(
+    pane_id: PaneId,
+    record: AgentSessionRecord,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    dormant: &DormantStore,
+) {
+    let (state, panes, config, dormant) = (
+        Arc::clone(state),
+        Arc::clone(panes),
+        Arc::clone(config),
+        Arc::clone(dormant),
+    );
+    tokio::spawn(async move {
+        let rules = crate::server::agents::AgentRules::only(&record.agent);
+        let still_pending = |pd: &PaneData| {
+            pd.agent_session
+                .as_ref()
+                .is_some_and(|held| held.pending && *held == record)
+        };
+        let deadline = std::time::Instant::now() + RESUME_CONFIRM_FOR;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(RESUME_CONFIRM_POLL).await;
+            let master = {
+                let ps = panes.lock().await;
+                match ps.get(&pane_id).filter(|pd| !pd.exited) {
+                    Some(pd) if still_pending(pd) => pd.pty.master_fd.try_clone().ok(),
+                    _ => return,
+                }
+            };
+            let Some(master) = master else {
+                return;
+            };
+            let found =
+                crate::server::agents::foreground_agent(std::os::fd::AsFd::as_fd(&master), &rules)
+                    .is_some();
+            drop(master);
+            if !found {
+                continue;
+            }
+            let confirmed = {
+                let mut ps = panes.lock().await;
+                match ps.get_mut(&pane_id) {
+                    Some(pd) if still_pending(pd) => {
+                        if let Some(held) = pd.agent_session.as_mut() {
+                            held.pending = false;
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if confirmed {
+                log::info!(
+                    "agent session: pane %{pane_id} {:?} typed resume confirmed by foreground",
+                    crate::server::agent_session::agent_label(&record.agent)
+                );
+                save_if_enabled(&state, &panes, &config, &dormant).await;
+            }
+            return;
+        }
+    });
 }
 
 /// Type `record`'s resume command into the freshly spawned shell of `pane_id`
