@@ -108,15 +108,24 @@ fn takes_paths(agent: &str) -> Option<bool> {
     }
 }
 
+/// The first byte is alphanumeric because the id is typed after the agent's
+/// flag: `--yolo` as an id would otherwise become `codex resume --yolo`.
 fn valid_id(id: &str) -> bool {
     (1..=MAX_ID).contains(&id.len())
+        && id.as_bytes()[0].is_ascii_alphanumeric()
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'@' | b'-'))
 }
 
+/// Absolute, so it can never start with `-`. No backslash: the typed line is
+/// quoted for POSIX shells, and fish reads `\'` inside single quotes as an
+/// escaped quote, which would end the quoting early in a fish pane.
 fn valid_path(path: &str) -> bool {
-    path.len() <= MAX_PATH && path.starts_with('/') && !path.chars().any(char::is_control)
+    path.len() <= MAX_PATH
+        && path.starts_with('/')
+        && !path.contains('\\')
+        && !path.chars().any(char::is_control)
 }
 
 /// Whether a report of `reference` from `agent` may be kept at all. The id
@@ -127,14 +136,14 @@ pub fn validate(agent: &str, reference: &AgentSessionRef) -> Result<(), Refusal>
     match reference {
         AgentSessionRef::Id(id) if valid_id(id) => Ok(()),
         AgentSessionRef::Id(_) => Err(Refusal::BadReference(
-            "an id is 1 to 128 bytes of [A-Za-z0-9._:@-]",
+            "an id is 1 to 128 bytes of [A-Za-z0-9._:@-], starting with a letter or digit",
         )),
         AgentSessionRef::Path(_) if !takes_paths => Err(Refusal::BadReference(
             "this agent reports an id, not a path",
         )),
         AgentSessionRef::Path(path) if valid_path(path) => Ok(()),
         AgentSessionRef::Path(_) => Err(Refusal::BadReference(
-            "a path is absolute, at most 4096 bytes, with no control characters",
+            "a path is absolute, at most 4096 bytes, with no backslash or control characters",
         )),
     }
 }
@@ -199,13 +208,17 @@ pub fn dedupe(
 /// for an agent this server does not know, which [`validate`] refuses.
 pub fn plan(record: &AgentSessionRecord) -> Option<Vec<String>> {
     let value = record.value.clone();
+    // The value is joined to its flag, or follows `--`, wherever the agent's
+    // parser takes that form, so that even a valid value is never read as an
+    // option. pi's parser could not be checked, so it keeps `--session <v>`;
+    // its values cannot start with `-` (see `validate`).
     let words = match record.agent.as_str() {
-        "claude" => vec!["claude".into(), "--resume".into(), value],
-        "codex" => vec!["codex".into(), "resume".into(), value],
+        "claude" => vec!["claude".into(), format!("--resume={value}")],
+        "codex" => vec!["codex".into(), "resume".into(), "--".into(), value],
         // omp has no `--session`, and takes the value only joined to the flag.
         "omp" => vec!["omp".into(), format!("--resume={value}")],
         "pi" => vec!["pi".into(), "--session".into(), value],
-        "opencode" => vec!["opencode".into(), "--session".into(), value],
+        "opencode" => vec!["opencode".into(), format!("--session={value}")],
         _ => return None,
     };
     Some(words)
@@ -363,12 +376,16 @@ mod tests {
     #[test]
     fn plan_builds_each_agents_resume_command() {
         let cases = [
-            ("claude", id(UUID), vec!["claude", "--resume", UUID]),
-            ("codex", id(UUID), vec!["codex", "resume", UUID]),
+            (
+                "claude",
+                id(UUID),
+                vec!["claude", "--resume=7f3c2a9e-51d4-4b8e-9a61-0c2f5d8e4b17"],
+            ),
+            ("codex", id(UUID), vec!["codex", "resume", "--", UUID]),
             (
                 "opencode",
                 id("ses_3f9a"),
-                vec!["opencode", "--session", "ses_3f9a"],
+                vec!["opencode", "--session=ses_3f9a"],
             ),
             (
                 "pi",
@@ -401,7 +418,7 @@ mod tests {
     fn the_typed_line_is_space_prefixed_quoted_and_submitted() {
         assert_eq!(
             typed_line(&record("claude", id(UUID))).as_deref(),
-            Some(format!(" claude --resume {UUID}\r").as_str())
+            Some(format!(" claude --resume={UUID}\r").as_str())
         );
         assert_eq!(
             typed_line(&record("pi", path("/home/u/my sessions/it's.jsonl"))).as_deref(),
@@ -411,6 +428,65 @@ mod tests {
             typed_line(&record("omp", path("/home/u/a b.jsonl"))).as_deref(),
             Some(" omp '--resume=/home/u/a b.jsonl'\r")
         );
+    }
+
+    /// An id is typed after the agent's flag, so one that starts with `-`
+    /// would be parsed by the agent as an option of its own:
+    /// `claude --resume --dangerously-skip-permissions`.
+    #[test]
+    fn an_id_that_starts_with_a_dash_is_refused_for_every_agent() {
+        for agent in ["claude", "codex", "opencode", "pi", "omp"] {
+            for bad in [
+                "--dangerously-skip-permissions",
+                "--yolo",
+                "-x",
+                "-",
+                ".hidden",
+                "_x",
+            ] {
+                assert_eq!(
+                    validate(agent, &id(bad)).map_err(Refusal::code),
+                    Err("bad_reference"),
+                    "({agent}, {bad:?})"
+                );
+            }
+        }
+    }
+
+    /// A path must be absolute, so it starts with `/` and can never start
+    /// with `-`; one with a backslash is refused because fish reads `\'`
+    /// inside single quotes as an escape, which breaks the POSIX quoting.
+    #[test]
+    fn a_path_that_starts_with_a_dash_or_holds_a_backslash_is_refused() {
+        for agent in ["pi", "omp"] {
+            for bad in [
+                "-rf/x.jsonl",
+                "--session=/x",
+                "/x\\' ; echo pwned ; echo \\'",
+            ] {
+                assert_eq!(
+                    validate(agent, &path(bad)).map_err(Refusal::code),
+                    Err("bad_reference"),
+                    "({agent}, {bad:?})"
+                );
+            }
+        }
+    }
+
+    /// Every argv `plan` builds keeps the value out of option position: joined
+    /// to its flag, or after `--`. pi takes `--session <value>` because pi's
+    /// own parser could not be checked here; its values cannot start with `-`.
+    #[test]
+    fn the_value_is_never_a_word_of_its_own_after_a_bare_flag() {
+        let value = "abc";
+        for agent in ["claude", "codex", "opencode", "omp"] {
+            let argv = plan(&record(agent, id(value))).unwrap();
+            let at = argv.iter().position(|w| w.ends_with(value)).unwrap();
+            assert!(
+                argv[at].contains('=') || argv[at - 1] == "--",
+                "{agent}: {argv:?}"
+            );
+        }
     }
 
     #[test]

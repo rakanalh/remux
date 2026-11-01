@@ -43,7 +43,7 @@ persist         state.json holds the record right after the report, before any
                 structural change; a report that hangs (a lock-order deadlock
                 in the save) is a timeout red here.
 restart_types   after `remux restart` the restored /bin/sh pane runs the stub
-                `claude` on PATH with `--resume` and the id as two argv words,
+                `claude` on PATH with the one argv word `--resume=<id>`,
                 read from the file the stub writes, never from the screen.
 default_stagger the main server's restart typed every held pane within 1 s
                 of the first, at the default 100 ms between panes.
@@ -70,6 +70,8 @@ missing_cwd     a pane whose directory is removed while the server is stopped
 edited_state_bad_id  a 129-byte id written into state.json while the server is
                 stopped is typed nothing, the drop is logged, and the next save
                 holds no record for it.
+edited_state_dash_id  the same for an id edited to `--dangerously-skip-permissions`,
+                which typed after the agent's flag would be an option.
 
 On a server of its own with `automatic_restore = false`, so sessions come back
 dormant:
@@ -446,7 +448,7 @@ def restart_types(rig, pane):
         for name in rig.argv_files("claude"):
             with open(f"{rig.argv_dir}/{name}") as f:
                 argv = f.read().split("\n")
-            if RESTORE_ID in argv:
+            if any(RESTORE_ID in word for word in argv):
                 out.append(argv)
         return out
 
@@ -456,8 +458,8 @@ def restart_types(rig, pane):
     time.sleep(0.5)
     got = runs()
     check(len(got) == 1, f"restart_types: the restore ran the stub claude once for the id (got {got})")
-    check(bool(got) and got[0] == ["--resume", RESTORE_ID, ""],
-          f"restart_types: --resume and the id are two argv words and nothing else (got {got})")
+    check(bool(got) and got[0] == [f"--resume={RESTORE_ID}", ""],
+          f"restart_types: the stub got one argv word, --resume=<id> (got {got})")
     check(re.search(rf"typed resume for pane %{pane} agent=\"claude\" \(54 bytes\)",
                     rig.srv.log()) is not None,
           f"restart_types: the line typed into %{pane} was 54 bytes, space and \\r included")
@@ -545,7 +547,7 @@ def stagger(rig):
 
 
 def runs_naming(rig, value):
-    return [argv for _, argv in rig.argv_runs("claude") if value in argv]
+    return [argv for _, argv in rig.argv_runs("claude") if any(value in w for w in argv)]
 
 
 def hardening(rig):
@@ -564,9 +566,17 @@ def hardening(rig):
     gone = rig.spawn(cwd=gone_dir)
     check(outcome(report(rig, gone, "claude", {"Id": gone_id}, source="startup")) == "Stored",
           f"missing_cwd: setup, %{gone} Stored")
-    bad = rig.spawn()
+    # An explicit cwd that survives the restart: a split inherits the focused
+    # pane's directory, which here is the one this case removes, and a record
+    # dropped for that would pass the bad-id checks for the wrong reason.
+    kept = rig.srv.rundir
+    bad = rig.spawn(cwd=kept)
     check(outcome(report(rig, bad, "claude", {"Id": bad_id}, source="startup")) == "Stored",
           f"edited_state_bad_id: setup, %{bad} Stored")
+    dash_id = "eeee0000-1111-4222-8333-944445555004"
+    dash = rig.spawn(cwd=kept)
+    check(outcome(report(rig, dash, "claude", {"Id": dash_id}, source="startup")) == "Stored",
+          f"edited_state_dash_id: setup, %{dash} Stored")
     path = f"{rig.srv.rundir}/data/remux/state.json"
 
     def edit():
@@ -574,8 +584,9 @@ def hardening(rig):
         with open(path) as f:
             text = f.read()
         assert text.count(bad_id) == 1, "the bad-id probe must replace exactly one value"
+        assert text.count(dash_id) == 1, "the dash-id probe must replace exactly one value"
         with open(path, "w") as f:
-            f.write(text.replace(bad_id, "a" * 129))
+            f.write(text.replace(bad_id, "a" * 129).replace(dash_id, "--dangerously-skip-permissions"))
 
     rig.restart(between=edit)
     rig.wait_runs("claude", 1, timeout=6.0)
@@ -586,16 +597,21 @@ def hardening(rig):
           and re.search(rf"typed resume for pane %{high} ", log) is None,
           f"dedupe: the lower pane %{low} was typed, not %{high}")
     check(runs_naming(rig, gone_id) == [], "missing_cwd: nothing was typed for the gone directory")
-    check(not any("a" * 129 in argv for _, argv in rig.argv_runs("claude")),
+    check(not any(any("a" * 129 in w for w in argv) for _, argv in rig.argv_runs("claude")),
           "edited_state_bad_id: nothing was typed for the 129-byte id")
-    check(re.search(rf"agent session: pane %{bad} .*dropped", log) is not None,
+    check(re.search(rf"agent session: pane %{bad} .*dropped on restore \(bad_reference\)", log) is not None,
           f"edited_state_bad_id: the drop of %{bad}'s record is logged")
+    check(not any(any("dangerously" in w for w in argv) for _, argv in rig.argv_runs("claude")),
+          "edited_state_dash_id: nothing was typed for an id that starts with '-'")
+    check(re.search(rf"agent session: pane %{dash} .*dropped on restore \(bad_reference\)", log) is not None,
+          f"edited_state_dash_id: the drop of %{dash}'s record is logged")
     # The shutdown save is the next save: a `CliSpawn` pane triggers none.
     rig.cli.close()
     rig.srv.stop()
     sessions = (rig.state_json() or {}).get("agent_sessions", {})
     check(str(gone) not in sessions, f"missing_cwd: the next save holds no record for %{gone}")
     check(str(bad) not in sessions, f"edited_state_bad_id: the next save holds no record for %{bad}")
+    check(str(dash) not in sessions, f"edited_state_dash_id: the next save holds no record for %{dash}")
     check(str(low) in sessions and str(high) not in sessions,
           f"dedupe: the next save holds the winner %{low} only (got {sorted(sessions)})")
     check("a" * 129 not in log, "edited_state_bad_id: the log never holds the edited value")
@@ -700,6 +716,11 @@ def main_server():
                            ("a control char", {"Id": "abc\x07def"})):
             r = report(rig, fresh, "claude", ref)
             check(code(r) == "bad_reference", f"bad_reference: {label} is refused (got {r})")
+        for agent, flag in (("claude", "--dangerously-skip-permissions"), ("codex", "--yolo"),
+                            ("opencode", "-x")):
+            r = report(rig, fresh, agent, {"Id": flag}, source="startup")
+            check(code(r) == "bad_reference",
+                  f"bad_reference: {agent} id {flag!r} would be an option on restore; refused (got {r})")
         r = report(rig, fresh, "claude", {"Id": UUID})
         check(outcome(r) == "Stored",
               f"bad_reference: the refusals stored nothing, so a good report is Stored (got {r})")

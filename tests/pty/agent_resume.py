@@ -19,7 +19,8 @@ is echoed by the shell whether or not anything ran.
 
 fast      the report is stored (state.json names the pane), the hook printed
           nothing on stdout and exited 0, and after `remux restart` the stub's
-          argv file holds `--resume` and the id as two separate lines.
+          argv file holds `--resume=<id>` as one line: the value is joined to
+          its flag, so no id can ever be read as an option.
 duplicate the stub runs in two panes with the same recorded session: both
           reports are stored, and the restart resumes it once.
 typed_at_prompt  `remux agent session claude --hook < payload` typed AT THE
@@ -256,8 +257,8 @@ def fast(rig):
     check(rig.wait(lambda: rig.argv_runs(), timeout=12.0), "fast: the restore ran the stub with arguments")
     time.sleep(0.5)
     runs = rig.argv_runs()
-    check(runs == [["--resume", SESSION_ID, ""]],
-          f"fast: --resume and the id are two argv lines, and the stub ran once (got {runs})")
+    check(runs == [[f"--resume={SESSION_ID}", ""]],
+          f"fast: the stub got --resume=<id> as one argv word, and ran once (got {runs})")
     log = t.log("server")
     check(re.search(rf"typed resume for pane %{pane} agent=\"claude\" \(\d+ bytes\)", log) is not None,
           "fast: server.log names the typed resume by pane, agent and byte count")
@@ -396,7 +397,7 @@ def slow_rc_case(rig, mode, races):
     names = sorted(os.listdir(rig.argv_dir))
     ran_at = os.path.getmtime(f"{rig.argv_dir}/{names[0]}") if names else None
     runs = rig.argv_runs()
-    check(runs == [["--resume", SESSION_ID, ""]],
+    check(runs == [[f"--resume={SESSION_ID}", ""]],
           f"{mode}: the typed line waited out the rc and ran the stub once (got {runs})")
     check(ran_at is not None and ran_at - restarted >= 1.5,
           f"{mode}: the stub ran only after the rc's 2 s sleep "
@@ -466,7 +467,7 @@ def duplicate(rig):
     runs = restart_and_collect(rig, wait=8.0)
     time.sleep(1.0)
     runs = rig.argv_runs()
-    check(runs == [["--resume", SESSION_ID, ""]], f"duplicate: the restart resumed it once (got {runs})")
+    check(runs == [[f"--resume={SESSION_ID}", ""]], f"duplicate: the restart resumed it once (got {runs})")
 
 
 MODES = {"fast": fast, "duplicate": duplicate, "typed_at_prompt": typed_at_prompt,
