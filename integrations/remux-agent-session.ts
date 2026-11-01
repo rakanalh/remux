@@ -13,14 +13,16 @@ import { execFile } from "node:child_process";
 const REMUX_BIN = "__REMUX_BIN__";
 const AGENT = "__REMUX_AGENT__";
 
-// pi reports only from its terminal UI. omp reports only with a UI, and not
-// when OMPCODE is set: omp sets it in its own bash tool, so an omp started
-// from inside omp would otherwise take over the pane's session.
+// Both report only with a UI: `hasUI` is false in print and RPC mode, which
+// is how an agent runs when another agent's tool starts it. (pi's context has
+// no `mode`.) omp also stops when OMPCODE is set: omp sets it in its own bash
+// tool, so an omp started from inside omp would otherwise take over the
+// pane's session.
 function reporting(ctx: any): boolean {
-  if (AGENT === "pi") {
-    return ctx?.mode === "tui";
+  if (ctx?.hasUI !== true) {
+    return false;
   }
-  return ctx?.hasUI === true && process.env.OMPCODE !== "1";
+  return AGENT !== "omp" || process.env.OMPCODE !== "1";
 }
 
 // The last reference sent. agent_start fires on every turn, and an unchanged

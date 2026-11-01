@@ -58,7 +58,16 @@ the T18 spike recorded; the driver records each CLI call):
   w5  TUI plugin: the route moves to another root session -> Replaced
   w6  server plugin under `opencode --mini` -> reports, as `run` does
 
-omp_real (OPTIONAL, never a failure, not in the default run): the REAL omp
+The *_real modes (OPTIONAL, never a failure, not in the default run) start the
+REAL agent: claude_real, codex_real (and codex_real_nested, the same start
+inside an outer codex thread, which must make no report), pi_real (needs
+REMUX_PI_CLI, the path of a pi cli.js from a throwaway npm prefix), omp_real
+and opencode_real. Each prints SMOKE lines: the report that reached the
+server, or the pane's screen when none did. Each hashes the real config it
+must not touch before and after (Python hashlib) and FAILS on a change, or on
+a check that hashed no file under a path that exists.
+
+omp_real: the REAL omp
 from `~/.bun/bin/omp`, started as a job at a shell pane's prompt under the
 throwaway HOME with the extension installed, for long enough to start a
 session. Prints `SMOKE` lines: whether a report reached the server, or why it
@@ -80,6 +89,7 @@ Run: python3 tests/pty/agent_session_hooks.py [claude codex pi omp opencode omp_
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -261,8 +271,10 @@ def extension_mode(agent):
         rc, err = rig.integrate(f"{agent}-resume")
         check(rc == 0, f"setup: {agent}-resume installs into the throwaway HOME (rc={rc}, err={err!r})")
         ext = f"{agent_dir}/extensions/remux-agent-session.ts"
-        ui = {"mode": "tui"} if agent == "pi" else {"hasUI": True}
-        no_ui = {"mode": "print"} if agent == "pi" else {"hasUI": False}
+        # What the real agents hand an extension: pi 0.73's ExtensionContext
+        # has `hasUI` and no `mode`; omp 18.3 has both.
+        ui = {"hasUI": True} if agent == "pi" else {"hasUI": True, "mode": "tui"}
+        no_ui = {"hasUI": False} if agent == "pi" else {"hasUI": False, "mode": "print"}
         start = "new" if agent == "pi" else None
         switch = "resume"
         record = f"{rig.srv.rundir}/calls.jsonl"
@@ -417,26 +429,111 @@ def opencode():
         rig.close()
 
 
-def opencode_real():
-    binary = os.path.expanduser("~/.opencode/bin/opencode")
-    unshare = shutil.which("unshare")
-    if not (os.path.exists(binary) and unshare):
-        print("SMOKE opencode_real: skipped, no opencode or unshare installed")
-        return
-    real = " ".join(os.path.expanduser(p) for p in
-                    ("~/.config/opencode", "~/.local/state/opencode", "~/.local/share/opencode"))
+# The developer's PATH as this harness was started with it, before any Rig
+# makes PATH hermetic: the real-binary smokes find their binary through it,
+# and nothing else does.
+DEV_PATH = os.environ.get("PATH", "")
+REAL_HOME = os.path.expanduser("~")
 
-    def sha():
-        return subprocess.run(["sh", "-c", f"find {real} -type f -exec sha256sum {{}} + 2>/dev/null | sort"],
-                              capture_output=True, timeout=120).stdout
-    before = sha()
-    rig = Rig("opencode-real")
+
+def dev_which(name):
+    return shutil.which(name, path=DEV_PATH)
+
+
+def launcher(path):
+    """The argv that runs `path` with no PATH lookup: a `#!/usr/bin/env X`
+    script gets X resolved from the developer's PATH, since the pane's PATH
+    holds no interpreter beyond the system's."""
+    path = os.path.realpath(path)
     try:
-        config = f"{rig.env['XDG_CONFIG_HOME']}/opencode"
-        os.makedirs(config)
-        rc, err = rig.integrate("opencode-resume")
-        if rc != 0:
-            print(f"SMOKE opencode_real: skipped, the install failed ({err.strip()})")
+        with open(path, "rb") as f:
+            first = f.readline(200).decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+    if first.startswith("#!"):
+        words = first[2:].split()
+        if words and os.path.basename(words[0]) == "env" and len(words) > 1:
+            interpreter = dev_which(words[1])
+            return [interpreter, path] if interpreter else None
+        return [*words, path]
+    return [path]
+
+
+class RealDirs:
+    """A sha256 of every file under the real dirs (and files) a smoke must not
+    touch, by Python's hashlib, so it needs no `sha256sum` (macOS has none).
+
+    A path that exists but yields no file is a failure of the check itself, not
+    a pass: two empty digests compare equal whatever happened."""
+
+    def __init__(self, label, paths):
+        # Against the REAL home, captured at import: a Rig points HOME at a
+        # throwaway one, and `~` expanded after that would hash the wrong tree.
+        self.label = label
+        self.paths = [REAL_HOME + p[1:] if p.startswith("~") else p for p in paths]
+        self.before = self.digest()
+
+    def digest(self):
+        import hashlib
+        out = {}
+        for root in self.paths:
+            if os.path.isfile(root):
+                files = [root]
+            else:
+                files = [os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs]
+            for path in files:
+                try:
+                    with open(path, "rb") as f:
+                        out[path] = hashlib.sha256(f.read()).hexdigest()
+                except OSError:
+                    out[path] = "unreadable"
+        return out
+
+    def existing(self):
+        return [p for p in self.paths if os.path.exists(p)]
+
+    def verify(self):
+        after = self.digest()
+        present = self.existing()
+        if not present:
+            check(True, f"{self.label}: no real config exists here, and the smoke created none "
+                        f"({', '.join(self.paths)})")
+            return
+        check(len(self.before) > 0, f"{self.label}: the real-config digest hashed "
+                                    f"{len(self.before)} file(s) under {present}")
+        changed = sorted(p for p in set(self.before) | set(after) if self.before.get(p) != after.get(p))
+        check(changed == [], f"{self.label}: the real config is byte for byte as it was "
+                             f"({len(after)} files; changed: {changed[:5]})")
+
+
+def screen_of(rig, pane):
+    c = Client(rig.srv.sock)
+    c.hello()
+    c.send({"SubscribePane": {"pane_id": pane, "cols": 110, "rows": 30, "size_demand": False}})
+    rows = []
+    try:
+        for msg in c.drain(1.5):
+            if name_of(msg) == "PaneContent" and msg["PaneContent"]["pane_id"] == pane:
+                rows = ["".join(cell["c"] for cell in row).rstrip() for row in msg["PaneContent"]["cells"]]
+    finally:
+        c.close()
+    return [r for r in rows if r.strip()]
+
+
+def real_smoke(name, agent, argv, prepare, real_paths, wait_s=30, env_line=""):
+    """Start the REAL `argv` as a job at a shell pane's prompt, with remux's
+    integration installed by `prepare(rig)` under the throwaway HOME, and say
+    whether its report reached the server. Never a failure, except a change to
+    the real config (RealDirs) or a check that hashed nothing."""
+    if not argv or not all(argv) or not all(os.path.exists(a) for a in argv if a.startswith("/")):
+        print(f"SMOKE {name}: skipped, the real {agent} is not installed here")
+        return
+    real = RealDirs(name, real_paths)
+    rig = Rig(name)
+    try:
+        why = prepare(rig)
+        if why:
+            print(f"SMOKE {name}: skipped, {why}")
             return
         c = Client(rig.srv.sock)
         c.hello()
@@ -447,81 +544,94 @@ def opencode_real():
                 pane = m["CliSpawned"]["pane_id"]
         c.close()
         time.sleep(0.5)
-        line = f"{unshare} -rn {binary} --mini\n"
+        line = env_line + " ".join(shlex.quote(a) for a in argv) + "\n"
         rig.cli.send({"InputToPane": {"pane_id": pane, "data": list(line.encode())}})
-        end = time.time() + 30
+        end = time.time() + wait_s
         found = None
         while time.time() < end and found is None:
-            found = re.search(rf'agent session: pane %{pane} "opencode" id (\d+) bytes source=(\S+) -> (\w+)',
+            found = re.search(rf'agent session: pane %{pane} "{agent}" (\w+) (\d+) bytes source=(\S+) -> (\w+)',
                               rig.srv.log())
             time.sleep(0.5)
         if found:
-            print(f"SMOKE opencode_real: the real opencode --mini reported its session: "
-                  f"{found.group(1)} bytes, source={found.group(2)} -> {found.group(3)}")
+            print(f"SMOKE {name}: the real {agent} reported its session: kind={found.group(1)} "
+                  f"{found.group(2)} bytes source={found.group(3)} -> {found.group(4)}")
         else:
-            lines = re.findall(rf"(?:agent session: pane %{pane} .*|identity: .*AgentSession.*)", rig.srv.log())
-            print(f"SMOKE opencode_real: no report within 30 s (lines: {lines[:3]})")
-        logs = subprocess.run(["sh", "-c", f"cat {rig.env['XDG_DATA_HOME']}/opencode/log/*.log 2>/dev/null"],
-                              capture_output=True, timeout=10).stdout.decode(errors="replace")
-        failed = [ln for ln in logs.splitlines() if "failed to load plugin" in ln]
-        print(f"SMOKE opencode_real: opencode logged {len(failed)} plugin load failure(s){': ' + failed[0][:200] if failed else ''}")
-        if not found:
-            # Offline, a first start's bootstrap (models.dev, node_modules) can
-            # stop before plugins load, which says nothing about the plugins.
-            last = logs.strip().splitlines()[-1:] or ["(no opencode log)"]
-            print(f"SMOKE opencode_real: opencode's last log line: {last[0][:240]}")
+            refused = re.findall(rf"agent session: pane %{pane} .*", rig.srv.log())
+            screen = screen_of(rig, pane)
+            print(f"SMOKE {name}: no report from the real {agent} within {wait_s} s "
+                  f"(server lines for the pane: {refused[:2]}); the pane shows:")
+            for row in screen[-12:]:
+                print(f"SMOKE {name}:   | {row[:100]}")
+        return rig, pane, found
     finally:
         rig.close()
-    check(sha() == before, "opencode_real: the real opencode dirs are byte for byte as they were")
+        real.verify()
+
+
+def needs_dir(rig, path, harness):
+    os.makedirs(path, exist_ok=True)
+    rc, err = rig.integrate(harness)
+    return None if rc == 0 else f"the install failed ({err.strip()})"
+
+
+def claude_real():
+    binary = os.path.expanduser("~/.local/bin/claude")
+    real_smoke("claude_real", "claude", launcher(binary) if os.path.exists(binary) else None,
+               lambda rig: needs_dir(rig, f"{rig.home}/.claude", "claude-resume"),
+               ["~/.claude/settings.json", "~/.claude/settings.local.json", "~/.claude/CLAUDE.md"])
+
+
+def codex_real():
+    binary = dev_which("codex")
+    argv = launcher(binary) if binary else None
+    real_smoke("codex_real", "codex", argv,
+               lambda rig: needs_dir(rig, f"{rig.home}/.codex", "codex-resume"),
+               ["~/.codex/config.toml", "~/.codex/hooks.json"])
+    # The nested-run filter against the real codex: the same start, inside an
+    # outer codex's thread. A report there would mean the filter failed.
+    real_smoke("codex_real_nested", "codex", argv,
+               lambda rig: needs_dir(rig, f"{rig.home}/.codex", "codex-resume"),
+               ["~/.codex/config.toml", "~/.codex/hooks.json"],
+               env_line="CODEX_THREAD_ID=an-outer-session-0000 ")
+
+
+def pi_real():
+    cli = os.environ.get("REMUX_PI_CLI")
+    node = dev_which("node")
+    argv = [node, os.path.realpath(cli)] if cli and node else None
+    real_smoke("pi_real", "pi", argv,
+               lambda rig: needs_dir(rig, f"{rig.home}/.pi/agent", "pi-resume"),
+               ["~/.pi"])
 
 
 def omp_real():
-    launcher = os.path.realpath(os.path.expanduser("~/.bun/bin/omp"))
-    bun = shutil.which("bun") or os.path.expanduser("~/.bun/bin/bun")
-    if not (os.path.exists(launcher) and os.path.exists(bun)):
-        print("SMOKE omp_real: skipped, no omp or bun installed")
-        return
-    real = os.path.expanduser("~/.omp")
+    binary = dev_which("omp") or os.path.expanduser("~/.bun/bin/omp")
+    real_smoke("omp_real", "omp", launcher(binary) if os.path.exists(binary) else None,
+               lambda rig: needs_dir(rig, f"{rig.home}/.omp/agent", "omp-resume"),
+               ["~/.omp"], wait_s=25)
 
-    def sha():
-        out = subprocess.run(["sh", "-c", f"find {real} -type f -exec sha256sum {{}} + 2>/dev/null | sort"],
-                             capture_output=True, timeout=60)
-        return out.stdout
-    before = sha()
-    rig = Rig("omp-real")
-    try:
-        os.makedirs(f"{rig.home}/.omp/agent")
-        rc, err = rig.integrate("omp-resume")
-        if rc != 0:
-            print(f"SMOKE omp_real: skipped, the install failed ({err.strip()})")
-            return
-        pane = None
-        c = Client(rig.srv.sock)
-        c.hello()
-        c.send({"CliSpawn": {"session": "main", "placement": "SplitBelow"}})
-        for m in c.drain(2.0):
-            if name_of(m) == "CliSpawned":
-                pane = m["CliSpawned"]["pane_id"]
-        c.close()
-        time.sleep(0.5)
-        line = f"{bun} {launcher}\n"
-        rig.cli.send({"InputToPane": {"pane_id": pane, "data": list(line.encode())}})
-        end = time.time() + 25
-        found = None
-        while time.time() < end and found is None:
-            found = re.search(rf'agent session: pane %{pane} "omp" (\w+) \d+ bytes source=(\S+) -> (\w+)',
-                              rig.srv.log())
-            time.sleep(0.5)
-        if found:
-            print(f"SMOKE omp_real: the real omp reported its session: kind={found.group(1)} "
-                  f"source={found.group(2)} -> {found.group(3)}")
-        else:
-            refused = re.findall(rf"agent session: pane %{pane} .*", rig.srv.log())
-            print(f"SMOKE omp_real: no report from the real omp within 25 s "
-                  f"(lines for the pane: {refused[:3]})")
-    finally:
-        rig.close()
-    check(sha() == before, "omp_real: the real ~/.omp is byte for byte as it was")
+
+def opencode_real():
+    """`--mini` creates a session at startup, so the server plugin reports it
+    once OpenCode's first-start bootstrap (which downloads @opencode-ai/plugin
+    into the throwaway config dir) is done. Under `unshare -rn` (Linux, no
+    network) that bootstrap cannot finish; where unshare is absent (macOS) it
+    runs with the network, as a first start does."""
+    binary = dev_which("opencode") or os.path.expanduser("~/.opencode/bin/opencode")
+    unshare = shutil.which("unshare")
+    base = launcher(binary) if os.path.exists(binary) else None
+    if not base:
+        argv = None
+    elif unshare:
+        argv = [unshare, "-rn", *base, "--mini"]
+    else:
+        argv = [*base, "--mini"]
+
+    def prepare(rig):
+        return needs_dir(rig, f"{rig.env['XDG_CONFIG_HOME']}/opencode", "opencode-resume")
+    real_smoke("opencode_real", "opencode", argv, prepare,
+               ["~/.config/opencode", "~/.local/state/opencode", "~/.local/share/opencode"],
+               wait_s=60)
 
 
 def claude():
@@ -562,7 +672,8 @@ def claude():
 
 MODES = {"claude": claude, "codex": codex,
          "pi": lambda: extension_mode("pi"), "omp": lambda: extension_mode("omp"),
-         "opencode": opencode, "omp_real": omp_real, "opencode_real": opencode_real}
+         "opencode": opencode, "omp_real": omp_real, "opencode_real": opencode_real,
+         "claude_real": claude_real, "codex_real": codex_real, "pi_real": pi_real}
 DEFAULT = ["claude", "codex", "pi", "omp", "opencode"]
 
 

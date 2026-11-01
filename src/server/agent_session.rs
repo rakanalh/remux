@@ -234,8 +234,9 @@ pub fn plan(record: &AgentSessionRecord) -> Option<Vec<String>> {
     let value = record.value.clone();
     // The value is joined to its flag, or follows `--`, wherever the agent's
     // parser takes that form, so that even a valid value is never read as an
-    // option. pi's parser could not be checked, so it keeps `--session <v>`;
-    // its values cannot start with `-` (see `validate`).
+    // option. pi takes neither (0.73's parser matches `--session` exactly),
+    // but it consumes the next argument as the value whatever it is, so
+    // `--session <v>` cannot be read as two options either.
     let words = match record.agent.as_str() {
         "claude" => vec!["claude".into(), format!("--resume={value}")],
         "codex" => vec!["codex".into(), "resume".into(), "--".into(), value],
@@ -498,8 +499,9 @@ mod tests {
     }
 
     /// Every argv `plan` builds keeps the value out of option position: joined
-    /// to its flag, or after `--`. pi takes `--session <value>` because pi's
-    /// own parser could not be checked here; its values cannot start with `-`.
+    /// to its flag, or after `--`. pi is the exception, and safe for its own
+    /// reason: its parser takes the word after `--session` as the value
+    /// whatever it is, and accepts no joined form.
     #[test]
     fn the_value_is_never_a_word_of_its_own_after_a_bare_flag() {
         let value = "abc";
