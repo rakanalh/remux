@@ -36,7 +36,9 @@ pi and omp (the same stub, installed as `pi` / `omp`, runs node with
 the extension's execFile reaches the CLI inside the pane, and the driver
 records each call's args, stdout and stderr):
   m1  session_start with an absolute session file -> --path, Stored as a path
-  m2  agent_start, the same file -> Unchanged
+  m2  a session start then two agent_starts, the same file -> ONE call (the
+      start's, Unchanged): agent_start fires every turn, and an unchanged
+      session spawns nothing
   m3  agent_start, the file changed under the agent -> session_held
   m4  session_switch with an allowlisted reason -> Replaced
   m5  pi outside its TUI / omp with no UI -> no call, no connection
@@ -305,8 +307,9 @@ def extension_mode(agent):
         first, second = "/home/u/.pi/sessions/one.jsonl", "/home/u/.pi/sessions/two.jsonl"
         drive(main, f"m1 {agent} session_start, absolute file", {**ui, "file": first, "id": "ignored"},
               [{"type": "session_start", "reason": start}], "Stored", kind="path")
-        drive(main, f"m2 {agent} agent_start, same file", {**ui, "file": first},
-              [{"type": "agent_start"}], "Unchanged")
+        drive(main, f"m2 {agent} agent_start, same file, makes no call", {**ui, "file": first},
+              [{"type": "session_start", "reason": start}, {"type": "agent_start"},
+               {"type": "agent_start"}], "Unchanged")
         drive(main, f"m3 {agent} agent_start, a changed file", {**ui, "file": second},
               [{"type": "agent_start"}], "session_held")
         drive(main, f"m4 {agent} session_switch ({switch})", {**ui, "file": second},

@@ -23,7 +23,11 @@ function reporting(ctx: any): boolean {
   return ctx?.hasUI === true && process.env.OMPCODE !== "1";
 }
 
-function report(ctx: any, source?: string): void {
+// The last reference sent. agent_start fires on every turn, and an unchanged
+// session must not spawn the remux CLI each time.
+let last = "";
+
+function report(ctx: any, source?: string, onlyIfChanged = false): void {
   if (!reporting(ctx)) {
     return;
   }
@@ -43,6 +47,11 @@ function report(ctx: any, source?: string): void {
   } else {
     return;
   }
+  const ref = args.slice(3).join("\0");
+  if (onlyIfChanged && ref === last) {
+    return;
+  }
+  last = ref;
   if (source) {
     args.push("--source", source);
   }
@@ -59,8 +68,8 @@ export default function (pi: any): void {
     report(ctx, event?.reason ?? "resume");
   });
   // No source: a session that changed under the agent without a start or a
-  // switch is refused by remux, and an unchanged one is a no-op.
+  // switch is refused by remux. An unchanged one is not sent at all.
   pi.on("agent_start", (_event: any, ctx: any) => {
-    report(ctx);
+    report(ctx, undefined, true);
   });
 }

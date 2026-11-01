@@ -191,9 +191,9 @@ impl Integration for OpencodeResume {
         Ok(Vec::new())
     }
 
+    /// The TUI config's entry goes first: a failure there leaves both files
+    /// in place, never a config listing a plugin that is gone.
     fn uninstall(&self) -> Result<Vec<String>> {
-        let mut notes = self.server.uninstall()?;
-        notes.extend(self.tui.uninstall()?);
         let read = read_for_edit(&self.tui_config(), self.euid)?;
         if let Some(text) = &read.text {
             if let Some(after) = remove_plugin(text, &self.entry())
@@ -202,6 +202,8 @@ impl Integration for OpencodeResume {
                 write_atomically(&read.path, &after, read.fingerprint, None)?;
             }
         }
+        let mut notes = self.server.uninstall()?;
+        notes.extend(self.tui.uninstall()?);
         Ok(notes)
     }
 }

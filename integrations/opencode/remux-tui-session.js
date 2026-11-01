@@ -14,8 +14,9 @@ import { execFile } from "node:child_process";
 const REMUX_BIN = "__REMUX_BIN__";
 
 // OpenCode 1.18 has no event for a session being selected, so the open route
-// is polled. A poll that finds the same session does nothing.
-const POLL_MS = 250;
+// is polled. A poll that finds the same session does nothing, and the CLI runs
+// only when the ROOT of the open session changes.
+const POLL_MS = 500;
 
 function report(id) {
   try {

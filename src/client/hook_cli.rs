@@ -581,7 +581,10 @@ async fn report_session(
         SessionInput::Hook => {
             let payload = read_payload().map_err(|e| Some(e.to_string()))?;
             if let Some(why) = not_reported(&agent, &payload, &HookEnv::read()) {
-                log::debug!("cmd: agent session {}: not reported, {why}", escape(&agent));
+                log::debug!(
+                    "cmd: agent session {}: not reported, {why}",
+                    crate::server::agent_session::agent_label(&agent)
+                );
                 return Err(None);
             }
             let id = payload

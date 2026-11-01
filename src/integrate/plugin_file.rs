@@ -254,9 +254,11 @@ impl PluginFile {
         match self.on_disk(read.text.as_deref()) {
             OnDisk::Absent => Ok(Vec::new()),
             OnDisk::Foreign => Ok(vec![self.foreign()]),
+            // The path itself, which may be a link into the user's dotfiles:
+            // the file it names is theirs.
             OnDisk::Installed | OnDisk::Stale => {
-                std::fs::remove_file(&read.path)
-                    .with_context(|| format!("removing {}", read.path.display()))?;
+                std::fs::remove_file(&self.path)
+                    .with_context(|| format!("removing {}", self.path.display()))?;
                 Ok(Vec::new())
             }
         }
@@ -332,6 +334,28 @@ mod tests {
             std::fs::read_to_string(p.path()).unwrap(),
             "// my own plugin\n"
         );
+    }
+
+    /// A plugin path that is a symlink (into a dotfiles repo, say) is
+    /// written through, but uninstall removes the LINK: the file it names is
+    /// the user's, and deleting it would leave a dangling link behind.
+    #[test]
+    fn uninstall_through_a_symlink_removes_the_link_and_keeps_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = plugin(dir.path());
+        let target = dir.path().join("dotfiles").join("demo.ts");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, TEMPLATE).unwrap();
+        std::fs::create_dir_all(p.path().parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, p.path()).unwrap();
+        p.install().unwrap();
+        assert!(target.exists(), "install writes through the link");
+        p.uninstall().unwrap();
+        assert!(
+            std::fs::symlink_metadata(p.path()).is_err(),
+            "the link is gone"
+        );
+        assert!(target.exists(), "and the file it named is kept");
     }
 
     #[test]

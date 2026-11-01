@@ -122,6 +122,9 @@ impl Integration for CodexResume {
     fn install(&self) -> Result<Vec<String>> {
         require_dir(&self.dir, "codex", "CODEX_HOME")?;
         self.hooks.check_binary()?;
+        // Every refusal of either file is found before the first write, so a
+        // refused hooks.json never leaves config.toml changed on its own.
+        self.hooks.plan()?;
         let (config, after) = self.config_change()?;
         if let Some(text) = after {
             write_atomically(&config.path, &text, config.fingerprint, Some(0o644))?;

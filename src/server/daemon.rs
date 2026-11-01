@@ -4169,8 +4169,8 @@ async fn handle_agent_session(
     match verdict {
         Ok(Some(outcome)) => {
             log::info!(
-                "agent session: pane %{pane} {} {kind} {bytes} bytes source={source} -> {outcome:?}",
-                loggable(&report.agent)
+                "agent session: pane %{pane} {:?} {kind} {bytes} bytes source={source} -> {outcome:?}",
+                crate::server::agent_session::agent_label(&report.agent)
             );
             // The `panes` lock is released by now: `save_if_enabled` takes
             // `state` and then `panes`, so saving under it would invert that
@@ -4183,8 +4183,8 @@ async fn handle_agent_session(
         Ok(None) => ServerMessage::refused("no_such_target", format!("no such target: %{pane}")),
         Err(refusal) => {
             log::info!(
-                "agent session: pane %{pane} {} {kind} {bytes} bytes source={source} -> {}{}",
-                loggable(&report.agent),
+                "agent session: pane %{pane} {:?} {kind} {bytes} bytes source={source} -> {}{}",
+                crate::server::agent_session::agent_label(&report.agent),
                 refusal.code(),
                 refusal
                     .reason()
@@ -5110,8 +5110,8 @@ impl PaneData {
             return false;
         };
         log::info!(
-            "agent session: pane %{pane_id} forgot {} {} (shell foreground)",
-            loggable(&record.agent),
+            "agent session: pane %{pane_id} forgot {:?} {} (shell foreground)",
+            crate::server::agent_session::agent_label(&record.agent),
             record.kind.as_str()
         );
         true
@@ -5864,6 +5864,9 @@ impl RemuxServer {
                 let dormant = self.dormant.lock().await;
                 merge_dormant_into(&mut persisted, &dormant);
             }
+            if !self.config.general.resume_agents {
+                persisted.agent_sessions.clear();
+            }
             if let Err(e) = crate::server::persistence::save_state(&persisted) {
                 log::error!("failed to save state on shutdown: {e}");
             } else {
@@ -6355,9 +6358,9 @@ async fn handle_client_message(
             pane_hint,
         } => {
             log::debug!(
-                "server: client_id={client_id} msg=AgentSession(agent={}, {}, {} bytes, \
+                "server: client_id={client_id} msg=AgentSession(agent={:?}, {}, {} bytes, \
                  source={}, pane={pane:?}, pane_hint={pane_hint:?})",
-                loggable(agent),
+                crate::server::agent_session::agent_label(agent),
                 reference.kind().as_str(),
                 reference.value().len(),
                 source.as_deref().map_or("None".to_string(), loggable)
@@ -17246,6 +17249,11 @@ async fn save_if_enabled(
             let d = dormant.lock().await;
             merge_dormant_into(&mut persisted, &d);
         }
+        // Off means no id on disk, including one a dormant session carried
+        // over from before the switch.
+        if !config.general.resume_agents {
+            persisted.agent_sessions.clear();
+        }
         if let Err(e) = crate::server::persistence::save_state(&persisted) {
             log::error!("failed to save state: {e}");
         }
@@ -17407,10 +17415,7 @@ async fn materialize_session(
         };
         if let Some(record) = record {
             if *typed > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    config.general.resume_agent_delay_ms,
-                ))
-                .await;
+                tokio::time::sleep(resume_gap(config.general.resume_agent_delay_ms)).await;
             }
             type_resume(*pane_id, record, panes).await;
             *typed += 1;
@@ -17443,7 +17448,10 @@ async fn resumable<'a>(
     record: &'a AgentSessionRecord,
     cwd: Option<&str>,
 ) -> Option<&'a AgentSessionRecord> {
-    let agent = loggable(&record.agent);
+    let agent = format!(
+        "{:?}",
+        crate::server::agent_session::agent_label(&record.agent)
+    );
     if let Err(refusal) = record.validate() {
         log::warn!(
             "agent session: pane %{pane_id} {agent} record dropped on restore ({})",
@@ -17472,11 +17480,21 @@ fn log_duplicates(
     for (pane_id, record) in all {
         if !winners.contains_key(pane_id) {
             log::info!(
-                "agent session: pane %{pane_id} {} record dropped on restore (another pane runs it)",
-                loggable(&record.agent)
+                "agent session: pane %{pane_id} {:?} record dropped on restore (another pane runs it)",
+                crate::server::agent_session::agent_label(&record.agent)
             );
         }
     }
+}
+
+/// The longest wait between two typed resumes, whatever is configured: the
+/// restore runs before the server accepts a connection, so every client, and
+/// each resumed agent's own report, waits out the whole stagger.
+const MAX_RESUME_GAP_MS: u64 = 2000;
+
+/// The wait between two typed resumes for a configured `ms`.
+fn resume_gap(ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(ms.min(MAX_RESUME_GAP_MS))
 }
 
 /// Type `record`'s resume command into the freshly spawned shell of `pane_id`
@@ -17499,8 +17517,8 @@ async fn type_resume(
     pd.agent_session = Some(record.clone());
     drop(ps);
     log::info!(
-        "typed resume for pane %{pane_id} agent={} ({} bytes)",
-        loggable(&record.agent),
+        "typed resume for pane %{pane_id} agent={:?} ({} bytes)",
+        crate::server::agent_session::agent_label(&record.agent),
         line.len()
     );
 }
@@ -18182,6 +18200,18 @@ mod tests {
         assert!(take_dormant_session(&mut dormant, &mut live, "alpha").is_none());
         // An unknown name returns None.
         assert!(take_dormant_session(&mut dormant, &mut live, "nope").is_none());
+    }
+
+    /// The restore runs before the server accepts connections, so a typo in
+    /// `resume_agent_delay_ms` would otherwise hold every client, and the
+    /// resumed agents' own hooks, in the socket's backlog.
+    #[test]
+    fn the_resume_gap_is_clamped() {
+        use super::resume_gap;
+        assert_eq!(resume_gap(100), std::time::Duration::from_millis(100));
+        assert_eq!(resume_gap(1500), std::time::Duration::from_millis(1500));
+        assert_eq!(resume_gap(60_000), std::time::Duration::from_millis(2000));
+        assert_eq!(resume_gap(u64::MAX), std::time::Duration::from_millis(2000));
     }
 
     #[test]

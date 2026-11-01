@@ -43,6 +43,16 @@ impl AgentSessionRecord {
     }
 }
 
+/// `agent` as it may be logged: one of the agents remux knows, else
+/// `<invalid>`. The field is whatever the sender put there, and arguments
+/// given in the wrong order put the session id in it.
+pub fn agent_label(agent: &str) -> &'static str {
+    ["claude", "codex", "opencode", "pi", "omp"]
+        .into_iter()
+        .find(|known| *known == agent)
+        .unwrap_or("<invalid>")
+}
+
 /// Why a report is refused, as the `code` of a `ServerMessage::Error`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {

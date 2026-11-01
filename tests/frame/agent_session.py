@@ -52,6 +52,12 @@ On a server of its own, with `resume_agents = false`:
 disabled        a report is refused `disabled`, state.json holds no record,
                 and a restart types nothing.
 
+On a server of its own, restarted with `resume_agents = false` and
+`automatic_restore = false`:
+disabled_dormant  a record saved before the switch is not carried through the
+                dormant store into the next save: turning the feature off keeps
+                ids off the disk.
+
 On a server of its own, with `save_sessions = false`:
 no_save         a report is answered, no state.json is ever written, and a
                 restart brings back nothing to type.
@@ -79,6 +85,9 @@ resurrect_dedupes_against_live  two sessions' panes hold the same id;
                 resurrecting the first types it, resurrecting the second types
                 nothing for its pane, because a live pane already runs it.
 
+bad_agent_label an agent name that is not one remux knows (here an id passed
+                in the agent's place) reaches neither log: it is logged as
+                `<invalid>`.
 redaction       server.log and client.log carry the summary line with the id's
                 byte count and never the id.
 no_panic        server.log has no `panicked at`.
@@ -507,6 +516,25 @@ def sender_unverified(rig):
     check(outcome(r) == "Stored", f"sender_unverified: the pane still holds nothing (got {r})")
 
 
+def disabled_dormant(rig):
+    pane = rig.spawn()
+    check(outcome(report(rig, pane, "claude", {"Id": RESTORE_ID}, source="startup")) == "Stored",
+          "disabled_dormant: setup, a record is Stored while the feature is on")
+    config = f"{rig.srv.rundir}/config/remux/config.toml"
+
+    def switch_off():
+        with open(config, "w") as f:
+            f.write(CONFIG.replace("automatic_restore = true", "automatic_restore = false")
+                    + "resume_agents = false\n")
+
+    rig.restart(between=switch_off)
+    held = (rig.state_json() or {}).get("agent_sessions", {})
+    rig.cli.close()
+    rig.srv.stop()
+    saved = (rig.state_json() or {}).get("agent_sessions")
+    check(saved in (None, {}), f"disabled_dormant: the next save holds no record (got {saved}; before {held})")
+
+
 def no_save(rig):
     pane = rig.spawn()
     r = report(rig, pane, "claude", {"Id": RESTORE_ID}, source="startup")
@@ -668,11 +696,14 @@ def on_own_server(suffix, config, case, base=CONFIG):
 
 
 def main():
-    groups = sys.argv[1:] or ["main", "disabled", "no_save", "stagger", "hardening", "resurrect"]
+    groups = sys.argv[1:] or ["main", "disabled", "disabled_dormant", "no_save", "stagger",
+                              "hardening", "resurrect"]
     if "main" in groups:
         main_server()
     if "disabled" in groups:
         on_own_server("disabled", "resume_agents = false\n", disabled)
+    if "disabled_dormant" in groups:
+        on_own_server("disabled_dormant", "", disabled_dormant)
     if "no_save" in groups:
         on_own_server("no_save", "", no_save, base=CONFIG.replace(
             "save_sessions = true", "save_sessions = false"))
@@ -728,6 +759,17 @@ def main_server():
         r = report(rig, None, "claude", {"Id": UUID})
         check(code(r) == "not_in_pane", f"not_in_pane: an outside caller naming no pane (got {r})")
         sender_unverified(rig)
+        secret = "c0ffee00-swapped-into-agent-place-9f8e7d6c"
+        r = report(rig, fresh, secret, {"Id": "claude"})
+        check(code(r) == "bad_agent", f"bad_agent_label: an id in the agent's place is bad_agent (got {r})")
+        run = cli(rig, [secret, "--id", "claude", "--pane", f"%{fresh}"], drop=("REMUX_PANE",))
+        check(run.returncode == 0 and b"bad_agent" in run.stderr,
+              f"bad_agent_label: the CLI reports it refused ({run.stderr!r})")
+        for name, text in (("server.log", rig.srv.log()),
+                           ("client.log", read(f"{rig.srv.rundir}/state/remux/client.log"))):
+            check(secret not in text, f"bad_agent_label: {name} never holds the invalid agent string")
+        check('AgentSession(agent="<invalid>", id, 6 bytes' in rig.srv.log(),
+              "bad_agent_label: server.log names it <invalid>")
 
         cli_attributed(rig)
         cli_stdout(rig)

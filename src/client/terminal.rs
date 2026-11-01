@@ -439,8 +439,9 @@ fn client_message_summary(msg: &ClientMessage) -> String {
             pane,
             pane_hint,
         } => format!(
-            "AgentSession(agent={agent:?}, {}, {} bytes, source={source:?}, pane={pane:?}, \
+            "AgentSession(agent={:?}, {}, {} bytes, source={source:?}, pane={pane:?}, \
              pane_hint={pane_hint:?})",
+            crate::server::agent_session::agent_label(agent),
             reference.kind().as_str(),
             reference.value().len()
         ),

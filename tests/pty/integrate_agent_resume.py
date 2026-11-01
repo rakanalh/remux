@@ -41,6 +41,8 @@ codex (the hook in `$CODEX_HOME/hooks.json`, the flag in its config.toml):
   x6  a config.toml with no [features] gains the table exactly once
   x7  --dry-run writes nothing
   x8  a missing CODEX_HOME is refused and nothing is created
+  x9  a hooks.json the install must refuse (a second hard link) leaves
+      config.toml untouched too: nothing is half-installed
 
 pi and omp (the extension `extensions/remux-agent-session.ts`; pi at its
 default `~/.pi/agent`, omp at `~/$PI_CONFIG_DIR/agent` with a custom name, and
@@ -74,6 +76,8 @@ listed in `tui.jsonc` / `tui.json`):
   q7  a file without remux's header at either plugin path is refused and
       nothing is written
   q8  a missing config dir is refused and nothing is created
+  q9  an uninstall that cannot edit tui.jsonc (it no longer parses) removes
+      neither plugin file, so the config never lists a file that is gone
 
 Run: python3 tests/pty/integrate_agent_resume.py [claude codex pi omp opencode ...]
 """
@@ -365,6 +369,20 @@ def codex():
     check(rc == 0 and "hooks = true" in out and changed(before, dry.snapshot()) == [],
           f"x7 --dry-run shows both changes and writes nothing ({out.strip()[:100]!r})")
 
+    linked = Tree("codex-link")
+    ld = linked.dirs["CODEX_HOME"]
+    os.makedirs(ld)
+    with open(f"{ld}/config.toml", "w") as f:
+        f.write(seeded)
+    with open(f"{ld}/hooks.json", "w") as f:
+        f.write("{}\n")
+    os.link(f"{ld}/hooks.json", f"{linked.root}/other-name.json")
+    before = linked.snapshot()
+    rc, _, err = linked.integrate(h)
+    check(rc != 0 and "hard link" in err and changed(before, linked.snapshot()) == [],
+          f"x9 a refused hooks.json leaves config.toml untouched (rc={rc}, err={err.strip()!r}, "
+          f"changed {changed(before, linked.snapshot())})")
+
     missing = Tree("codex-missing")
     before = missing.snapshot()
     rc, _, err = missing.integrate(h)
@@ -525,6 +543,19 @@ def opencode():
         rc, _, err = mine.integrate(h)
         check(rc != 0 and "not a file remux wrote" in err and changed(before, mine.snapshot()) == [],
               f"q7 a headerless {label} plugin file is refused and nothing is written (rc={rc}, err={err.strip()!r})")
+
+    broken = Tree("opencode-broken")
+    bd = broken.dirs["OPENCODE_CONFIG_DIR"]
+    os.makedirs(bd)
+    with open(f"{bd}/tui.jsonc", "w") as f:
+        f.write(seeded)
+    rc, _, _ = broken.integrate(h)
+    with open(f"{bd}/tui.jsonc", "w") as f:
+        f.write("{ \"plugin\": [ unparseable\n")
+    rc, _, err = broken.integrate(h, "--uninstall")
+    check(rc != 0 and os.path.exists(f"{bd}/plugins/remux-agent-session.js")
+          and os.path.exists(f"{bd}/remux-tui-session.js"),
+          f"q9 an uninstall that cannot edit tui.jsonc leaves both plugins (rc={rc}, err={err.strip()!r})")
 
     missing = Tree("opencode-missing")
     before = missing.snapshot()
