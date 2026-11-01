@@ -73,8 +73,9 @@ enum IntegrateHarness {
     /// omp: the remux-agent-session.ts extension in ~/$PI_CONFIG_DIR/agent
     /// (~/.omp/agent by default)
     OmpResume,
-    /// OpenCode 1.18: a server plugin in $OPENCODE_CONFIG_DIR/plugins/ and a
-    /// TUI plugin listed in its tui.json(c) (~/.config/opencode by default)
+    /// OpenCode 1.x and 2.x: a server plugin and a TUI plugin under
+    /// $OPENCODE_CONFIG_DIR/plugins/, the TUI one also listed in its
+    /// tui.json(c) for 1.x (~/.config/opencode by default)
     OpencodeResume,
 }
 

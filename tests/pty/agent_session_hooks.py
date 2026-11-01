@@ -57,6 +57,18 @@ the T18 spike recorded; the driver records each CLI call):
       makes no second call
   w5  TUI plugin: the route moves to another root session -> Replaced
   w6  server plugin under `opencode --mini` -> reports, as `run` does
+then the same two files driven as OpenCode 2.x drives them (`api: v2`):
+  w7  the server plugin has a `setup`, and calling it (v2's shared background
+      service, or 1.18's TUI worker, which calls it beside `server`) makes no
+      call and no connection
+  w8  TUI `setup`: the route goes from home to a CHILD session -> one call,
+      --id <root> --source select, Stored; polled again, no second call
+  w9  TUI `setup`: the child is on screen before the store has loaded it ->
+      still one call, for the ROOT, never the child first
+  w10 TUI `setup` in a TUI started with `--server <url>` or `--server=<url>`
+      (a session on another machine) -> no call, no connection
+  w11 TUI `setup` with `--standalone` -> reports
+  w12 TUI `setup`: the route moves to another root -> Replaced
 
 The *_real modes (OPTIONAL, never a failure, not in the default run) start the
 REAL agent: claude_real, codex_real (and codex_real_nested, the same start
@@ -355,7 +367,8 @@ def opencode():
         os.makedirs(config)
         rc, err = rig.integrate("opencode-resume")
         check(rc == 0, f"setup: opencode-resume installs into the throwaway HOME (rc={rc}, err={err!r})")
-        server, tui = f"{config}/plugins/remux-agent-session.js", f"{config}/remux-tui-session.js"
+        server = f"{config}/plugins/remux-agent-session.js"
+        tui = f"{config}/plugins/remux-tui-session/tui.js"
         record = f"{rig.srv.rundir}/calls.jsonl"
         count = [0]
 
@@ -383,6 +396,10 @@ def opencode():
                                              if os.path.exists(record) else [])]
             return (ran[0] if ran else None, calls, rig.verdicts(fake.pane)[before:],
                     rig.connections() - before_conn)
+
+        def called(ran):
+            lines = [ln for ln in (ran or {}).get("stdout", "").splitlines() if ln.startswith("{")]
+            return json.loads(lines[0]).get("called") if lines else None
 
         def created(sid, parent=None, kind="session.created"):
             info = {"id": sid, **({"parentID": parent} if parent else {})}
@@ -425,6 +442,58 @@ def opencode():
         _, calls, got, _ = drive(mini_pane, server, {"argv": ["--mini"], "events": [created(other)]})
         check([c["args"][4] for c in calls] == [other] and got == ["Stored"],
               f"w6 --mini reports from the server plugin (calls {calls}, got {got})")
+
+        v2_server = stub("oc2-server")
+        for argv in (["serve", "--service"], []):
+            ran, calls, got, conns = drive(v2_server, server, {"api": "v2", "argv": argv})
+            check(ran and ran["rc"] == 0 and called(ran) == "setup" and calls == [] and got == []
+                  and conns == 0,
+                  f"w7 the server plugin's setup (argv {argv}) runs and makes no call "
+                  f"(hook {called(ran)}, rc {ran and ran['rc']}, calls {calls}, conns {conns})")
+
+        def session_route(sid):
+            return {"type": "session", "sessionID": sid}
+
+        v2_tui = stub("oc2-tui")
+        ran, calls, got, _ = drive(v2_tui, tui, {
+            "api": "v2", "sessions": {child: {"parentID": root}, root: {}},
+            "routes": [{"after_ms": 300, "route": session_route(child)}], "run_ms": 1600})
+        check(called(ran) == "setup"
+              and [c["args"] for c in calls] == [["agent", "session", "opencode", "--id", root, "--source", "select"]]
+              and all(c["stdout"] == "" for c in calls),
+              f"w8 v2 setup reports the selected child's ROOT once, with select (hook {called(ran)}, calls {calls})")
+        check(got == ["Stored"], f"w8 the server stored it (got {got})")
+
+        late = stub("oc2-late")
+        ran, calls, got, _ = drive(late, tui, {
+            "api": "v2", "sessions": {child: {"parentID": root, "loaded_after_ms": 900},
+                                      root: {"loaded_after_ms": 900}},
+            "routes": [{"after_ms": 100, "route": session_route(child)}], "run_ms": 2200})
+        check(called(ran) == "setup" and [c["args"][4] for c in calls] == [root] and got == ["Stored"],
+              f"w9 a child on screen before the store loads it is reported once, as its root "
+              f"(hook {called(ran)}, calls {[c['args'][4] for c in calls]}, got {got})")
+
+        for flag in (["--server", "http://10.0.0.9:4096"], ["--server=http://10.0.0.9:4096"]):
+            remote = stub("oc2-remote" + str(len(flag)))
+            ran, calls, got, conns = drive(remote, tui, {
+                "api": "v2", "argv": flag, "sessions": {root: {}},
+                "routes": [{"after_ms": 200, "route": session_route(root)}], "run_ms": 1200})
+            check(called(ran) == "setup" and calls == [] and got == [] and conns == 0,
+                  f"w10 a TUI attached with {flag[0].split('=')[0]} makes no call "
+                  f"(hook {called(ran)}, calls {calls}, conns {conns})")
+
+        standalone = stub("oc2-standalone")
+        ran, calls, got, _ = drive(standalone, tui, {
+            "api": "v2", "argv": ["--standalone"], "sessions": {root: {}},
+            "routes": [{"after_ms": 200, "route": session_route(root)}], "run_ms": 1200})
+        check(called(ran) == "setup" and [c["args"][4] for c in calls] == [root] and got == ["Stored"],
+              f"w11 --standalone reports (hook {called(ran)}, calls {calls}, got {got})")
+
+        ran, calls, got, _ = drive(v2_tui, tui, {
+            "api": "v2", "sessions": {other: {}},
+            "routes": [{"after_ms": 300, "route": session_route(other)}], "run_ms": 1200})
+        check([c["args"][4] for c in calls] == [other] and got == ["Replaced"],
+              f"w12 v2: a different session selected is Replaced (calls {calls}, got {got})")
         check("panicked at" not in rig.srv.log(), "opencode: no panic in server.log")
     finally:
         rig.close()

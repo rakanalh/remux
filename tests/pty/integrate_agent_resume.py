@@ -60,8 +60,9 @@ default `~/.pi/agent`, omp at `~/$PI_CONFIG_DIR/agent` with a custom name, and
   e8  a missing agent dir is refused and nothing is created
   e9  with $PI_CODING_AGENT_DIR set, pi and omp resolve to one dir: refused
 
-opencode (a server plugin in `plugins/`, a TUI plugin at the dir's top level
-listed in `tui.jsonc` / `tui.json`):
+opencode (a server plugin in `plugins/`, a TUI plugin in its own directory
+`plugins/remux-tui-session/`, which OpenCode 2.x finds by itself and 1.x reads
+from the entry in `tui.jsonc` / `tui.json`):
   q1  a fresh config dir is Absent
   q2  with a commented tui.jsonc and OpenCode's own files (package.json,
       .gitignore, node_modules/) present, install writes both plugins and adds
@@ -70,7 +71,8 @@ listed in `tui.jsonc` / `tui.json`):
   q3  --status is Installed
   q4  a second install changes no byte, inode or mtime
   q5  --uninstall removes both plugins and the entry, and tui.jsonc is byte for
-      byte what it was before the install
+      byte what it was before the install, and the emptied
+      plugins/remux-tui-session/ is gone
   q6  with no tui.json(c), install creates tui.json holding the schema and the
       one entry; with only tui.json, that file is the one edited
   q7  a file without remux's header at either plugin path is refused and
@@ -78,6 +80,15 @@ listed in `tui.jsonc` / `tui.json`):
   q8  a missing config dir is refused and nothing is created
   q9  an uninstall that cannot edit tui.jsonc (it no longer parses) removes
       neither plugin file, so the config never lists a file that is gone
+  q10 cli.json (OpenCode 2.x's, which its one-shot migration fills from
+      tui.json): install never creates or touches it; --uninstall removes
+      remux's entry from its `plugins` and keeps every other byte, including
+      the user's own entries, an `{package, options}` entry, a `-id` entry and
+      the comments
+  q11 a file of the user's inside plugins/remux-tui-session/ keeps that
+      directory; only remux's tui.js goes
+  q12 a cli.json that does not parse is left byte for byte, with a note,
+      and the uninstall still removes both plugins
 
 Run: python3 tests/pty/integrate_agent_resume.py [claude codex pi omp opencode ...]
 """
@@ -484,7 +495,7 @@ def opencode():
                        ("node_modules/@opencode-ai/plugin/index.js", "export {}\n")):
         with open(f"{d}/{name}", "w") as f:
             f.write(text)
-    server, tui = f"{d}/plugins/remux-agent-session.js", f"{d}/remux-tui-session.js"
+    server, tui = f"{d}/plugins/remux-agent-session.js", f"{d}/plugins/remux-tui-session/tui.js"
     rc, out, _ = t.integrate(h, "--status")
     check(rc == 0 and "Absent" in out, f"q1 a fresh config dir is Absent ({out.strip()!r})")
 
@@ -499,8 +510,9 @@ def opencode():
     check(rc == 0 and added == [f'    {json.dumps(tui)},'] and
           [ln for ln in text.splitlines() if ln in seeded.splitlines()] == seeded.splitlines(),
           f"q2 tui.jsonc gains exactly one entry line and keeps every other (rc={rc}, err={err.strip()!r}, added={added})")
-    check(changed(before, after) == sorted([f"{d}/plugins", server, tui, f"{d}/tui.jsonc"]),
-          f"q2 only the two plugins, plugins/ and tui.jsonc changed ({changed(before, after)})")
+    check(changed(before, after) == sorted([f"{d}/plugins", server, os.path.dirname(tui), tui,
+                                           f"{d}/tui.jsonc"]),
+          f"q2 only the two plugins, their directories and tui.jsonc changed ({changed(before, after)})")
     for path in (server, tui):
         body = open(path).read() if os.path.exists(path) else ""
         node = subprocess.run(["node", "--check", path], capture_output=True, timeout=30)
@@ -519,6 +531,8 @@ def opencode():
           f"q5 uninstall removes both plugins (rc={rc}, err={err.strip()!r})")
     check(open(f"{d}/tui.jsonc").read() == seeded,
           f"q5 ...and tui.jsonc is byte for byte as before the install ({open(f'{d}/tui.jsonc').read()!r})")
+    check(not os.path.exists(os.path.dirname(tui)) and os.path.isdir(f"{d}/plugins"),
+          "q5 ...and the emptied plugins/remux-tui-session/ is gone, plugins/ kept")
     rc, out, _ = t.integrate(h, "--status")
     check("Absent" in out, f"q5 --status is Absent again ({out.strip()!r})")
 
@@ -527,7 +541,7 @@ def opencode():
     os.makedirs(fd)
     rc, _, _ = fresh.integrate(h)
     doc = json.load(open(f"{fd}/tui.json")) if os.path.exists(f"{fd}/tui.json") else None
-    check(rc == 0 and doc == {"$schema": "https://opencode.ai/tui.json", "plugin": [f"{fd}/remux-tui-session.js"]},
+    check(rc == 0 and doc == {"$schema": "https://opencode.ai/tui.json", "plugin": [f"{fd}/plugins/remux-tui-session/tui.js"]},
           f"q6 with no tui.json(c) a new tui.json holds the schema and the entry (got {doc})")
     plain = Tree("opencode-plain")
     pd = plain.dirs["OPENCODE_CONFIG_DIR"]
@@ -536,11 +550,11 @@ def opencode():
         f.write('{\n  "theme": "x"\n}\n')
     rc, _, _ = plain.integrate(h)
     doc = json.load(open(f"{pd}/tui.json"))
-    check(rc == 0 and doc.get("theme") == "x" and doc.get("plugin") == [f"{pd}/remux-tui-session.js"]
+    check(rc == 0 and doc.get("theme") == "x" and doc.get("plugin") == [f"{pd}/plugins/remux-tui-session/tui.js"]
           and not os.path.exists(f"{pd}/tui.jsonc"),
           f"q6 with only tui.json, that file gains the entry (got {doc})")
 
-    for label, path in (("server", "plugins/remux-agent-session.js"), ("TUI", "remux-tui-session.js")):
+    for label, path in (("server", "plugins/remux-agent-session.js"), ("TUI", "plugins/remux-tui-session/tui.js")):
         mine = Tree(f"opencode-mine-{label}")
         md = mine.dirs["OPENCODE_CONFIG_DIR"]
         os.makedirs(os.path.dirname(f"{md}/{path}"), exist_ok=True)
@@ -561,8 +575,68 @@ def opencode():
         f.write("{ \"plugin\": [ unparseable\n")
     rc, _, err = broken.integrate(h, "--uninstall")
     check(rc != 0 and os.path.exists(f"{bd}/plugins/remux-agent-session.js")
-          and os.path.exists(f"{bd}/remux-tui-session.js"),
+          and os.path.exists(f"{bd}/plugins/remux-tui-session/tui.js"),
           f"q9 an uninstall that cannot edit tui.jsonc leaves both plugins (rc={rc}, err={err.strip()!r})")
+
+    cli = Tree("opencode-cli")
+    cd = cli.dirs["OPENCODE_CONFIG_DIR"]
+    os.makedirs(cd)
+    ours = f"{cd}/plugins/remux-tui-session/tui.js"
+    users = ('{\n'
+             '  // OpenCode 2 settings\n'
+             '  "$schema": "https://opencode.ai/v2/cli.json",\n'
+             '  "theme": { "name": "tokyonight" },\n'
+             '  "plugins": [\n'
+             '    "./plugins/mine",  // my own\n'
+             '    { "package": "@acme/opencode-x", "options": { "path": "' + ours + '" } },\n'
+             '    "-opencode.tips",\n'
+             '  ],\n'
+             '}\n')
+    with open(f"{cd}/cli.json", "w") as f:
+        f.write(users)
+    before = cli.snapshot()
+    rc, _, err = cli.integrate(h)
+    check(rc == 0 and before[f"{cd}/cli.json"] == cli.snapshot()[f"{cd}/cli.json"],
+          f"q10 install leaves an existing cli.json alone, byte, inode and mtime (rc={rc}, err={err.strip()!r})")
+    check(not os.path.exists(f"{fd}/cli.json") and not os.path.exists(f"{d}/cli.json"),
+          "q10 install never creates a cli.json")
+    migrated = users.replace('    "-opencode.tips",\n', '    "-opencode.tips",\n    ' + json.dumps(ours) + ',\n')
+    assert migrated != users
+    with open(f"{cd}/cli.json", "w") as f:
+        f.write(migrated)
+    rc, _, err = cli.integrate(h, "--uninstall")
+    after = open(f"{cd}/cli.json").read()
+    check(rc == 0 and after == users,
+          f"q10 uninstall removes remux's cli.json entry and keeps every other byte "
+          f"(rc={rc}, err={err.strip()!r}, got {after!r})")
+    check(not os.path.exists(ours), "q10 ...and the TUI plugin is gone")
+
+    kept = Tree("opencode-kept")
+    kd = kept.dirs["OPENCODE_CONFIG_DIR"]
+    os.makedirs(kd)
+    kept.integrate(h)
+    os.makedirs(f"{kd}/plugins/remux-tui-session", exist_ok=True)
+    with open(f"{kd}/plugins/remux-tui-session/notes.txt", "w") as f:
+        f.write("mine\n")
+    rc, _, err = kept.integrate(h, "--uninstall")
+    check(rc == 0 and not os.path.exists(f"{kd}/plugins/remux-tui-session/tui.js")
+          and os.path.exists(f"{kd}/plugins/remux-tui-session/notes.txt")
+          and open(f"{kd}/plugins/remux-tui-session/notes.txt").read() == "mine\n",
+          f"q11 a user's file keeps plugins/remux-tui-session/; only tui.js goes (rc={rc}, err={err.strip()!r})")
+
+    bad = Tree("opencode-badcli")
+    xd = bad.dirs["OPENCODE_CONFIG_DIR"]
+    os.makedirs(xd)
+    bad.integrate(h)
+    with open(f"{xd}/cli.json", "w") as f:
+        f.write('{ "plugins": [ "' + f"{xd}/plugins/remux-tui-session/tui.js" + '", oops\n')
+    unparsed = bad.snapshot()[f"{xd}/cli.json"]
+    rc, out, err = bad.integrate(h, "--uninstall")
+    check(rc == 0 and bad.snapshot().get(f"{xd}/cli.json") == unparsed and "cli.json" in err
+          and not os.path.exists(f"{xd}/plugins/remux-agent-session.js")
+          and not os.path.exists(f"{xd}/plugins/remux-tui-session/tui.js"),
+          f"q12 a cli.json that does not parse is left alone with a note, and both plugins go "
+          f"(rc={rc}, out={out.strip()!r}, err={err.strip()!r})")
 
     missing = Tree("opencode-missing")
     before = missing.snapshot()

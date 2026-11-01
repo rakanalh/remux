@@ -1,24 +1,30 @@
-//! OpenCode's session restore integration, for OpenCode 1.18, in its config
-//! dir (`$OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`, else
-//! `~/.config/opencode`):
+//! OpenCode's session restore integration, for OpenCode 1.x and 2.x from one
+//! install, in its config dir (`$OPENCODE_CONFIG_DIR`, else
+//! `$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`, in both):
 //!
-//! - `plugins/remux-agent-session.js`, a server plugin OpenCode discovers by
-//!   itself, which reports for `opencode run` and `opencode --mini`;
-//! - `remux-tui-session.js`, a TUI plugin, listed by absolute path in the
-//!   `plugin` array of `tui.jsonc` if there is one, else `tui.json`, created
-//!   when neither exists. It is kept out of `plugins/`: OpenCode loads every
-//!   file there as a SERVER plugin and logs a load failure for one without
-//!   `server()`, on every start.
+//! - `plugins/remux-agent-session.js`, a server plugin both discover by
+//!   themselves. Under 1.x it reports for `opencode run` and `opencode --mini`.
+//!   Under 2.x it does nothing, because 2.x runs server plugins in one
+//!   background service shared by every TUI on the machine, where a session
+//!   cannot be traced to a pane.
+//! - `plugins/remux-tui-session/tui.js`, a TUI plugin. 2.x loads it by
+//!   itself, as a plugin directory under `plugins/`. 1.x loads TUI plugins
+//!   only from its TUI config, so the file is also listed by absolute path in
+//!   the `plugin` array of `tui.jsonc` if there is one, else `tui.json`,
+//!   created when neither exists. 1.x's server plugin scan reads only the
+//!   files directly in `plugins/`, so it never sees this one.
 //!
 //! OpenCode writes its own files into the dir (`package.json`,
-//! `node_modules/`, `.gitignore`); none of them is touched.
+//! `node_modules/`, `.gitignore`, and 2.x's `cli.json`). Install touches none
+//! of them. Uninstall removes remux's entry from `cli.json`, where 2.x's
+//! one-time migration copies it from `tui.json`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use super::hooks_file::{effective_uid, home_and_binary, shown, write_atomically};
-use super::jsonc_file::{add_plugin, has_plugin, new_tui_json, remove_plugin, TUI_KEY};
+use super::jsonc_file::{add_plugin, has_plugin, new_tui_json, remove_plugin, CLI_KEY, TUI_KEY};
 use super::plugin_file::{js_string, read_for_edit, render, PluginFile};
 use super::require_dir;
 use super::{Change, Integration, IntegrationStatus};
@@ -71,7 +77,7 @@ impl OpencodeResume {
                 SERVER_PLUGIN,
             ),
             tui: file(
-                dir.join("remux-tui-session.js"),
+                dir.join("plugins").join("remux-tui-session").join("tui.js"),
                 "opencode-resume-tui",
                 TUI_PLUGIN,
             ),
@@ -107,6 +113,50 @@ impl OpencodeResume {
             before: read.text,
             after: Some(after),
         }))
+    }
+
+    /// Remove remux's entry from 2.x's `cli.json`. One that does not parse is
+    /// left alone with a note: OpenCode ignores such a file, and an entry
+    /// naming a deleted plugin only shows as unsupported in its plugin list.
+    fn unregister_cli(&self) -> Result<Vec<String>> {
+        let read = read_for_edit(&self.dir.join("cli.json"), self.euid)?;
+        let Some(text) = &read.text else {
+            return Ok(Vec::new());
+        };
+        match remove_plugin(text, CLI_KEY, &self.entry()) {
+            Ok(Some(after)) => {
+                write_atomically(&read.path, &after, read.fingerprint, None)?;
+                Ok(Vec::new())
+            }
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => Ok(vec![format!(
+                "{} was not edited ({e:#}); remove {} from its `plugins` by hand",
+                shown(&read.path),
+                self.entry()
+            )]),
+        }
+    }
+
+    /// The TUI plugin's directory, once remux's file has left it empty.
+    fn remove_tui_dir(&self) -> Result<()> {
+        let Some(dir) = self.tui.path().parent() else {
+            return Ok(());
+        };
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) if meta.is_dir() => match std::fs::remove_dir(dir) {
+                Ok(()) => Ok(()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    Ok(())
+                }
+                Err(e) => Err(e).with_context(|| format!("removing {}", dir.display())),
+            },
+            _ => Ok(()),
+        }
     }
 
     fn registered(&self) -> Result<bool> {
@@ -191,8 +241,8 @@ impl Integration for OpencodeResume {
         Ok(Vec::new())
     }
 
-    /// The TUI config's entry goes first: a failure there leaves both files
-    /// in place, never a config listing a plugin that is gone.
+    /// The config entries go first: a failure there leaves both files in
+    /// place, never a config listing a plugin that is gone.
     fn uninstall(&self) -> Result<Vec<String>> {
         let read = read_for_edit(&self.tui_config(), self.euid)?;
         if let Some(text) = &read.text {
@@ -202,8 +252,10 @@ impl Integration for OpencodeResume {
                 write_atomically(&read.path, &after, read.fingerprint, None)?;
             }
         }
-        let mut notes = self.server.uninstall()?;
+        let mut notes = self.unregister_cli()?;
+        notes.extend(self.server.uninstall()?);
         notes.extend(self.tui.uninstall()?);
+        self.remove_tui_dir()?;
         Ok(notes)
     }
 }

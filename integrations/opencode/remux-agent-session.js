@@ -1,7 +1,7 @@
 // managed by remux; REMUX_INTEGRATION_ID=opencode-resume-server REMUX_INTEGRATION_VERSION=1
 //
-// Tells remux which OpenCode session `opencode run` or `opencode --mini` is
-// running in its pane, so that `remux restart` can resume it there. Installed
+// Tells remux which OpenCode 1.x session `opencode run` or `opencode --mini`
+// is running in its pane, so that `remux restart` can resume it there. Installed
 // by `remux integrate opencode-resume`; remove it with `remux integrate
 // opencode-resume --uninstall`. remux rewrites this file on install, so edit
 // nothing here.
@@ -13,8 +13,8 @@ import { execFile } from "node:child_process";
 
 const REMUX_BIN = "__REMUX_BIN__";
 
-// The full TUI reports through remux-tui-session.js, which knows the session
-// on screen. serve, web and attach run sessions for other clients, not for
+// The full TUI reports through remux-tui-session/tui.js, which knows the
+// session on screen. serve, web and attach run sessions for other clients, not for
 // this pane, so only `run` and `--mini` report from here.
 function reporting() {
   const main = typeof Bun === "undefined" ? "" : String(Bun.main ?? "");
@@ -45,6 +45,12 @@ function report(id) {
 
 export default {
   id: "remux-agent-session",
+  // OpenCode 2.x calls `setup` and never `server`. It runs server plugins in
+  // one background service that every TUI on the machine shares and that
+  // outlives the pane that started it, so a session seen there cannot be
+  // traced to a pane: under 2.x only the TUI plugin reports. 1.x's TUI worker
+  // calls `setup` too, beside `server`, so it must stay a no-op.
+  setup: () => {},
   server: async () => ({
     event: async ({ event }) => {
       if (event?.type !== "session.created" && event?.type !== "session.updated") {
