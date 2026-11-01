@@ -29,6 +29,10 @@ taken by rename, so none is lost; each is acknowledged with `{"ctl": cmd}` in
   stop:once=<file>    run the Stop hooks once with <file> as the payload
   start=<file>        run the SessionStart hooks once with <file> as the
                       payload, as Claude does when a session starts
+  node=<ext>|<spec>   run `$NODE <fixtures>/pi_omp_driver.mjs <ext> <spec>`,
+                      the way pi or omp loads an extension and fires events
+                      at it, recording it as one `node` entry; NODE is set by
+                      `env:NODE=<abs path>`, so the pane's PATH can stay bare
   prompt              run the UserPromptSubmit hooks with a prompt payload
   prompt:wrong        run them with a Stop payload, as a swapped settings
                       entry would
@@ -200,6 +204,14 @@ def main():
                 run("Stop", cmd[len("stop:once="):], "stop")
             elif cmd.startswith("start="):
                 run("SessionStart", cmd[len("start="):], "start")
+            elif cmd.startswith("node="):
+                ext, _, spec = cmd[len("node="):].partition("|")
+                done = subprocess.run([env.get("NODE", "node"),
+                                       os.path.join(fixtures, "pi_omp_driver.mjs"), ext, spec],
+                                      env=env, capture_output=True, timeout=30)
+                note({"event": "node", "rc": done.returncode,
+                      "stdout": done.stdout.decode("utf-8", "replace"),
+                      "stderr": done.stderr.decode("utf-8", "replace")})
             elif cmd == "prompt":
                 run("UserPromptSubmit", os.path.join(fixtures, "claude_prompt.json"), "prompt")
             elif cmd == "prompt:wrong":
