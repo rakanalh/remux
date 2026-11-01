@@ -29,7 +29,9 @@ taken by rename, so none is lost; each is acknowledged with `{"ctl": cmd}` in
   stop:once=<file>    run the Stop hooks once with <file> as the payload
   start=<file>        run the SessionStart hooks once with <file> as the
                       payload, as Claude does when a session starts
-  node=<ext>|<spec>   run `$NODE <fixtures>/pi_omp_driver.mjs <ext> <spec>`,
+  node=<ext>|<spec>[|<driver>]
+                      run `$NODE <fixtures>/<driver> <ext> <spec>`, the driver
+                      `pi_omp_driver.mjs` unless named,
                       the way pi or omp loads an extension and fires events
                       at it, recording it as one `node` entry; NODE is set by
                       `env:NODE=<abs path>`, so the pane's PATH can stay bare
@@ -205,9 +207,10 @@ def main():
             elif cmd.startswith("start="):
                 run("SessionStart", cmd[len("start="):], "start")
             elif cmd.startswith("node="):
-                ext, _, spec = cmd[len("node="):].partition("|")
+                ext, spec, *driver = cmd[len("node="):].split("|")
+                driver = driver[0] if driver else "pi_omp_driver.mjs"
                 done = subprocess.run([env.get("NODE", "node"),
-                                       os.path.join(fixtures, "pi_omp_driver.mjs"), ext, spec],
+                                       os.path.join(fixtures, driver), ext, spec],
                                       env=env, capture_output=True, timeout=30)
                 note({"event": "node", "rc": done.returncode,
                       "stdout": done.stdout.decode("utf-8", "replace"),

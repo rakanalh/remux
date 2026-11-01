@@ -43,6 +43,19 @@ records each call's args, stdout and stderr):
   m6  omp with OMPCODE=1 (a nested omp) -> no call, no connection
   m7  no absolute session file -> --id, Stored as an id (a pane of its own)
 
+opencode (the stub, installed as `opencode`, runs node with
+`opencode_driver.mjs`, which imports the INSTALLED plugins with the API surface
+the T18 spike recorded; the driver records each CLI call):
+  w1  server plugin under `opencode run`: a root session, then a child of it
+      (parentID), then the child updated -> ONE call, for the ROOT, Stored
+  w2  server plugin under `opencode serve` -> no call
+  w3  server plugin inside the full TUI (Bun.main is the TUI worker) -> no call
+  w4  TUI plugin: the route goes from home to a CHILD session -> one call,
+      --id <root> --source select, Stored; the same route polled for a second
+      makes no second call
+  w5  TUI plugin: the route moves to another root session -> Replaced
+  w6  server plugin under `opencode --mini` -> reports, as `run` does
+
 omp_real (OPTIONAL, never a failure, not in the default run): the REAL omp
 from `~/.bun/bin/omp`, started as a job at a shell pane's prompt under the
 throwaway HOME with the extension installed, for long enough to start a
@@ -50,7 +63,17 @@ session. Prints `SMOKE` lines: whether a report reached the server, or why it
 was skipped. A sha256 of every file under the real `~/.omp` is taken before
 and after and must not change; a change is the one thing reported as FAIL.
 
-Run: python3 tests/pty/agent_session_hooks.py [claude codex pi omp omp_real ...]
+opencode_real (OPTIONAL, never a failure, not in the default run): the REAL
+`~/.opencode/bin/opencode --mini`, started as a job at a shell pane's prompt
+under `unshare -rn` (no network, so no model call) and the throwaway HOME and
+XDG dirs, with the integration installed. `--mini` creates a session at
+startup, so the installed server plugin should report it, once OpenCode's
+first-start bootstrap is done; offline, that bootstrap can stop first, and the
+smoke then says so rather than claiming anything about the plugins. Prints `SMOKE`
+lines; a change under the real `~/.config/opencode`, `~/.local/state/opencode`
+or `~/.local/share/opencode` is the one thing reported as FAIL.
+
+Run: python3 tests/pty/agent_session_hooks.py [claude codex pi omp opencode omp_real opencode_real ...]
 """
 import json
 import os
@@ -305,6 +328,150 @@ def extension_mode(agent):
         rig.close()
 
 
+def opencode():
+    os.makedirs(BINDIR, exist_ok=True)
+    fakeclaude.install(f"{BINDIR}/opencode")
+    rig = Rig("opencode")
+    try:
+        # The server's environment sets XDG_CONFIG_HOME, which OpenCode's dir
+        # follows when OPENCODE_CONFIG_DIR is unset.
+        config = f"{rig.env['XDG_CONFIG_HOME']}/opencode"
+        os.makedirs(config)
+        rc, err = rig.integrate("opencode-resume")
+        check(rc == 0, f"setup: opencode-resume installs into the throwaway HOME (rc={rc}, err={err!r})")
+        server, tui = f"{config}/plugins/remux-agent-session.js", f"{config}/remux-tui-session.js"
+        record = f"{rig.srv.rundir}/calls.jsonl"
+        count = [0]
+
+        def stub(name):
+            fake = FakeClaude.__new__(FakeClaude)
+            fake.ctl, fake.log = f"{rig.srv.rundir}/{name}.ctl", f"{rig.srv.rundir}/{name}.log"
+            fake.pane = rig.spawn([f"{BINDIR}/opencode", fake.ctl, fake.log, FIXTURES, BIN])
+            end = time.time() + 8
+            while time.time() < end and not os.path.exists(fake.log):
+                time.sleep(0.05)
+            fake.tell(f"env:NODE={NODE}")
+            return fake
+
+        def drive(fake, plugin, spec):
+            count[0] += 1
+            path = f"{rig.srv.rundir}/oc-spec-{count[0]}.json"
+            with open(path, "w") as f:
+                json.dump({**spec, "record": record}, f)
+            before_calls = len(open(record).readlines()) if os.path.exists(record) else 0
+            before_conn, before = rig.connections(), len(rig.verdicts(fake.pane))
+            fake.tell(f"node={plugin}|{path}|opencode_driver.mjs")
+            ran = [e for e in fake.entries() if e.get("event") == "node"][-1:]
+            time.sleep(0.3)
+            calls = [json.loads(c) for c in (open(record).readlines()[before_calls:]
+                                             if os.path.exists(record) else [])]
+            return (ran[0] if ran else None, calls, rig.verdicts(fake.pane)[before:],
+                    rig.connections() - before_conn)
+
+        def created(sid, parent=None, kind="session.created"):
+            info = {"id": sid, **({"parentID": parent} if parent else {})}
+            return {"type": kind, "properties": {"sessionID": sid, "info": info}}
+
+        root, child, other = "ses_root0001aaaa", "ses_child002bbbb", "ses_other003cccc"
+        run_pane = stub("oc-run")
+        ran, calls, got, _ = drive(run_pane, server, {"argv": ["run", "hello"], "events": [
+            created(root), created(child, root), created(child, root, "session.updated")]})
+        check(ran and ran["rc"] == 0, f"w1 the driver ran the server plugin (got {ran})")
+        check([c["args"] for c in calls] == [["agent", "session", "opencode", "--id", root]]
+              and all(c["code"] == 0 and c["stdout"] == "" for c in calls),
+              f"w1 one call, for the root, exit 0, nothing on stdout (got {calls})")
+        check(got == ["Stored"], f"w1 the server stored it (got {got})")
+
+        serve_pane = stub("oc-serve")
+        _, calls, got, conns = drive(serve_pane, server, {"argv": ["serve", "--port", "1"],
+                                                          "events": [created(root)]})
+        check(calls == [] and got == [] and conns == 0, f"w2 serve makes no call (got {calls})")
+        _, calls, got, conns = drive(serve_pane, server, {
+            "argv": [], "bun_main": "/$bunfs/root/src/cli/tui/worker.js", "events": [created(root)]})
+        check(calls == [] and got == [] and conns == 0, f"w3 the TUI's own process makes no call (got {calls})")
+
+        tui_pane = stub("oc-tui")
+        _, calls, got, _ = drive(tui_pane, tui, {
+            "parents": {child: root},
+            "routes": [{"after_ms": 300, "route": {"name": "session", "params": {"sessionID": child}}}],
+            "run_ms": 1600})
+        check([c["args"] for c in calls] == [["agent", "session", "opencode", "--id", root, "--source", "select"]]
+              and all(c["stdout"] == "" for c in calls),
+              f"w4 the TUI plugin reports the selected child's ROOT once, with select (got {calls})")
+        check(got == ["Stored"], f"w4 the server stored it (got {got})")
+        _, calls, got, _ = drive(tui_pane, tui, {
+            "routes": [{"after_ms": 300, "route": {"name": "session", "params": {"sessionID": other}}}],
+            "run_ms": 1200})
+        check([c["args"][4] for c in calls] == [other] and got == ["Replaced"],
+              f"w5 a different session selected is Replaced (calls {calls}, got {got})")
+
+        mini_pane = stub("oc-mini")
+        _, calls, got, _ = drive(mini_pane, server, {"argv": ["--mini"], "events": [created(other)]})
+        check([c["args"][4] for c in calls] == [other] and got == ["Stored"],
+              f"w6 --mini reports from the server plugin (calls {calls}, got {got})")
+        check("panicked at" not in rig.srv.log(), "opencode: no panic in server.log")
+    finally:
+        rig.close()
+
+
+def opencode_real():
+    binary = os.path.expanduser("~/.opencode/bin/opencode")
+    unshare = shutil.which("unshare")
+    if not (os.path.exists(binary) and unshare):
+        print("SMOKE opencode_real: skipped, no opencode or unshare installed")
+        return
+    real = " ".join(os.path.expanduser(p) for p in
+                    ("~/.config/opencode", "~/.local/state/opencode", "~/.local/share/opencode"))
+
+    def sha():
+        return subprocess.run(["sh", "-c", f"find {real} -type f -exec sha256sum {{}} + 2>/dev/null | sort"],
+                              capture_output=True, timeout=120).stdout
+    before = sha()
+    rig = Rig("opencode-real")
+    try:
+        config = f"{rig.env['XDG_CONFIG_HOME']}/opencode"
+        os.makedirs(config)
+        rc, err = rig.integrate("opencode-resume")
+        if rc != 0:
+            print(f"SMOKE opencode_real: skipped, the install failed ({err.strip()})")
+            return
+        c = Client(rig.srv.sock)
+        c.hello()
+        c.send({"CliSpawn": {"session": "main", "placement": "SplitBelow"}})
+        pane = None
+        for m in c.drain(2.0):
+            if name_of(m) == "CliSpawned":
+                pane = m["CliSpawned"]["pane_id"]
+        c.close()
+        time.sleep(0.5)
+        line = f"{unshare} -rn {binary} --mini\n"
+        rig.cli.send({"InputToPane": {"pane_id": pane, "data": list(line.encode())}})
+        end = time.time() + 30
+        found = None
+        while time.time() < end and found is None:
+            found = re.search(rf'agent session: pane %{pane} "opencode" id (\d+) bytes source=(\S+) -> (\w+)',
+                              rig.srv.log())
+            time.sleep(0.5)
+        if found:
+            print(f"SMOKE opencode_real: the real opencode --mini reported its session: "
+                  f"{found.group(1)} bytes, source={found.group(2)} -> {found.group(3)}")
+        else:
+            lines = re.findall(rf"(?:agent session: pane %{pane} .*|identity: .*AgentSession.*)", rig.srv.log())
+            print(f"SMOKE opencode_real: no report within 30 s (lines: {lines[:3]})")
+        logs = subprocess.run(["sh", "-c", f"cat {rig.env['XDG_DATA_HOME']}/opencode/log/*.log 2>/dev/null"],
+                              capture_output=True, timeout=10).stdout.decode(errors="replace")
+        failed = [ln for ln in logs.splitlines() if "failed to load plugin" in ln]
+        print(f"SMOKE opencode_real: opencode logged {len(failed)} plugin load failure(s){': ' + failed[0][:200] if failed else ''}")
+        if not found:
+            # Offline, a first start's bootstrap (models.dev, node_modules) can
+            # stop before plugins load, which says nothing about the plugins.
+            last = logs.strip().splitlines()[-1:] or ["(no opencode log)"]
+            print(f"SMOKE opencode_real: opencode's last log line: {last[0][:240]}")
+    finally:
+        rig.close()
+    check(sha() == before, "opencode_real: the real opencode dirs are byte for byte as they were")
+
+
 def omp_real():
     launcher = os.path.realpath(os.path.expanduser("~/.bun/bin/omp"))
     bun = shutil.which("bun") or os.path.expanduser("~/.bun/bin/bun")
@@ -392,8 +559,8 @@ def claude():
 
 MODES = {"claude": claude, "codex": codex,
          "pi": lambda: extension_mode("pi"), "omp": lambda: extension_mode("omp"),
-         "omp_real": omp_real}
-DEFAULT = ["claude", "codex", "pi", "omp"]
+         "opencode": opencode, "omp_real": omp_real, "opencode_real": opencode_real}
+DEFAULT = ["claude", "codex", "pi", "omp", "opencode"]
 
 
 def main():
