@@ -5085,6 +5085,28 @@ fn group_alive(pgid: i32) -> bool {
 }
 
 impl PaneData {
+    /// Drop the agent session when the shell takes the foreground back, which
+    /// is how the agent's exit shows. Whether one was dropped, so the caller
+    /// saves once the `panes` lock is released.
+    fn forget_agent_session(
+        &mut self,
+        pane_id: PaneId,
+        t: crate::server::title::Transition,
+    ) -> bool {
+        if !matches!(t, crate::server::title::Transition::Shell { .. }) {
+            return false;
+        }
+        let Some(record) = self.agent_session.take() else {
+            return false;
+        };
+        log::info!(
+            "agent session: pane %{pane_id} forgot {} {} (shell foreground)",
+            loggable(&record.agent),
+            record.kind.as_str()
+        );
+        true
+    }
+
     /// What to re-read into [`PaneData::names`], if anything.
     ///
     /// Everything is re-read when `foreground_changed`, and otherwise once the
@@ -17009,13 +17031,15 @@ async fn start_forwarding_for_pane(
                             }
                         }
 
-                        let (responses, bell, clipboard, retitled, fg_changed, refresh) = {
+                        let (responses, bell, clipboard, retitled, fg_changed, refresh, forgot) = {
                             let mut ps = panes.lock().await;
                             if let Some(pane_data) = ps.get_mut(&pane_id) {
                                 let now = std::time::Instant::now();
                                 let mut fg_changed = false;
+                                let mut forgot = false;
                                 for chunk in &chunks {
                                     let t = pane_data.ingest_chunk(chunk);
+                                    forgot |= pane_data.forget_agent_session(pane_id, t);
                                     fg_changed |= note_transition(pane_id, t);
                                 }
                                 pane_data.last_output = now;
@@ -17038,11 +17062,15 @@ async fn start_forwarding_for_pane(
                                     retitled,
                                     fg_changed,
                                     refresh,
+                                    forgot,
                                 )
                             } else {
-                                (Vec::new(), false, None, false, false, None)
+                                (Vec::new(), false, None, false, false, None, false)
                             }
                         };
+                        if forgot {
+                            save_if_enabled(&state, &panes, &config, &dormant).await;
+                        }
                         let renamed = match refresh {
                             Some(what) => refresh_pane_names(pane_id, &panes, what).await,
                             None => false,
@@ -17110,30 +17138,32 @@ async fn start_forwarding_for_pane(
                         // A quiet pane gets no tagged reads, so its foreground
                         // is sampled here, and the settle windows end here.
                         let sample = watch.sample();
-                        let (retitled, fg_changed, refresh) = {
+                        let (retitled, fg_changed, refresh, forgot) = {
                             let mut ps = panes.lock().await;
                             match ps.get_mut(&pane_id) {
                                 Some(pane_data) => {
-                                    let fg_changed = sample.is_some_and(|(fg, at)| {
+                                    let t = sample.map(|(fg, at)| {
                                         let shell = pane_data.shell_pgid();
-                                        let t = pane_data.title.note_foreground(
-                                            fg,
-                                            at,
-                                            shell,
-                                            group_alive,
-                                        );
-                                        note_transition(pane_id, t)
+                                        pane_data.title.note_foreground(fg, at, shell, group_alive)
                                     });
+                                    let forgot = t.is_some_and(|t| {
+                                        pane_data.forget_agent_session(pane_id, t)
+                                    });
+                                    let fg_changed = t.is_some_and(|t| note_transition(pane_id, t));
                                     let now = std::time::Instant::now();
                                     (
                                         pane_data.settle_title(pane_id, now),
                                         fg_changed,
                                         pane_data.names_to_refresh(now, fg_changed),
+                                        forgot,
                                     )
                                 }
                                 None => break,
                             }
                         };
+                        if forgot {
+                            save_if_enabled(&state, &panes, &config, &dormant).await;
+                        }
                         let renamed = match refresh {
                             Some(what) => refresh_pane_names(pane_id, &panes, what).await,
                             None => false,

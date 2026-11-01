@@ -24,6 +24,11 @@ cli_filters     a subagent payload, a non-SessionStart payload, and
                 `CURSOR_VERSION` set each exit 0 without connecting, with
                 `$REMUX_PANE` set so that the filter is what stops them; the
                 plain SessionStart payload does connect.
+forget_on_exit  an agent JOB at a shell pane's prompt reports and exits; the
+                shell takes the foreground back and the record is gone from
+                state.json within about a second, and a new report is Stored.
+keep_while_running  the same job staying in the foreground keeps its record:
+                Unchanged on a repeat, still in state.json after 2 s.
 persist         state.json holds the record right after the report, before any
                 structural change; a report that hangs (a lock-order deadlock
                 in the save) is a timeout red here.
@@ -52,6 +57,9 @@ UUID = "7f3c2a9e-51d4-4b8e-9a61-0c2f5d8e4b17"
 OTHER = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
 CLI_ID = "c11a77e1-9d0b-4c3a-8e2f-6b5a4d3c2b1a"
 RESTORE_ID = "4e5a1f0c-7b2d-4c8e-a3f9-1d6b0e2c5a7f"
+FORGET_ID = "f0f0f0f0-1111-4222-8333-944445555666"
+KEEP_ID = "cafe0000-1111-4222-8333-944445555777"
+SESSION_JOB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_job.py")
 CONFIG = """
 [general]
 save_sessions = true
@@ -267,6 +275,56 @@ def cli_filters(rig):
           f"(got {run.returncode}, {run.stdout!r}, {run.stderr!r})")
 
 
+def held_in_state(rig, pane):
+    return (rig.state_json() or {}).get("agent_sessions", {}).get(str(pane))
+
+
+def run_job(rig, pane, then, args, timeout=8.0):
+    """Start `session_job.py` as a job at `pane`'s prompt, reporting `args`,
+    and return its result once the report has been answered."""
+    rig.jobs = getattr(rig, "jobs", 0) + 1
+    result = f"{rig.srv.rundir}/job-{rig.jobs}.json"
+    line = " ".join(["python3", SESSION_JOB, result, then, BIN, *args]) + "\n"
+    rig.cli.send({"InputToPane": {"pane_id": pane, "data": list(line.encode())}})
+    end = time.time() + timeout
+    while time.time() < end:
+        if os.path.exists(result):
+            with open(result) as f:
+                return json.load(f)
+        time.sleep(0.05)
+    return None
+
+
+def forget_on_exit(rig):
+    pane = rig.spawn()
+    time.sleep(0.5)
+    got = run_job(rig, pane, "exit", ["claude", "--id", FORGET_ID, "--source", "startup"])
+    check(got is not None and got["rc"] == 0 and got["stdout"] == "" and got["stderr"] == "",
+          f"forget_on_exit: the job's report was accepted silently (got {got})")
+    check(held_in_state(rig, pane) is not None,
+          "forget_on_exit: state.json holds the record while the job runs")
+    end = time.time() + 2.5
+    while time.time() < end and held_in_state(rig, pane) is not None:
+        time.sleep(0.05)
+    check(held_in_state(rig, pane) is None,
+          f"forget_on_exit: state.json drops the record once the job exits (got {held_in_state(rig, pane)})")
+    r = report(rig, pane, "claude", {"Id": FORGET_ID}, source="startup")
+    check(outcome(r) == "Stored", f"forget_on_exit: the next report is Stored (got {r})")
+
+
+def keep_while_running(rig):
+    pane = rig.spawn()
+    time.sleep(0.5)
+    got = run_job(rig, pane, "stay", ["claude", "--id", KEEP_ID, "--source", "startup"])
+    check(got is not None and got["rc"] == 0 and got["stderr"] == "",
+          f"keep_while_running: the job's report was accepted (got {got})")
+    time.sleep(2.0)
+    check(held_in_state(rig, pane) is not None,
+          "keep_while_running: state.json still holds the record after 2 s")
+    r = report(rig, pane, "claude", {"Id": KEEP_ID}, source="startup")
+    check(outcome(r) == "Unchanged", f"keep_while_running: a repeat is Unchanged (got {r})")
+
+
 def persist(rig):
     pane = rig.spawn()
     before = rig.state_json() or {}
@@ -305,9 +363,9 @@ def restart_types(rig, pane):
     check(len(got) == 1, f"restart_types: the restore ran the stub claude once for the id (got {got})")
     check(bool(got) and got[0] == ["--resume", RESTORE_ID, ""],
           f"restart_types: --resume and the id are two argv words and nothing else (got {got})")
-    r = report(rig, pane, "claude", {"Id": RESTORE_ID}, source="resume")
-    check(outcome(r) == "Unchanged",
-          f"restart_types: the restored pane %{pane} holds the record again (got {r})")
+    check(re.search(rf"typed resume for pane %{pane} agent=\"claude\" \(54 bytes\)",
+                    rig.srv.log()) is not None,
+          f"restart_types: the line typed into %{pane} was 54 bytes, space and \\r included")
 
 
 def main():
@@ -347,6 +405,8 @@ def main():
         cli_stdout(rig)
         cli_outside(rig)
         cli_filters(rig)
+        forget_on_exit(rig)
+        keep_while_running(rig)
         restored = persist(rig)
         restart_types(rig, restored)
 
@@ -357,7 +417,7 @@ def main():
         check("AgentSession(agent=\"claude\", id, 36 bytes" in client_log,
               "redaction: client.log has the summary line with the byte count")
         for name, text in (("server.log", log), ("client.log", client_log)):
-            check(all(v not in text for v in (UUID, OTHER, CLI_ID)),
+            check(all(v not in text for v in (UUID, OTHER, CLI_ID, RESTORE_ID, FORGET_ID, KEEP_ID)),
                   f"redaction: {name} never holds an id")
         check("panicked at" not in log, "no_panic: server.log has no panic")
         check("panicked at" not in client_log, "no_panic: client.log has no panic")
