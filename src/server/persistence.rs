@@ -606,6 +606,77 @@ mod tests {
         assert!(loaded.agent_sessions.is_empty());
     }
 
+    /// A file a LATER build wrote, with a top-level key this build has never
+    /// heard of, still loads: that is what lets a downgrade, or an older
+    /// server on another machine, read today's `state.json`.
+    #[test]
+    fn an_unknown_top_level_key_is_ignored() {
+        let persisted =
+            PersistedState::from_server(&ServerState::new(), &HashMap::new(), &HashMap::new())
+                .unwrap();
+        let mut value = serde_json::to_value(&persisted).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("from_a_later_build".into(), serde_json::json!({"x": 1}));
+        let loaded: PersistedState = serde_json::from_value(value).unwrap();
+        assert!(loaded.agent_sessions.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_key_inside_the_server_state_is_ignored() {
+        let mut state = ServerState::new();
+        state
+            .create_session(
+                "s1",
+                None,
+                crate::config::BorderStyle::ZellijStyle,
+                Default::default(),
+            )
+            .unwrap();
+        let persisted =
+            PersistedState::from_server(&state, &HashMap::new(), &HashMap::new()).unwrap();
+        let mut value = serde_json::to_value(&persisted).unwrap();
+        value["state"]
+            .as_object_mut()
+            .unwrap()
+            .insert("from_a_later_build".into(), serde_json::json!(true));
+        value["state"]["sessions"]["s1"]
+            .as_object_mut()
+            .unwrap()
+            .insert("from_a_later_build".into(), serde_json::json!(true));
+        let loaded: PersistedState = serde_json::from_value(value).unwrap();
+        assert!(loaded.state.sessions.contains_key("s1"));
+    }
+
+    /// Both properties above hold only while no persisted type refuses
+    /// unknown fields, and the tests cover two structs out of many. The
+    /// attribute appears nowhere in the source but two doc comments in
+    /// `protocol.rs`.
+    #[test]
+    fn no_type_refuses_unknown_fields() {
+        let needle = concat!("deny_", "unknown_fields");
+        let mut hits = Vec::new();
+        let mut dirs = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for line in text.lines().filter(|l| l.contains(needle)) {
+                        let doc = line.trim_start().starts_with("///");
+                        if !(doc && path.ends_with("protocol.rs")) {
+                            hits.push(format!("{}: {}", path.display(), line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(hits.is_empty(), "{hits:#?}");
+    }
+
     #[test]
     fn test_persisted_state_from_server_clones_state() {
         let mut state = ServerState::new();
