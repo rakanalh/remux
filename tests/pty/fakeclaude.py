@@ -26,6 +26,8 @@ taken by rename, so none is lost; each is acknowledged with `{"ctl": cmd}` in
   stop:keepfeeding    the same, and after every block send this pane one new
                       message (a sender mailing once per Stop)
   stop:once=<file>    run the Stop hooks once with <file> as the payload
+  start=<file>        run the SessionStart hooks once with <file> as the
+                      payload, as Claude does when a session starts
   prompt              run the UserPromptSubmit hooks with a prompt payload
   prompt:wrong        run them with a Stop payload, as a swapped settings
                       entry would
@@ -195,6 +197,8 @@ def main():
                 stop(True)
             elif cmd.startswith("stop:once="):
                 run("Stop", cmd[len("stop:once="):], "stop")
+            elif cmd.startswith("start="):
+                run("SessionStart", cmd[len("start="):], "start")
             elif cmd == "prompt":
                 run("UserPromptSubmit", os.path.join(fixtures, "claude_prompt.json"), "prompt")
             elif cmd == "prompt:wrong":
