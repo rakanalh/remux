@@ -29,14 +29,12 @@ pub fn codex_home(home: &Path) -> PathBuf {
 }
 
 /// `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
-#[allow(dead_code)]
 pub fn pi_agent_dir(home: &Path) -> PathBuf {
     pi_agent_dir_with(home, var)
 }
 
 /// `$PI_CODING_AGENT_DIR`, else `~/$PI_CONFIG_DIR/agent`, `PI_CONFIG_DIR`
 /// defaulting to `.omp`.
-#[allow(dead_code)]
 pub fn omp_agent_dir(home: &Path) -> PathBuf {
     omp_agent_dir_with(home, var)
 }

@@ -66,6 +66,12 @@ enum IntegrateHarness {
     /// Codex: the SessionStart hook in $CODEX_HOME/hooks.json (~/.codex by
     /// default), and `[features] hooks = true` in its config.toml
     CodexResume,
+    /// pi: the remux-agent-session.ts extension in $PI_CODING_AGENT_DIR
+    /// (~/.pi/agent by default)
+    PiResume,
+    /// omp: the remux-agent-session.ts extension in ~/$PI_CONFIG_DIR/agent
+    /// (~/.omp/agent by default)
+    OmpResume,
 }
 
 #[derive(Subcommand)]
@@ -865,6 +871,14 @@ fn run_integrate(
             integrate::claude_resume::ClaudeResume::from_env(allow_dev_path)?,
         ),
         IntegrateHarness::CodexResume => Box::new(integrate::codex_resume::CodexResume::from_env(
+            allow_dev_path,
+        )?),
+        IntegrateHarness::PiResume => Box::new(integrate::pi_omp_resume::PiOmpResume::from_env(
+            integrate::pi_omp_resume::Agent::Pi,
+            allow_dev_path,
+        )?),
+        IntegrateHarness::OmpResume => Box::new(integrate::pi_omp_resume::PiOmpResume::from_env(
+            integrate::pi_omp_resume::Agent::Omp,
             allow_dev_path,
         )?),
     };

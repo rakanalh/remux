@@ -9,6 +9,8 @@ pub mod claude_resume;
 pub mod codex_resume;
 pub mod env;
 pub mod hooks_file;
+pub mod pi_omp_resume;
+pub mod plugin_file;
 pub mod toml_file;
 
 use std::path::PathBuf;

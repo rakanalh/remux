@@ -446,6 +446,22 @@ pub fn check_directory(path: &Path, euid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Before anything that runs `binary` is written: it must be safe from other
+/// users, and not a cargo build output unless `allow_dev_path`.
+pub fn check_hook_binary(binary: &Path, allow_dev_path: bool, euid: u32) -> Result<()> {
+    // Safety first: past it, every directory `is_dev_build` reads is this
+    // user's or root's and closed to others.
+    check_binary_safe(binary, euid)?;
+    anyhow::ensure!(
+        allow_dev_path || !is_dev_build(binary),
+        "{} is a cargo build output; hooks pointing there break on the next \
+         build or clean. Install remux (cargo install --path .) and run that \
+         binary's `integrate`, or pass --allow-dev-path to use this one anyway",
+        binary.display()
+    );
+    Ok(())
+}
+
 impl HooksFile {
     /// The hooks file at `settings`, writing `hooks` as the user `euid`.
     pub fn new(settings: PathBuf, hooks: Hooks, allow_dev_path: bool, euid: u32) -> Self {
@@ -459,17 +475,7 @@ impl HooksFile {
 
     /// A hook must not be baked onto a build directory by accident.
     pub fn check_binary(&self) -> Result<()> {
-        // Safety first: past it, every directory `is_dev_build` reads is this
-        // user's or root's and closed to others.
-        check_binary_safe(self.hooks.binary(), self.euid)?;
-        anyhow::ensure!(
-            self.allow_dev_path || !is_dev_build(self.hooks.binary()),
-            "{} is a cargo build output; hooks pointing there break on the next \
-             build or clean. Install remux (cargo install --path .) and run that \
-             binary's `integrate`, or pass --allow-dev-path to use this one anyway",
-            self.hooks.binary().display()
-        );
-        Ok(())
+        check_hook_binary(self.hooks.binary(), self.allow_dev_path, self.euid)
     }
 
     /// The file to read and write, resolved ONCE per operation: the settings

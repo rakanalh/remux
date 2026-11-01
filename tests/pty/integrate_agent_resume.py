@@ -42,7 +42,23 @@ codex (the hook in `$CODEX_HOME/hooks.json`, the flag in its config.toml):
   x7  --dry-run writes nothing
   x8  a missing CODEX_HOME is refused and nothing is created
 
-Run: python3 tests/pty/integrate_agent_resume.py [claude codex ...]
+pi and omp (the extension `extensions/remux-agent-session.ts`; pi at its
+default `~/.pi/agent`, omp at `~/$PI_CONFIG_DIR/agent` with a custom name, and
+`$PI_CODING_AGENT_DIR` unset, since both agents honour it):
+  e1  a fresh agent dir is Absent
+  e2  install writes the extension with this binary's path and the agent's
+      name baked in, the header first, and nothing else in the tree changes;
+      `node --check` accepts it
+  e3  --status is Installed
+  e4  a second install changes no byte, inode or mtime
+  e5  an edited copy of ours is Stale, and install rewrites it to this build's
+  e6  a file without remux's header at the path is refused by install and
+      left byte-identical by install and uninstall
+  e7  --uninstall removes ours and nothing else
+  e8  a missing agent dir is refused and nothing is created
+  e9  with $PI_CODING_AGENT_DIR set, pi and omp resolve to one dir: refused
+
+Run: python3 tests/pty/integrate_agent_resume.py [claude codex pi omp ...]
 """
 import hashlib
 import json
@@ -99,7 +115,8 @@ class Tree:
         for var in drop:
             env.pop(var, None)
         for var, value in env.items():
-            if var in self.dirs or var in ("HOME", "XDG_CONFIG_HOME"):
+            # PI_CONFIG_DIR is a directory NAME under HOME, not a path.
+            if (var in self.dirs and var != "PI_CONFIG_DIR") or var in ("HOME", "XDG_CONFIG_HOME"):
                 assert value.startswith(RUNDIR + "/"), (var, value)
         return env
 
@@ -338,7 +355,85 @@ def codex():
           f"x8 a missing CODEX_HOME is refused (rc={rc}, err={err.strip()!r})")
 
 
-MODES = {"claude": lambda: (claude(), claude_wrapper()), "codex": codex}
+def extension(agent):
+    h = f"{agent}-resume"
+    drop = ("PI_CODING_AGENT_DIR",)
+
+    def tree(name):
+        t = Tree(name)
+        if agent == "omp":
+            t.dirs["PI_CONFIG_DIR"] = ".omp-test"
+        t.dirs.pop("PI_CODING_AGENT_DIR")
+        return t
+
+    def agent_dir(t):
+        return f"{t.home}/.pi/agent" if agent == "pi" else f"{t.home}/.omp-test/agent"
+
+    t = tree(agent)
+    d = agent_dir(t)
+    path = f"{d}/extensions/remux-agent-session.ts"
+    os.makedirs(d)
+    rc, out, _ = t.integrate(h, "--status", drop=drop)
+    check(rc == 0 and "Absent" in out, f"e1 {agent}: a fresh agent dir is Absent ({out.strip()!r})")
+
+    before = t.snapshot()
+    rc, _, err = t.integrate(h, drop=drop)
+    after = t.snapshot()
+    text = open(path).read() if os.path.exists(path) else ""
+    check(rc == 0 and text.startswith("// managed by remux; REMUX_INTEGRATION_ID=pi-omp-resume ")
+          and f"const REMUX_BIN = {json.dumps(REAL)};" in text and f'const AGENT = "{agent}";' in text,
+          f"e2 {agent}: install bakes the binary and the agent in (rc={rc}, err={err.strip()!r})")
+    check(changed(before, after) == sorted([path, os.path.dirname(path)]),
+          f"e2 {agent}: only the extension (and its new extensions/ dir) appeared ({changed(before, after)})")
+    node = subprocess.run(["node", "--check", path], capture_output=True, timeout=30)
+    check(node.returncode == 0, f"e2 {agent}: node --check accepts it ({node.stderr[:200]!r})")
+
+    rc, out, _ = t.integrate(h, "--status", drop=drop)
+    check(rc == 0 and "Installed" in out, f"e3 {agent}: --status is Installed ({out.strip()!r})")
+
+    before = t.snapshot()
+    t.integrate(h, drop=drop)
+    check(changed(before, t.snapshot()) == [], f"e4 {agent}: a second install changes nothing")
+
+    with open(path, "w") as f:
+        f.write(text.replace("timeout: 3000", "timeout: 9999"))
+    rc, out, _ = t.integrate(h, "--status", drop=drop)
+    check("Stale" in out and "differs" in out, f"e5 {agent}: an edited copy is Stale ({out.strip()!r})")
+    t.integrate(h, drop=drop)
+    check(open(path).read() == text, f"e5 {agent}: install rewrites it to this build's")
+
+    before = t.snapshot()
+    rc, _, err = t.integrate(h, "--uninstall", drop=drop)
+    check(rc == 0 and not os.path.exists(path) and changed(before, t.snapshot()) == [path],
+          f"e7 {agent}: uninstall removes ours and nothing else (rc={rc}, err={err.strip()!r})")
+
+    foreign = "// my own extension\nexport default function () {}\n"
+    with open(path, "w") as f:
+        f.write(foreign)
+    before = t.snapshot()
+    rc, _, err = t.integrate(h, drop=drop)
+    check(rc != 0 and "not a file remux wrote" in err and changed(before, t.snapshot()) == [],
+          f"e6 {agent}: a headerless file is refused and untouched (rc={rc}, err={err.strip()!r})")
+    rc, _, err = t.integrate(h, "--uninstall", drop=drop)
+    check(rc == 0 and "left alone" in err and changed(before, t.snapshot()) == [],
+          f"e6 {agent}: uninstall leaves it too, saying so (err={err.strip()!r})")
+
+    missing = tree(f"{agent}-missing")
+    before = missing.snapshot()
+    rc, _, err = missing.integrate(h, drop=drop)
+    check(rc != 0 and "does not exist" in err and changed(before, missing.snapshot()) == [],
+          f"e8 {agent}: a missing agent dir is refused (rc={rc}, err={err.strip()!r})")
+
+    both = Tree(f"{agent}-same")
+    os.makedirs(both.dirs["PI_CODING_AGENT_DIR"])
+    before = both.snapshot()
+    rc, _, err = both.integrate(h)
+    check(rc != 0 and "pi and omp both resolve to" in err and changed(before, both.snapshot()) == [],
+          f"e9 {agent}: one dir for both agents is refused (rc={rc}, err={err.strip()!r})")
+
+
+MODES = {"claude": lambda: (claude(), claude_wrapper()), "codex": codex,
+         "pi": lambda: extension("pi"), "omp": lambda: extension("omp")}
 
 
 def main():
