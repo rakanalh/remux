@@ -161,6 +161,7 @@ The `sessions` panel with a remote connected, and the `files` panel:
 - **Names and states** — `remux agent name` gives a pane a name to send to, and `remux agent ls` lists the agents with their state (`idle`, `working`, `needs-input`).
 - **Across machines** — `devbox:alpha` reaches a pane on a [remote](#remote-sessions-ssh), forwarded over SSH.
 - **Claude Code hooks** — `remux integrate claude-messaging` installs hooks that hand an agent its mail at the end of a turn and beside its user's next prompt.
+- **Agents come back after a restart** — with `remux integrate <agent>-resume` installed, an agent reports the session it is running, and after `remux restart` (or a reboot) its pane comes back as a shell in the same directory with ` claude --resume <id>` (or the agent's equivalent) typed and running. Quitting the agent leaves an ordinary prompt. See [Resuming agents after a restart](#resuming-agents-after-a-restart).
 
 See [Messaging between agents](#messaging-between-agents) below. Full details: [https://rakanalh.github.io/remux/messaging/](https://rakanalh.github.io/remux/messaging/)
 
@@ -370,6 +371,39 @@ Run it on the machine Claude Code runs on, as the user it runs as. It adds a `St
 - **Upgrading** — messaging needs protocol 20. A client refuses a server built from an older Remux (`incompatible remux: remote protocol v…`), so rebuild Remux on every machine, remotes included, and run `remux restart` on each so the running server is replaced.
 
 Full details: [https://rakanalh.github.io/remux/messaging/](https://rakanalh.github.io/remux/messaging/)
+
+### Resuming agents after a restart
+
+Each agent's hook or plugin runs `remux agent session <agent>` when a session starts, and the server keeps the session beside the pane's working directory in `state.json`. When the server restores sessions it types the agent's resume command into the pane's new shell, with a leading space so that a shell set to ignore such lines leaves it out of the history. Install the integration for each agent you use, on the machine it runs on:
+
+```bash
+remux integrate claude-resume     # SessionStart hook in $CLAUDE_CONFIG_DIR/settings.json (~/.claude)
+remux integrate codex-resume      # SessionStart hook in $CODEX_HOME/hooks.json (~/.codex), and
+                                  #   [features] hooks = true in its config.toml
+remux integrate pi-resume         # extension in $PI_CODING_AGENT_DIR/extensions (~/.pi/agent)
+remux integrate omp-resume        # extension in ~/$PI_CONFIG_DIR/agent/extensions (~/.omp/agent)
+remux integrate opencode-resume   # server plugin in plugins/ and a TUI plugin in tui.json(c),
+                                  #   in $OPENCODE_CONFIG_DIR (~/.config/opencode)
+```
+
+Each takes `--status`, `--dry-run` and `--uninstall`, like `claude-messaging`, and refuses an agent config dir that does not exist yet: run the agent once first. `claude-resume` and `claude-messaging` share one `settings.json`. Uninstalling `codex-resume` leaves `hooks = true` in place, since other hooks may rely on it. pi and omp both honour `$PI_CODING_AGENT_DIR`, so with it set they resolve to one directory and both installs are refused.
+
+| Agent | Typed after a restart |
+|---|---|
+| claude | `claude --resume <id>` |
+| codex | `codex resume <id>` |
+| pi | `pi --session <file>` |
+| omp | `omp --resume=<file>` |
+| opencode | `opencode --session <id>` |
+
+`[general] resume_agents = false` turns it all off: reports are refused and nothing is stored or typed. `resume_agent_delay_ms` (default 100) spaces the typed commands out. Both are read by the server, so they need `remux restart`.
+
+- **Only the agent in the pane** — a report typed at the prompt is refused, and so is a nested run: a `claude -p` or a subagent inside the pane's Claude, a `codex exec` inside its Codex, an omp started from omp's own shell tool. Another agent's session in a pane is never replaced while it runs.
+- **Quitting forgets it** — the moment the pane's shell takes the foreground back, the session is forgotten, so a pane where you quit the agent comes back as a plain shell. Suspending the agent with `^Z` hands the foreground back too, and forgets it as well.
+- **A slow `.zshrc` forgets it until the agent reports again** — zsh runs `.zshrc` with job control on, so any external command there (`starship init`, `zoxide init`, a `sleep`) takes the foreground and gives it back before the typed resume line runs, which forgets the session on every restore. The resumed agent reports it again as soon as it starts, so this only matters if the server is restarted again before that. bash, including `/bin/sh` on most Linux systems, runs its rc without job control and is not affected.
+- **Missing directories** — a pane whose saved directory is gone comes back as a plain shell rather than resuming in your home directory. Two panes holding the same session resume it once, in the lower-numbered pane.
+- **Ids stay out of the logs** — `server.log` and `client.log` name the agent, the pane and the length of the session id or path, never the value.
+- **Upgrading** — this needs protocol 21. Rebuild Remux on every machine and run `remux restart` on each.
 
 ### Configuration file
 
