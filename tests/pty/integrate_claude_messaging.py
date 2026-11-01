@@ -44,6 +44,9 @@
       with other members is refused (SKIPs when the user's primary group is
       not a private one: named after another user, or listing other members;
       the shared half SKIPs when the user is in no other group)
+  i24 with $CLAUDE_CONFIG_DIR set to an absolute directory, install writes the
+      hooks and the skill THERE, and ~/.claude is never created; a relative
+      value is ignored and ~/.claude is used
 
 Copies of the binary go under ~/.cache/rmx-integmsg, never under /tmp: /tmp
 is world-writable, so a binary there is refused (i21). That tree is removed
@@ -88,6 +91,8 @@ SAFE = os.path.join(os.path.expanduser("~"), ".cache", "rmx-integmsg")
 assert "/.claude" not in SAFE, SAFE
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fixtures", "settings")
 HARNESS = "claude-messaging"
+SKILL_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "skills",
+                         "remux-messaging", "SKILL.md")
 
 
 def shq(text):
@@ -117,20 +122,30 @@ def fresh_home(name):
     return home
 
 
-def env_for(home):
-    env = {k: v for k, v in os.environ.items() if k not in ("REMUX_SESSION", "REMUX_PANE")}
+# Every variable an agent resolves its config dir from: inherited, one of them
+# would point an install at the developer's real directory.
+AGENT_DIR_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR",
+                  "OPENCODE_CONFIG_DIR")
+
+
+def env_for(home, extra=None):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("REMUX_SESSION", "REMUX_PANE", *AGENT_DIR_VARS)}
     env.update(HOME=home, XDG_RUNTIME_DIR=f"{RUNDIR}/run", XDG_STATE_HOME=f"{RUNDIR}/state",
                XDG_DATA_HOME=f"{RUNDIR}/data", XDG_CONFIG_HOME=f"{RUNDIR}/config")
+    env.update(extra or {})
     return env
 
 
-def integrate(home, *args, binary=BIN, dev=True):
-    env = env_for(home)
+def integrate(home, *args, binary=BIN, dev=True, extra=None):
+    env = env_for(home, extra)
     # The one thing this harness must never do is touch the real ~/.claude.
     assert "HOME" in env and env["HOME"].startswith(RUNDIR + "/"), env.get("HOME")
     flags = ["--allow-dev-path"] if dev and args and args[0] == HARNESS else []
+    # Run from inside the throwaway HOME, so a relative config dir that were
+    # wrongly honoured would land there and be seen, not in the repo.
     p = subprocess.run([binary, "integrate", *args, *flags], env=env, capture_output=True,
-                       timeout=20)
+                       timeout=20, cwd=home)
     return p.returncode, p.stdout.decode(errors="replace"), p.stderr.decode(errors="replace")
 
 
@@ -587,6 +602,25 @@ check(rc != 0 and f"{openskills}/.claude/skills is writable by others" in err
       and not os.path.exists(os.path.dirname(skill(openskills))) and not os.path.exists(settings(openskills)),
       f"s9 a skills/ others can write is refused before anything is written (rc={rc}, err={err.strip()!r})")
 os.chmod(f"{openskills}/.claude/skills", 0o755)
+
+# -- i24 ---------------------------------------------------------------------
+configured = fresh_home("configdir")
+claude_dir = f"{configured}/elsewhere/claude"
+os.makedirs(claude_dir)
+rc, _, err = integrate(configured, HARNESS, extra={"CLAUDE_CONFIG_DIR": claude_dir})
+doc = json.load(open(f"{claude_dir}/settings.json")) if os.path.exists(f"{claude_dir}/settings.json") else {}
+check(rc == 0 and STOP in commands(doc, "Stop") and PROMPT in commands(doc, "UserPromptSubmit"),
+      f"i24 $CLAUDE_CONFIG_DIR receives the hooks (rc={rc}, err={err.strip()!r})")
+check(open(f"{claude_dir}/skills/remux-messaging/SKILL.md").read() == open(SKILL_SRC).read()
+      if os.path.exists(f"{claude_dir}/skills/remux-messaging/SKILL.md") else False,
+      "i24 ...and the skill")
+check(not os.path.exists(f"{configured}/.claude"), "i24 ...and ~/.claude is never created")
+rc, out, _ = integrate(configured, HARNESS, "--status", extra={"CLAUDE_CONFIG_DIR": claude_dir})
+check(rc == 0 and "Installed" in out, f"i24 --status with the variable reads Installed ({out.strip()!r})")
+rel = fresh_home("configrel")
+rc, _, _ = integrate(rel, HARNESS, extra={"CLAUDE_CONFIG_DIR": "relative/claude"})
+check(rc == 0 and os.path.exists(settings(rel)) and not os.path.exists(f"{rel}/relative"),
+      "i24 a relative $CLAUDE_CONFIG_DIR is ignored: ~/.claude is used")
 
 # -- i9 ----------------------------------------------------------------------
 for bogus in ("bogus", "claude"):

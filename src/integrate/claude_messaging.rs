@@ -1,8 +1,8 @@
 //! Claude Code's messaging integration: the `Stop` and `UserPromptSubmit`
-//! hooks in `$HOME/.claude/settings.json`, running `remux msg hook
-//! claude-stop` and `remux msg hook claude-prompt` by this binary's absolute
-//! path, and the remux-messaging skill at
-//! `$HOME/.claude/skills/remux-messaging/SKILL.md`.
+//! hooks in `settings.json` in Claude's config dir (`$CLAUDE_CONFIG_DIR`, else
+//! `~/.claude`), running `remux msg hook claude-stop` and `remux msg hook
+//! claude-prompt` by this binary's absolute path, and the remux-messaging
+//! skill at `skills/remux-messaging/SKILL.md` in the same dir.
 //!
 //! The binary knows only its own build's skill text. A skill file that
 //! differs from it may be an older build's or the user's edit, and the two
@@ -65,17 +65,22 @@ pub struct ClaudeMessaging {
 }
 
 impl ClaudeMessaging {
-    /// For `$HOME/.claude`, writing hooks that run THIS binary by its
-    /// canonical path, as this process's user.
+    /// For Claude's config dir as Claude resolves it, writing hooks that run
+    /// THIS binary by its canonical path, as this process's user. The same
+    /// dir as `claude-resume`, so both write one `settings.json`.
     pub fn from_env(allow_dev_path: bool) -> Result<Self> {
         let (home, binary) = home_and_binary()?;
-        Ok(Self::new(&home, binary, allow_dev_path, effective_uid()))
+        Ok(Self::new(
+            &super::env::claude_config_dir(&home),
+            binary,
+            allow_dev_path,
+            effective_uid(),
+        ))
     }
 
-    /// For `home/.claude`, writing hooks that run `binary`, as the user
-    /// `euid`.
-    pub fn new(home: &Path, binary: PathBuf, allow_dev_path: bool, euid: u32) -> Self {
-        let claude = home.join(".claude");
+    /// For the Claude config dir `claude`, writing hooks that run `binary`,
+    /// as the user `euid`.
+    pub fn new(claude: &Path, binary: PathBuf, allow_dev_path: bool, euid: u32) -> Self {
         Self {
             hooks: HooksFile::new(
                 claude.join("settings.json"),
@@ -303,7 +308,12 @@ mod tests {
 
     /// The integration under a throwaway `home`, never the real `$HOME`.
     fn in_home(home: &Path) -> ClaudeMessaging {
-        ClaudeMessaging::new(home, PathBuf::from(BINARY), true, effective_uid())
+        ClaudeMessaging::new(
+            &home.join(".claude"),
+            PathBuf::from(BINARY),
+            true,
+            effective_uid(),
+        )
     }
 
     fn skill_path(home: &Path) -> PathBuf {
