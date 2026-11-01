@@ -41,6 +41,7 @@ notify = "7"
 # pattern language at runtime. Already in the lock file via `env_logger`, so
 # promoting it to a direct dependency adds no new crate to the build.
 regex = "1"
+toml_edit = "0.22"
 
 [dev-dependencies]
 # `start_paused` for tests that cross a timeout without waiting it out.

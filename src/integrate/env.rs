@@ -24,7 +24,6 @@ pub fn claude_config_dir(home: &Path) -> PathBuf {
 }
 
 /// `$CODEX_HOME`, else `~/.codex`.
-#[allow(dead_code)]
 pub fn codex_home(home: &Path) -> PathBuf {
     codex_home_with(home, var)
 }

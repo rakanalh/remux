@@ -63,6 +63,9 @@ enum IntegrateHarness {
     /// Claude Code: the SessionStart hook that reports the session for
     /// restore after `remux restart`, in the same settings.json
     ClaudeResume,
+    /// Codex: the SessionStart hook in $CODEX_HOME/hooks.json (~/.codex by
+    /// default), and `[features] hooks = true` in its config.toml
+    CodexResume,
 }
 
 #[derive(Subcommand)]
@@ -861,6 +864,9 @@ fn run_integrate(
         IntegrateHarness::ClaudeResume => Box::new(
             integrate::claude_resume::ClaudeResume::from_env(allow_dev_path)?,
         ),
+        IntegrateHarness::CodexResume => Box::new(integrate::codex_resume::CodexResume::from_env(
+            allow_dev_path,
+        )?),
     };
     let name = integration.name();
     if status {

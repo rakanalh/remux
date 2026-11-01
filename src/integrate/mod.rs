@@ -6,8 +6,10 @@
 
 pub mod claude_messaging;
 pub mod claude_resume;
+pub mod codex_resume;
 pub mod env;
 pub mod hooks_file;
+pub mod toml_file;
 
 use std::path::PathBuf;
 

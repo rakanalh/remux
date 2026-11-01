@@ -29,7 +29,20 @@ claude (the hook in `$CLAUDE_CONFIG_DIR/settings.json`):
       Stale, left byte-identical by install and uninstall, and no hook of ours
       is added beside it
 
-Run: python3 tests/pty/integrate_agent_resume.py [claude ...]
+codex (the hook in `$CODEX_HOME/hooks.json`, the flag in its config.toml):
+  x1  a fresh CODEX_HOME is Absent
+  x2  install into a commented config.toml with its own [features] keys adds
+      `hooks = true` as one new line and leaves every other byte; hooks.json
+      gains exactly one SessionStart group; only those two files changed
+  x3  --status is Installed
+  x4  a second install changes no byte, inode or mtime anywhere
+  x5  --uninstall removes the hook, says it left `hooks = true`, and leaves
+      config.toml byte for byte as the install made it
+  x6  a config.toml with no [features] gains the table exactly once
+  x7  --dry-run writes nothing
+  x8  a missing CODEX_HOME is refused and nothing is created
+
+Run: python3 tests/pty/integrate_agent_resume.py [claude codex ...]
 """
 import hashlib
 import json
@@ -253,7 +266,79 @@ def claude_wrapper():
     check(changed(before, t.snapshot()) == [], "c11 uninstall leaves it byte-identical")
 
 
-MODES = {"claude": lambda: (claude(), claude_wrapper())}
+CODEX_RESUME = f"{shq(REAL)} agent session codex --hook || true"
+
+
+def codex():
+    h = "codex-resume"
+    t = Tree("codex")
+    d = t.dirs["CODEX_HOME"]
+    os.makedirs(d)
+    rc, out, _ = t.integrate(h, "--status")
+    check(rc == 0 and "Absent" in out, f"x1 a fresh CODEX_HOME is Absent ({out.strip()!r})")
+
+    seeded = open(f"{FIXTURES}/agent_session/codex_config.toml").read()
+    with open(f"{d}/config.toml", "w") as f:
+        f.write(seeded)
+    before = t.snapshot()
+    rc, out, err = t.integrate(h)
+    after = t.snapshot()
+    config = open(f"{d}/config.toml").read()
+    check(rc == 0 and config == seeded.replace("other = false\n", "other = false\nhooks = true\n"),
+          f"x2 config.toml gains one `hooks = true` line and keeps every other byte "
+          f"(rc={rc}, err={err.strip()!r}, got {config!r})")
+    doc = json.load(open(f"{d}/hooks.json")) if os.path.exists(f"{d}/hooks.json") else {}
+    check(groups(doc, "SessionStart") == [{"hooks": [{"type": "command", "command": CODEX_RESUME,
+                                                      "timeout": 10}]}],
+          f"x2 hooks.json holds one SessionStart group running ours (got {doc})")
+    check(changed(before, after) == sorted([f"{d}/config.toml", f"{d}/hooks.json"]),
+          f"x2 only config.toml and hooks.json changed ({changed(before, after)})")
+
+    rc, out, _ = t.integrate(h, "--status")
+    check(rc == 0 and "Installed" in out, f"x3 --status is Installed ({out.strip()!r})")
+
+    before = t.snapshot()
+    t.integrate(h)
+    check(changed(before, t.snapshot()) == [], "x4 a second install changes no byte, inode or mtime")
+
+    installed = open(f"{d}/config.toml").read()
+    before = t.snapshot()
+    rc, out, err = t.integrate(h, "--uninstall")
+    doc = json.load(open(f"{d}/hooks.json"))
+    check(rc == 0 and CODEX_RESUME not in commands(doc, "SessionStart"), f"x5 uninstall removes the hook (rc={rc})")
+    check("hooks = true" in err and "left" in err, f"x5 ...and says it left the flag ({err.strip()!r})")
+    check(open(f"{d}/config.toml").read() == installed and changed(before, t.snapshot()) == [f"{d}/hooks.json"],
+          "x5 ...leaving config.toml exactly as the install made it")
+
+    bare = Tree("codex-bare")
+    bd = bare.dirs["CODEX_HOME"]
+    os.makedirs(bd)
+    with open(f"{bd}/config.toml", "w") as f:
+        f.write('# no features yet\nmodel = "o3"\n')
+    rc, _, err = bare.integrate(h)
+    text = open(f"{bd}/config.toml").read()
+    check(rc == 0 and text.startswith('# no features yet\nmodel = "o3"\n') and text.count("[features]") == 1
+          and "hooks = true" in text, f"x6 [features] is created once (got {text!r})")
+    bare.integrate(h)
+    check(open(f"{bd}/config.toml").read() == text, "x6 ...and a re-run adds no second one")
+
+    dry = Tree("codex-dry")
+    os.makedirs(dry.dirs["CODEX_HOME"])
+    with open(f"{dry.dirs['CODEX_HOME']}/config.toml", "w") as f:
+        f.write(seeded)
+    before = dry.snapshot()
+    rc, out, _ = dry.integrate(h, "--dry-run")
+    check(rc == 0 and "hooks = true" in out and changed(before, dry.snapshot()) == [],
+          f"x7 --dry-run shows both changes and writes nothing ({out.strip()[:100]!r})")
+
+    missing = Tree("codex-missing")
+    before = missing.snapshot()
+    rc, _, err = missing.integrate(h)
+    check(rc != 0 and "does not exist" in err and changed(before, missing.snapshot()) == [],
+          f"x8 a missing CODEX_HOME is refused (rc={rc}, err={err.strip()!r})")
+
+
+MODES = {"claude": lambda: (claude(), claude_wrapper()), "codex": codex}
 
 
 def main():
