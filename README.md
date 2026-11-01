@@ -403,7 +403,7 @@ Each takes `--status`, `--dry-run` and `--uninstall`, like `claude-messaging`, a
 - **A slow `.zshrc` forgets it until the agent reports again** — zsh runs `.zshrc` with job control on, so any external command there (`starship init`, `zoxide init`, a `sleep`) takes the foreground and gives it back before the typed resume line runs, which forgets the session on every restore. The resumed agent reports it again as soon as it starts, so this only matters if the server is restarted again before that. bash, including `/bin/sh` on most Linux systems, runs its rc without job control and is not affected.
 - **Missing directories** — a pane whose saved directory is gone comes back as a plain shell rather than resuming in your home directory. Two panes holding the same session resume it once, in the lower-numbered pane.
 - **Ids stay out of the logs** — `server.log` and `client.log` name the agent, the pane and the length of the session id or path, never the value.
-- **Upgrading** — this needs protocol 21. Rebuild Remux on every machine and run `remux restart` on each.
+- **Upgrading** — this needs protocol 22. Rebuild Remux on every machine and run `remux restart` on each.
 
 ### Configuration file
 
