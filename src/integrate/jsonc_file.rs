@@ -10,7 +10,6 @@ use anyhow::{Context, Result};
 use jsonc_parser::cst::{CstArray, CstRootNode};
 use jsonc_parser::ParseOptions;
 
-#[allow(dead_code)]
 pub const TUI_SCHEMA: &str = "https://opencode.ai/tui.json";
 
 fn parse(text: &str) -> Result<CstRootNode> {
@@ -53,7 +52,6 @@ fn is_entry(node: &jsonc_parser::cst::CstNode, entry: &str) -> bool {
 }
 
 /// Whether the `plugin` array lists `entry`.
-#[allow(dead_code)]
 pub fn has_plugin(text: &str, entry: &str) -> Result<bool> {
     let root = parse(text)?;
     Ok(plugin_array(&root, false)?
@@ -62,7 +60,6 @@ pub fn has_plugin(text: &str, entry: &str) -> Result<bool> {
 
 /// `text` with `entry` appended to the `plugin` array, the array created when
 /// absent; `None` when it is already listed, so nothing is written.
-#[allow(dead_code)]
 pub fn add_plugin(text: &str, entry: &str) -> Result<Option<String>> {
     if has_plugin(text, entry)? {
         return Ok(None);
@@ -75,7 +72,6 @@ pub fn add_plugin(text: &str, entry: &str) -> Result<Option<String>> {
 
 /// `text` without `entry` in the `plugin` array; `None` when it is not
 /// listed. The array itself stays, emptied or not: it is the user's key.
-#[allow(dead_code)]
 pub fn remove_plugin(text: &str, entry: &str) -> Result<Option<String>> {
     let root = parse(text)?;
     let Some(array) = plugin_array(&root, false)? else {
@@ -96,7 +92,6 @@ pub fn remove_plugin(text: &str, entry: &str) -> Result<Option<String>> {
 }
 
 /// A new `tui.json` holding the schema and `entry` alone.
-#[allow(dead_code)]
 pub fn new_tui_json(entry: &str) -> String {
     let value = serde_json::json!({ "$schema": TUI_SCHEMA, "plugin": [entry] });
     format!(

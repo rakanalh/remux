@@ -58,7 +58,24 @@ default `~/.pi/agent`, omp at `~/$PI_CONFIG_DIR/agent` with a custom name, and
   e8  a missing agent dir is refused and nothing is created
   e9  with $PI_CODING_AGENT_DIR set, pi and omp resolve to one dir: refused
 
-Run: python3 tests/pty/integrate_agent_resume.py [claude codex pi omp ...]
+opencode (a server plugin in `plugins/`, a TUI plugin at the dir's top level
+listed in `tui.jsonc` / `tui.json`):
+  q1  a fresh config dir is Absent
+  q2  with a commented tui.jsonc and OpenCode's own files (package.json,
+      .gitignore, node_modules/) present, install writes both plugins and adds
+      one array entry; tui.jsonc keeps every other byte; OpenCode's files and
+      the rest of the tree are untouched; `node --check` accepts both plugins
+  q3  --status is Installed
+  q4  a second install changes no byte, inode or mtime
+  q5  --uninstall removes both plugins and the entry, and tui.jsonc is byte for
+      byte what it was before the install
+  q6  with no tui.json(c), install creates tui.json holding the schema and the
+      one entry; with only tui.json, that file is the one edited
+  q7  a file without remux's header at either plugin path is refused and
+      nothing is written
+  q8  a missing config dir is refused and nothing is created
+
+Run: python3 tests/pty/integrate_agent_resume.py [claude codex pi omp opencode ...]
 """
 import hashlib
 import json
@@ -432,7 +449,91 @@ def extension(agent):
           f"e9 {agent}: one dir for both agents is refused (rc={rc}, err={err.strip()!r})")
 
 
-MODES = {"claude": lambda: (claude(), claude_wrapper()), "codex": codex,
+def opencode():
+    h = "opencode-resume"
+    t = Tree("opencode")
+    d = t.dirs["OPENCODE_CONFIG_DIR"]
+    os.makedirs(f"{d}/node_modules/@opencode-ai/plugin")
+    for name, text in ((".gitignore", "node_modules\n"),
+                       ("package.json", '{"dependencies":{"@opencode-ai/plugin":"1.18.32"}}\n'),
+                       ("node_modules/@opencode-ai/plugin/index.js", "export {}\n")):
+        with open(f"{d}/{name}", "w") as f:
+            f.write(text)
+    server, tui = f"{d}/plugins/remux-agent-session.js", f"{d}/remux-tui-session.js"
+    rc, out, _ = t.integrate(h, "--status")
+    check(rc == 0 and "Absent" in out, f"q1 a fresh config dir is Absent ({out.strip()!r})")
+
+    seeded = open(f"{FIXTURES}/agent_session/opencode_tui.jsonc").read()
+    with open(f"{d}/tui.jsonc", "w") as f:
+        f.write(seeded)
+    before = t.snapshot()
+    rc, _, err = t.integrate(h)
+    after = t.snapshot()
+    text = open(f"{d}/tui.jsonc").read()
+    added = [ln for ln in text.splitlines() if ln not in seeded.splitlines()]
+    check(rc == 0 and added == [f'    {json.dumps(tui)},'] and
+          [ln for ln in text.splitlines() if ln in seeded.splitlines()] == seeded.splitlines(),
+          f"q2 tui.jsonc gains exactly one entry line and keeps every other (rc={rc}, err={err.strip()!r}, added={added})")
+    check(changed(before, after) == sorted([f"{d}/plugins", server, tui, f"{d}/tui.jsonc"]),
+          f"q2 only the two plugins, plugins/ and tui.jsonc changed ({changed(before, after)})")
+    for path in (server, tui):
+        body = open(path).read() if os.path.exists(path) else ""
+        node = subprocess.run(["node", "--check", path], capture_output=True, timeout=30)
+        check(f"const REMUX_BIN = {json.dumps(REAL)};" in body and node.returncode == 0,
+              f"q2 {os.path.basename(path)} runs this binary and node accepts it ({node.stderr[:120]!r})")
+
+    rc, out, _ = t.integrate(h, "--status")
+    check(rc == 0 and "Installed" in out, f"q3 --status is Installed ({out.strip()!r})")
+
+    before = t.snapshot()
+    t.integrate(h)
+    check(changed(before, t.snapshot()) == [], "q4 a second install changes nothing")
+
+    rc, _, err = t.integrate(h, "--uninstall")
+    check(rc == 0 and not os.path.exists(server) and not os.path.exists(tui),
+          f"q5 uninstall removes both plugins (rc={rc}, err={err.strip()!r})")
+    check(open(f"{d}/tui.jsonc").read() == seeded,
+          f"q5 ...and tui.jsonc is byte for byte as before the install ({open(f'{d}/tui.jsonc').read()!r})")
+    rc, out, _ = t.integrate(h, "--status")
+    check("Absent" in out, f"q5 --status is Absent again ({out.strip()!r})")
+
+    fresh = Tree("opencode-fresh")
+    fd = fresh.dirs["OPENCODE_CONFIG_DIR"]
+    os.makedirs(fd)
+    rc, _, _ = fresh.integrate(h)
+    doc = json.load(open(f"{fd}/tui.json")) if os.path.exists(f"{fd}/tui.json") else None
+    check(rc == 0 and doc == {"$schema": "https://opencode.ai/tui.json", "plugin": [f"{fd}/remux-tui-session.js"]},
+          f"q6 with no tui.json(c) a new tui.json holds the schema and the entry (got {doc})")
+    plain = Tree("opencode-plain")
+    pd = plain.dirs["OPENCODE_CONFIG_DIR"]
+    os.makedirs(pd)
+    with open(f"{pd}/tui.json", "w") as f:
+        f.write('{\n  "theme": "x"\n}\n')
+    rc, _, _ = plain.integrate(h)
+    doc = json.load(open(f"{pd}/tui.json"))
+    check(rc == 0 and doc.get("theme") == "x" and doc.get("plugin") == [f"{pd}/remux-tui-session.js"]
+          and not os.path.exists(f"{pd}/tui.jsonc"),
+          f"q6 with only tui.json, that file gains the entry (got {doc})")
+
+    for label, path in (("server", "plugins/remux-agent-session.js"), ("TUI", "remux-tui-session.js")):
+        mine = Tree(f"opencode-mine-{label}")
+        md = mine.dirs["OPENCODE_CONFIG_DIR"]
+        os.makedirs(os.path.dirname(f"{md}/{path}"), exist_ok=True)
+        with open(f"{md}/{path}", "w") as f:
+            f.write("// my own plugin\nexport default {}\n")
+        before = mine.snapshot()
+        rc, _, err = mine.integrate(h)
+        check(rc != 0 and "not a file remux wrote" in err and changed(before, mine.snapshot()) == [],
+              f"q7 a headerless {label} plugin file is refused and nothing is written (rc={rc}, err={err.strip()!r})")
+
+    missing = Tree("opencode-missing")
+    before = missing.snapshot()
+    rc, _, err = missing.integrate(h)
+    check(rc != 0 and "does not exist" in err and changed(before, missing.snapshot()) == [],
+          f"q8 a missing config dir is refused (rc={rc}, err={err.strip()!r})")
+
+
+MODES = {"claude": lambda: (claude(), claude_wrapper()), "codex": codex, "opencode": opencode,
          "pi": lambda: extension("pi"), "omp": lambda: extension("omp")}
 
 

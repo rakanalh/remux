@@ -1,0 +1,8 @@
+{
+  // my TUI config, with comments remux must keep
+  "$schema": "https://opencode.ai/tui.json",
+  "theme": "tokyonight", /* keep this */
+  "plugin": [
+    "./plugins/mine.js", // the one I wrote
+  ],
+}

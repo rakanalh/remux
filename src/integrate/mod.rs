@@ -10,6 +10,7 @@ pub mod codex_resume;
 pub mod env;
 pub mod hooks_file;
 pub mod jsonc_file;
+pub mod opencode_resume;
 pub mod pi_omp_resume;
 pub mod plugin_file;
 pub mod toml_file;

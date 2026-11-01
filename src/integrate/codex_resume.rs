@@ -7,16 +7,15 @@
 //! Uninstall removes the hook and LEAVES the feature flag: other hooks may
 //! rely on it, and turning a user's feature off is not remux's to do.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use super::claude_resume::require_dir;
 use super::hooks_file::{
-    check_directory, check_owner, check_plain_file, effective_uid, home_and_binary,
-    write_atomically, Fingerprint, HookSet, Hooks, HooksFile,
+    effective_uid, home_and_binary, write_atomically, HookSet, Hooks, HooksFile,
 };
+use super::plugin_file::{read_for_edit, ForEdit};
 use super::{Change, Integration, IntegrationStatus};
 
 pub static RESUME_CODEX: HookSet = HookSet {
@@ -35,13 +34,6 @@ pub struct CodexResume {
     hooks: HooksFile,
     config: PathBuf,
     euid: u32,
-}
-
-/// `config.toml` as read for an edit.
-struct Config {
-    path: PathBuf,
-    text: Option<String>,
-    fingerprint: Option<Fingerprint>,
 }
 
 impl CodexResume {
@@ -69,51 +61,12 @@ impl CodexResume {
         }
     }
 
-    /// `config.toml`, or the file it links to, so a dotfiles link is written
-    /// through rather than replaced. A link to nothing is refused.
-    fn read_config(&self) -> Result<Config> {
-        let path = match std::fs::canonicalize(&self.config) {
-            Ok(path) => path,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                anyhow::ensure!(
-                    std::fs::symlink_metadata(&self.config).is_err(),
-                    "{} is a symlink to a file that does not exist; create the file it \
-                     names, or remove the link, and re-run",
-                    self.config.display()
-                );
-                self.config.clone()
-            }
-            Err(e) => {
-                return Err(e).with_context(|| format!("resolving {}", self.config.display()))
-            }
-        };
-        check_owner(&path, self.euid)?;
-        check_directory(&path, self.euid)?;
-        check_plain_file(&path)?;
-        let mut file = match std::fs::File::open(&path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Config {
-                    path,
-                    text: None,
-                    fingerprint: None,
-                })
-            }
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-        };
-        let fingerprint = Fingerprint::of(&file.metadata()?);
-        let mut text = String::new();
-        file.read_to_string(&mut text)
-            .with_context(|| format!("reading {}", path.display()))?;
-        Ok(Config {
-            path,
-            text: Some(text),
-            fingerprint: Some(fingerprint),
-        })
+    fn read_config(&self) -> Result<ForEdit> {
+        read_for_edit(&self.config, self.euid)
     }
 
     /// The config change an install makes, if any.
-    fn config_change(&self) -> Result<(Config, Option<String>)> {
+    fn config_change(&self) -> Result<(ForEdit, Option<String>)> {
         let config = self.read_config()?;
         let after = super::toml_file::ensure_features_hooks(config.text.as_deref().unwrap_or(""))
             .with_context(|| format!("editing {}", config.path.display()))?;

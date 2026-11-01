@@ -72,6 +72,9 @@ enum IntegrateHarness {
     /// omp: the remux-agent-session.ts extension in ~/$PI_CONFIG_DIR/agent
     /// (~/.omp/agent by default)
     OmpResume,
+    /// OpenCode 1.18: a server plugin in $OPENCODE_CONFIG_DIR/plugins/ and a
+    /// TUI plugin listed in its tui.json(c) (~/.config/opencode by default)
+    OpencodeResume,
 }
 
 #[derive(Subcommand)]
@@ -881,6 +884,9 @@ fn run_integrate(
             integrate::pi_omp_resume::Agent::Omp,
             allow_dev_path,
         )?),
+        IntegrateHarness::OpencodeResume => Box::new(
+            integrate::opencode_resume::OpencodeResume::from_env(allow_dev_path)?,
+        ),
     };
     let name = integration.name();
     if status {

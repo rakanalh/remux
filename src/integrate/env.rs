@@ -41,7 +41,6 @@ pub fn omp_agent_dir(home: &Path) -> PathBuf {
 
 /// `$OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`, else
 /// `~/.config/opencode`.
-#[allow(dead_code)]
 pub fn opencode_config_dir(home: &Path) -> PathBuf {
     opencode_config_dir_with(home, var)
 }

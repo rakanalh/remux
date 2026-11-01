@@ -19,6 +19,60 @@ use super::hooks_file::{
 };
 use super::{Change, IntegrationStatus};
 
+/// A file remux edits but does not own (a config file), as read for an edit:
+/// the path written to, its text, and the fingerprint the write checks.
+pub struct ForEdit {
+    pub path: PathBuf,
+    pub text: Option<String>,
+    pub fingerprint: Option<Fingerprint>,
+}
+
+/// `path`, or the file it links to, so a link is written through rather than
+/// replaced; a link to nothing is refused.
+fn resolve(path: &Path) -> Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::ensure!(
+                std::fs::symlink_metadata(path).is_err(),
+                "{} is a symlink to a file that does not exist; create the file it names, \
+                 or remove the link, and re-run",
+                path.display()
+            );
+            Ok(path.to_path_buf())
+        }
+        Err(e) => Err(e).with_context(|| format!("resolving {}", path.display())),
+    }
+}
+
+/// Read `path` for an edit, through the ownership and plain-file checks.
+pub fn read_for_edit(path: &Path, euid: u32) -> Result<ForEdit> {
+    let path = resolve(path)?;
+    check_owner(&path, euid)?;
+    check_directory(&path, euid)?;
+    check_plain_file(&path)?;
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ForEdit {
+                path,
+                text: None,
+                fingerprint: None,
+            })
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let fingerprint = Fingerprint::of(&file.metadata()?);
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(ForEdit {
+        path,
+        text: Some(text),
+        fingerprint: Some(fingerprint),
+    })
+}
+
 /// What every remux-managed plugin file starts with.
 pub const HEADER: &str = "// managed by remux; REMUX_INTEGRATION_ID=";
 
@@ -92,22 +146,8 @@ impl PluginFile {
         &self.path
     }
 
-    /// The file, or what it links to, so a link is written through; a link to
-    /// nothing is refused.
     fn target(&self) -> Result<PathBuf> {
-        match std::fs::canonicalize(&self.path) {
-            Ok(path) => Ok(path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                anyhow::ensure!(
-                    std::fs::symlink_metadata(&self.path).is_err(),
-                    "{} is a symlink to a file that does not exist; create the file it \
-                     names, or remove the link, and re-run",
-                    self.path.display()
-                );
-                Ok(self.path.clone())
-            }
-            Err(e) => Err(e).with_context(|| format!("resolving {}", self.path.display())),
-        }
+        resolve(&self.path)
     }
 
     fn read(&self) -> Result<OnDiskFile> {
