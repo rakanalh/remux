@@ -12,6 +12,8 @@ bad_agent       an agent nobody configured is refused bad_agent.
 bad_reference   a 129-byte id, a path for claude, and a control char are each
                 refused bad_reference.
 not_in_pane     an outside caller that names no pane is refused not_in_pane.
+sender_unverified  a socket handed on after its connector exited is refused
+                sender_unverified, never attributed, and nothing is stored.
 cli_attributed  `remux agent session claude --id` run as a pane's own program,
                 with a DIRECT argv so remux's parent is the server and not the
                 pane's shell, is attributed to that pane by the server and
@@ -50,6 +52,10 @@ On a server of its own, with `resume_agents = false`:
 disabled        a report is refused `disabled`, state.json holds no record,
                 and a restart types nothing.
 
+On a server of its own, with `save_sessions = false`:
+no_save         a report is answered, no state.json is ever written, and a
+                restart brings back nothing to type.
+
 On a server of its own, with `resume_agent_delay_ms = 1500`:
 stagger         two panes in two SESSIONS holding different ids: the second
                 stub runs at least 1.4 s after the first, so the delay
@@ -75,7 +81,7 @@ redaction       server.log and client.log carry the summary line with the id's
                 byte count and never the id.
 no_panic        server.log has no `panicked at`.
 
-Run: python3 tests/frame/agent_session.py [main|disabled|stagger|hardening|resurrect ...]
+Run: python3 tests/frame/agent_session.py [main|disabled|no_save|stagger|hardening|resurrect ...]
      (RMX_RUNDIR overrides the run dir)
 """
 import json
@@ -457,6 +463,60 @@ def restart_types(rig, pane):
           f"restart_types: the line typed into %{pane} was 54 bytes, space and \\r included")
 
 
+def inherited_socket_report(rig, body):
+    """P connects and finishes the handshake, forks C and exits; the harness
+    reaps P; C then sends on the socket it inherited, so the connector the
+    server pinned is gone when the report is checked."""
+    out_file = f"{rig.srv.rundir}/inherited.json"
+    p = os.fork()
+    if p == 0:
+        try:
+            c = Client(rig.srv.sock)
+            c.s.settimeout(5)
+            c.hello()
+            if os.fork() == 0:
+                time.sleep(1.0)
+                c.send({"AgentSession": body})
+                while True:
+                    reply = c.recv()
+                    if name_of(reply) not in ("ViewList", "Event"):
+                        break
+                with open(out_file + ".tmp", "w") as f:
+                    f.write(json.dumps(reply))
+                os.rename(out_file + ".tmp", out_file)
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+    os.waitpid(p, 0)
+    end = time.time() + 6.0
+    while time.time() < end and not os.path.exists(out_file):
+        time.sleep(0.05)
+    with open(out_file) as f:
+        return json.load(f)
+
+
+def sender_unverified(rig):
+    pane = rig.spawn()
+    r = inherited_socket_report(rig, {"agent": "claude", "reference": {"Id": UUID}, "pane": pane})
+    check(code(r) == "sender_unverified" and "exited" in r["Error"]["message"],
+          f"sender_unverified: a report on a socket whose connector exited is refused (got {r})")
+    check(held_in_state(rig, pane) is None, "sender_unverified: nothing was stored")
+    r = report(rig, pane, "claude", {"Id": UUID})
+    check(outcome(r) == "Stored", f"sender_unverified: the pane still holds nothing (got {r})")
+
+
+def no_save(rig):
+    pane = rig.spawn()
+    r = report(rig, pane, "claude", {"Id": RESTORE_ID}, source="startup")
+    check(name_of(r) == "AgentSessionStored", f"no_save: the report is answered (got {r})")
+    path = f"{rig.srv.rundir}/data/remux/state.json"
+    check(not os.path.exists(path), "no_save: no state.json was written")
+    rig.restart()
+    check(not os.path.exists(path), "no_save: nor on shutdown")
+    runs = rig.wait_runs("claude", 1, timeout=3.0)
+    check(runs == [], f"no_save: the restart typed nothing (got {runs})")
+
+
 def disabled(rig):
     pane = rig.spawn()
     r = report(rig, pane, "claude", {"Id": RESTORE_ID}, source="startup")
@@ -592,11 +652,14 @@ def on_own_server(suffix, config, case, base=CONFIG):
 
 
 def main():
-    groups = sys.argv[1:] or ["main", "disabled", "stagger", "hardening", "resurrect"]
+    groups = sys.argv[1:] or ["main", "disabled", "no_save", "stagger", "hardening", "resurrect"]
     if "main" in groups:
         main_server()
     if "disabled" in groups:
         on_own_server("disabled", "resume_agents = false\n", disabled)
+    if "no_save" in groups:
+        on_own_server("no_save", "", no_save, base=CONFIG.replace(
+            "save_sessions = true", "save_sessions = false"))
     if "stagger" in groups:
         on_own_server("stagger", "resume_agent_delay_ms = 1500\n", stagger)
     if "hardening" in groups:
@@ -643,6 +706,7 @@ def main_server():
 
         r = report(rig, None, "claude", {"Id": UUID})
         check(code(r) == "not_in_pane", f"not_in_pane: an outside caller naming no pane (got {r})")
+        sender_unverified(rig)
 
         cli_attributed(rig)
         cli_stdout(rig)
