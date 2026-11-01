@@ -42,9 +42,9 @@ slow_rc   `/bin/sh` with `ENV` naming an rc that sleeps 2 s before the first
           rc's `sleep` never takes the foreground and NO forget lands before
           the stub runs.
 slow_rc_zsh  the same under zsh, whose `.zshrc` runs with job control on:
-          its `sleep` takes the foreground and gives it back, which forgets the
-          record BEFORE the typed line runs, and state.json holds NO record
-          once the stub has run. That is the race SPEC 1.7 step 5 accepts
+          its `sleep` takes the foreground and gives it back, which usually
+          forgets the record BEFORE the typed line runs (the run prints which),
+          and state.json holds NO record once the stub has run. That is the race SPEC 1.7 step 5 accepts
           (the resumed agent's own hook re-stores it), pinned as understood.
           It also proves the typed line survives zsh's line editor starting.
 disabled  with `resume_agents = false` the hook's report is refused
@@ -160,6 +160,13 @@ class Rig:
         the run dir. The pane's shell looks `claude` up when it is typed."""
         for d in (self.bin, self.argv_dir, f"{RUNDIR}/home/.claude"):
             os.makedirs(d, exist_ok=True)
+        # A login shell's /etc/profile can put system dirs ahead of the
+        # inherited PATH (macOS path_helper, with Homebrew's real agents); the
+        # throwaway HOME's profile, read after it, puts the stubs first again
+        # in every shell the restore spawns.
+        for profile in (".profile", ".zprofile"):
+            with open(f"{RUNDIR}/home/{profile}", "w") as f:
+                f.write(f'PATH="{self.bin}:$PATH"; export PATH\n')
         path = f"{self.bin}/claude"
         source = STUB.format(argv_dir=self.argv_dir, log=self.hook_log,
                              payload=os.path.join(FIXTURES, "claude_startup.json"))
@@ -406,8 +413,16 @@ def slow_rc_case(rig, mode, races):
     early = [at for at in log_times(t.log("server"), f"pane %{pane} forgot")
              if ran_at is not None and restarted <= at <= ran_at]
     if races:
-        check(len(early) == 1, f"{mode}: the rc's job forgot the record before the stub ran "
-                               f"({len(early)} forget(s) in that window)")
+        # Whether the forget lands BEFORE the stub depends on a foreground
+        # sample catching the shell between the rc's sleep and the typed line,
+        # which it usually does and on a slower machine does not: zsh starts
+        # the stub at once, the tracker sees one job hand over to another, and
+        # the forget comes when the stub exits instead. Either way the record
+        # is forgotten, which is what is pinned; the order is reported.
+        forgets = [at for at in log_times(t.log("server"), f"pane %{pane} forgot") if at >= restarted]
+        print(f"note: {mode}: {len(early)} of {len(forgets)} forget(s) landed before the stub ran")
+        check(len(forgets) >= 1, f"{mode}: the record was forgotten after the restart "
+                                 f"({len(forgets)} forget(s))")
         if os.environ.get("AGENT_RESUME_PROBE") == "plant" and pane is not None:
             plant(rig, int(pane))
         check(rig.wait(lambda: no_record(rig), timeout=3.0),

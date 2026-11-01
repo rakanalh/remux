@@ -50,7 +50,7 @@ default `~/.pi/agent`, omp at `~/$PI_CONFIG_DIR/agent` with a custom name, and
   e1  a fresh agent dir is Absent
   e2  install writes the extension with this binary's path and the agent's
       name baked in, the header first, and nothing else in the tree changes;
-      `node --check` accepts it
+      node imports it and its default export is a function
   e3  --status is Installed
   e4  a second install changes no byte, inode or mtime
   e5  an edited copy of ours is Stale, and install rewrites it to this build's
@@ -420,8 +420,15 @@ def extension(agent):
           f"e2 {agent}: install bakes the binary and the agent in (rc={rc}, err={err.strip()!r})")
     check(changed(before, after) == sorted([path, os.path.dirname(path)]),
           f"e2 {agent}: only the extension (and its new extensions/ dir) appeared ({changed(before, after)})")
-    node = subprocess.run(["node", "--check", path], capture_output=True, timeout=30)
-    check(node.returncode == 0, f"e2 {agent}: node --check accepts it ({node.stderr[:200]!r})")
+    # Imported, not `node --check`: from node 26 `--check` no longer strips
+    # TypeScript types, while an import does, which is also what loading it
+    # means. The default export must be the function pi and omp call.
+    loader = ("import(require('url').pathToFileURL(process.argv[1]).href)"
+              ".then(m => process.exit(typeof m.default === 'function' ? 0 : 3),"
+              " e => { console.error(String(e)); process.exit(1); })")
+    node = subprocess.run(["node", "-e", loader, path], capture_output=True, timeout=30)
+    check(node.returncode == 0, f"e2 {agent}: node imports it and finds the registration function "
+                                f"(rc={node.returncode}, {node.stderr[:200]!r})")
 
     rc, out, _ = t.integrate(h, "--status", drop=drop)
     check(rc == 0 and "Installed" in out, f"e3 {agent}: --status is Installed ({out.strip()!r})")

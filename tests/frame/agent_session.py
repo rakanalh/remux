@@ -119,9 +119,15 @@ CONFIG = """
 save_sessions = true
 automatic_restore = true
 """
+# With `stay` present in the run dir the stub keeps running after it records
+# its argv, as a resumed agent does; without, it exits at once. A stub that
+# exits can be seen leaving the foreground, which forgets its record: right,
+# but timing-dependent, so the cases that need a live pane to hold one say so.
 STUB = """#!/bin/sh
 for a in "$@"; do printf '%s\\n' "$a"; done > "{argv_dir}/$(basename "$0").$$"
+[ -e "{argv_dir}/../stay" ] && exec sleep 3600
 """
+MAC = sys.platform == "darwin"
 FIXTURES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "fixtures", "agent_session")
 
@@ -142,10 +148,21 @@ class Rig:
         # wipes the run dir.
         self.bin = f"{rundir}/bin"
         self.argv_dir = f"{rundir}/argv"
-        os.environ["PATH"] = f"{self.bin}:{os.environ['PATH']}"
+        # The stubs and the system dirs only: real agents are installed on the
+        # machines this runs on, and a stub must never lose to one.
+        os.environ["PATH"] = f"{self.bin}:/usr/local/bin:/usr/bin:/bin"
         self.srv.start(config=config)
         for d in (self.bin, self.argv_dir):
             os.makedirs(d, exist_ok=True)
+        # The panes run LOGIN shells, and on macOS /etc/profile's path_helper
+        # puts /etc/paths and /etc/paths.d (Homebrew's, which holds a real
+        # codex, opencode and omp) in front of the inherited PATH. The
+        # throwaway HOME's own profile, read after it, puts the stubs first
+        # again. The panes are spawned after this, at attach.
+        home = self.srv.env["HOME"]
+        for profile in (".profile", ".zprofile"):
+            with open(f"{home}/{profile}", "w") as f:
+                f.write(f'PATH="{self.bin}:$PATH"; export PATH\n')
         for agent in ("claude", "codex", "opencode", "pi", "omp"):
             stub = f"{self.bin}/{agent}"
             with open(stub, "w") as f:
@@ -189,6 +206,21 @@ class Rig:
             with open(path) as f:
                 out.append((os.stat(path).st_mtime, f.read().split("\n")))
         return sorted(out)
+
+    def stay(self):
+        """From now on every stub keeps running once it has recorded its argv."""
+        open(f"{self.srv.rundir}/stay", "w").close()
+
+    def typed_at(self):
+        """The server's own time for each `typed resume` line, oldest first:
+        when the line was written to the pane, not when its stub started."""
+        import datetime
+        out = []
+        for line in self.srv.log().splitlines():
+            if "typed resume for pane" in line and line.startswith("["):
+                stamp = line[1:].split(" ", 1)[0]
+                out.append(datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp())
+        return out
 
     def wait_runs(self, agent, n, timeout=10.0):
         end = time.time() + timeout
@@ -507,10 +539,17 @@ def inherited_socket_report(rig, body):
 
 
 def sender_unverified(rig):
+    """No `pane` in the report: a caller outside every pane may name one, so
+    with it the case would test the outside path, not the pin. Linux pins the
+    connector with a pidfd and refuses the exited one; macOS pins the
+    socket's audit token, which still names the exited connector, so the walk
+    finds no pane and it is refused as outside every pane (as msg_mailbox 3j)."""
     pane = rig.spawn()
-    r = inherited_socket_report(rig, {"agent": "claude", "reference": {"Id": UUID}, "pane": pane})
-    check(code(r) == "sender_unverified" and "exited" in r["Error"]["message"],
-          f"sender_unverified: a report on a socket whose connector exited is refused (got {r})")
+    r = inherited_socket_report(rig, {"agent": "claude", "reference": {"Id": UUID}})
+    want, why = (("not_in_pane", "not a descendant of any pane") if MAC
+                 else ("sender_unverified", "exited"))
+    check(code(r) == want and why in r["Error"]["message"],
+          f"sender_unverified: a report on a socket whose connector exited is refused {want} (got {r})")
     check(held_in_state(rig, pane) is None, "sender_unverified: nothing was stored")
     r = report(rig, pane, "claude", {"Id": UUID})
     check(outcome(r) == "Stored", f"sender_unverified: the pane still holds nothing (got {r})")
@@ -569,9 +608,10 @@ def stagger(rig):
     rig.restart()
     runs = rig.wait_runs("claude", 2, timeout=10.0)
     check(len(runs) == 2, f"stagger: both panes were resumed (got {runs})")
-    if len(runs) == 2:
-        gap = runs[1][0] - runs[0][0]
-        check(gap >= 1.4, f"stagger: the second session's pane ran {gap:.2f}s after the first")
+    typed = rig.typed_at()
+    check(len(typed) == 2 and typed[1] - typed[0] >= 1.4,
+          f"stagger: the second session's pane was typed >= 1.4 s after the first "
+          f"({[round(t - typed[0], 2) for t in typed]})")
 
 
 def runs_naming(rig, value):
@@ -616,6 +656,9 @@ def hardening(rig):
         with open(path, "w") as f:
             f.write(text.replace(bad_id, "a" * 129).replace(dash_id, "--dangerously-skip-permissions"))
 
+    # The dedupe winner must still hold its record at the shutdown save, which
+    # it does only while its resumed agent runs.
+    rig.stay()
     rig.restart(between=edit)
     rig.wait_runs("claude", 1, timeout=6.0)
     got = runs_naming(rig, dup)
@@ -663,6 +706,9 @@ def resurrect(rig):
     rig.cli.send({"Attach": {"session_name": "scratch"}})
     rig.cli.drain(0.8)
     check(rig.argv_runs("claude") == [], "resurrect: dormant sessions are typed nothing at start")
+    # "A live pane already runs it" holds only while the first resumed stub
+    # keeps running.
+    rig.stay()
     rig.cli.send({"ResurrectSession": {"name": "main"}})
     rig.wait_runs("claude", 1, timeout=6.0)
     check(len(runs_naming(rig, shared)) == 1, "resurrect: resurrecting main typed the id once")
@@ -677,12 +723,16 @@ def resurrect(rig):
 
 def default_stagger(rig):
     typed = len(re.findall(r"typed resume for pane", rig.srv.log()))
+    end = time.time() + 8.0
+    while time.time() < end and len(rig.argv_runs("claude") + rig.argv_runs("codex")) < typed:
+        time.sleep(0.1)
     runs = sorted(rig.argv_runs("claude") + rig.argv_runs("codex"))
     check(typed >= 2 and len(runs) == typed,
           f"default_stagger: every typed pane ran the stub ({typed} typed, {len(runs)} ran)")
-    if runs:
-        spread = runs[-1][0] - runs[0][0]
-        check(spread < 1.0, f"default_stagger: {len(runs)} panes ran within {spread:.2f}s")
+    at = rig.typed_at()
+    if at:
+        spread = at[-1] - at[0]
+        check(spread < 1.0, f"default_stagger: {len(at)} panes were typed within {spread:.2f}s")
 
 
 def on_own_server(suffix, config, case, base=CONFIG):
