@@ -12,12 +12,25 @@ use serde::{Deserialize, Serialize};
 use crate::protocol::{AgentSessionOutcome, AgentSessionRef, RefKind};
 
 /// One pane's agent session, as held live on the pane and persisted beside
-/// its cwd.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// its cwd. Two records are equal when they name the same session, whatever
+/// `pending` says.
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct AgentSessionRecord {
     pub agent: String,
     pub kind: RefKind,
     pub value: String,
+    /// A restore typed this session's resume and its agent has not reported
+    /// it since. A record still pending at the next restore is dropped rather
+    /// than typed again: a resume that did not take (the agent is gone, its
+    /// hook was removed) would otherwise be retried on every restore.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+}
+
+impl PartialEq for AgentSessionRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.agent == other.agent && self.kind == other.kind && self.value == other.value
+    }
 }
 
 impl AgentSessionRecord {
@@ -26,6 +39,7 @@ impl AgentSessionRecord {
             agent: agent.to_string(),
             kind: reference.kind(),
             value: reference.value().to_string(),
+            pending: false,
         }
     }
 
@@ -497,6 +511,27 @@ mod tests {
                 "{agent}: {argv:?}"
             );
         }
+    }
+
+    /// `pending` is written only when set, so a file without it is what an
+    /// older build reads, and it never makes two records of one session
+    /// unequal (dedupe and `decide` compare sessions).
+    #[test]
+    fn pending_is_written_only_when_set_and_ignored_by_equality() {
+        let held = AgentSessionRecord::new("claude", &id(UUID));
+        let typed = AgentSessionRecord {
+            pending: true,
+            ..held.clone()
+        };
+        assert_eq!(held, typed);
+        assert!(!serde_json::to_string(&held).unwrap().contains("pending"));
+        let json = serde_json::to_string(&typed).unwrap();
+        assert!(json.contains(r#""pending":true"#), "{json}");
+        let back: AgentSessionRecord = serde_json::from_str(&json).unwrap();
+        assert!(back.pending);
+        let old: AgentSessionRecord =
+            serde_json::from_str(r#"{"agent":"claude","kind":"Id","value":"x"}"#).unwrap();
+        assert!(!old.pending);
     }
 
     #[test]

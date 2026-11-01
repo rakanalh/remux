@@ -47,6 +47,11 @@ slow_rc_zsh  the same under zsh, whose `.zshrc` runs with job control on:
           and state.json holds NO record once the stub has run. That is the race SPEC 1.7 step 5 accepts
           (the resumed agent's own hook re-stores it), pinned as understood.
           It also proves the typed line survives zsh's line editor starting.
+never_reported  the resumed stub stays running but never reports its session:
+          the restart after that does not type it again, and says why (a
+          resume that did not take is not retried for ever)
+re_reported  the resumed stub reports `resume` with its session: the restart
+          after that types it again
 disabled  with `resume_agents = false` the hook's report is refused
           `disabled` (one stderr line, exit 0, nothing on stdout), state.json
           holds no record, and the restart runs no stub.
@@ -97,31 +102,49 @@ automatic_restore = true
 STUB = r'''
 import json, os, subprocess, sys, time
 
-ARGV_DIR, LOG = {argv_dir!r}, {log!r}
+ARGV_DIR, LOG, RESUME = {argv_dir!r}, {log!r}, {resume!r}
 PAYLOAD = os.environ.get("STUB_PAYLOAD", {payload!r})
+MARKS = os.path.dirname(ARGV_DIR)
 
+
+def run_hooks(payload_path):
+    settings = os.path.join(os.environ.get("HOME", ""), ".claude", "settings.json")
+    with open(settings) as f:
+        hooks = json.load(f).get("hooks", {{}}).get("SessionStart", [])
+    with open(payload_path, "rb") as f:
+        payload = f.read()
+    for entry in hooks:
+        for hook in entry.get("hooks", []):
+            done = subprocess.run(["sh", "-c", hook["command"]], input=payload,
+                                  capture_output=True, timeout=20)
+            with open(LOG, "a") as f:
+                f.write(json.dumps({{"rc": done.returncode,
+                                     "stdout": done.stdout.decode("utf-8", "replace"),
+                                     "stderr": done.stderr.decode("utf-8", "replace")}}) + "\n")
+
+
+def stay():
+    while True:
+        time.sleep(1)
+
+
+# With arguments it is a resumed session: it records them, and then, as the
+# run dir's marks say, runs its SessionStart hook with a `resume` payload and
+# stays (`resumed-reports`), stays without reporting (`resumed-stays`), or exits.
 if len(sys.argv) > 1:
     with open(os.path.join(ARGV_DIR, "claude.%d" % os.getpid()), "w") as f:
         f.write("".join(a + "\n" for a in sys.argv[1:]))
+    if os.path.exists(os.path.join(MARKS, "resumed-reports")):
+        run_hooks(RESUME)
+        stay()
+    if os.path.exists(os.path.join(MARKS, "resumed-stays")):
+        stay()
     sys.exit(0)
 
-settings = os.path.join(os.environ.get("HOME", ""), ".claude", "settings.json")
-with open(settings) as f:
-    hooks = json.load(f).get("hooks", {{}}).get("SessionStart", [])
-with open(PAYLOAD, "rb") as f:
-    payload = f.read()
-for entry in hooks:
-    for hook in entry.get("hooks", []):
-        done = subprocess.run(["sh", "-c", hook["command"]], input=payload,
-                              capture_output=True, timeout=20)
-        with open(LOG, "a") as f:
-            f.write(json.dumps({{"rc": done.returncode,
-                                 "stdout": done.stdout.decode("utf-8", "replace"),
-                                 "stderr": done.stderr.decode("utf-8", "replace")}}) + "\n")
+run_hooks(PAYLOAD)
 sys.stdout.write("STUB-%s\r\n" % "READY")
 sys.stdout.flush()
-while True:
-    time.sleep(1)
+stay()
 '''
 
 failures = []
@@ -169,7 +192,8 @@ class Rig:
                 f.write(f'PATH="{self.bin}:$PATH"; export PATH\n')
         path = f"{self.bin}/claude"
         source = STUB.format(argv_dir=self.argv_dir, log=self.hook_log,
-                             payload=os.path.join(FIXTURES, "claude_startup.json"))
+                             payload=os.path.join(FIXTURES, "claude_startup.json"),
+                             resume=os.path.join(FIXTURES, "claude_resume.json"))
         script = path + ".py"
 
         def shebang():
@@ -452,6 +476,37 @@ def plant(rig, pane):
     c.close()
 
 
+def restart_twice(rig, mark):
+    """Start the stub, restart, let the resumed stub behave as `mark` says,
+    restart again; the stub's runs after each restart."""
+    start_agent(rig)
+    check(rig.wait(lambda: not no_record(rig)), f"{mark}: state.json holds the record")
+    open(f"{RUNDIR}/home/{mark}", "w").close()
+    first = restart_and_collect(rig, wait=8.0)
+    time.sleep(1.5)
+    second = restart_and_collect(rig, wait=4.0)
+    return first, second
+
+
+def never_reported(rig):
+    first, second = restart_twice(rig, "resumed-stays")
+    check(first == [[f"--resume={SESSION_ID}", ""]], f"never_reported: the first restart resumed it (got {first})")
+    check(second == first,
+          f"never_reported: a session typed and never reported again is not typed again "
+          f"(got {len(second)} run(s))")
+    check(re.search(r"record dropped on restore \(typed last time and never reported again\)",
+                    rig.t.log("server")) is not None, "never_reported: the drop is logged")
+
+
+def re_reported(rig):
+    first, second = restart_twice(rig, "resumed-reports")
+    check(first == [[f"--resume={SESSION_ID}", ""]], f"re_reported: the first restart resumed it (got {first})")
+    resumed = [r for r in rig.hook_runs()[1:]]
+    check(len(resumed) >= 1 and all(r["rc"] == 0 and r["stdout"] == "" and r["stderr"] == "" for r in resumed),
+          f"re_reported: the resumed stub reported its session silently (got {resumed})")
+    check(len(second) == 2, f"re_reported: a session its agent reported again is typed again (got {len(second)} run(s))")
+
+
 def disabled(rig):
     runs = start_agent(rig)
     check(len(runs) == 1 and runs[0]["rc"] == 0 and runs[0]["stdout"] == "",
@@ -485,7 +540,8 @@ def duplicate(rig):
     check(runs == [[f"--resume={SESSION_ID}", ""]], f"duplicate: the restart resumed it once (got {runs})")
 
 
-MODES = {"fast": fast, "duplicate": duplicate, "typed_at_prompt": typed_at_prompt,
+MODES = {"fast": fast, "duplicate": duplicate, "never_reported": never_reported,
+         "re_reported": re_reported, "typed_at_prompt": typed_at_prompt,
          "stub_exited": stub_exited, "bad_id": bad_id, "pane_unset": pane_unset,
          "setsid": setsid,
          "slow_rc": (slow_rc, "", {"ENV": os.path.join(FIXTURES, "slow_rc.sh")}),

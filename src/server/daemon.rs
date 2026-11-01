@@ -4153,7 +4153,7 @@ async fn handle_agent_session(
         .source
         .as_deref()
         .map_or("None".to_string(), loggable);
-    let verdict: Result<Option<AgentSessionOutcome>, agent_session::Refusal> = async {
+    let verdict: Result<Option<(AgentSessionOutcome, bool)>, agent_session::Refusal> = async {
         agent_session::validate(&report.agent, &report.reference)?;
         let record = AgentSessionRecord::new(&report.agent, &report.reference);
         let mut ps = panes.lock().await;
@@ -4162,12 +4162,15 @@ async fn handle_agent_session(
         };
         let outcome =
             agent_session::decide(pd.agent_session.as_ref(), &record, report.source.as_deref())?;
+        // The agent's own report of a session a restore typed is what clears
+        // its pending mark, so that it is resumed again next time.
+        let confirmed = pd.agent_session.as_ref().is_some_and(|held| held.pending);
         pd.agent_session = Some(record);
-        Ok(Some(outcome))
+        Ok(Some((outcome, confirmed)))
     }
     .await;
     match verdict {
-        Ok(Some(outcome)) => {
+        Ok(Some((outcome, confirmed))) => {
             log::info!(
                 "agent session: pane %{pane} {:?} {kind} {bytes} bytes source={source} -> {outcome:?}",
                 crate::server::agent_session::agent_label(&report.agent)
@@ -4175,7 +4178,7 @@ async fn handle_agent_session(
             // The `panes` lock is released by now: `save_if_enabled` takes
             // `state` and then `panes`, so saving under it would invert that
             // order.
-            if outcome != AgentSessionOutcome::Unchanged {
+            if outcome != AgentSessionOutcome::Unchanged || confirmed {
                 save_if_enabled(state, panes, config, dormant).await;
             }
             ServerMessage::AgentSessionStored { pane, outcome }
@@ -17452,6 +17455,13 @@ async fn resumable<'a>(
         "{:?}",
         crate::server::agent_session::agent_label(&record.agent)
     );
+    if record.pending {
+        log::info!(
+            "agent session: pane %{pane_id} {agent} record dropped on restore (typed last time and \
+             never reported again)"
+        );
+        return None;
+    }
     if let Err(refusal) = record.validate() {
         log::warn!(
             "agent session: pane %{pane_id} {agent} record dropped on restore ({})",
@@ -17514,7 +17524,10 @@ async fn type_resume(
         return;
     };
     pd.send_input(line.as_bytes());
-    pd.agent_session = Some(record.clone());
+    pd.agent_session = Some(AgentSessionRecord {
+        pending: true,
+        ..record.clone()
+    });
     drop(ps);
     log::info!(
         "typed resume for pane %{pane_id} agent={:?} ({} bytes)",
