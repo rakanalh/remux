@@ -22,6 +22,30 @@ fast      the report is stored (state.json names the pane), the hook printed
           argv file holds `--resume` and the id as two separate lines.
 duplicate the stub runs in two panes with the same recorded session: both
           reports are stored, and the restart resumes it once.
+typed_at_prompt  `remux agent session claude --hook < payload` typed AT THE
+          PROMPT: its parent is the pane's shell, so it is refused
+          `not_from_agent` on stderr, exits 0, stores nothing, and the restart
+          runs no stub.
+stub_exited  the stub reports and is then interrupted; the shell takes the
+          foreground back, the record is forgotten, and the restart runs no
+          stub.
+bad_id    the stub's payload carries an id outside the charset: one stderr line
+          naming bad_reference, nothing stored, no stub after the restart.
+pane_unset  the stub runs with `$REMUX_PANE` unset: the hook exits 0 with no
+          output and never connects (no new connection in server.log).
+setsid    the report runs detached into a session of its own (`setsid -f`),
+          so the server cannot place it: `not_in_pane` on stderr, exit 0.
+slow_rc   `/bin/sh` with `ENV` naming an rc that sleeps 2 s before the first
+          prompt: the typed resume waits out the rc and runs the stub with
+          `--resume` and the id. bash reads an rc without job control, so the
+          rc's `sleep` never takes the foreground and NO forget lands before
+          the stub runs.
+slow_rc_zsh  the same under zsh, whose `.zshrc` runs with job control on:
+          its `sleep` takes the foreground and gives it back, which forgets the
+          record BEFORE the typed line runs, and state.json holds NO record
+          once the stub has run. That is the race SPEC 1.7 step 5 accepts
+          (the resumed agent's own hook re-stores it), pinned as understood.
+          It also proves the typed line survives zsh's line editor starting.
 disabled  with `resume_agents = false` the hook's report is refused
           `disabled` (one stderr line, exit 0, nothing on stdout), state.json
           holds no record, and the restart runs no stub.
@@ -30,11 +54,21 @@ disabled  with `resume_agents = false` the hook's report is refused
 `CLAUDE_CONFIG_DIR` unset and writes the settings file there by hand. HOME is
 the throwaway tree.
 
-Run: python3 tests/pty/agent_resume.py [fast|duplicate|disabled ...]   (RMX_RUNDIR overrides the run dir)
+Every mode but fast, duplicate and the slow_rc pair ends in "no argv file
+after the restart". The argv FILE is read, never the screen. The pane's PATH
+is the stubs and the system directories only, so no real agent on the
+developer's PATH can run in place of a stub.
+
+`AGENT_RESUME_PROBE=plant` stores a record from outside every pane once
+slow_rc_zsh's stub has run, which must turn its no-record check red.
+
+Run: python3 tests/pty/agent_resume.py [MODE ...]   (default: every mode)   (RMX_RUNDIR overrides the run dir)
 """
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -43,10 +77,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pty_harness import BIN, Tui  # noqa: E402
 import standin  # noqa: E402
+from portable import SETSID_F  # noqa: E402
 
 RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-agres")
 FIXTURES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "fixtures", "agent_session")
+ZDOTDIR = f"{RUNDIR}-zdot"
 SESSION_ID = "7f3c2a9e-51d4-4b8e-9a61-0c2f5d8e4b17"
 CONFIG = """
 [general]
@@ -60,7 +96,8 @@ automatic_restore = true
 STUB = r'''
 import json, os, subprocess, sys, time
 
-ARGV_DIR, LOG, PAYLOAD = {argv_dir!r}, {log!r}, {payload!r}
+ARGV_DIR, LOG = {argv_dir!r}, {log!r}
+PAYLOAD = os.environ.get("STUB_PAYLOAD", {payload!r})
 
 if len(sys.argv) > 1:
     with open(os.path.join(ARGV_DIR, "claude.%d" % os.getpid()), "w") as f:
@@ -96,16 +133,24 @@ def check(cond, label):
 
 
 class Rig:
-    def __init__(self, config=CONFIG):
+    def __init__(self, config=CONFIG, extra_env=None):
         self.bin = f"{RUNDIR}/home/bin"
         self.argv_dir = f"{RUNDIR}/home/argv"
         self.hook_log = f"{RUNDIR}/home/hooks.jsonl"
+        # System directories only after the stubs: the developer's own PATH
+        # can hold a REAL agent (`~/.local/bin/claude`), which a shell that
+        # rebuilds PATH would otherwise find first.
         self.t = Tui(RUNDIR, cols=120, rows=36, config=config,
-                     extra_env={"PATH": f"{RUNDIR}/home/bin:{os.environ['PATH']}"})
+                     extra_env={"PATH": f"{self.bin}:/usr/local/bin:/usr/bin:/bin",
+                                "STUB_BIN": self.bin, **(extra_env or {})})
         # Its own REMUX_PANE would make the outside-a-pane gate pass on the
         # developer's own pane.
         for var in ("REMUX_PANE", "REMUX_SESSION", "CLAUDE_CONFIG_DIR", "CURSOR_VERSION"):
             os.environ.pop(var, None)
+        # Outside the run dir, which `start()` wipes, and in place before the
+        # first zsh starts: without a .zshrc zsh runs its new-user wizard.
+        os.makedirs(ZDOTDIR, exist_ok=True)
+        shutil.copy(os.path.join(FIXTURES, "slow_rc.zsh"), f"{ZDOTDIR}/.zshrc")
         self.t.start()
         self.install()
 
@@ -161,6 +206,21 @@ class Rig:
 
     def stopped(self):
         self.t.kill()
+
+    def typed(self, command, timeout=10.0):
+        """Type `command` at the prompt with its stderr and exit code sent to
+        files, and return (rc, stderr) once it has finished."""
+        self.runs = getattr(self, "runs", 0) + 1
+        rc, err = f"{RUNDIR}/home/rc.{self.runs}", f"{RUNDIR}/home/err.{self.runs}"
+        self.t.send(f"{command} 2> {err}; echo $? > {rc}\r", 0.5)
+        self.wait(lambda: os.path.exists(rc) and open(rc).read().endswith("\n"), timeout)
+        if not os.path.exists(rc):
+            return None, None
+        with open(rc) as f, open(err) as g:
+            return int(f.read().strip()), g.read()
+
+    def connections(self):
+        return len(set(re.findall(r"identity: client_id=(\d+) peer=", self.t.log("server"))))
 
 
 def ready_marker(t):
@@ -221,6 +281,159 @@ def restart_and_collect(rig, wait=4.0):
     return rig.argv_runs()
 
 
+def payload(name):
+    return os.path.join(FIXTURES, name)
+
+
+def prompt(rig):
+    check(rig.wait(lambda: rig.t.has("$ ")), "the pane shows a prompt")
+
+
+def no_record(rig):
+    return not (rig.state() or {}).get("agent_sessions")
+
+
+def no_stub_after_restart(rig, mode):
+    runs = restart_and_collect(rig)
+    check(runs == [], f"{mode}: the restart ran no stub (got {runs})")
+
+
+def typed_at_prompt(rig):
+    prompt(rig)
+    rc, err = rig.typed(f"'{BIN}' agent session claude --hook < {payload('claude_startup.json')}")
+    check(rc == 0, f"typed_at_prompt: exit 0 (got {rc})")
+    check(err is not None and len(err.splitlines()) == 1 and "not_from_agent" in err,
+          f"typed_at_prompt: one stderr line naming not_from_agent (got {err!r})")
+    check(no_record(rig), "typed_at_prompt: state.json holds no record")
+    no_stub_after_restart(rig, "typed_at_prompt")
+
+
+def stub_exited(rig):
+    runs = start_agent(rig)
+    check(len(runs) == 1 and runs[0]["rc"] == 0 and runs[0]["stderr"] == "",
+          f"stub_exited: the report was accepted (got {runs})")
+    check(rig.wait(lambda: not no_record(rig)), "stub_exited: state.json held the record")
+    rig.t.send("\x03", 0.5)
+    check(rig.wait(lambda: no_record(rig), timeout=3.0),
+          "stub_exited: the record is forgotten once the stub has exited")
+    no_stub_after_restart(rig, "stub_exited")
+
+
+def bad_id(rig):
+    prompt(rig)
+    rig.t.send(f"STUB_PAYLOAD={payload('claude_bad_id.json')} claude\r", 0.5)
+    check(rig.wait(lambda: rig.hook_runs()), "bad_id: the stub ran its hook")
+    runs = rig.hook_runs()
+    lines = runs[0]["stderr"].splitlines() if runs else []
+    check(bool(runs) and runs[0]["rc"] == 0 and runs[0]["stdout"] == "",
+          f"bad_id: the hook exited 0 with nothing on stdout (got {runs})")
+    check(len(lines) == 1 and "bad_reference" in lines[0],
+          f"bad_id: one stderr line naming bad_reference (got {lines})")
+    check(no_record(rig), "bad_id: state.json holds no record")
+    no_stub_after_restart(rig, "bad_id")
+
+
+def pane_unset(rig):
+    prompt(rig)
+    time.sleep(0.5)
+    before = rig.connections()
+    rig.t.send("env -u REMUX_PANE claude\r", 0.5)
+    check(rig.wait(lambda: rig.hook_runs() and ready_marker(rig.t)), "pane_unset: the stub ran its hook")
+    runs = rig.hook_runs()
+    check(runs == [{"rc": 0, "stdout": "", "stderr": ""}],
+          f"pane_unset: exit 0 and no output at all (got {runs})")
+    time.sleep(0.5)
+    check(rig.connections() == before,
+          f"pane_unset: no connection reached the server ({before} before, {rig.connections()} after)")
+    check(no_record(rig), "pane_unset: state.json holds no record")
+    no_stub_after_restart(rig, "pane_unset")
+
+
+def setsid(rig):
+    prompt(rig)
+    rc_file, err_file = f"{RUNDIR}/home/setsid.rc", f"{RUNDIR}/home/setsid.err"
+    inner = (f"sleep 0.3; '{BIN}' agent session claude --hook < {payload('claude_startup.json')} "
+             f"2> {err_file}; echo $? > {rc_file}")
+    rig.t.send(" ".join(shlex.quote(a) for a in SETSID_F) + f" /bin/sh -c {shlex.quote(inner)}\r", 0.5)
+    check(rig.wait(lambda: os.path.exists(rc_file) and open(rc_file).read().endswith("\n")),
+          "setsid: the detached report finished")
+    rc = open(rc_file).read().strip() if os.path.exists(rc_file) else None
+    err = open(err_file).read() if os.path.exists(err_file) else ""
+    check(rc == "0", f"setsid: exit 0 (got {rc})")
+    check(len(err.splitlines()) == 1 and "not_in_pane" in err,
+          f"setsid: one stderr line naming not_in_pane (got {err!r})")
+    check(no_record(rig), "setsid: state.json holds no record")
+    no_stub_after_restart(rig, "setsid")
+
+
+def log_times(log, needle):
+    """The wall-clock time of every server.log line containing `needle`."""
+    import datetime
+    out = []
+    for line in log.splitlines():
+        if needle in line and line.startswith("["):
+            stamp = line[1:].split(" ", 1)[0]
+            out.append(datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp())
+    return out
+
+
+def slow_rc_case(rig, mode, races):
+    t = rig.t
+    check(rig.wait(lambda: t.has("$ "), timeout=8.0), f"{mode}: the pane shows a prompt after the rc")
+    t.send("claude\r", 0.5)
+    ran = rig.wait(lambda: rig.hook_runs() and ready_marker(t))
+    check(ran, f"{mode}: the stub ran its hook")
+    if not ran:
+        t.dump(mode)
+    check(rig.wait(lambda: not no_record(rig)), f"{mode}: state.json holds the record")
+    pane = next(iter((rig.state() or {}).get("agent_sessions", {})), None)
+    done = subprocess.run([BIN, "restart"], env=t.env, capture_output=True, timeout=30)
+    check(done.returncode == 0, f"{mode}: remux restart exits 0")
+    restarted = time.time()
+    rig.wait(lambda: rig.argv_runs(), timeout=12.0)
+    names = sorted(os.listdir(rig.argv_dir))
+    ran_at = os.path.getmtime(f"{rig.argv_dir}/{names[0]}") if names else None
+    runs = rig.argv_runs()
+    check(runs == [["--resume", SESSION_ID, ""]],
+          f"{mode}: the typed line waited out the rc and ran the stub once (got {runs})")
+    check(ran_at is not None and ran_at - restarted >= 1.5,
+          f"{mode}: the stub ran only after the rc's 2 s sleep "
+          f"({None if ran_at is None else round(ran_at - restarted, 2)} s after the restart)")
+    time.sleep(1.0)
+    early = [at for at in log_times(t.log("server"), f"pane %{pane} forgot")
+             if ran_at is not None and restarted <= at <= ran_at]
+    if races:
+        check(len(early) == 1, f"{mode}: the rc's job forgot the record before the stub ran "
+                               f"({len(early)} forget(s) in that window)")
+        if os.environ.get("AGENT_RESUME_PROBE") == "plant" and pane is not None:
+            plant(rig, int(pane))
+        check(rig.wait(lambda: no_record(rig), timeout=3.0),
+              f"{mode}: state.json holds no record once the stub has run "
+              f"(got {(rig.state() or {}).get('agent_sessions')})")
+    else:
+        check(early == [], f"{mode}: no forget landed before the stub ran (got {len(early)})")
+
+
+def slow_rc(rig):
+    slow_rc_case(rig, "slow_rc", races=False)
+
+
+def slow_rc_zsh(rig):
+    slow_rc_case(rig, "slow_rc_zsh", races=True)
+
+
+def plant(rig, pane):
+    """Store a record from outside every pane, for the slow_rc probe."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                    "frame"))
+    from harness import Client
+    c = Client(f"{RUNDIR}/run/remux.sock")
+    c.hello()
+    c.send({"AgentSession": {"agent": "claude", "reference": {"Id": SESSION_ID}, "pane": pane}})
+    print(f"probe: planted -> {c.drain(1.0)[-1:]}")
+    c.close()
+
+
 def disabled(rig):
     runs = start_agent(rig)
     check(len(runs) == 1 and runs[0]["rc"] == 0 and runs[0]["stdout"] == "",
@@ -254,14 +467,24 @@ def duplicate(rig):
     check(runs == [["--resume", SESSION_ID, ""]], f"duplicate: the restart resumed it once (got {runs})")
 
 
-MODES = {"fast": fast, "duplicate": duplicate, "disabled": (disabled, "resume_agents = false\n")}
+MODES = {"fast": fast, "duplicate": duplicate, "typed_at_prompt": typed_at_prompt,
+         "stub_exited": stub_exited, "bad_id": bad_id, "pane_unset": pane_unset,
+         "setsid": setsid,
+         "slow_rc": (slow_rc, "", {"ENV": os.path.join(FIXTURES, "slow_rc.sh")}),
+         "slow_rc_zsh": (slow_rc_zsh, "", {"SHELL": "/bin/zsh", "ZDOTDIR": ZDOTDIR}),
+         "disabled": (disabled, "resume_agents = false\n")}
 
 
 def main():
     modes = sys.argv[1:] or list(MODES)
+    newest = max(os.path.getmtime(os.path.join(d, f))
+                 for d, _, fs in os.walk(os.path.join(os.path.dirname(BIN), "..", "..", "src"))
+                 for f in fs)
+    check(os.path.getmtime(BIN) >= newest, f"{BIN} is newer than every file under src/")
     for mode in modes:
-        case, extra = MODES[mode] if isinstance(MODES[mode], tuple) else (MODES[mode], "")
-        rig = Rig(CONFIG + extra)
+        entry = MODES[mode] if isinstance(MODES[mode], tuple) else (MODES[mode],)
+        case, extra, env = (entry + ("", None)[len(entry) - 1:])[:3]
+        rig = Rig(CONFIG + extra, env)
         try:
             case(rig)
         finally:
