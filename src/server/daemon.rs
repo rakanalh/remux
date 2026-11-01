@@ -4141,6 +4141,12 @@ async fn handle_agent_session(
     if let Err(refused) = check_addressable(pane, state, panes).await {
         return *refused;
     }
+    if !config.general.resume_agents {
+        return ServerMessage::refused(
+            "disabled",
+            "agent session restore is off: [general] resume_agents = false",
+        );
+    }
     let kind = report.reference.kind().as_str();
     let bytes = report.reference.value().len();
     let source = report
@@ -17392,7 +17398,16 @@ async fn materialize_session(
             log::warn!("failed to spawn PTY for restored pane {pane_id}: {e}");
             continue;
         }
-        if let Some(record) = agent_sessions.get(pane_id) {
+        let record = agent_sessions
+            .get(pane_id)
+            .filter(|_| config.general.resume_agents);
+        if let Some(record) = record {
+            if *typed > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    config.general.resume_agent_delay_ms,
+                ))
+                .await;
+            }
             type_resume(*pane_id, record, panes).await;
             *typed += 1;
         }

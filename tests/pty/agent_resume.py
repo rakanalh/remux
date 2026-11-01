@@ -17,15 +17,18 @@ runs the same stub WITH arguments; the stub writes them one per line to a file
 under `argv/`. The assertion reads that file, never the screen: the typed line
 is echoed by the shell whether or not anything ran.
 
-fast    the report is stored (state.json names the pane), the hook printed
-        nothing on stdout and exited 0, and after `remux restart` the stub's
-        argv file holds `--resume` and the id as two separate lines.
+fast      the report is stored (state.json names the pane), the hook printed
+          nothing on stdout and exited 0, and after `remux restart` the stub's
+          argv file holds `--resume` and the id as two separate lines.
+disabled  with `resume_agents = false` the hook's report is refused
+          `disabled` (one stderr line, exit 0, nothing on stdout), state.json
+          holds no record, and the restart runs no stub.
 
 `fakeclaude.py` reads `$HOME/.claude/settings.json` too, so this harness leaves
 `CLAUDE_CONFIG_DIR` unset and writes the settings file there by hand. HOME is
 the throwaway tree.
 
-Run: python3 tests/pty/agent_resume.py [fast]   (RMX_RUNDIR overrides the run dir)
+Run: python3 tests/pty/agent_resume.py [fast|disabled ...]   (RMX_RUNDIR overrides the run dir)
 """
 import json
 import os
@@ -91,11 +94,11 @@ def check(cond, label):
 
 
 class Rig:
-    def __init__(self):
+    def __init__(self, config=CONFIG):
         self.bin = f"{RUNDIR}/home/bin"
         self.argv_dir = f"{RUNDIR}/home/argv"
         self.hook_log = f"{RUNDIR}/home/hooks.jsonl"
-        self.t = Tui(RUNDIR, cols=120, rows=36, config=CONFIG,
+        self.t = Tui(RUNDIR, cols=120, rows=36, config=config,
                      extra_env={"PATH": f"{RUNDIR}/home/bin:{os.environ['PATH']}"})
         # Its own REMUX_PANE would make the outside-a-pane gate pass on the
         # developer's own pane.
@@ -198,15 +201,47 @@ def fast(rig):
     check(SESSION_ID not in t.log("client"), "fast: client.log never holds the id")
 
 
-MODES = {"fast": fast}
+def start_agent(rig):
+    """Type `claude` at the prompt and wait for the stub's hook to have run."""
+    t = rig.t
+    check(rig.wait(lambda: t.has("$ ")), "the pane shows a prompt")
+    t.send("claude\r", 0.5)
+    check(rig.wait(lambda: rig.hook_runs() and ready_marker(t)),
+          "the stub agent ran its SessionStart hook and is in the foreground")
+    return rig.hook_runs()
+
+
+def restart_and_collect(rig, wait=4.0):
+    done = subprocess.run([BIN, "restart"], env=rig.t.env, capture_output=True, timeout=30)
+    check(done.returncode == 0, f"remux restart exits 0 (got {done.returncode}, {done.stderr[:200]!r})")
+    rig.wait(lambda: rig.argv_runs(), timeout=wait)
+    time.sleep(0.5)
+    return rig.argv_runs()
+
+
+def disabled(rig):
+    runs = start_agent(rig)
+    check(len(runs) == 1 and runs[0]["rc"] == 0 and runs[0]["stdout"] == "",
+          f"disabled: the hook exited 0 with nothing on stdout (got {runs})")
+    lines = runs[0]["stderr"].splitlines() if runs else []
+    check(len(lines) == 1 and "disabled" in lines[0],
+          f"disabled: one stderr line naming the refusal (got {lines})")
+    time.sleep(0.5)
+    check(not (rig.state() or {}).get("agent_sessions"), "disabled: state.json holds no record")
+    runs = restart_and_collect(rig)
+    check(runs == [], f"disabled: the restart ran no stub (got {runs})")
+
+
+MODES = {"fast": fast, "disabled": (disabled, "resume_agents = false\n")}
 
 
 def main():
     modes = sys.argv[1:] or list(MODES)
     for mode in modes:
-        rig = Rig()
+        case, extra = MODES[mode] if isinstance(MODES[mode], tuple) else (MODES[mode], "")
+        rig = Rig(CONFIG + extra)
         try:
-            MODES[mode](rig)
+            case(rig)
         finally:
             rig.stopped()
         for which in ("server", "client"):

@@ -43,11 +43,24 @@ persist         state.json holds the record right after the report, before any
 restart_types   after `remux restart` the restored /bin/sh pane runs the stub
                 `claude` on PATH with `--resume` and the id as two argv words,
                 read from the file the stub writes, never from the screen.
+default_stagger the main server's restart typed every held pane within 1 s
+                of the first, at the default 100 ms between panes.
+
+On a server of its own, with `resume_agents = false`:
+disabled        a report is refused `disabled`, state.json holds no record,
+                and a restart types nothing.
+
+On a server of its own, with `resume_agent_delay_ms = 1500`:
+stagger         two panes in two SESSIONS holding different ids: the second
+                stub runs at least 1.4 s after the first, so the delay
+                counter spans sessions.
+
 redaction       server.log and client.log carry the summary line with the id's
                 byte count and never the id.
 no_panic        server.log has no `panicked at`.
 
-Run: python3 tests/frame/agent_session.py   (RMX_RUNDIR overrides the run dir)
+Run: python3 tests/frame/agent_session.py [main|disabled|stagger ...]
+     (RMX_RUNDIR overrides the run dir)
 """
 import json
 import os
@@ -131,10 +144,26 @@ class Rig:
     def argv_files(self, agent):
         return sorted(n for n in os.listdir(self.argv_dir) if n.startswith(agent + "."))
 
-    def spawn(self, argv=None):
+    def argv_runs(self, agent):
+        """(mtime, argv) of every run of the stub `agent`, oldest first."""
+        out = []
+        for name in self.argv_files(agent):
+            path = f"{self.argv_dir}/{name}"
+            with open(path) as f:
+                out.append((os.stat(path).st_mtime, f.read().split("\n")))
+        return sorted(out)
+
+    def wait_runs(self, agent, n, timeout=10.0):
+        end = time.time() + timeout
+        while time.time() < end and len(self.argv_runs(agent)) < n:
+            time.sleep(0.1)
+        time.sleep(0.5)
+        return self.argv_runs(agent)
+
+    def spawn(self, argv=None, session="main"):
         c = Client(self.srv.sock)
         c.hello()
-        body = {"session": "main", "placement": "SplitRight"}
+        body = {"session": session, "placement": "SplitRight"}
         if argv is not None:
             body["argv"] = argv
         c.send({"CliSpawn": body})
@@ -408,7 +437,69 @@ def restart_types(rig, pane):
           f"restart_types: the line typed into %{pane} was 54 bytes, space and \\r included")
 
 
+def disabled(rig):
+    pane = rig.spawn()
+    r = report(rig, pane, "claude", {"Id": RESTORE_ID}, source="startup")
+    check(code(r) == "disabled", f"disabled: a report is refused disabled (got {r})")
+    check(held_in_state(rig, pane) is None, "disabled: state.json holds no record")
+    rig.restart()
+    runs = rig.wait_runs("claude", 1, timeout=3.0)
+    check(runs == [], f"disabled: the restart typed nothing (got {runs})")
+
+
+def stagger(rig):
+    rig.cli.send({"CreateSession": {"name": "other", "folder": None}})
+    rig.cli.drain(0.5)
+    ids = {"main": "dddd0000-1111-4222-8333-944445555001",
+           "other": "dddd0000-1111-4222-8333-944445555002"}
+    for session, sid in ids.items():
+        pane = rig.spawn(session=session)
+        r = report(rig, pane, "claude", {"Id": sid}, source="startup")
+        check(outcome(r) == "Stored", f"stagger: setup, %{pane} in {session} Stored (got {r})")
+    rig.restart()
+    runs = rig.wait_runs("claude", 2, timeout=10.0)
+    check(len(runs) == 2, f"stagger: both panes were resumed (got {runs})")
+    if len(runs) == 2:
+        gap = runs[1][0] - runs[0][0]
+        check(gap >= 1.4, f"stagger: the second session's pane ran {gap:.2f}s after the first")
+
+
+def default_stagger(rig):
+    typed = len(re.findall(r"typed resume for pane", rig.srv.log()))
+    runs = sorted(rig.argv_runs("claude") + rig.argv_runs("codex"))
+    check(typed >= 2 and len(runs) == typed,
+          f"default_stagger: every typed pane ran the stub ({typed} typed, {len(runs)} ran)")
+    if runs:
+        spread = runs[-1][0] - runs[0][0]
+        check(spread < 1.0, f"default_stagger: {len(runs)} panes ran within {spread:.2f}s")
+
+
+def on_own_server(suffix, config, case):
+    rig = Rig(f"{RUNDIR}-{suffix}", CONFIG + config)
+    try:
+        case(rig)
+        check("panicked at" not in rig.srv.log(), f"{suffix}: no panic in server.log")
+    finally:
+        rig.cli.close()
+        rig.srv.kill()
+
+
 def main():
+    groups = sys.argv[1:] or ["main", "disabled", "stagger"]
+    if "main" in groups:
+        main_server()
+    if "disabled" in groups:
+        on_own_server("disabled", "resume_agents = false\n", disabled)
+    if "stagger" in groups:
+        on_own_server("stagger", "resume_agent_delay_ms = 1500\n", stagger)
+
+    if failures:
+        print(f"\n{len(failures)} FAILED")
+        sys.exit(1)
+    print("\nALL PASS")
+
+
+def main_server():
     rig = Rig(RUNDIR, CONFIG)
     try:
         pane = rig.spawn()
@@ -451,6 +542,7 @@ def main():
         cross_agent_after_forget(rig)
         restored = persist(rig)
         restart_types(rig, restored)
+        default_stagger(rig)
 
         log = rig.srv.log()
         client_log = read(f"{rig.srv.rundir}/state/remux/client.log")
@@ -466,11 +558,6 @@ def main():
     finally:
         rig.cli.close()
         rig.srv.kill()
-
-    if failures:
-        print(f"\n{len(failures)} FAILED")
-        sys.exit(1)
-    print("\nALL PASS")
 
 
 if __name__ == "__main__":
