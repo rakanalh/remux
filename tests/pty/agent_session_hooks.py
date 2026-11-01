@@ -617,8 +617,13 @@ def opencode_real():
     into the throwaway config dir) is done. Under `unshare -rn` (Linux, no
     network) that bootstrap cannot finish; where unshare is absent (macOS) it
     runs with the network, as a first start does."""
-    binary = dev_which("opencode") or os.path.expanduser("~/.opencode/bin/opencode")
-    unshare = shutil.which("unshare")
+    # REMUX_OPENCODE_BIN picks a version installed in a throwaway npm prefix:
+    # the integration targets OpenCode 1.18, and a machine's own may be newer.
+    binary = (os.environ.get("REMUX_OPENCODE_BIN") or dev_which("opencode")
+              or os.path.expanduser("~/.opencode/bin/opencode"))
+    # REMUX_SMOKE_NETWORK=1 lets the bootstrap reach the network, as on a
+    # machine with no unshare; by default Linux runs it offline.
+    unshare = None if os.environ.get("REMUX_SMOKE_NETWORK") == "1" else shutil.which("unshare")
     base = launcher(binary) if os.path.exists(binary) else None
     if not base:
         argv = None
