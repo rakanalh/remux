@@ -890,6 +890,44 @@ impl ServerState {
         }
     }
 
+    /// The layouts view `id` can be switched to, in the order
+    /// [`Self::view_cycle_layout`] visits them, and the name of its layout now.
+    /// Custom is never offered: the cycle cannot reach it and a view keeps no
+    /// manual arrangement to return to once it leaves one.
+    pub fn view_layout_choices(
+        &self,
+        id: ViewId,
+        enabled: &EnabledLayouts,
+    ) -> Option<(Vec<String>, String)> {
+        let v = self.views.iter().find(|v| v.id == id)?;
+        Some((enabled.automatic_names(), v.layout_name().to_string()))
+    }
+
+    /// Switch view `id` to the automatic layout `name`, dropping any custom
+    /// tree as [`Self::view_cycle_layout`] does. `Ok(false)` when the view
+    /// already shows that layout, and `Err` names why the request is refused.
+    pub fn view_set_layout(
+        &mut self,
+        id: ViewId,
+        name: &str,
+        enabled: &EnabledLayouts,
+    ) -> Result<bool, &'static str> {
+        let v = self.find_view_mut(id).ok_or("no such view")?;
+        let mode = LayoutMode::from_name(name).ok_or("unknown layout")?;
+        if !mode.is_automatic() {
+            return Err("custom is not offered for a view");
+        }
+        if name == v.layout_name() {
+            return Ok(false);
+        }
+        if !enabled.allows(&mode) {
+            return Err("disabled under [layouts]");
+        }
+        v.layout = mode;
+        v.custom_tree = None;
+        Ok(true)
+    }
+
     /// Toggle focus-cell zoom for view `id`.
     pub fn view_toggle_zoom(&mut self, id: ViewId) {
         if let Some(v) = self.find_view_mut(id) {
@@ -2055,6 +2093,116 @@ mod tests {
         st.view_remove_cell(id, c1);
         assert!(st.views[0].cells.is_empty());
         assert!(st.views[0].custom_tree.is_none());
+    }
+
+    /// The names `view_cycle_layout` visits from `id`'s current layout, in
+    /// cycle order starting from the first automatic layout.
+    fn view_cycle_names(st: &mut ServerState, id: ViewId, enabled: &EnabledLayouts) -> Vec<String> {
+        let mut seen = Vec::new();
+        for _ in 0..LayoutMode::automatic_modes().len() {
+            st.view_cycle_layout(id, enabled);
+            let name = st.views[0].layout_name().to_string();
+            if !seen.contains(&name) {
+                seen.push(name);
+            }
+        }
+        let order: Vec<String> = LayoutMode::automatic_modes()
+            .iter()
+            .map(|m| m.name().to_string())
+            .collect();
+        seen.sort_by_key(|n| order.iter().position(|o| o == n));
+        seen
+    }
+
+    #[test]
+    fn view_layout_choices_are_the_view_cycle() {
+        let no_grid = EnabledLayouts {
+            grid: false,
+            ..EnabledLayouts::default()
+        };
+        for enabled in [EnabledLayouts::default(), no_grid] {
+            let mut st = ServerState::new();
+            let id = st.view_create("V".into(), &enabled);
+            st.view_add_cells(
+                id,
+                vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
+            );
+            let (choices, current) = st.view_layout_choices(id, &enabled).expect("view");
+            assert_eq!(current, st.views[0].layout_name());
+            assert_eq!(choices, view_cycle_names(&mut st, id, &enabled));
+            assert!(!choices.iter().any(|c| c == "custom"));
+        }
+    }
+
+    #[test]
+    fn view_layout_choices_mark_custom_but_never_offer_it() {
+        let mut st = ServerState::new();
+        let id = st.view_create("V".into(), &EnabledLayouts::default());
+        st.view_add_cells(
+            id,
+            vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
+        );
+        {
+            let v = st.find_view_mut(id).unwrap();
+            v.custom_tree = Some(v.auto_tree());
+        }
+        let (choices, current) = st
+            .view_layout_choices(id, &EnabledLayouts::default())
+            .expect("view");
+        assert_eq!(current, "custom");
+        assert!(!choices.iter().any(|c| c == "custom"));
+        assert_eq!(
+            st.view_layout_choices(id + 1, &EnabledLayouts::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn view_set_layout_switches_and_drops_the_custom_tree() {
+        let enabled = EnabledLayouts::default();
+        let mut st = ServerState::new();
+        let id = st.view_create("V".into(), &enabled);
+        st.view_add_cells(
+            id,
+            vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
+        );
+        st.view_toggle_zoom(id);
+        assert_eq!(st.view_set_layout(id, "grid", &enabled), Ok(false));
+        assert_eq!(st.view_set_layout(id, "rows", &enabled), Ok(true));
+        assert_eq!(st.views[0].layout_name(), "rows");
+        assert!(
+            st.views[0].zoomed,
+            "a switch keeps the zoom, as a cycle does"
+        );
+        {
+            let v = st.find_view_mut(id).unwrap();
+            v.custom_tree = Some(v.auto_tree());
+        }
+        assert_eq!(st.view_set_layout(id, "rows", &enabled), Ok(true));
+        assert!(st.views[0].custom_tree.is_none());
+        assert_eq!(st.views[0].layout_name(), "rows");
+    }
+
+    #[test]
+    fn view_set_layout_refuses_what_the_list_never_offers() {
+        let enabled = EnabledLayouts {
+            columns: false,
+            ..EnabledLayouts::default()
+        };
+        let mut st = ServerState::new();
+        let id = st.view_create("V".into(), &enabled);
+        for (name, why) in [
+            ("columns", "disabled under [layouts]"),
+            ("custom", "custom is not offered for a view"),
+            ("spiral", "unknown layout"),
+        ] {
+            assert_eq!(st.view_set_layout(id, name, &enabled), Err(why));
+        }
+        assert_eq!(
+            st.view_set_layout(id + 1, "rows", &enabled),
+            Err("no such view")
+        );
+        assert_eq!(st.views[0].layout_name(), "grid");
     }
 
     #[test]

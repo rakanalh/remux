@@ -214,7 +214,14 @@ pub enum ConnDescriptor {
 /// the request and drops the connection, so the bump turns that into a
 /// refused handshake for the upgraded client. Developed as 20 -> 21 and
 /// renumbered when it merged after the layout switcher.
-pub const PROTOCOL_VERSION: u32 = 22;
+///
+/// 22 -> 23: the layout switcher in a View. Adds
+/// [`ClientMessage::ListViewLayouts`], answered with the existing
+/// [`ServerMessage::LayoutList`], and [`ClientMessage::ViewSetLayout`]. A View's
+/// layout is shared state on the local server, so choosing one by name needs a
+/// server message; [`ClientMessage::ViewCycleLayout`] only steps. A 22 server
+/// cannot decode either and drops the connection.
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -710,6 +717,16 @@ pub enum ClientMessage {
     ViewSetFocus { id: ViewId, cell_id: CellId },
     /// Cycle view `id` to the next automatic layout (dropping any custom tree).
     ViewCycleLayout { id: ViewId },
+    /// Ask for the layouts view `id` can switch to. Answered with one
+    /// [`ServerMessage::LayoutList`] carrying `request`, whose `layouts` are the
+    /// automatic layouts `[layouts]` enables in [`ClientMessage::ViewCycleLayout`]'s
+    /// order, never `custom`, and whose `popup_open` is always false. Both lists
+    /// are empty for an unknown view.
+    ListViewLayouts { request: u64, id: ViewId },
+    /// Switch view `id` to the automatic layout `name`, dropping any custom tree
+    /// as [`ClientMessage::ViewCycleLayout`] does. A disabled, unknown or
+    /// `custom` name is refused and nothing is broadcast.
+    ViewSetLayout { id: ViewId, name: String },
     /// Toggle focus-cell zoom for view `id`.
     ViewToggleZoom { id: ViewId },
     /// Switch view `id` to the Master layout and promote its focused cell into
@@ -4434,6 +4451,11 @@ mod tests {
             ClientMessage::ViewRemoveCell { id: 7, cell_id: 2 },
             ClientMessage::ViewSetFocus { id: 7, cell_id: 2 },
             ClientMessage::ViewCycleLayout { id: 7 },
+            ClientMessage::ListViewLayouts { request: 3, id: 7 },
+            ClientMessage::ViewSetLayout {
+                id: 7,
+                name: "rows".into(),
+            },
             ClientMessage::ViewToggleZoom { id: 7 },
             ClientMessage::ViewSetMaster { id: 7 },
             ClientMessage::ViewResizeCell {
@@ -4643,12 +4665,12 @@ mod tests {
         serde_json::from_slice(&encoded[4..4 + len]).unwrap()
     }
 
-    /// 21 introduced the layout switcher and 22 agent session restore; a peer
-    /// on 21 cannot decode `AgentSession`, so the handshake has to refuse that
-    /// pairing.
+    /// 22 introduced agent session restore and 23 the layout switcher in a
+    /// View; a peer on 22 cannot decode `ListViewLayouts` or `ViewSetLayout`,
+    /// so the handshake has to refuse that pairing.
     #[test]
-    fn protocol_version_is_22_for_agent_session_restore() {
-        assert_eq!(PROTOCOL_VERSION, 22);
+    fn protocol_version_is_23_for_the_view_layout_switcher() {
+        assert_eq!(PROTOCOL_VERSION, 23);
     }
 
     #[test]

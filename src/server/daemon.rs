@@ -7581,6 +7581,37 @@ entries={} error={:?} truncated={}",
             broadcast_view_list(state, clients).await;
             Ok(())
         }
+        ClientMessage::ListViewLayouts { request, id } => {
+            let (layouts, current) = {
+                let st = state.lock().await;
+                st.view_layout_choices(id, &config.layouts)
+                    .unwrap_or_default()
+            };
+            let cls = clients.lock().await;
+            if let Some(client) = cls.get(&client_id) {
+                let _ = client.tx.send(ServerMessage::LayoutList {
+                    request,
+                    layouts,
+                    current,
+                    popup_open: false,
+                });
+            }
+            Ok(())
+        }
+        ClientMessage::ViewSetLayout { id, ref name } => {
+            let outcome = {
+                let mut st = state.lock().await;
+                st.view_set_layout(id, name, &config.layouts)
+            };
+            match outcome {
+                Ok(true) => broadcast_view_list(state, clients).await,
+                Ok(false) => {}
+                Err(why) => {
+                    log::info!("server: ViewSetLayout id={id} name={name:?} refused: {why}");
+                }
+            }
+            Ok(())
+        }
         ClientMessage::ViewToggleZoom { id } => {
             {
                 let mut st = state.lock().await;
@@ -12806,11 +12837,7 @@ fn layout_choices(
     has_saved_custom: bool,
     enabled: &EnabledLayouts,
 ) -> Vec<String> {
-    let mut names: Vec<String> = LayoutMode::automatic_modes()
-        .iter()
-        .filter(|mode| enabled.allows(mode))
-        .map(|mode| mode.name().to_string())
-        .collect();
+    let mut names = enabled.automatic_names();
     if has_saved_custom || !current.is_automatic() {
         names.push(LayoutMode::Custom(CustomLayout).name().to_string());
     }

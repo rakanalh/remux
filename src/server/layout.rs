@@ -502,6 +502,15 @@ impl EnabledLayouts {
         }
     }
 
+    /// The names of the automatic layouts this allows, in cycle order.
+    pub fn automatic_names(&self) -> Vec<String> {
+        LayoutMode::automatic_modes()
+            .iter()
+            .filter(|mode| self.allows(mode))
+            .map(|mode| mode.name().to_string())
+            .collect()
+    }
+
     /// `mode` if it is allowed, else the first enabled mode in cycle order.
     pub fn or_first(&self, mode: LayoutMode) -> LayoutMode {
         if self.allows(&mode) {
