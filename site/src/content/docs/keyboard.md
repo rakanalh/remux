@@ -41,7 +41,7 @@ These work directly in Normal mode, with no prefix.
 | New tab | `Alt-t` |
 | Quick session switcher | `Alt-s` |
 | Agent switcher | `Alt-a` |
-| Layout switcher | `Alt-g` |
+| Layout switcher (the tab's, or the view's in a view) | `Alt-g` |
 | Previous session | `Alt-o` |
 | Zoom the focused pane (fullscreen, or a float with `[zoom] mode = "float"`) | `Alt-z` |
 | Toggle the popup terminal | `Alt-p` |

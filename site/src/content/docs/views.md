@@ -39,6 +39,7 @@ A view takes over the keyboard while it's on screen. The familiar pane keys act 
 |---|---|
 | Move focus between cells | `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` |
 | Cycle the view's layout | `Alt-Space`, `Ctrl-a Space` or `Ctrl-a w Space` |
+| Pick the view's layout from a list | `Alt-g` or `Ctrl-a L` |
 | Zoom the focused cell | `Alt-z`, `Ctrl-a z` or `Ctrl-a p z` |
 | Move the focused cell | `Alt-H` / `Alt-J` / `Alt-K` / `Alt-L` |
 | Resize the focused cell | `Ctrl-a p R` then `h` / `j` / `k` / `l` |
@@ -53,7 +54,7 @@ Removing a cell never closes the pane. `Ctrl-a p x`, which closes a pane in a no
 
 ## Layouts in a view
 
-A view uses the same layout engine as a tab (see [Layouts](/remux/layouts/)). It starts in **Grid**, or in the first enabled layout if `[layouts]` turns Grid off, and cycles through whichever automatic layouts are enabled. Moving or resizing a cell switches the view to `custom` until you next cycle.
+A view uses the same layout engine as a tab (see [Layouts](/remux/layouts/)). It starts in **Grid**, or in the first enabled layout if `[layouts]` turns Grid off, and cycles through whichever automatic layouts are enabled. The layout switcher (`Alt-g`) lists the same layouts, with the current one marked, and applies the one you pick. Moving or resizing a cell switches the view to `custom` until you next cycle or pick a layout; `custom` is never offered in the list, because the view does not remember the arrangement once it leaves it.
 
 In Monocle, a title strip along the top names every cell:
 

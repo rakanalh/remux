@@ -352,7 +352,7 @@ Every action you can bind or run from the command palette. The names are PascalC
 |---|---|
 | `LayoutNext` | Cycle to the next enabled automatic layout |
 | `LayoutSet <layout>` | Switch to a layout by name (`bsp` … `rows`, `custom`). Refused when `[layouts]` disables it |
-| `LayoutQuickSwitch` | Open the layout switcher: the layouts `LayoutNext` visits, current one marked; `Enter` or `l` applies one. Tabs only |
+| `LayoutQuickSwitch` | Open the layout switcher: the layouts `LayoutNext` visits, current one marked; `Enter` or `l` applies one. In a view, the view's layout |
 | `ToggleStyle` | Switch between zellij and tmux border styles |
 
 ### Sessions and folders
