@@ -474,8 +474,12 @@ pub enum InputAction {
     LayoutSwitchOpen,
     /// Layout switcher updated (re-render needed).
     LayoutSwitchUpdate,
-    /// Layout switcher confirmed: send `LayoutSet(name)` to `conn`.
-    LayoutSwitchConfirm { conn: ConnId, name: String },
+    /// Layout switcher confirmed: switch `target` to `name` on `conn`.
+    LayoutSwitchConfirm {
+        conn: ConnId,
+        target: LayoutTarget,
+        name: String,
+    },
     /// Layout switcher closed without a change.
     LayoutSwitchClose,
     // -- Views (client-only virtual tabs; never forwarded to the server) --
@@ -628,7 +632,7 @@ pub struct InputHandler {
     pub tab_picker: Option<TabPickerOverlay>,
     /// The layout switcher, while it is open.
     pub layout_switch: Option<LayoutSwitchOverlay>,
-    /// The id of the last `ListLayouts` sent. See [`LayoutSwitchOverlay`].
+    /// The id of the last layout list request sent. See [`LayoutSwitchOverlay`].
     layout_request: u64,
     /// Whether we are waiting for scrollback content to open in an editor.
     pub pending_editor_open: bool,
@@ -1536,20 +1540,49 @@ impl TabPickerOverlay {
 
 const POPUP_OPEN: &str = "popup open";
 
+/// What a layout switcher lists and switches: the requester's active tab, or
+/// a View. A View's layout is shared state on the local server, so both are
+/// asked of a server; only the messages differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutTarget {
+    Tab,
+    View(crate::protocol::ViewId),
+}
+
+impl LayoutTarget {
+    /// The request answered by the `LayoutList` for this target.
+    pub fn list_request(self, request: u64) -> crate::protocol::ClientMessage {
+        use crate::protocol::ClientMessage;
+        match self {
+            LayoutTarget::Tab => ClientMessage::ListLayouts { request },
+            LayoutTarget::View(id) => ClientMessage::ListViewLayouts { request, id },
+        }
+    }
+
+    /// The message that switches this target to the layout `name`.
+    pub fn set_request(self, name: String) -> crate::protocol::ClientMessage {
+        use crate::protocol::ClientMessage;
+        match self {
+            LayoutTarget::Tab => ClientMessage::Command(RemuxCommand::LayoutSet(name)),
+            LayoutTarget::View(id) => ClientMessage::ViewSetLayout { id, name },
+        }
+    }
+}
+
 /// The layout switcher behind `LayoutQuickSwitch`: the layouts the active tab
-/// can switch to, with its current one marked.
+/// or View can switch to, with its current one marked.
 ///
 /// The list comes from the server ([`crate::protocol::ServerMessage::LayoutList`]),
 /// because `[layouts]` is server config. Like [`TabPickerOverlay`], it is pinned
-/// to the connection that was in the foreground when it opened, so the list it
-/// shows and the `LayoutSet` it sends name the same server.
+/// to the connection it asked, so the list it shows and the switch it sends
+/// name the same server.
 #[derive(Debug)]
 pub struct LayoutSwitchOverlay {
     conn: ConnId,
-    /// The id of the `ListLayouts` this open sent. A reply carrying any other
-    /// id answers an earlier open of the switcher. `None` when this open sent
-    /// no request, so no reply is taken.
-    request: Option<u64>,
+    target: LayoutTarget,
+    /// The id of the request this open sent. A reply carrying any other id
+    /// answers an earlier open of the switcher.
+    request: u64,
     /// `None` until the server answers.
     layouts: Option<Vec<String>>,
     current: String,
@@ -1559,25 +1592,14 @@ pub struct LayoutSwitchOverlay {
 }
 
 impl LayoutSwitchOverlay {
-    pub fn new(conn: ConnId, request: u64) -> Self {
+    pub fn new(conn: ConnId, target: LayoutTarget, request: u64) -> Self {
         Self {
             conn,
-            request: Some(request),
+            target,
+            request,
             layouts: None,
             current: String::new(),
             why_empty: None,
-            nav: crate::client::sidebar::nav::NavList::new(),
-        }
-    }
-
-    /// A switcher that offers nothing and says `why`. Enter closes it.
-    pub fn unavailable(conn: ConnId, why: &'static str) -> Self {
-        Self {
-            conn,
-            request: None,
-            layouts: Some(Vec::new()),
-            current: String::new(),
-            why_empty: Some(why),
             nav: crate::client::sidebar::nav::NavList::new(),
         }
     }
@@ -1597,7 +1619,7 @@ impl LayoutSwitchOverlay {
         current: String,
         popup_open: bool,
     ) -> bool {
-        if *src != self.conn || self.request != Some(request) {
+        if *src != self.conn || self.request != request {
             return false;
         }
         if popup_open {
@@ -1615,11 +1637,15 @@ impl LayoutSwitchOverlay {
         self.nav.apply(cmd, len);
     }
 
-    /// The pinned connection and the highlighted layout name, if the list has
-    /// arrived and is not empty.
-    fn choice(&self) -> Option<(ConnId, String)> {
+    /// The confirm action for the highlighted layout, if the list has arrived
+    /// and is not empty.
+    fn choice(&self) -> Option<InputAction> {
         let name = self.layouts.as_ref()?.get(self.nav.selected())?;
-        Some((self.conn.clone(), name.clone()))
+        Some(InputAction::LayoutSwitchConfirm {
+            conn: self.conn.clone(),
+            target: self.target,
+            name: name.clone(),
+        })
     }
 
     /// Render the layout switcher popup as draw commands.
@@ -1871,12 +1897,16 @@ impl InputHandler {
         }
     }
 
-    /// Open the layout switcher pinned to `conn`, and return the id the
-    /// `ListLayouts` sent for it must carry.
-    pub fn open_layout_switch(&mut self, conn: ConnId) -> u64 {
+    /// Open the layout switcher for `target`, pinned to `conn`, and return the
+    /// request to send `conn` for its list.
+    pub fn open_layout_switch(
+        &mut self,
+        conn: ConnId,
+        target: LayoutTarget,
+    ) -> crate::protocol::ClientMessage {
         self.layout_request += 1;
-        self.layout_switch = Some(LayoutSwitchOverlay::new(conn, self.layout_request));
-        self.layout_request
+        self.layout_switch = Some(LayoutSwitchOverlay::new(conn, target, self.layout_request));
+        target.list_request(self.layout_request)
     }
 
     /// The current keybinding for `action`, as shown in the context menu: a
@@ -3593,11 +3623,9 @@ impl InputHandler {
             this.mode = Mode::Normal;
             action
         };
-        let confirm =
-            |this: &mut Self, overlay_choice: Option<(ConnId, String)>| match overlay_choice {
-                Some((conn, name)) => close(this, InputAction::LayoutSwitchConfirm { conn, name }),
-                None => close(this, InputAction::LayoutSwitchClose),
-            };
+        let confirm = |this: &mut Self, choice: Option<InputAction>| {
+            close(this, choice.unwrap_or(InputAction::LayoutSwitchClose))
+        };
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => close(self, InputAction::LayoutSwitchClose),
             KeyCode::Char('l') => {
@@ -6620,10 +6648,16 @@ mod tests {
         assert_eq!(handler.mode, Mode::Command);
     }
 
-    fn layout_switch_handler() -> InputHandler {
+    /// Open the switcher for `target` and return the request id it sent.
+    fn open_layout_switch(handler: &mut InputHandler, target: LayoutTarget) -> u64 {
+        handler.open_layout_switch(ConnId::Local, target);
+        handler.layout_request
+    }
+
+    fn layout_switch_handler_for(target: LayoutTarget) -> InputHandler {
         let mut handler = InputHandler::with_defaults();
         handler.mode = Mode::Command;
-        let request = handler.open_layout_switch(ConnId::Local);
+        let request = open_layout_switch(&mut handler, target);
         let overlay = handler.layout_switch.as_mut().expect("opened");
         assert!(overlay.apply_from(
             &ConnId::Local,
@@ -6633,6 +6667,10 @@ mod tests {
             false
         ));
         handler
+    }
+
+    fn layout_switch_handler() -> InputHandler {
+        layout_switch_handler_for(LayoutTarget::Tab)
     }
 
     fn layout_names() -> Vec<String> {
@@ -6650,6 +6688,7 @@ mod tests {
             handler.handle_key(make_key(KeyCode::Enter, KeyModifiers::NONE)),
             InputAction::LayoutSwitchConfirm {
                 conn: ConnId::Local,
+                target: LayoutTarget::Tab,
                 name: "monocle".to_string()
             }
         );
@@ -6658,8 +6697,49 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_switcher_asks_for_and_sets_the_tab_layout() {
+        let mut handler = InputHandler::with_defaults();
+        assert!(matches!(
+            handler.open_layout_switch(ConnId::Local, LayoutTarget::Tab),
+            crate::protocol::ClientMessage::ListLayouts { request: 1 }
+        ));
+        assert!(matches!(
+            LayoutTarget::Tab.set_request("rows".to_string()),
+            crate::protocol::ClientMessage::Command(RemuxCommand::LayoutSet(ref name)) if name == "rows"
+        ));
+    }
+
+    #[test]
+    fn a_view_switcher_asks_for_and_sets_the_view_layout() {
+        let mut handler = InputHandler::with_defaults();
+        assert!(matches!(
+            handler.open_layout_switch(ConnId::Local, LayoutTarget::View(5)),
+            crate::protocol::ClientMessage::ListViewLayouts { request: 1, id: 5 }
+        ));
+        assert!(matches!(
+            LayoutTarget::View(5).set_request("rows".to_string()),
+            crate::protocol::ClientMessage::ViewSetLayout { id: 5, ref name } if name == "rows"
+        ));
+    }
+
+    #[test]
+    fn the_view_switcher_confirms_the_pick_for_its_view() {
+        let mut handler = layout_switch_handler_for(LayoutTarget::View(5));
+        handler.handle_key(make_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Char('l'), KeyModifiers::NONE)),
+            InputAction::LayoutSwitchConfirm {
+                conn: ConnId::Local,
+                target: LayoutTarget::View(5),
+                name: "bsp".to_string()
+            }
+        );
+        assert!(handler.layout_switch.is_none());
+    }
+
+    #[test]
     fn the_layout_switcher_ignores_another_connections_list() {
-        let mut overlay = LayoutSwitchOverlay::new(ConnId::Local, 1);
+        let mut overlay = LayoutSwitchOverlay::new(ConnId::Local, LayoutTarget::Tab, 1);
         assert!(!overlay.apply_from(
             &ConnId::Remote("mini".to_string()),
             1,
@@ -6674,7 +6754,7 @@ mod tests {
     fn enter_before_the_list_arrives_closes_the_layout_switcher() {
         let mut handler = InputHandler::with_defaults();
         handler.mode = Mode::Command;
-        handler.open_layout_switch(ConnId::Local);
+        handler.open_layout_switch(ConnId::Local, LayoutTarget::Tab);
         assert_eq!(
             handler.handle_key(make_key(KeyCode::Enter, KeyModifiers::NONE)),
             InputAction::LayoutSwitchClose
@@ -6686,7 +6766,7 @@ mod tests {
     fn the_layout_switcher_offers_nothing_while_the_popup_is_open() {
         let mut handler = InputHandler::with_defaults();
         handler.mode = Mode::Command;
-        let request = handler.open_layout_switch(ConnId::Local);
+        let request = open_layout_switch(&mut handler, LayoutTarget::Tab);
         let overlay = handler.layout_switch.as_mut().expect("opened");
         assert!(overlay.apply_from(&ConnId::Local, request, Vec::new(), "bsp".to_string(), true));
         assert_eq!(overlay.why_empty, Some(POPUP_OPEN));
@@ -6697,21 +6777,6 @@ mod tests {
         assert!(handler.layout_switch.is_none());
     }
 
-    #[test]
-    fn an_unavailable_layout_switcher_takes_no_reply() {
-        let mut overlay = LayoutSwitchOverlay::unavailable(ConnId::Local, "in a view");
-        for request in 0..3 {
-            assert!(!overlay.apply_from(
-                &ConnId::Local,
-                request,
-                layout_names(),
-                "bsp".to_string(),
-                false
-            ));
-        }
-        assert_eq!(overlay.choice(), None);
-    }
-
     /// Alt-g, Esc, Alt-g sends two `ListLayouts` before either reply arrives.
     /// The first reply answers the closed open: taking it would reset the
     /// highlight, so Enter would apply a layout the user did not pick.
@@ -6720,13 +6785,13 @@ mod tests {
         let mut handler = InputHandler::with_defaults();
         let alt_g = make_key(KeyCode::Char('g'), KeyModifiers::ALT);
         assert_eq!(handler.handle_key(alt_g), InputAction::LayoutSwitchOpen);
-        let first = handler.open_layout_switch(ConnId::Local);
+        let first = open_layout_switch(&mut handler, LayoutTarget::Tab);
         assert_eq!(
             handler.handle_key(make_key(KeyCode::Esc, KeyModifiers::NONE)),
             InputAction::LayoutSwitchClose
         );
         assert_eq!(handler.handle_key(alt_g), InputAction::LayoutSwitchOpen);
-        let second = handler.open_layout_switch(ConnId::Local);
+        let second = open_layout_switch(&mut handler, LayoutTarget::Tab);
         assert_ne!(first, second);
 
         let reply = |handler: &mut InputHandler, request: u64| {
@@ -6747,6 +6812,7 @@ mod tests {
             handler.handle_key(make_key(KeyCode::Enter, KeyModifiers::NONE)),
             InputAction::LayoutSwitchConfirm {
                 conn: ConnId::Local,
+                target: LayoutTarget::Tab,
                 name: "master".to_string()
             }
         );

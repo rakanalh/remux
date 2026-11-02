@@ -2,7 +2,8 @@
 """The layout switcher (Alt-g), and Alt+Shift+H/J/K/L moving panes.
 
 A real PTY, because the switcher is a CLIENT overlay opened by a key the client
-decodes: the server only answers `ListLayouts` and applies `LayoutSet`. The
+decodes: the server only answers `ListLayouts` / `ListViewLayouts` and applies
+`LayoutSet` / `ViewSetLayout`. The
 move keys are here too because they share the decoding fix: crossterm reports
 `ESC L` as `'L'` + Alt + Shift, and before `NormalizedKeyEvent` dropped that
 Shift, no Alt+Shift+letter shortcut ever fired.
@@ -27,9 +28,12 @@ What it covers:
   8  with the popup terminal open (`Alt-p`) the server offers no layouts, the
      switcher says why, and Enter closes it without changing the layout; once
      the popup is closed the list comes back
-  9  in a View the switcher says it is unavailable there instead of doing
-     nothing, Enter closes it, the rows it covered show the View's cells
-     again, and the client stays alive
+  9  in a View with two cells side by side, the switcher lists the View's
+     layouts (grid absent, the current one marked); picking `rows` stacks the
+     cells, judged by the `stty size` each cell's own shell reports; the tab
+     underneath keeps its layout; server.log shows `ListViewLayouts` and
+     `ViewSetLayout` and no `ListLayouts` or `LayoutSet`; the client stays
+     alive
 
 Run from the repo root:
     python3 tests/pty/layout_selector.py [-v]
@@ -315,13 +319,41 @@ def popup_section():
     check_logs(t, "popup")
 
 
+SIZE_RE = re.compile(r"SZ(\d):(\d+) (\d+)")
+
+
+def cell_sizes(t, phase):
+    """Every `(rows, cols)` a cell's shell reported for `phase`, left to right
+    and top to bottom. The shell assembles `SZ<phase>:` itself, so the typed
+    command never matches.
+    """
+    hits = []
+    for y, row in enumerate(t.rows_text()):
+        for m in SIZE_RE.finditer(row):
+            if m.group(1) == str(phase):
+                hits.append((y, m.start(), int(m.group(2)), int(m.group(3))))
+    return sorted(hits)
+
+
+def report_sizes(t, phase, other_cell):
+    """Have each of the View's two cells print its own `stty size`: the focused
+    one, then the one `other_cell` (an Alt+direction key) moves focus to.
+    """
+    cmd = f"printf 'SZ%s:%s\\n' {phase} \"$(stty size)\"\r".encode()
+    t.send(cmd, 0.6)
+    t.send(other_cell, 0.6)
+    t.send(cmd, 0.8)
+    return cell_sizes(t, phase)
+
+
 def view_section():
     t = Tui(RUN, config=CONFIG).start()
     try:
         t.send(b"printf 'P%s\\n' A\r", 0.5)
         t.prefix(b"pv", 0.8)
         t.send(b"printf 'P%s\\n' B\r", 0.5)
-        # A background tab, so the composed cells are not session-visible.
+        # A background tab, so the composed cells are not session-visible and
+        # each pane's size is its cell's.
         t.send(b"\x1bt", 0.8)
         sm_compose_view(t, panes=(0, 1), settle=1.2)
         in_view = t.has("View 1")
@@ -330,46 +362,60 @@ def view_section():
             return
         screen = "\n".join(t.rows_text())
         check("view: the cells show both panes", "PA" in screen and "PB" in screen, screen)
-        before = t.rows_text()[-1]
-        view_rows = t.rows_text()
+
+        # `grid = false`, so the View starts in bsp: two cells side by side.
+        side = report_sizes(t, 1, b"\x1bl")
+        check("view: both cells report a size side by side",
+              len(side) == 2 and side[0][0] == side[1][0] and side[0][1] < side[1][1],
+              side)
+        if len(side) != 2:
+            t.dump("view sizes before")
+            return
+
         t.send(OPEN, 1.0)
         items = popup_rows(t)
-        extent = popup_extent(t)
         if VERBOSE:
             t.dump("switcher in a view")
-        check("view: the switcher says it is unavailable",
-              items == ["  no layouts: in a view"],
-              items if items is not None else "\n".join(t.rows_text()))
-        t.send(b"\r", 1.0)
-        check("view: Enter closes the switcher", popup_rows(t) is None,
+        names = [i[2:] for i in items or []]
+        check("view: the switcher lists the View's layouts, grid absent",
+              names == EXPECTED, items if items is not None else "\n".join(t.rows_text()))
+        check("view: the current layout is marked", "* bsp" in (items or []), items)
+
+        pick(t, "rows", items or [])
+        t.pump(0.8)
+        check("view: the switcher closed", popup_rows(t) is None,
               "\n".join(t.rows_text()))
-        check("view: still in the view, status bar unchanged",
-              t.rows_text()[-1] == before, f"{before!r} -> {t.rows_text()[-1]!r}")
-        # Judged on the rows the box covered, not on the markers: those sit
-        # above the box and survive whether or not anything repainted. The
-        # View's two cells put a divider through those rows; the single-pane
-        # tab behind it has none, and a box left on screen breaks the match.
-        check("view: the switcher box was found", extent is not None,
-              "\n".join(t.rows_text()))
-        if extent is not None:
-            top, bottom, left, right = extent
-            covered = range(top, bottom + 1)
-            divider_cols = [m.start() for m in re.finditer("│", view_rows[top])
-                            if left <= m.start() <= right
-                            and all(view_rows[y][m.start():m.start() + 1] == "│"
-                                    for y in covered)]
-            check("view: a cell divider runs under the switcher box",
-                  bool(divider_cols),
-                  f"cols {left}..{right}, rows {top}..{bottom}\n"
-                  + "\n".join(view_rows))
-            after = t.rows_text()
-            stale = [y for y in covered
-                     if after[y] != view_rows[y]
-                     or any(x in after[y] for x in (TITLE, "no layouts", "╭", "╰"))]
-            check("view: the rows the switcher covered show the cells again",
-                  not stale and bool(divider_cols),
-                  "\n".join(f"{y:2} {after[y]!r}" for y in covered))
+        check("view: still in the view", t.has("View 1"), "\n".join(t.rows_text()))
+
+        # The focused cell is still the right/second one; in rows it is the
+        # bottom one, so Alt+k reaches the other.
+        stacked = report_sizes(t, 2, b"\x1bk")
+        detail = f"before {side}\nafter {stacked}\n" + "\n".join(t.rows_text())
+        if VERBOSE:
+            print(f"        sizes before {side} after {stacked}")
+        check("view: both cells report a size after the switch", len(stacked) == 2, detail)
+        if len(stacked) == 2:
+            (_, _, r_a, c_a), (_, _, r_b, c_b) = stacked
+            (_, _, side_rows, side_cols), _ = side
+            check("view: the cells are stacked full width",
+                  c_a == c_b and c_a > side_cols * 1.5 and r_a < side_rows * 0.75
+                  and r_b < side_rows * 0.75,
+                  detail)
+
+        t.prefix(b"wq", 1.2)
+        check("view: left the view", not t.has("View 1"), "\n".join(t.rows_text()))
+        check("view: the tab underneath kept its own layout",
+              status_layout(t) == "bsp", t.rows_text()[-1])
         check("client is alive after the view checks", t.alive())
+
+        server = t.log("server")
+        check("view: the list and the switch went to the server as View messages",
+              "ListViewLayouts" in server and "ViewSetLayout" in server,
+              [ln for ln in server.splitlines() if "View" in ln][-10:])
+        check("view: no ListLayouts or LayoutSet reached the server",
+              "ListLayouts" not in server and "LayoutSet" not in server,
+              [ln for ln in server.splitlines()
+               if "ListLayouts" in ln or "LayoutSet" in ln][:10])
     finally:
         t.kill()
     check_logs(t, "view")

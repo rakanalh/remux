@@ -22,7 +22,7 @@ use futures::StreamExt;
 
 use crate::client::editor::copy_to_clipboard;
 use crate::client::input::{
-    AgentSwitchOverlay, FolderSelectOverlay, InputAction, InputHandler, LayoutSwitchOverlay, Mode,
+    AgentSwitchOverlay, FolderSelectOverlay, InputAction, InputHandler, LayoutTarget, Mode,
     RenameTarget, SessionSwitchOverlay, SidebarIntent, TabPickerOverlay, TabPickerTree,
 };
 use crate::client::popup::{HeldLayer, PopupBox, PopupState};
@@ -6370,20 +6370,14 @@ async fn run_client_loop(
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
                                 }
-                                let conn = mgr.foreground().clone();
-                                if active_view.is_some() {
-                                    // A view cycles its own client-side layout
-                                    // (`ViewLayoutNext`), which no server list
-                                    // describes. The switcher still opens, to
-                                    // say so: a key that does nothing reads as
-                                    // a dropped keypress.
-                                    log::debug!("layout switcher: unavailable, a view is displayed");
-                                    input.layout_switch =
-                                        Some(LayoutSwitchOverlay::unavailable(conn, "in a view"));
-                                } else {
-                                    let request = input.open_layout_switch(conn.clone());
-                                    mgr.send(&conn, ClientMessage::ListLayouts { request }).await?;
-                                }
+                                // Views live on the local server, whatever
+                                // the foreground connection is.
+                                let (conn, target) = match active_view {
+                                    Some(av) => (ConnId::Local, LayoutTarget::View(views[av].id)),
+                                    None => (mgr.foreground().clone(), LayoutTarget::Tab),
+                                };
+                                let request = input.open_layout_switch(conn.clone(), target);
+                                mgr.send(&conn, request).await?;
                                 if let Some(ref ls) = input.layout_switch {
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.clear_overlay(c, r)?;
@@ -6400,13 +6394,29 @@ async fn run_client_loop(
                                     renderer.flush()?;
                                 }
                             }
-                            InputAction::LayoutSwitchConfirm { ref conn, ref name } => {
+                            InputAction::LayoutSwitchConfirm { ref conn, target, ref name } => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 renderer.flush()?;
-                                let cmd = ClientMessage::Command(RemuxCommand::LayoutSet(name.clone()));
-                                if let Err(e) = mgr.send(conn, cmd).await {
-                                    log::info!("layout switcher: LayoutSet not sent to {conn:?}: {e}");
+                                if let Err(e) = mgr.send(conn, target.set_request(name.clone())).await {
+                                    log::info!("layout switcher: {target:?} switch not sent to {conn:?}: {e}");
+                                }
+                                // The overlay sat on top of the view; the
+                                // `ViewList` resync repaints the new layout.
+                                if let (LayoutTarget::View(_), Some(av)) = (target, active_view) {
+                                    paint_view(
+                                        &mut renderer,
+                                        &chrome,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &view_border_style,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
                                 }
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
