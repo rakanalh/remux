@@ -349,10 +349,11 @@ class Run:
 
     def preseed(self, config_dir):
         if self.agent == "claude":
+            # Claude keys trust by the realpath, and macOS's /tmp is /private/tmp.
+            trusted = {"hasTrustDialogAccepted": True, "hasCompletedProjectOnboarding": True}
             with open(f"{config_dir}/.claude.json", "w") as f:
                 json.dump({"hasCompletedOnboarding": True, "theme": "dark", "numStartups": 1,
-                           "projects": {self.work: {"hasTrustDialogAccepted": True,
-                                                    "hasCompletedProjectOnboarding": True}}}, f)
+                           "projects": {p: trusted for p in {self.work, os.path.realpath(self.work)}}}, f)
         else:
             with open(f"{config_dir}/config.toml", "w") as f:
                 # No update check: its dialog's default action runs
