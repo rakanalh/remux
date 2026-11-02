@@ -65,6 +65,18 @@
 # (default: true).
 # allow_app_clipboard = true
 
+# When true (default), an AI agent in a pane may report the session it is
+# running (through `remux integrate <agent>-resume`), and a restore types the
+# agent's resume command into the pane's restored shell, e.g.
+# ` claude --resume=<id>`. When false, reports are refused and nothing is
+# stored or typed, so no session id is written to disk (default: true).
+# resume_agents = true
+
+# How long a restore waits between typing one pane's resume command and the
+# next, across every restored session, so several agents do not all start at
+# once, in milliseconds (default: 100).
+# resume_agent_delay_ms = 100
+
 # -----------------------------------------------------------------------------
 # APPEARANCE
 # -----------------------------------------------------------------------------

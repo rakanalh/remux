@@ -34,6 +34,7 @@ export default defineConfig({
 						{ label: 'Sidebars', slug: 'sidebars' },
 						{ label: 'Agents', slug: 'agents' },
 						{ label: 'Agent messaging', slug: 'messaging' },
+						{ label: 'Resuming agents', slug: 'session-restore' },
 						{ label: 'Sessions & persistence', slug: 'sessions' },
 					],
 				},

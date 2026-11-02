@@ -1,0 +1,10 @@
+# my codex config, with comments remux must keep
+model = "o3" # the good one
+
+[features]
+# keep this one on
+web_search_request = true
+other = false
+
+[profiles.work]
+model = "gpt-5"   # aligned by hand

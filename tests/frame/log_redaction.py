@@ -73,6 +73,11 @@ CLI_SUBMIT_SECRET = "the-badge-code-is-3141-CLI-SUBMIT"
 # A body a Stop hook hands to a fake Claude: `remux msg hook claude-stop`
 # prints it on stdout, which must never reach either log.
 HOOK_SECRET = "the-safe-combination-is-2718-HOOK"
+# An agent's session id and session file, reported with `remux agent session`
+# from inside a pane. The id names a transcript on disk and the path a file in
+# the user's home; the summary keeps the agent, the kind and the byte count.
+SESSION_ID_SECRET = "sessid-lobster-2718-AGENTSESSION"
+SESSION_PATH_SECRET = "/home/sam/.omp/sessions/secret-merger-plan-AGENTPATH.jsonl"
 FAKECLAUDE = f"{RUNDIR}-bin/claude"
 HOOK_HOME = f"{RUNDIR}-home"
 # Outside the run dir, which `Server.start` wipes.
@@ -350,6 +355,24 @@ def run_msg_cli(srv, result):
         time.sleep(0.2)
 
 
+def run_agent_session(srv):
+    """12. `remux agent session` from inside a pane, as its own program through
+    `CliSpawn` with a DIRECT argv: remux's parent is then the server rather than
+    the pane's shell, so the report is accepted rather than refused
+    `not_from_agent`, and both the CLI and the server log it."""
+    for argv in (["claude", "--id", SESSION_ID_SECRET], ["omp", "--path", SESSION_PATH_SECRET]):
+        cli = Client(srv.sock)
+        cli.hello()
+        cli.send({"CliSpawn": {"session": "main", "placement": "SplitBelow",
+                               "argv": [os.path.abspath(BIN), "agent", "session", *argv],
+                               "cwd": None}})
+        cli.drain(0.6)
+        cli.close()
+    end = time.time() + 8.0
+    while time.time() < end and srv.log().count("bytes source=None -> Stored") < 2:
+        time.sleep(0.2)
+
+
 def leak_forms(secret):
     """Every form a body has leaked into a log in: as text, as hex, and as
     the Debug print of a byte list (`[99, 111, 114, ...]`, how InputToPane
@@ -493,6 +516,7 @@ def main():
             run_submit(srv, result)
             run_cli_submit(srv, result)
             run_hook(srv, result)
+            run_agent_session(srv)
         except Exception as e:  # noqa: BLE001 -- the log is the point; reach it
             check(False, f"the run completed without an exception ({e!r})")
     finally:
@@ -668,6 +692,21 @@ def main():
         "cmd: msg hook claude-stop -> 1 queued, acked 1" in client_log,
         "11 ...but client.log names the hook and its counts",
     )
+
+    # 12. An agent's session id and path: in neither log in any form, while
+    #     both logs name the report by agent, kind and byte count.
+    for kind, agent, secret in (("id", "claude", SESSION_ID_SECRET),
+                                ("path", "omp", SESSION_PATH_SECRET)):
+        check(
+            f'agent session: pane %' in log
+            and f'"{agent}" {kind} {len(secret)} bytes source=None -> Stored' in log,
+            f"12 the {agent} {kind} report really was stored (otherwise 12 proves nothing)",
+        )
+        summary = f'AgentSession(agent="{agent}", {kind}, {len(secret)} bytes'
+        check(summary in log, f"12 server.log names the {agent} report by kind and byte count")
+        check(summary in client_log, f"12 client.log names the {agent} report by kind and byte count")
+        leaked = [form for form in leak_forms(secret) if form in log or form in client_log]
+        check(not leaked, f"12 the {agent} session {kind} is in neither log (found {leaked})")
 
     # 5. ListDirectory: logged on CHANGE, not on every 2s poll.
     lists = [ln for ln in log.splitlines() if "msg=ListDirectory" in ln]

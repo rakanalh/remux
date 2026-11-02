@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use crate::client::cli_common::{ask, escape, pane_hint, CliError};
 use crate::client::msg_cli::{render_context, render_mark};
-use crate::protocol::{ClientMessage, Message, PaneId, ServerMessage};
+use crate::protocol::{AgentSessionRef, ClientMessage, Message, PaneId, ServerMessage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum HookEvent {
@@ -72,13 +72,23 @@ const PAYLOAD_WAIT: Duration = Duration::from_millis(1500);
 /// past this the mail waits for the user's next prompt.
 pub const MAX_CONTINUATIONS: u32 = 3;
 
-/// The two fields kept from Claude's payload. The rest is dropped by the parse
-/// and never held, logged or quoted.
+/// The fields kept from an agent's hook payload. The rest is dropped by the
+/// parse and never held, logged or quoted.
 #[derive(Debug, serde::Deserialize)]
 struct Payload {
     hook_event_name: String,
     #[serde(default)]
     stop_hook_active: bool,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    /// Set when the session is a subagent's, which shares its parent's pane.
+    #[serde(default)]
+    agent_id: Option<String>,
+    /// Codex writes one for every session a user can resume.
+    #[serde(default)]
+    transcript_path: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -481,6 +491,135 @@ fn render(messages: &[Message]) -> Option<String> {
     Some(render_context(messages, &render_mark()?))
 }
 
+/// What `remux agent session` reports: the agent's hook payload, or a
+/// reference a plugin passed on the command line.
+pub enum SessionInput {
+    Hook,
+    Id(String),
+    Path(String),
+}
+
+/// What in the hook's environment says who is running it.
+struct HookEnv {
+    /// `CURSOR_VERSION` is set: Cursor runs Claude's hooks for its own agent.
+    cursor: bool,
+    /// `CODEX_THREAD_ID`: Codex exports its session to every child, so a
+    /// nested `codex exec` sees the OUTER session's id here.
+    codex_thread: Option<String>,
+}
+
+impl HookEnv {
+    fn read() -> Self {
+        Self {
+            cursor: std::env::var_os("CURSOR_VERSION").is_some(),
+            codex_thread: std::env::var("CODEX_THREAD_ID").ok(),
+        }
+    }
+}
+
+/// Why a hook payload is not this pane's agent's own session start, so that
+/// nothing is reported.
+///
+/// For codex these two are the whole defence against a nested run: codex
+/// allows `startup` to replace a held session, so a `codex exec` run from
+/// inside the pane's codex would otherwise take the pane over.
+fn not_reported(agent: &str, payload: &Payload, env: &HookEnv) -> Option<&'static str> {
+    if payload.hook_event_name != "SessionStart" {
+        return Some("not a SessionStart payload");
+    }
+    if agent == "claude" && payload.agent_id.is_some() {
+        return Some("a subagent's session");
+    }
+    if agent == "claude" && env.cursor {
+        return Some("Cursor, not Claude Code");
+    }
+    if agent == "codex" {
+        if env
+            .codex_thread
+            .as_deref()
+            .is_some_and(|outer| Some(outer) != payload.session_id.as_deref())
+        {
+            return Some("a codex run nested in another codex session");
+        }
+        if payload.transcript_path.is_none() {
+            return Some("a codex session with no transcript to resume");
+        }
+    }
+    None
+}
+
+/// `remux agent session`. Outside every pane there is nothing to report, so
+/// it returns without reading the payload or connecting: Claude runs its
+/// hooks in every terminal, not only in remux.
+pub async fn run_session(
+    agent: String,
+    input: SessionInput,
+    source: Option<String>,
+    pane: Option<PaneId>,
+) {
+    if pane.is_none() && std::env::var_os("REMUX_PANE").is_none() {
+        return;
+    }
+    match report_session(agent, input, source, pane).await {
+        Ok(()) => {}
+        Err(Some(why)) => eprintln!("remux: agent session: {}", escape(&why)),
+        Err(None) => {}
+    }
+}
+
+/// `Err(None)` is a payload that is not this agent's session start, which is
+/// no failure and prints nothing.
+async fn report_session(
+    agent: String,
+    input: SessionInput,
+    source: Option<String>,
+    pane: Option<PaneId>,
+) -> Result<(), Option<String>> {
+    let (reference, source) = match input {
+        SessionInput::Id(id) => (AgentSessionRef::Id(id), source),
+        SessionInput::Path(path) => (AgentSessionRef::Path(path), source),
+        SessionInput::Hook => {
+            let payload = read_payload().map_err(|e| Some(e.to_string()))?;
+            if let Some(why) = not_reported(&agent, &payload, &HookEnv::read()) {
+                log::debug!(
+                    "cmd: agent session {}: not reported, {why}",
+                    crate::server::agent_session::agent_label(&agent)
+                );
+                return Err(None);
+            }
+            let id = payload
+                .session_id
+                .ok_or_else(|| Some("the payload has no session_id".to_string()))?;
+            (AgentSessionRef::Id(id), payload.source.or(source))
+        }
+    };
+    let answer = ask(
+        ClientMessage::AgentSession {
+            agent,
+            reference,
+            source,
+            pane,
+            pane_hint: pane_hint(),
+        },
+        HOOK_REPLY_DEADLINE,
+    )
+    .await
+    .map_err(|e| {
+        let line = e.stderr();
+        Some(
+            line.strip_prefix("remux: ")
+                .map_or(line.clone(), str::to_string),
+        )
+    })?;
+    match answer {
+        ServerMessage::AgentSessionStored { pane, outcome } => {
+            log::debug!("cmd: agent session answered %{pane} {outcome:?}");
+            Ok(())
+        }
+        other => Err(Some(format!("unexpected {} answer", other.variant_name()))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn the_payload_keeps_two_fields_and_drops_the_rest() {
+    fn the_payload_keeps_its_fields_and_drops_the_rest() {
         let raw = br#"{"session_id":"s","transcript_path":"/x","hook_event_name":"Stop",
             "stop_hook_active":true,"last_assistant_message":"a secret"}"#;
         let payload = parse_payload(raw).unwrap();
@@ -710,5 +849,66 @@ mod tests {
             worst + Duration::from_secs(1) <= HOOK_TIMEOUT,
             "{worst:?} leaves under a second of {HOOK_TIMEOUT:?}"
         );
+    }
+
+    fn fixture(name: &str) -> Payload {
+        let raw = match name {
+            "startup" => include_str!("../../tests/fixtures/agent_session/claude_startup.json"),
+            "subagent" => include_str!("../../tests/fixtures/agent_session/claude_subagent.json"),
+            "prompt" => {
+                include_str!("../../tests/fixtures/agent_session/claude_prompt_submit.json")
+            }
+            _ => unreachable!(),
+        };
+        parse_payload(raw.as_bytes()).unwrap()
+    }
+
+    fn plain() -> HookEnv {
+        HookEnv {
+            cursor: false,
+            codex_thread: None,
+        }
+    }
+
+    #[test]
+    fn a_claude_session_start_is_reported_with_its_id_and_source() {
+        let payload = fixture("startup");
+        assert_eq!(not_reported("claude", &payload, &plain()), None);
+        assert_eq!(
+            payload.session_id.as_deref(),
+            Some("7f3c2a9e-51d4-4b8e-9a61-0c2f5d8e4b17")
+        );
+        assert_eq!(payload.source.as_deref(), Some("startup"));
+    }
+
+    #[test]
+    fn a_subagent_another_event_and_cursor_are_not_reported() {
+        let cursor = HookEnv {
+            cursor: true,
+            ..plain()
+        };
+        assert!(not_reported("claude", &fixture("subagent"), &plain()).is_some());
+        assert!(not_reported("claude", &fixture("prompt"), &plain()).is_some());
+        assert!(not_reported("claude", &fixture("startup"), &cursor).is_some());
+    }
+
+    #[test]
+    fn codex_reports_only_its_own_session_with_a_transcript() {
+        let payload = |raw: &str| parse_payload(raw.as_bytes()).unwrap();
+        let startup = payload(include_str!(
+            "../../tests/fixtures/agent_session/codex_startup.json"
+        ));
+        let thread = |id: &str| HookEnv {
+            codex_thread: Some(id.to_string()),
+            ..plain()
+        };
+        let own = startup.session_id.clone().unwrap();
+        assert_eq!(not_reported("codex", &startup, &plain()), None);
+        assert_eq!(not_reported("codex", &startup, &thread(&own)), None);
+        assert!(not_reported("codex", &startup, &thread("an-outer-session")).is_some());
+        let bare = payload(include_str!(
+            "../../tests/fixtures/agent_session/codex_no_transcript.json"
+        ));
+        assert!(not_reported("codex", &bare, &plain()).is_some());
     }
 }

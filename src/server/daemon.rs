@@ -21,6 +21,7 @@ use crate::config::{BorderStyle, Config, ZoomMode};
 use crate::protocol;
 use crate::protocol::*;
 use crate::screen::Screen;
+use crate::server::agent_session::AgentSessionRecord;
 use crate::server::browse;
 use crate::server::compositor::{
     composite, draw_popup, fits_zellij_border, float_zoom_box, hit_test, is_multi_stack,
@@ -625,6 +626,15 @@ struct OutgoingMessage {
 /// A [`ClientMessage::AgentName`], unpacked.
 struct NameRequest {
     name: Option<String>,
+    pane: Option<PaneId>,
+    pane_hint: Option<PaneId>,
+}
+
+/// A [`ClientMessage::AgentSession`], unpacked.
+struct SessionReport {
+    agent: String,
+    reference: crate::protocol::AgentSessionRef,
+    source: Option<String>,
     pane: Option<PaneId>,
     pane_hint: Option<PaneId>,
 }
@@ -4081,6 +4091,113 @@ async fn handle_agent_name(
     }
 }
 
+/// Keep the session the caller's pane's agent reports, or `pane`'s for a
+/// caller outside every pane. The pane is the attribution, never `pane_hint`.
+async fn handle_agent_session(
+    client_id: u64,
+    report: SessionReport,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    dormant: &DormantStore,
+) -> ServerMessage {
+    use crate::protocol::AgentSessionOutcome;
+    use crate::server::agent_session;
+
+    let caller = attribute_frame_caller(peer, panes).await;
+    if let Ok(found) = &caller {
+        log_caller(client_id, "AgentSession", found);
+        log_hint(report.pane_hint, found.pane);
+    }
+    if let Some(refused) = unverified_refusal(&caller) {
+        return refused;
+    }
+    let pane = match (report.pane, &caller) {
+        (Some(_), Ok(found)) => {
+            return ServerMessage::refused(
+                "bad_address",
+                format!(
+                    "--pane is for callers outside a pane; you are %{}",
+                    found.pane
+                ),
+            )
+        }
+        (None, Ok(found)) if found.parent_is_shell => {
+            return ServerMessage::refused(
+                "not_from_agent",
+                "run by an agent's hook or plugin, not from the prompt",
+            )
+        }
+        (Some(pane), Err(_)) => pane,
+        (None, Ok(found)) => found.pane,
+        (None, Err(why)) => {
+            return ServerMessage::refused(
+                "not_in_pane",
+                format!("not in a pane ({}): pass --pane %N", why.reason()),
+            )
+        }
+    };
+    if let Err(refused) = check_addressable(pane, state, panes).await {
+        return *refused;
+    }
+    if !config.general.resume_agents {
+        return ServerMessage::refused(
+            "disabled",
+            "agent session restore is off: [general] resume_agents = false",
+        );
+    }
+    let kind = report.reference.kind().as_str();
+    let bytes = report.reference.value().len();
+    let source = report
+        .source
+        .as_deref()
+        .map_or("None".to_string(), loggable);
+    let verdict: Result<Option<(AgentSessionOutcome, bool)>, agent_session::Refusal> = async {
+        agent_session::validate(&report.agent, &report.reference)?;
+        let record = AgentSessionRecord::new(&report.agent, &report.reference);
+        let mut ps = panes.lock().await;
+        let Some(pd) = ps.get_mut(&pane).filter(|pd| !pd.exited) else {
+            return Ok(None);
+        };
+        let outcome =
+            agent_session::decide(pd.agent_session.as_ref(), &record, report.source.as_deref())?;
+        // The agent's own report of a session a restore typed is what clears
+        // its pending mark, so that it is resumed again next time.
+        let confirmed = pd.agent_session.as_ref().is_some_and(|held| held.pending);
+        pd.agent_session = Some(record);
+        Ok(Some((outcome, confirmed)))
+    }
+    .await;
+    match verdict {
+        Ok(Some((outcome, confirmed))) => {
+            log::info!(
+                "agent session: pane %{pane} {:?} {kind} {bytes} bytes source={source} -> {outcome:?}",
+                crate::server::agent_session::agent_label(&report.agent)
+            );
+            // The `panes` lock is released by now: `save_if_enabled` takes
+            // `state` and then `panes`, so saving under it would invert that
+            // order.
+            if outcome != AgentSessionOutcome::Unchanged || confirmed {
+                save_if_enabled(state, panes, config, dormant).await;
+            }
+            ServerMessage::AgentSessionStored { pane, outcome }
+        }
+        Ok(None) => ServerMessage::refused("no_such_target", format!("no such target: %{pane}")),
+        Err(refusal) => {
+            log::info!(
+                "agent session: pane %{pane} {:?} {kind} {bytes} bytes source={source} -> {}{}",
+                crate::server::agent_session::agent_label(&report.agent),
+                refusal.code(),
+                refusal
+                    .reason()
+                    .map_or(String::new(), |why| format!(" ({why})"))
+            );
+            ServerMessage::refused(refusal.code(), refusal.message())
+        }
+    }
+}
+
 /// Every agent, named pane and pane with mail, or only `target`. Answered per
 /// request and never on a timer, so it logs nothing per pane.
 /// The pane `address` names on this server, among the `live` ones, or the
@@ -4927,6 +5044,8 @@ struct PaneData {
     /// `close_pane` declines to close it (a background tab), and it must not
     /// be a message target or a sender's pane in the meantime.
     exited: bool,
+    /// The session the pane's agent reported, which a restore resumes.
+    agent_session: Option<AgentSessionRecord>,
 }
 
 /// A pane's cached process names and working directory.
@@ -4979,6 +5098,28 @@ fn group_alive(pgid: i32) -> bool {
 }
 
 impl PaneData {
+    /// Drop the agent session when the shell takes the foreground back, which
+    /// is how the agent's exit shows. Whether one was dropped, so the caller
+    /// saves once the `panes` lock is released.
+    fn forget_agent_session(
+        &mut self,
+        pane_id: PaneId,
+        t: crate::server::title::Transition,
+    ) -> bool {
+        if !matches!(t, crate::server::title::Transition::Shell { .. }) {
+            return false;
+        }
+        let Some(record) = self.agent_session.take() else {
+            return false;
+        };
+        log::info!(
+            "agent session: pane %{pane_id} forgot {:?} {} (shell foreground)",
+            crate::server::agent_session::agent_label(&record.agent),
+            record.kind.as_str()
+        );
+        true
+    }
+
     /// What to re-read into [`PaneData::names`], if anything.
     ///
     /// Everything is re-read when `foreground_changed`, and otherwise once the
@@ -5405,6 +5546,7 @@ impl RemuxServer {
             dormant: Arc::new(Mutex::new(PersistedState {
                 state: ServerState::new(),
                 pane_cwds: HashMap::new(),
+                agent_sessions: HashMap::new(),
             })),
         }
     }
@@ -5713,15 +5855,20 @@ impl RemuxServer {
             }
         }
 
-        if let Ok(mut persisted) =
-            crate::server::persistence::PersistedState::from_server(&state, &pane_cwds)
-        {
+        if let Ok(mut persisted) = crate::server::persistence::PersistedState::from_server(
+            &state,
+            &pane_cwds,
+            &agent_sessions_of(&panes),
+        ) {
             forget_titles(&mut persisted.state, &panes);
             // Persist live + still-dormant sessions so a live-only save never
             // clobbers un-resurrected dormant sessions on disk.
             {
                 let dormant = self.dormant.lock().await;
                 merge_dormant_into(&mut persisted, &dormant);
+            }
+            if !self.config.general.resume_agents {
+                persisted.agent_sessions.clear();
             }
             if let Err(e) = crate::server::persistence::save_state(&persisted) {
                 log::error!("failed to save state on shutdown: {e}");
@@ -6203,6 +6350,25 @@ async fn handle_client_message(
                 name.as_deref().map_or("None".to_string(), loggable)
             );
         }
+        // The id names a transcript on disk and a path names a file in the
+        // user's home; neither is a diagnostic. The agent, the kind and the
+        // length are.
+        ClientMessage::AgentSession {
+            agent,
+            reference,
+            source,
+            pane,
+            pane_hint,
+        } => {
+            log::debug!(
+                "server: client_id={client_id} msg=AgentSession(agent={:?}, {}, {} bytes, \
+                 source={}, pane={pane:?}, pane_hint={pane_hint:?})",
+                crate::server::agent_session::agent_label(agent),
+                reference.kind().as_str(),
+                reference.value().len(),
+                source.as_deref().map_or("None".to_string(), loggable)
+            );
+        }
         ClientMessage::AgentStatus { target, req } => {
             log::debug!(
                 "server: client_id={client_id} msg=AgentStatus(target={}, req={req:?})",
@@ -6374,6 +6540,32 @@ async fn handle_client_message(
                 state,
                 panes,
                 messaging(),
+            )
+            .await;
+            reply(client_id, clients, answer).await;
+            Ok(())
+        }
+        ClientMessage::AgentSession {
+            agent,
+            reference,
+            source,
+            pane,
+            pane_hint,
+        } => {
+            let answer = handle_agent_session(
+                client_id,
+                SessionReport {
+                    agent,
+                    reference,
+                    source,
+                    pane,
+                    pane_hint,
+                },
+                peer,
+                state,
+                panes,
+                config,
+                dormant,
             )
             .await;
             reply(client_id, clients, answer).await;
@@ -14031,6 +14223,7 @@ async fn spawn_pane(
                 ..PaneNames::default()
             },
             exited: false,
+            agent_session: None,
         },
     );
     drop(ps);
@@ -16854,13 +17047,15 @@ async fn start_forwarding_for_pane(
                             }
                         }
 
-                        let (responses, bell, clipboard, retitled, fg_changed, refresh) = {
+                        let (responses, bell, clipboard, retitled, fg_changed, refresh, forgot) = {
                             let mut ps = panes.lock().await;
                             if let Some(pane_data) = ps.get_mut(&pane_id) {
                                 let now = std::time::Instant::now();
                                 let mut fg_changed = false;
+                                let mut forgot = false;
                                 for chunk in &chunks {
                                     let t = pane_data.ingest_chunk(chunk);
+                                    forgot |= pane_data.forget_agent_session(pane_id, t);
                                     fg_changed |= note_transition(pane_id, t);
                                 }
                                 pane_data.last_output = now;
@@ -16883,11 +17078,15 @@ async fn start_forwarding_for_pane(
                                     retitled,
                                     fg_changed,
                                     refresh,
+                                    forgot,
                                 )
                             } else {
-                                (Vec::new(), false, None, false, false, None)
+                                (Vec::new(), false, None, false, false, None, false)
                             }
                         };
+                        if forgot {
+                            save_if_enabled(&state, &panes, &config, &dormant).await;
+                        }
                         let renamed = match refresh {
                             Some(what) => refresh_pane_names(pane_id, &panes, what).await,
                             None => false,
@@ -16955,30 +17154,32 @@ async fn start_forwarding_for_pane(
                         // A quiet pane gets no tagged reads, so its foreground
                         // is sampled here, and the settle windows end here.
                         let sample = watch.sample();
-                        let (retitled, fg_changed, refresh) = {
+                        let (retitled, fg_changed, refresh, forgot) = {
                             let mut ps = panes.lock().await;
                             match ps.get_mut(&pane_id) {
                                 Some(pane_data) => {
-                                    let fg_changed = sample.is_some_and(|(fg, at)| {
+                                    let t = sample.map(|(fg, at)| {
                                         let shell = pane_data.shell_pgid();
-                                        let t = pane_data.title.note_foreground(
-                                            fg,
-                                            at,
-                                            shell,
-                                            group_alive,
-                                        );
-                                        note_transition(pane_id, t)
+                                        pane_data.title.note_foreground(fg, at, shell, group_alive)
                                     });
+                                    let forgot = t.is_some_and(|t| {
+                                        pane_data.forget_agent_session(pane_id, t)
+                                    });
+                                    let fg_changed = t.is_some_and(|t| note_transition(pane_id, t));
                                     let now = std::time::Instant::now();
                                     (
                                         pane_data.settle_title(pane_id, now),
                                         fg_changed,
                                         pane_data.names_to_refresh(now, fg_changed),
+                                        forgot,
                                     )
                                 }
                                 None => break,
                             }
                         };
+                        if forgot {
+                            save_if_enabled(&state, &panes, &config, &dormant).await;
+                        }
                         let renamed = match refresh {
                             Some(what) => refresh_pane_names(pane_id, &panes, what).await,
                             None => false,
@@ -17036,9 +17237,11 @@ async fn save_if_enabled(
             pane_cwds.insert(pane_id, cwd);
         }
     }
-    if let Ok(mut persisted) =
-        crate::server::persistence::PersistedState::from_server(&st, &pane_cwds)
-    {
+    if let Ok(mut persisted) = crate::server::persistence::PersistedState::from_server(
+        &st,
+        &pane_cwds,
+        &agent_sessions_of(&ps),
+    ) {
         forget_titles(&mut persisted.state, &ps);
         // Persist live + still-dormant sessions so a live-only save never
         // clobbers un-resurrected dormant sessions on disk. No-op (byte-identical
@@ -17049,10 +17252,22 @@ async fn save_if_enabled(
             let d = dormant.lock().await;
             merge_dormant_into(&mut persisted, &d);
         }
+        // Off means no id on disk, including one a dormant session carried
+        // over from before the switch.
+        if !config.general.resume_agents {
+            persisted.agent_sessions.clear();
+        }
         if let Err(e) = crate::server::persistence::save_state(&persisted) {
             log::error!("failed to save state: {e}");
         }
     }
+}
+
+/// Every live pane's agent session, for a save.
+fn agent_sessions_of(ps: &HashMap<PaneId, PaneData>) -> HashMap<u64, AgentSessionRecord> {
+    ps.iter()
+        .filter_map(|(&id, pd)| pd.agent_session.clone().map(|record| (id, record)))
+        .collect()
 }
 
 /// Replace every pane name that did not come from the user with the pane's
@@ -17118,6 +17333,12 @@ fn merge_dormant_into(target: &mut PersistedState, dormant: &PersistedState) {
     for (&pid, cwd) in &dormant.pane_cwds {
         target.pane_cwds.entry(pid).or_insert_with(|| cwd.clone());
     }
+    for (&pid, record) in &dormant.agent_sessions {
+        target
+            .agent_sessions
+            .entry(pid)
+            .or_insert_with(|| record.clone());
+    }
     // Keep id counters above any merged pane/tab id.
     target.state.ensure_id_counters();
 }
@@ -17138,6 +17359,8 @@ fn merge_dormant_into(target: &mut PersistedState, dormant: &PersistedState) {
 async fn materialize_session(
     session_name: &str,
     pane_cwds: &HashMap<u64, String>,
+    agent_sessions: &HashMap<u64, AgentSessionRecord>,
+    typed: &mut usize,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -17184,6 +17407,22 @@ async fn materialize_session(
         .await
         {
             log::warn!("failed to spawn PTY for restored pane {pane_id}: {e}");
+            continue;
+        }
+        let record = agent_sessions
+            .get(pane_id)
+            .filter(|_| config.general.resume_agents);
+        let record = match record {
+            Some(record) => resumable(*pane_id, record, cwd.as_deref()).await,
+            None => None,
+        };
+        if let Some(record) = record {
+            if *typed > 0 {
+                tokio::time::sleep(resume_gap(config.general.resume_agent_delay_ms)).await;
+            }
+            type_resume(*pane_id, record, panes).await;
+            confirm_resume_by_foreground(*pane_id, record.clone(), state, panes, config, dormant);
+            *typed += 1;
         }
     }
 
@@ -17202,6 +17441,187 @@ async fn materialize_session(
     }
 
     Ok(())
+}
+
+/// `record` when a restore may type it into `pane_id`, else `None` with the
+/// drop logged. A record off disk is checked again because `state.json` may
+/// have been edited. The cwd must still be a directory: `Pty::spawn` falls
+/// back to `$HOME` when it is not, and the agent would resume somewhere else.
+async fn resumable<'a>(
+    pane_id: PaneId,
+    record: &'a AgentSessionRecord,
+    cwd: Option<&str>,
+) -> Option<&'a AgentSessionRecord> {
+    let agent = format!(
+        "{:?}",
+        crate::server::agent_session::agent_label(&record.agent)
+    );
+    if record.pending {
+        log::info!(
+            "agent session: pane %{pane_id} {agent} record dropped on restore (typed last time and \
+             never reported again)"
+        );
+        return None;
+    }
+    if let Err(refusal) = record.validate() {
+        log::warn!(
+            "agent session: pane %{pane_id} {agent} record dropped on restore ({})",
+            refusal.code()
+        );
+        return None;
+    }
+    let is_dir = match cwd {
+        Some(cwd) => tokio::fs::metadata(cwd).await.is_ok_and(|m| m.is_dir()),
+        None => false,
+    };
+    if !is_dir {
+        log::info!(
+            "agent session: pane %{pane_id} {agent} record dropped on restore (its directory is gone)"
+        );
+        return None;
+    }
+    Some(record)
+}
+
+/// Log the records [`agent_session::dedupe`] left out of a restore.
+fn log_duplicates(
+    all: &HashMap<u64, AgentSessionRecord>,
+    winners: &HashMap<u64, AgentSessionRecord>,
+) {
+    for (pane_id, record) in all {
+        if !winners.contains_key(pane_id) {
+            log::info!(
+                "agent session: pane %{pane_id} {:?} record dropped on restore (another pane runs it)",
+                crate::server::agent_session::agent_label(&record.agent)
+            );
+        }
+    }
+}
+
+/// The longest wait between two typed resumes, whatever is configured: the
+/// restore runs before the server accepts a connection, so every client, and
+/// each resumed agent's own report, waits out the whole stagger.
+const MAX_RESUME_GAP_MS: u64 = 2000;
+
+/// The wait between two typed resumes for a configured `ms`.
+fn resume_gap(ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(ms.min(MAX_RESUME_GAP_MS))
+}
+
+/// How often, and for how long after the typing, a typed resume is checked
+/// for its agent in the pane's foreground.
+const RESUME_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+const RESUME_CONFIRM_FOR: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Clear the `pending` mark of the resume typed into `pane_id` once the pane's
+/// foreground job is `record`'s own agent.
+///
+/// Some agents never report a resumed session (codex runs no SessionStart for
+/// `codex resume`), so with the re-report as the only confirmation their
+/// records stayed pending, and the next restore dropped a session that had
+/// resumed. The shell holds the foreground while it echoes the typed line and
+/// runs its rc, and a forked child carries the shell's name until it execs, so
+/// a match means the agent itself is running. Detection is the agents panel's
+/// (`foreground_agent`: process name, then argv[0], then the job under a
+/// launcher), with rules naming this agent alone, so neither the shell nor
+/// another agent can confirm it. A resume that fails back to the prompt is
+/// forgotten by the shell-foreground rule, and that ends this watch too.
+///
+/// As in `collect_agents`, the PTY master is dup'd under `panes` and read with
+/// no lock held, and `panes` is released before `save_if_enabled` takes
+/// `state` then `panes`.
+fn confirm_resume_by_foreground(
+    pane_id: PaneId,
+    record: AgentSessionRecord,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    dormant: &DormantStore,
+) {
+    let (state, panes, config, dormant) = (
+        Arc::clone(state),
+        Arc::clone(panes),
+        Arc::clone(config),
+        Arc::clone(dormant),
+    );
+    tokio::spawn(async move {
+        let rules = crate::server::agents::AgentRules::only(&record.agent);
+        let still_pending = |pd: &PaneData| {
+            pd.agent_session
+                .as_ref()
+                .is_some_and(|held| held.pending && *held == record)
+        };
+        let deadline = std::time::Instant::now() + RESUME_CONFIRM_FOR;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(RESUME_CONFIRM_POLL).await;
+            let master = {
+                let ps = panes.lock().await;
+                match ps.get(&pane_id).filter(|pd| !pd.exited) {
+                    Some(pd) if still_pending(pd) => pd.pty.master_fd.try_clone().ok(),
+                    _ => return,
+                }
+            };
+            let Some(master) = master else {
+                return;
+            };
+            let found =
+                crate::server::agents::foreground_agent(std::os::fd::AsFd::as_fd(&master), &rules)
+                    .is_some();
+            drop(master);
+            if !found {
+                continue;
+            }
+            let confirmed = {
+                let mut ps = panes.lock().await;
+                match ps.get_mut(&pane_id) {
+                    Some(pd) if still_pending(pd) => {
+                        if let Some(held) = pd.agent_session.as_mut() {
+                            held.pending = false;
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if confirmed {
+                log::info!(
+                    "agent session: pane %{pane_id} {:?} typed resume confirmed by foreground",
+                    crate::server::agent_session::agent_label(&record.agent)
+                );
+                save_if_enabled(&state, &panes, &config, &dormant).await;
+            }
+            return;
+        }
+    });
+}
+
+/// Type `record`'s resume command into the freshly spawned shell of `pane_id`
+/// and hold the record on the pane again. The bytes wait in the tty's input
+/// queue until the shell first reads, so this need not wait for a prompt.
+async fn type_resume(
+    pane_id: PaneId,
+    record: &AgentSessionRecord,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) {
+    let Some(line) = crate::server::agent_session::typed_line(record) else {
+        log::warn!("agent session: pane %{pane_id} holds an unknown agent; not resumed");
+        return;
+    };
+    let mut ps = panes.lock().await;
+    let Some(pd) = ps.get_mut(&pane_id) else {
+        return;
+    };
+    pd.send_input(line.as_bytes());
+    pd.agent_session = Some(AgentSessionRecord {
+        pending: true,
+        ..record.clone()
+    });
+    drop(ps);
+    log::info!(
+        "typed resume for pane %{pane_id} agent={:?} ({} bytes)",
+        crate::server::agent_session::agent_label(&record.agent),
+        line.len()
+    );
 }
 
 /// Restore server state from a persisted snapshot on startup
@@ -17234,10 +17654,15 @@ async fn restore_state(
         *st = restored_state;
     }
 
+    let agent_sessions = crate::server::agent_session::dedupe(&persisted.agent_sessions, &[]);
+    log_duplicates(&persisted.agent_sessions, &agent_sessions);
+    let mut typed = 0;
     for session_name in &session_names {
         materialize_session(
             session_name,
             &persisted.pane_cwds,
+            &agent_sessions,
+            &mut typed,
             &server.state,
             &server.panes,
             &server.clients,
@@ -17253,9 +17678,9 @@ async fn restore_state(
 }
 
 /// Move the named session from a dormant snapshot into live `ServerState`,
-/// recreating folder membership. Returns the CWDs of the session's panes (for
-/// PTY spawning) on success, or `None` if the name isn't dormant or a live
-/// session already exists under that name.
+/// recreating folder membership. Returns the CWDs and agent sessions of the
+/// session's panes (for PTY spawning) on success, or `None` if the name isn't
+/// dormant or a live session already exists under that name.
 ///
 /// Pure state manipulation with no PTY side effects, so it is unit-testable
 /// independently of [`materialize_session`]. Guards on the live collision
@@ -17265,7 +17690,7 @@ fn take_dormant_session(
     dormant: &mut PersistedState,
     live: &mut ServerState,
     name: &str,
-) -> Option<HashMap<u64, String>> {
+) -> Option<(HashMap<u64, String>, HashMap<u64, AgentSessionRecord>)> {
     if live.sessions.contains_key(name) {
         log::warn!("resurrect: live session '{name}' already exists; ignoring");
         return None;
@@ -17297,9 +17722,13 @@ fn take_dormant_session(
         .flat_map(|t| layout::all_pane_ids(&t.layout))
         .collect();
     let mut cwds = HashMap::new();
+    let mut agent_sessions = HashMap::new();
     for pid in &pane_ids {
         if let Some(cwd) = dormant.pane_cwds.remove(pid) {
             cwds.insert(*pid, cwd);
+        }
+        if let Some(record) = dormant.agent_sessions.remove(pid) {
+            agent_sessions.insert(*pid, record);
         }
     }
 
@@ -17315,7 +17744,7 @@ fn take_dormant_session(
     }
     live.sessions.insert(name.to_string(), session);
     live.ensure_id_counters();
-    Some(cwds)
+    Some((cwds, agent_sessions))
 }
 
 /// Materialize a dormant session into a live session on client request.
@@ -17335,7 +17764,7 @@ async fn handle_resurrect_session(
 ) -> Result<()> {
     // Lock state before dormant to match `save_if_enabled`'s ordering and avoid
     // any lock-order inversion.
-    let cwds = {
+    let (cwds, agent_sessions) = {
         let mut st = state.lock().await;
         let mut d = dormant.lock().await;
         match take_dormant_session(&mut d, &mut st, name) {
@@ -17344,10 +17773,21 @@ async fn handle_resurrect_session(
         }
     };
 
+    let winners = {
+        let ps = panes.lock().await;
+        let live: Vec<&AgentSessionRecord> = ps
+            .values()
+            .filter_map(|pd| pd.agent_session.as_ref())
+            .collect();
+        crate::server::agent_session::dedupe(&agent_sessions, &live)
+    };
+    log_duplicates(&agent_sessions, &winners);
     log::info!("resurrecting dormant session '{name}'");
     materialize_session(
         name,
         &cwds,
+        &winners,
+        &mut 0,
         state,
         panes,
         clients,
@@ -17835,10 +18275,11 @@ mod tests {
         let mut dormant = PersistedState {
             state: dstate,
             pane_cwds: cwds,
+            agent_sessions: HashMap::new(),
         };
 
         let mut live = ServerState::new();
-        let got =
+        let (got, _) =
             take_dormant_session(&mut dormant, &mut live, "alpha").expect("alpha should resurrect");
 
         // alpha migrated into live with its folder membership recreated.
@@ -17862,15 +18303,29 @@ mod tests {
         assert!(take_dormant_session(&mut dormant, &mut live, "nope").is_none());
     }
 
+    /// The restore runs before the server accepts connections, so a typo in
+    /// `resume_agent_delay_ms` would otherwise hold every client, and the
+    /// resumed agents' own hooks, in the socket's backlog.
+    #[test]
+    fn the_resume_gap_is_clamped() {
+        use super::resume_gap;
+        assert_eq!(resume_gap(100), std::time::Duration::from_millis(100));
+        assert_eq!(resume_gap(1500), std::time::Duration::from_millis(1500));
+        assert_eq!(resume_gap(60_000), std::time::Duration::from_millis(2000));
+        assert_eq!(resume_gap(u64::MAX), std::time::Duration::from_millis(2000));
+    }
+
     #[test]
     fn merge_dormant_into_unions_live_and_dormant() {
         let mut target = PersistedState {
             state: state_with_sessions(&[("live1", None)]),
             pane_cwds: HashMap::new(),
+            agent_sessions: HashMap::new(),
         };
         let dormant = PersistedState {
             state: state_with_sessions(&[("dorm1", Some("f"))]),
             pane_cwds: HashMap::new(),
+            agent_sessions: HashMap::new(),
         };
 
         merge_dormant_into(&mut target, &dormant);
@@ -17893,12 +18348,14 @@ mod tests {
         let mut target = PersistedState {
             state: state_with_sessions(&[("live1", None), ("live2", None)]),
             pane_cwds: HashMap::new(),
+            agent_sessions: HashMap::new(),
         };
         let before = serde_json::to_string(&target).unwrap();
 
         let empty = PersistedState {
             state: ServerState::new(),
             pane_cwds: HashMap::new(),
+            agent_sessions: HashMap::new(),
         };
         merge_dormant_into(&mut target, &empty);
 
@@ -19280,6 +19737,7 @@ mod popup_tests {
                 dormant: Arc::new(Mutex::new(PersistedState {
                     state: ServerState::new(),
                     pane_cwds: HashMap::new(),
+                    agent_sessions: HashMap::new(),
                 })),
                 rx,
             }

@@ -5,9 +5,17 @@
 //! non-zero rather than following the hooks' exit-0 contract.
 
 pub mod claude_messaging;
+pub mod claude_resume;
+pub mod codex_resume;
+pub mod env;
 pub mod hooks_file;
+pub mod jsonc_file;
+pub mod opencode_resume;
+pub mod pi_omp_resume;
+pub mod plugin_file;
+pub mod toml_file;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -49,4 +57,16 @@ pub trait Integration {
     fn instructions(&self) -> Option<String> {
         None
     }
+}
+
+/// Refuse an install into an agent's config dir that is not there: the agent
+/// creates it on its first run, and a dir remux made would say the agent is
+/// set up when it is not.
+pub fn require_dir(dir: &Path, agent: &str, variable: &str) -> Result<()> {
+    anyhow::ensure!(
+        dir.is_dir(),
+        "{} does not exist: run {agent} once first, or point ${variable} at its config dir",
+        dir.display()
+    );
+    Ok(())
 }

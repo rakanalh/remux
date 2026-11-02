@@ -7,7 +7,8 @@ as it would the real one, on macOS as well as Linux.
 
 Run as `claude <control> <log> <fixtures dir> <remux binary>`. It reads the
 hook commands from `$HOME/.claude/settings.json` on every run, the way Claude
-Code reads them, and runs each through `sh -c` with a payload on stdin,
+Code reads them (or from `$HOOKS_FILE` once `env:HOOKS_FILE=<path>` sets it,
+which is how it stands in for Codex and its `hooks.json`), and runs each through `sh -c` with a payload on stdin,
 recording `{"event", "rc", "stdout", "stderr"}` as one JSON line in `<log>`
 and `HOOK:<event> rc=<rc>` on the pane.
 
@@ -26,6 +27,14 @@ taken by rename, so none is lost; each is acknowledged with `{"ctl": cmd}` in
   stop:keepfeeding    the same, and after every block send this pane one new
                       message (a sender mailing once per Stop)
   stop:once=<file>    run the Stop hooks once with <file> as the payload
+  start=<file>        run the SessionStart hooks once with <file> as the
+                      payload, as Claude does when a session starts
+  node=<ext>|<spec>[|<driver>]
+                      run `$NODE <fixtures>/<driver> <ext> <spec>`, the driver
+                      `pi_omp_driver.mjs` unless named,
+                      the way pi or omp loads an extension and fires events
+                      at it, recording it as one `node` entry; NODE is set by
+                      `env:NODE=<abs path>`, so the pane's PATH can stay bare
   prompt              run the UserPromptSubmit hooks with a prompt payload
   prompt:wrong        run them with a Stop payload, as a swapped settings
                       entry would
@@ -78,7 +87,7 @@ def main():
         sys.stdout.flush()
 
     def commands(event):
-        path = os.path.join(env.get("HOME", ""), ".claude", "settings.json")
+        path = env.get("HOOKS_FILE") or os.path.join(env.get("HOME", ""), ".claude", "settings.json")
         try:
             with open(path) as f:
                 settings = json.load(f)
@@ -195,6 +204,17 @@ def main():
                 stop(True)
             elif cmd.startswith("stop:once="):
                 run("Stop", cmd[len("stop:once="):], "stop")
+            elif cmd.startswith("start="):
+                run("SessionStart", cmd[len("start="):], "start")
+            elif cmd.startswith("node="):
+                ext, spec, *driver = cmd[len("node="):].split("|")
+                driver = driver[0] if driver else "pi_omp_driver.mjs"
+                done = subprocess.run([env.get("NODE", "node"),
+                                       os.path.join(fixtures, driver), ext, spec],
+                                      env=env, capture_output=True, timeout=30)
+                note({"event": "node", "rc": done.returncode,
+                      "stdout": done.stdout.decode("utf-8", "replace"),
+                      "stderr": done.stderr.decode("utf-8", "replace")})
             elif cmd == "prompt":
                 run("UserPromptSubmit", os.path.join(fixtures, "claude_prompt.json"), "prompt")
             elif cmd == "prompt:wrong":

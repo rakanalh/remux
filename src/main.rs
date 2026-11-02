@@ -10,6 +10,7 @@ mod protocol;
 mod relay;
 mod screen;
 mod server;
+mod shell_word;
 
 use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
@@ -57,8 +58,25 @@ struct Cli {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum IntegrateHarness {
     /// Claude Code: the Stop and UserPromptSubmit hooks in
-    /// ~/.claude/settings.json, and the remux-messaging skill
+    /// $CLAUDE_CONFIG_DIR/settings.json (~/.claude by default), and the
+    /// remux-messaging skill
     ClaudeMessaging,
+    /// Claude Code: the SessionStart hook that reports the session for
+    /// restore after `remux restart`, in the same settings.json
+    ClaudeResume,
+    /// Codex: the SessionStart hook in $CODEX_HOME/hooks.json (~/.codex by
+    /// default), and `[features] hooks = true` in its config.toml
+    CodexResume,
+    /// pi: the remux-agent-session.ts extension in $PI_CODING_AGENT_DIR
+    /// (~/.pi/agent by default)
+    PiResume,
+    /// omp: the remux-agent-session.ts extension in ~/$PI_CONFIG_DIR/agent
+    /// (~/.omp/agent by default)
+    OmpResume,
+    /// OpenCode 1.x and 2.x: a server plugin and a TUI plugin under
+    /// $OPENCODE_CONFIG_DIR/plugins/, the TUI one also listed in its
+    /// tui.json(c) for 1.x (~/.config/opencode by default)
+    OpencodeResume,
 }
 
 #[derive(Subcommand)]
@@ -853,6 +871,23 @@ fn run_integrate(
     let integration: Box<dyn Integration> = match harness {
         IntegrateHarness::ClaudeMessaging => Box::new(
             integrate::claude_messaging::ClaudeMessaging::from_env(allow_dev_path)?,
+        ),
+        IntegrateHarness::ClaudeResume => Box::new(
+            integrate::claude_resume::ClaudeResume::from_env(allow_dev_path)?,
+        ),
+        IntegrateHarness::CodexResume => Box::new(integrate::codex_resume::CodexResume::from_env(
+            allow_dev_path,
+        )?),
+        IntegrateHarness::PiResume => Box::new(integrate::pi_omp_resume::PiOmpResume::from_env(
+            integrate::pi_omp_resume::Agent::Pi,
+            allow_dev_path,
+        )?),
+        IntegrateHarness::OmpResume => Box::new(integrate::pi_omp_resume::PiOmpResume::from_env(
+            integrate::pi_omp_resume::Agent::Omp,
+            allow_dev_path,
+        )?),
+        IntegrateHarness::OpencodeResume => Box::new(
+            integrate::opencode_resume::OpencodeResume::from_env(allow_dev_path)?,
         ),
     };
     let name = integration.name();
@@ -8733,6 +8768,7 @@ async fn run_client_loop(
                     | Some(ServerMessage::AgentStatusList { .. })
                     | Some(ServerMessage::AgentWaited { .. })
                     | Some(ServerMessage::Pong { .. })
+                    | Some(ServerMessage::AgentSessionStored { .. })
                     | Some(ServerMessage::MsgInbound { .. }) => {
                         log::warn!("client: a messaging reply on the TUI connection; ignored");
                     }

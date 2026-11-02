@@ -1,0 +1,855 @@
+#!/usr/bin/env python3
+"""Agent session reports, the server half: `ClientMessage::AgentSession`.
+
+The harness's own connection is in no pane, so every report it sends names
+the pane with `pane: %N`, which is what that field is for. Each case uses a
+pane of its own, created through `CliSpawn`, so no case sees another's record.
+
+accept          a claude UUID is Stored on a pane holding nothing.
+unchanged       the same report again is Unchanged.
+held_other_id   a different claude id is refused session_held.
+bad_agent       an agent nobody configured is refused bad_agent.
+bad_reference   a 129-byte id, a path for claude, and a control char are each
+                refused bad_reference.
+not_in_pane     an outside caller that names no pane is refused not_in_pane.
+sender_unverified  a socket handed on after its connector exited is refused
+                sender_unverified, never attributed, and nothing is stored.
+cli_attributed  `remux agent session claude --id` run as a pane's own program,
+                with a DIRECT argv so remux's parent is the server and not the
+                pane's shell, is attributed to that pane by the server and
+                Stored.
+cli_stdout      the CLI prints nothing on stdout for any outcome, exits 0, and
+                writes one stderr line for a refusal.
+cli_outside     with `$REMUX_PANE` unset and no --pane the CLI exits 0, prints
+                nothing and never connects.
+cli_filters     a subagent payload, a non-SessionStart payload, and
+                `CURSOR_VERSION` set each exit 0 without connecting, with
+                `$REMUX_PANE` set so that the filter is what stops them; the
+                plain SessionStart payload does connect.
+forget_on_exit  an agent JOB at a shell pane's prompt reports and exits; the
+                shell takes the foreground back and the record is gone from
+                state.json within about a second, and a new report is Stored.
+keep_while_running  the same job staying in the foreground keeps its record:
+                Unchanged on a repeat, still in state.json after 2 s.
+held_startup    claude held, a claude `startup` with a new id is session_held:
+                a nested `claude -p` starts with `startup`.
+replace_clear   claude held, a claude `clear` with a new id is Replaced, and
+                state.json holds the new id.
+cross_agent_held  claude held, a codex `startup` is session_held, though codex
+                allowlists `startup`: claude's Bash tool running `codex exec`.
+cross_agent_after_forget  the claude job exits, its record is forgotten, and
+                then the codex `startup` is Stored.
+persist         state.json holds the record right after the report, before any
+                structural change; a report that hangs (a lock-order deadlock
+                in the save) is a timeout red here.
+restart_types   after `remux restart` the restored /bin/sh pane runs the stub
+                `claude` on PATH with the one argv word `--resume=<id>`,
+                read from the file the stub writes, never from the screen.
+default_stagger the main server's restart typed every held pane within 1 s
+                of the first, at the default 100 ms between panes.
+
+On a server of its own, with `resume_agents = false`:
+disabled        a report is refused `disabled`, state.json holds no record,
+                and a restart types nothing.
+
+On a server of its own, restarted with `resume_agents = false` and
+`automatic_restore = false`:
+disabled_dormant  a record saved before the switch is not carried through the
+                dormant store into the next save: turning the feature off keeps
+                ids off the disk.
+
+On a server of its own, with `save_sessions = false`:
+no_save         a report is answered, no state.json is ever written, and a
+                restart brings back nothing to type.
+
+On a server of its own, with `resume_agent_delay_ms = 1500`:
+stagger         two panes in two SESSIONS holding different ids: the second
+                stub runs at least 1.4 s after the first, so the delay
+                counter spans sessions.
+
+On a server of its own, restarted once:
+dedupe          two panes in two SESSIONS hold the same id; the restart runs the
+                stub once for it, in the lower pane.
+missing_cwd     a pane whose directory is removed while the server is stopped
+                is typed nothing, and the next save (the shutdown's) holds no
+                record for it.
+edited_state_bad_id  a 129-byte id written into state.json while the server is
+                stopped is typed nothing, the drop is logged, and the next save
+                holds no record for it.
+edited_state_dash_id  the same for an id edited to `--dangerously-skip-permissions`,
+                which typed after the agent's flag would be an option.
+
+On a server of its own with `automatic_restore = false`, so sessions come back
+dormant:
+resurrect_dedupes_against_live  two sessions' panes hold the same id;
+                resurrecting the first types it, resurrecting the second types
+                nothing for its pane, because a live pane already runs it.
+
+bad_agent_label an agent name that is not one remux knows (here an id passed
+                in the agent's place) reaches neither log: it is logged as
+                `<invalid>`.
+redaction       server.log and client.log carry the summary line with the id's
+                byte count and never the id.
+no_panic        server.log has no `panicked at`.
+
+Run: python3 tests/frame/agent_session.py [main|disabled|no_save|stagger|hardening|resurrect ...]
+     (RMX_RUNDIR overrides the run dir)
+"""
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from harness import BIN, Server, Client, name_of  # noqa: E402
+
+RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-agentsess")
+UUID = "7f3c2a9e-51d4-4b8e-9a61-0c2f5d8e4b17"
+OTHER = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+CLI_ID = "c11a77e1-9d0b-4c3a-8e2f-6b5a4d3c2b1a"
+RESTORE_ID = "4e5a1f0c-7b2d-4c8e-a3f9-1d6b0e2c5a7f"
+FORGET_ID = "f0f0f0f0-1111-4222-8333-944445555666"
+KEEP_ID = "cafe0000-1111-4222-8333-944445555777"
+SESSION_JOB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_job.py")
+CONFIG = """
+[general]
+save_sessions = true
+automatic_restore = true
+"""
+# With `stay` present in the run dir the stub keeps running after it records
+# its argv, as a resumed agent does; without, it exits at once. A stub that
+# exits can be seen leaving the foreground, which forgets its record: right,
+# but timing-dependent, so the cases that need a live pane to hold one say so.
+STUB = """#!/bin/sh
+for a in "$@"; do printf '%s\\n' "$a"; done > "{argv_dir}/$(basename "$0").$$"
+[ -e "{argv_dir}/../stay" ] && exec sleep 3600
+"""
+MAC = sys.platform == "darwin"
+FIXTURES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "fixtures", "agent_session")
+
+failures = []
+
+
+def check(cond, label):
+    print(("PASS  " if cond else "FAIL  ") + label)
+    if not cond:
+        failures.append(label)
+
+
+class Rig:
+    def __init__(self, rundir, config=None):
+        self.srv = Server(rundir)
+        # The pane shells inherit the server's PATH, so the stub agents must
+        # come first on it. The directory is filled after `start()`, which
+        # wipes the run dir.
+        self.bin = f"{rundir}/bin"
+        self.argv_dir = f"{rundir}/argv"
+        # The stubs and the system dirs only: real agents are installed on the
+        # machines this runs on, and a stub must never lose to one.
+        os.environ["PATH"] = f"{self.bin}:/usr/local/bin:/usr/bin:/bin"
+        self.srv.start(config=config)
+        for d in (self.bin, self.argv_dir):
+            os.makedirs(d, exist_ok=True)
+        # The panes run LOGIN shells, and on macOS /etc/profile's path_helper
+        # puts /etc/paths and /etc/paths.d (Homebrew's, which holds a real
+        # codex, opencode and omp) in front of the inherited PATH. The
+        # throwaway HOME's own profile, read after it, puts the stubs first
+        # again. The panes are spawned after this, at attach.
+        home = self.srv.env["HOME"]
+        for profile in (".profile", ".zprofile"):
+            with open(f"{home}/{profile}", "w") as f:
+                f.write(f'PATH="{self.bin}:$PATH"; export PATH\n')
+        for agent in ("claude", "codex", "opencode", "pi", "omp"):
+            stub = f"{self.bin}/{agent}"
+            with open(stub, "w") as f:
+                f.write(STUB.format(argv_dir=self.argv_dir))
+            os.chmod(stub, 0o755)
+        self.attach(create=True)
+
+    def attach(self, create=False):
+        self.cli = Client(self.srv.sock)
+        self.cli.hello()
+        if create:
+            self.cli.send({"CreateSession": {"name": "main", "folder": None}})
+        self.cli.send({"Attach": {"session_name": "main"}})
+        self.cli.send({"Resize": {"cols": 160, "rows": 50}})
+        self.cli.drain(0.8)
+
+    def restart(self, between=None):
+        """`remux restart`, running `between()` while the server is down."""
+        self.cli.close()
+        self.srv.stop()
+        if between:
+            between()
+        self.srv.start_again()
+        self.attach()
+
+    def state_json(self):
+        try:
+            with open(f"{self.srv.rundir}/data/remux/state.json") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def argv_files(self, agent):
+        return sorted(n for n in os.listdir(self.argv_dir) if n.startswith(agent + "."))
+
+    def argv_runs(self, agent):
+        """(mtime, argv) of every run of the stub `agent`, oldest first."""
+        out = []
+        for name in self.argv_files(agent):
+            path = f"{self.argv_dir}/{name}"
+            with open(path) as f:
+                out.append((os.stat(path).st_mtime, f.read().split("\n")))
+        return sorted(out)
+
+    def stay(self):
+        """From now on every stub keeps running once it has recorded its argv."""
+        open(f"{self.srv.rundir}/stay", "w").close()
+
+    def typed_at(self):
+        """The server's own time for each `typed resume` line, oldest first:
+        when the line was written to the pane, not when its stub started."""
+        import datetime
+        out = []
+        for line in self.srv.log().splitlines():
+            if "typed resume for pane" in line and line.startswith("["):
+                stamp = line[1:].split(" ", 1)[0]
+                out.append(datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp())
+        return out
+
+    def wait_runs(self, agent, n, timeout=10.0):
+        end = time.time() + timeout
+        while time.time() < end and len(self.argv_runs(agent)) < n:
+            time.sleep(0.1)
+        time.sleep(0.5)
+        return self.argv_runs(agent)
+
+    def spawn(self, argv=None, session="main", cwd=None):
+        c = Client(self.srv.sock)
+        c.hello()
+        body = {"session": session, "placement": "SplitRight", "cwd": cwd}
+        if argv is not None:
+            body["argv"] = argv
+        c.send({"CliSpawn": body})
+        try:
+            for m in c.drain(2.0):
+                if name_of(m) == "CliSpawned":
+                    return m["CliSpawned"]["pane_id"]
+                if name_of(m) == "Error":
+                    return None
+        finally:
+            c.close()
+        return None
+
+    def ask(self, msg):
+        """One request on a fresh connection; the first answer that is not a
+        push. A closed connection is an answer too: an old server drops a
+        message it cannot decode."""
+        c = Client(self.srv.sock)
+        c.hello()
+        c.send(msg)
+        end = time.time() + 3.0
+        try:
+            while time.time() < end:
+                try:
+                    m = c.recv()
+                except socket.timeout:
+                    continue
+                if name_of(m) not in ("ViewList", "Event"):
+                    return m
+        except ConnectionError as e:
+            return {"Closed": str(e)}
+        finally:
+            c.close()
+        return None
+
+
+def report(rig, pane, agent, reference, source=None):
+    body = {"agent": agent, "reference": reference}
+    if pane is not None:
+        body["pane"] = pane
+    if source is not None:
+        body["source"] = source
+    return rig.ask({"AgentSession": body})
+
+
+def outcome(reply):
+    if name_of(reply) == "AgentSessionStored":
+        return reply["AgentSessionStored"]["outcome"]
+    return None
+
+
+def code(reply):
+    if name_of(reply) == "Error":
+        return reply["Error"].get("code")
+    return None
+
+
+def read(path):
+    return open(path).read() if os.path.exists(path) else ""
+
+
+def connections(rig):
+    """How many connections the server has accepted, by the identity line it
+    writes for each one at accept."""
+    return len(set(re.findall(r"identity: client_id=(\d+) peer=", rig.srv.log())))
+
+
+def cli(rig, args, env_extra=None, drop=(), stdin=None):
+    env = {k: v for k, v in rig.srv.env.items() if k not in drop}
+    env.update(env_extra or {})
+    return subprocess.run([BIN, "agent", "session", *args], env=env, input=stdin,
+                          capture_output=True, timeout=20)
+
+
+def wait_log(rig, pattern, timeout=6.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        m = re.search(pattern, rig.srv.log())
+        if m:
+            return m
+        time.sleep(0.1)
+    return None
+
+
+def cli_attributed(rig):
+    before = rig.srv.log().count("AgentSession caller -> pane")
+    pane = rig.spawn([BIN, "agent", "session", "claude", "--id", CLI_ID, "--source", "startup"])
+    check(pane is not None, f"cli_attributed: the pane was spawned (got {pane})")
+    found = wait_log(rig, rf"agent session: pane %{pane} \"claude\" id 36 bytes "
+                          rf"source=\"startup\" -> Stored")
+    check(found is not None, f"cli_attributed: the report from inside %{pane} was Stored")
+    callers = re.findall(r"AgentSession caller -> pane %(\d+) by (\w+)", rig.srv.log())[before:]
+    check(callers == [(str(pane), "Sid")] or callers == [(str(pane), "Walk")],
+          f"cli_attributed: the server attributed the caller to %{pane} (got {callers})")
+
+
+def cli_stdout(rig):
+    pane = rig.spawn()
+    first = cli(rig, ["claude", "--id", CLI_ID, "--pane", f"%{pane}"], drop=("REMUX_PANE",))
+    again = cli(rig, ["claude", "--id", CLI_ID, "--pane", f"%{pane}"], drop=("REMUX_PANE",))
+    held = cli(rig, ["claude", "--id", OTHER, "--pane", f"%{pane}"], drop=("REMUX_PANE",))
+    for label, run in (("Stored", first), ("Unchanged", again), ("session_held", held)):
+        check(run.returncode == 0, f"cli_stdout: {label} exits 0 (got {run.returncode})")
+        check(run.stdout == b"", f"cli_stdout: {label} prints nothing on stdout (got {run.stdout!r})")
+    check(first.stderr == b"" and again.stderr == b"",
+          f"cli_stdout: a success writes no stderr (got {first.stderr!r}, {again.stderr!r})")
+    lines = held.stderr.decode(errors="replace").splitlines()
+    check(len(lines) == 1 and "session_held" in lines[0],
+          f"cli_stdout: a refusal writes one stderr line naming it (got {lines})")
+
+
+def cli_outside(rig):
+    before = connections(rig)
+    run = cli(rig, ["claude", "--id", CLI_ID], drop=("REMUX_PANE",))
+    time.sleep(0.3)
+    check(run.returncode == 0 and run.stdout == b"" and run.stderr == b"",
+          f"cli_outside: exit 0 and no output (got {run.returncode}, {run.stdout!r}, {run.stderr!r})")
+    check(connections(rig) == before, "cli_outside: no connection reached the server")
+
+
+def cli_filters(rig):
+    pane = rig.spawn()
+    in_pane = {"REMUX_PANE": f"%{pane}"}
+    for label, fixture, extra in (
+            ("a subagent payload", "claude_subagent.json", {}),
+            ("a UserPromptSubmit payload", "claude_prompt_submit.json", {}),
+            ("CURSOR_VERSION set", "claude_startup.json", {"CURSOR_VERSION": "1.2.3"})):
+        before = connections(rig)
+        payload = open(os.path.join(FIXTURES, fixture), "rb").read()
+        run = cli(rig, ["claude", "--hook"], env_extra={**in_pane, **extra},
+                  drop=("CURSOR_VERSION",), stdin=payload)
+        time.sleep(0.3)
+        check(run.returncode == 0 and run.stdout == b"" and run.stderr == b"",
+              f"cli_filters: {label} exits 0 silently "
+              f"(got {run.returncode}, {run.stdout!r}, {run.stderr!r})")
+        check(connections(rig) == before, f"cli_filters: {label} never connects")
+    before = connections(rig)
+    payload = open(os.path.join(FIXTURES, "claude_startup.json"), "rb").read()
+    run = cli(rig, ["claude", "--hook"], env_extra=in_pane, drop=("CURSOR_VERSION",), stdin=payload)
+    time.sleep(0.3)
+    check(connections(rig) == before + 1,
+          "cli_filters: the plain SessionStart payload does connect, so the filters are what "
+          "stopped the others")
+    check(run.returncode == 0 and run.stdout == b"" and b"not_in_pane" in run.stderr,
+          f"cli_filters: from outside every pane it is refused not_in_pane on stderr "
+          f"(got {run.returncode}, {run.stdout!r}, {run.stderr!r})")
+
+
+def held_in_state(rig, pane):
+    return (rig.state_json() or {}).get("agent_sessions", {}).get(str(pane))
+
+
+def run_job(rig, pane, then, args, timeout=8.0):
+    """Start `session_job.py` as a job at `pane`'s prompt, reporting `args`,
+    and return its result once the report has been answered."""
+    rig.jobs = getattr(rig, "jobs", 0) + 1
+    result = f"{rig.srv.rundir}/job-{rig.jobs}.json"
+    line = " ".join(["python3", SESSION_JOB, result, then, BIN, *args]) + "\n"
+    rig.cli.send({"InputToPane": {"pane_id": pane, "data": list(line.encode())}})
+    end = time.time() + timeout
+    while time.time() < end:
+        if os.path.exists(result):
+            with open(result) as f:
+                return json.load(f)
+        time.sleep(0.05)
+    return None
+
+
+def forget_on_exit(rig):
+    pane = rig.spawn()
+    time.sleep(0.5)
+    got = run_job(rig, pane, "exit", ["claude", "--id", FORGET_ID, "--source", "startup"])
+    check(got is not None and got["rc"] == 0 and got["stdout"] == "" and got["stderr"] == "",
+          f"forget_on_exit: the job's report was accepted silently (got {got})")
+    check(held_in_state(rig, pane) is not None,
+          "forget_on_exit: state.json holds the record while the job runs")
+    end = time.time() + 2.5
+    while time.time() < end and held_in_state(rig, pane) is not None:
+        time.sleep(0.05)
+    check(held_in_state(rig, pane) is None,
+          f"forget_on_exit: state.json drops the record once the job exits (got {held_in_state(rig, pane)})")
+    r = report(rig, pane, "claude", {"Id": FORGET_ID}, source="startup")
+    check(outcome(r) == "Stored", f"forget_on_exit: the next report is Stored (got {r})")
+
+
+def keep_while_running(rig):
+    pane = rig.spawn()
+    time.sleep(0.5)
+    got = run_job(rig, pane, "stay", ["claude", "--id", KEEP_ID, "--source", "startup"])
+    check(got is not None and got["rc"] == 0 and got["stderr"] == "",
+          f"keep_while_running: the job's report was accepted (got {got})")
+    time.sleep(2.0)
+    check(held_in_state(rig, pane) is not None,
+          "keep_while_running: state.json still holds the record after 2 s")
+    r = report(rig, pane, "claude", {"Id": KEEP_ID}, source="startup")
+    check(outcome(r) == "Unchanged", f"keep_while_running: a repeat is Unchanged (got {r})")
+
+
+def replacement(rig):
+    pane = rig.spawn()
+    first, second = "aaaa0000-1111-4222-8333-944445555001", "aaaa0000-1111-4222-8333-944445555002"
+    check(outcome(report(rig, pane, "claude", {"Id": first}, source="startup")) == "Stored",
+          "held_startup: setup, the first id is Stored")
+    r = report(rig, pane, "claude", {"Id": second}, source="startup")
+    check(code(r) == "session_held", f"held_startup: a new id with startup is session_held (got {r})")
+    r = report(rig, pane, "claude", {"Id": second}, source="clear")
+    check(outcome(r) == "Replaced", f"replace_clear: a new id with clear is Replaced (got {r})")
+    held = held_in_state(rig, pane)
+    check(held == {"agent": "claude", "kind": "Id", "value": second},
+          f"replace_clear: state.json holds the new id (got {held})")
+    r = report(rig, pane, "codex", {"Id": first}, source="startup")
+    check(code(r) == "session_held", f"cross_agent_held: codex startup over claude is session_held (got {r})")
+    r = report(rig, pane, "codex", {"Id": first}, source="resume")
+    check(code(r) == "session_held", f"cross_agent_held: and so is codex resume (got {r})")
+
+
+def cross_agent_after_forget(rig):
+    pane = rig.spawn()
+    time.sleep(0.5)
+    claude_id, codex_id = "bbbb0000-1111-4222-8333-944445555001", "bbbb0000-1111-4222-8333-944445555002"
+    got = run_job(rig, pane, "exit", ["claude", "--id", claude_id, "--source", "startup"])
+    check(got is not None and got["rc"] == 0 and got["stderr"] == "",
+          f"cross_agent_after_forget: the claude job reported (got {got})")
+    end = time.time() + 2.5
+    while time.time() < end and held_in_state(rig, pane) is not None:
+        time.sleep(0.05)
+    r = report(rig, pane, "codex", {"Id": codex_id}, source="startup")
+    check(outcome(r) == "Stored", f"cross_agent_after_forget: codex startup is Stored (got {r})")
+
+
+def persist(rig):
+    pane = rig.spawn()
+    before = rig.state_json() or {}
+    check(str(pane) not in before.get("agent_sessions", {}),
+          "persist: the new pane holds no record before the report")
+    started = time.time()
+    r = report(rig, pane, "claude", {"Id": RESTORE_ID}, source="startup")
+    check(outcome(r) == "Stored", f"persist: the report is Stored without hanging (got {r} "
+                                  f"after {time.time() - started:.1f}s)")
+    held = (rig.state_json() or {}).get("agent_sessions", {}).get(str(pane))
+    check(held == {"agent": "claude", "kind": "Id", "value": RESTORE_ID},
+          f"persist: state.json holds the record at once (got {held})")
+    mode = os.stat(f"{rig.srv.rundir}/data/remux/state.json").st_mode & 0o777
+    check(mode == 0o600, f"persist: state.json, which now holds ids, is 0600 (got {oct(mode)})")
+    return pane
+
+
+def restart_types(rig, pane):
+    check(rig.argv_files("claude") == [], "restart_types: the stub has not run before the restart")
+    rig.restart()
+
+    def runs():
+        """The stub's argv, one list per run that named this case's id. The
+        earlier cases' panes hold records too, and are resumed alongside."""
+        out = []
+        for name in rig.argv_files("claude"):
+            with open(f"{rig.argv_dir}/{name}") as f:
+                argv = f.read().split("\n")
+            if any(RESTORE_ID in word for word in argv):
+                out.append(argv)
+        return out
+
+    end = time.time() + 8.0
+    while time.time() < end and not runs():
+        time.sleep(0.1)
+    time.sleep(0.5)
+    got = runs()
+    check(len(got) == 1, f"restart_types: the restore ran the stub claude once for the id (got {got})")
+    check(bool(got) and got[0] == [f"--resume={RESTORE_ID}", ""],
+          f"restart_types: the stub got one argv word, --resume=<id> (got {got})")
+    check(re.search(rf"typed resume for pane %{pane} agent=\"claude\" \(54 bytes\)",
+                    rig.srv.log()) is not None,
+          f"restart_types: the line typed into %{pane} was 54 bytes, space and \\r included")
+
+
+def inherited_socket_report(rig, body):
+    """P connects and finishes the handshake, forks C and exits; the harness
+    reaps P; C then sends on the socket it inherited, so the connector the
+    server pinned is gone when the report is checked."""
+    out_file = f"{rig.srv.rundir}/inherited.json"
+    p = os.fork()
+    if p == 0:
+        try:
+            c = Client(rig.srv.sock)
+            c.s.settimeout(5)
+            c.hello()
+            if os.fork() == 0:
+                time.sleep(1.0)
+                c.send({"AgentSession": body})
+                while True:
+                    reply = c.recv()
+                    if name_of(reply) not in ("ViewList", "Event"):
+                        break
+                with open(out_file + ".tmp", "w") as f:
+                    f.write(json.dumps(reply))
+                os.rename(out_file + ".tmp", out_file)
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+    os.waitpid(p, 0)
+    end = time.time() + 6.0
+    while time.time() < end and not os.path.exists(out_file):
+        time.sleep(0.05)
+    with open(out_file) as f:
+        return json.load(f)
+
+
+def sender_unverified(rig):
+    """No `pane` in the report: a caller outside every pane may name one, so
+    with it the case would test the outside path, not the pin. Linux pins the
+    connector with a pidfd and refuses the exited one; macOS pins the
+    socket's audit token, which still names the exited connector, so the walk
+    finds no pane and it is refused as outside every pane (as msg_mailbox 3j)."""
+    pane = rig.spawn()
+    r = inherited_socket_report(rig, {"agent": "claude", "reference": {"Id": UUID}})
+    want, why = (("not_in_pane", "not a descendant of any pane") if MAC
+                 else ("sender_unverified", "exited"))
+    check(code(r) == want and why in r["Error"]["message"],
+          f"sender_unverified: a report on a socket whose connector exited is refused {want} (got {r})")
+    check(held_in_state(rig, pane) is None, "sender_unverified: nothing was stored")
+    r = report(rig, pane, "claude", {"Id": UUID})
+    check(outcome(r) == "Stored", f"sender_unverified: the pane still holds nothing (got {r})")
+
+
+def disabled_dormant(rig):
+    pane = rig.spawn()
+    check(outcome(report(rig, pane, "claude", {"Id": RESTORE_ID}, source="startup")) == "Stored",
+          "disabled_dormant: setup, a record is Stored while the feature is on")
+    config = f"{rig.srv.rundir}/config/remux/config.toml"
+
+    def switch_off():
+        with open(config, "w") as f:
+            f.write(CONFIG.replace("automatic_restore = true", "automatic_restore = false")
+                    + "resume_agents = false\n")
+
+    rig.restart(between=switch_off)
+    held = (rig.state_json() or {}).get("agent_sessions", {})
+    rig.cli.close()
+    rig.srv.stop()
+    saved = (rig.state_json() or {}).get("agent_sessions")
+    check(saved in (None, {}), f"disabled_dormant: the next save holds no record (got {saved}; before {held})")
+
+
+def no_save(rig):
+    pane = rig.spawn()
+    r = report(rig, pane, "claude", {"Id": RESTORE_ID}, source="startup")
+    check(name_of(r) == "AgentSessionStored", f"no_save: the report is answered (got {r})")
+    path = f"{rig.srv.rundir}/data/remux/state.json"
+    check(not os.path.exists(path), "no_save: no state.json was written")
+    rig.restart()
+    check(not os.path.exists(path), "no_save: nor on shutdown")
+    runs = rig.wait_runs("claude", 1, timeout=3.0)
+    check(runs == [], f"no_save: the restart typed nothing (got {runs})")
+
+
+def disabled(rig):
+    pane = rig.spawn()
+    r = report(rig, pane, "claude", {"Id": RESTORE_ID}, source="startup")
+    check(code(r) == "disabled", f"disabled: a report is refused disabled (got {r})")
+    check(held_in_state(rig, pane) is None, "disabled: state.json holds no record")
+    rig.restart()
+    runs = rig.wait_runs("claude", 1, timeout=3.0)
+    check(runs == [], f"disabled: the restart typed nothing (got {runs})")
+
+
+def stagger(rig):
+    rig.cli.send({"CreateSession": {"name": "other", "folder": None}})
+    rig.cli.drain(0.5)
+    ids = {"main": "dddd0000-1111-4222-8333-944445555001",
+           "other": "dddd0000-1111-4222-8333-944445555002"}
+    for session, sid in ids.items():
+        pane = rig.spawn(session=session)
+        r = report(rig, pane, "claude", {"Id": sid}, source="startup")
+        check(outcome(r) == "Stored", f"stagger: setup, %{pane} in {session} Stored (got {r})")
+    rig.restart()
+    runs = rig.wait_runs("claude", 2, timeout=10.0)
+    check(len(runs) == 2, f"stagger: both panes were resumed (got {runs})")
+    typed = rig.typed_at()
+    check(len(typed) == 2 and typed[1] - typed[0] >= 1.4,
+          f"stagger: the second session's pane was typed >= 1.4 s after the first "
+          f"({[round(t - typed[0], 2) for t in typed]})")
+
+
+def runs_naming(rig, value):
+    return [argv for _, argv in rig.argv_runs("claude") if any(value in w for w in argv)]
+
+
+def hardening(rig):
+    rig.cli.send({"CreateSession": {"name": "other", "folder": None}})
+    rig.cli.drain(0.5)
+    dup = "eeee0000-1111-4222-8333-944445555001"
+    gone_id = "eeee0000-1111-4222-8333-944445555002"
+    bad_id = "eeee0000-1111-4222-8333-944445555003"
+    low = rig.spawn(session="main")
+    high = rig.spawn(session="other")
+    for pane in (low, high):
+        r = report(rig, pane, "claude", {"Id": dup}, source="startup")
+        check(outcome(r) == "Stored", f"dedupe: setup, %{pane} Stored (got {r})")
+    gone_dir = f"{rig.srv.rundir}/gone"
+    os.makedirs(gone_dir)
+    gone = rig.spawn(cwd=gone_dir)
+    check(outcome(report(rig, gone, "claude", {"Id": gone_id}, source="startup")) == "Stored",
+          f"missing_cwd: setup, %{gone} Stored")
+    # An explicit cwd that survives the restart: a split inherits the focused
+    # pane's directory, which here is the one this case removes, and a record
+    # dropped for that would pass the bad-id checks for the wrong reason.
+    kept = rig.srv.rundir
+    bad = rig.spawn(cwd=kept)
+    check(outcome(report(rig, bad, "claude", {"Id": bad_id}, source="startup")) == "Stored",
+          f"edited_state_bad_id: setup, %{bad} Stored")
+    dash_id = "eeee0000-1111-4222-8333-944445555004"
+    dash = rig.spawn(cwd=kept)
+    check(outcome(report(rig, dash, "claude", {"Id": dash_id}, source="startup")) == "Stored",
+          f"edited_state_dash_id: setup, %{dash} Stored")
+    path = f"{rig.srv.rundir}/data/remux/state.json"
+
+    def edit():
+        os.rmdir(gone_dir)
+        with open(path) as f:
+            text = f.read()
+        assert text.count(bad_id) == 1, "the bad-id probe must replace exactly one value"
+        assert text.count(dash_id) == 1, "the dash-id probe must replace exactly one value"
+        with open(path, "w") as f:
+            f.write(text.replace(bad_id, "a" * 129).replace(dash_id, "--dangerously-skip-permissions"))
+
+    # The dedupe winner must still hold its record at the shutdown save, which
+    # it does only while its resumed agent runs.
+    rig.stay()
+    rig.restart(between=edit)
+    rig.wait_runs("claude", 1, timeout=6.0)
+    got = runs_naming(rig, dup)
+    check(len(got) == 1, f"dedupe: the stub ran once for the shared id (got {got})")
+    log = rig.srv.log()
+    check(re.search(rf"typed resume for pane %{low} ", log) is not None
+          and re.search(rf"typed resume for pane %{high} ", log) is None,
+          f"dedupe: the lower pane %{low} was typed, not %{high}")
+    check(runs_naming(rig, gone_id) == [], "missing_cwd: nothing was typed for the gone directory")
+    check(not any(any("a" * 129 in w for w in argv) for _, argv in rig.argv_runs("claude")),
+          "edited_state_bad_id: nothing was typed for the 129-byte id")
+    check(re.search(rf"agent session: pane %{bad} .*dropped on restore \(bad_reference\)", log) is not None,
+          f"edited_state_bad_id: the drop of %{bad}'s record is logged")
+    check(not any(any("dangerously" in w for w in argv) for _, argv in rig.argv_runs("claude")),
+          "edited_state_dash_id: nothing was typed for an id that starts with '-'")
+    check(re.search(rf"agent session: pane %{dash} .*dropped on restore \(bad_reference\)", log) is not None,
+          f"edited_state_dash_id: the drop of %{dash}'s record is logged")
+    # The shutdown save is the next save: a `CliSpawn` pane triggers none.
+    rig.cli.close()
+    rig.srv.stop()
+    sessions = (rig.state_json() or {}).get("agent_sessions", {})
+    check(str(gone) not in sessions, f"missing_cwd: the next save holds no record for %{gone}")
+    check(str(bad) not in sessions, f"edited_state_bad_id: the next save holds no record for %{bad}")
+    check(str(dash) not in sessions, f"edited_state_dash_id: the next save holds no record for %{dash}")
+    check(str(low) in sessions and str(high) not in sessions,
+          f"dedupe: the next save holds the winner %{low} only (got {sorted(sessions)})")
+    check("a" * 129 not in log, "edited_state_bad_id: the log never holds the edited value")
+
+
+def resurrect(rig):
+    rig.cli.send({"CreateSession": {"name": "other", "folder": None}})
+    rig.cli.drain(0.5)
+    shared = "ffff0000-1111-4222-8333-944445555001"
+    first = rig.spawn(session="main")
+    second = rig.spawn(session="other")
+    for pane in (first, second):
+        check(outcome(report(rig, pane, "claude", {"Id": shared}, source="startup")) == "Stored",
+              f"resurrect: setup, %{pane} Stored")
+    rig.cli.close()
+    rig.srv.stop()
+    rig.srv.start_again()
+    rig.cli = Client(rig.srv.sock)
+    rig.cli.hello()
+    rig.cli.send({"CreateSession": {"name": "scratch", "folder": None}})
+    rig.cli.send({"Attach": {"session_name": "scratch"}})
+    rig.cli.drain(0.8)
+    check(rig.argv_runs("claude") == [], "resurrect: dormant sessions are typed nothing at start")
+    # "A live pane already runs it" holds only while the first resumed stub
+    # keeps running.
+    rig.stay()
+    rig.cli.send({"ResurrectSession": {"name": "main"}})
+    rig.wait_runs("claude", 1, timeout=6.0)
+    check(len(runs_naming(rig, shared)) == 1, "resurrect: resurrecting main typed the id once")
+    rig.cli.send({"ResurrectSession": {"name": "other"}})
+    time.sleep(2.0)
+    check(len(runs_naming(rig, shared)) == 1,
+          f"resurrect_dedupes_against_live: resurrecting other typed nothing more "
+          f"(got {runs_naming(rig, shared)})")
+    check(re.search(rf"typed resume for pane %{second} ", rig.srv.log()) is None,
+          f"resurrect_dedupes_against_live: %{second} was not typed")
+
+
+def default_stagger(rig):
+    typed = len(re.findall(r"typed resume for pane", rig.srv.log()))
+    end = time.time() + 8.0
+    while time.time() < end and len(rig.argv_runs("claude") + rig.argv_runs("codex")) < typed:
+        time.sleep(0.1)
+    runs = sorted(rig.argv_runs("claude") + rig.argv_runs("codex"))
+    check(typed >= 2 and len(runs) == typed,
+          f"default_stagger: every typed pane ran the stub ({typed} typed, {len(runs)} ran)")
+    at = rig.typed_at()
+    if at:
+        spread = at[-1] - at[0]
+        check(spread < 1.0, f"default_stagger: {len(at)} panes were typed within {spread:.2f}s")
+
+
+def on_own_server(suffix, config, case, base=CONFIG):
+    rig = Rig(f"{RUNDIR}-{suffix}", base + config)
+    try:
+        case(rig)
+        check("panicked at" not in rig.srv.log(), f"{suffix}: no panic in server.log")
+    finally:
+        rig.cli.close()
+        rig.srv.kill()
+
+
+def main():
+    groups = sys.argv[1:] or ["main", "disabled", "disabled_dormant", "no_save", "stagger",
+                              "hardening", "resurrect"]
+    if "main" in groups:
+        main_server()
+    if "disabled" in groups:
+        on_own_server("disabled", "resume_agents = false\n", disabled)
+    if "disabled_dormant" in groups:
+        on_own_server("disabled_dormant", "", disabled_dormant)
+    if "no_save" in groups:
+        on_own_server("no_save", "", no_save, base=CONFIG.replace(
+            "save_sessions = true", "save_sessions = false"))
+    if "stagger" in groups:
+        on_own_server("stagger", "resume_agent_delay_ms = 1500\n", stagger)
+    if "hardening" in groups:
+        on_own_server("hardening", "", hardening)
+    if "resurrect" in groups:
+        on_own_server("resurrect", "", resurrect, base=CONFIG.replace(
+            "automatic_restore = true", "automatic_restore = false"))
+
+    if failures:
+        print(f"\n{len(failures)} FAILED")
+        sys.exit(1)
+    print("\nALL PASS")
+
+
+def main_server():
+    rig = Rig(RUNDIR, CONFIG)
+    try:
+        pane = rig.spawn()
+        check(pane is not None, f"a pane to report into (got {pane})")
+
+        r = report(rig, pane, "claude", {"Id": UUID}, source="startup")
+        check(outcome(r) == "Stored", f"accept: a claude UUID is Stored (got {r})")
+        check(name_of(r) == "AgentSessionStored" and r["AgentSessionStored"]["pane"] == pane,
+              f"accept: the reply names the pane (got {r})")
+
+        r = report(rig, pane, "claude", {"Id": UUID}, source="startup")
+        check(outcome(r) == "Unchanged", f"unchanged: the same report is Unchanged (got {r})")
+
+        r = report(rig, pane, "claude", {"Id": OTHER}, source="startup")
+        check(code(r) == "session_held", f"held_other_id: a different id is session_held (got {r})")
+
+        fresh = rig.spawn()
+        r = report(rig, fresh, "vim", {"Id": UUID})
+        check(code(r) == "bad_agent", f"bad_agent: an unknown agent is refused (got {r})")
+
+        for label, ref in (("129-byte id", {"Id": "a" * 129}),
+                           ("a path for claude", {"Path": "/home/u/.claude/x.jsonl"}),
+                           ("a control char", {"Id": "abc\x07def"})):
+            r = report(rig, fresh, "claude", ref)
+            check(code(r) == "bad_reference", f"bad_reference: {label} is refused (got {r})")
+        for agent, flag in (("claude", "--dangerously-skip-permissions"), ("codex", "--yolo"),
+                            ("opencode", "-x")):
+            r = report(rig, fresh, agent, {"Id": flag}, source="startup")
+            check(code(r) == "bad_reference",
+                  f"bad_reference: {agent} id {flag!r} would be an option on restore; refused (got {r})")
+        r = report(rig, fresh, "claude", {"Id": UUID})
+        check(outcome(r) == "Stored",
+              f"bad_reference: the refusals stored nothing, so a good report is Stored (got {r})")
+
+        r = report(rig, None, "claude", {"Id": UUID})
+        check(code(r) == "not_in_pane", f"not_in_pane: an outside caller naming no pane (got {r})")
+        sender_unverified(rig)
+        secret = "c0ffee00-swapped-into-agent-place-9f8e7d6c"
+        r = report(rig, fresh, secret, {"Id": "claude"})
+        check(code(r) == "bad_agent", f"bad_agent_label: an id in the agent's place is bad_agent (got {r})")
+        run = cli(rig, [secret, "--id", "claude", "--pane", f"%{fresh}"], drop=("REMUX_PANE",))
+        check(run.returncode == 0 and b"bad_agent" in run.stderr,
+              f"bad_agent_label: the CLI reports it refused ({run.stderr!r})")
+        for name, text in (("server.log", rig.srv.log()),
+                           ("client.log", read(f"{rig.srv.rundir}/state/remux/client.log"))):
+            check(secret not in text, f"bad_agent_label: {name} never holds the invalid agent string")
+        check('AgentSession(agent="<invalid>", id, 6 bytes' in rig.srv.log(),
+              "bad_agent_label: server.log names it <invalid>")
+
+        cli_attributed(rig)
+        cli_stdout(rig)
+        cli_outside(rig)
+        cli_filters(rig)
+        forget_on_exit(rig)
+        keep_while_running(rig)
+        replacement(rig)
+        cross_agent_after_forget(rig)
+        restored = persist(rig)
+        restart_types(rig, restored)
+        default_stagger(rig)
+
+        log = rig.srv.log()
+        client_log = read(f"{rig.srv.rundir}/state/remux/client.log")
+        check("AgentSession(agent=\"claude\", id, 36 bytes" in log,
+              "redaction: server.log has the summary line with the byte count")
+        check("AgentSession(agent=\"claude\", id, 36 bytes" in client_log,
+              "redaction: client.log has the summary line with the byte count")
+        for name, text in (("server.log", log), ("client.log", client_log)):
+            check(all(v not in text for v in (UUID, OTHER, CLI_ID, RESTORE_ID, FORGET_ID, KEEP_ID)),
+                  f"redaction: {name} never holds an id")
+        check("panicked at" not in log, "no_panic: server.log has no panic")
+        check("panicked at" not in client_log, "no_panic: client.log has no panic")
+    finally:
+        rig.cli.close()
+        rig.srv.kill()
+
+
+if __name__ == "__main__":
+    main()

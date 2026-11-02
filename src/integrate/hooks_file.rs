@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 
 use super::{Change, IntegrationStatus};
+use crate::shell_word::sh_quote;
 
 /// One integration's hooks, as data.
 #[derive(Debug)]
@@ -93,12 +94,7 @@ impl Hooks {
     }
 }
 
-/// `text` as one `sh` word: single quotes, a quote inside as `'\''`.
-fn sh_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
-}
-
-/// The inverse of [`sh_quote`], for exactly what it produces.
+/// The inverse of [`crate::shell_word::sh_quote`], for exactly what it produces.
 fn sh_unquote(word: &str) -> Option<String> {
     let inner = word.strip_prefix('\'')?.strip_suffix('\'')?;
     let text = inner.replace(r"'\''", "'");
@@ -425,6 +421,22 @@ pub fn check_directory(path: &Path, euid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Before anything that runs `binary` is written: it must be safe from other
+/// users, and not a cargo build output unless `allow_dev_path`.
+pub fn check_hook_binary(binary: &Path, allow_dev_path: bool, euid: u32) -> Result<()> {
+    // Safety first: past it, every directory `is_dev_build` reads is this
+    // user's or root's and closed to others.
+    check_binary_safe(binary, euid)?;
+    anyhow::ensure!(
+        allow_dev_path || !is_dev_build(binary),
+        "{} is a cargo build output; hooks pointing there break on the next \
+         build or clean. Install remux (cargo install --path .) and run that \
+         binary's `integrate`, or pass --allow-dev-path to use this one anyway",
+        binary.display()
+    );
+    Ok(())
+}
+
 impl HooksFile {
     /// The hooks file at `settings`, writing `hooks` as the user `euid`.
     pub fn new(settings: PathBuf, hooks: Hooks, allow_dev_path: bool, euid: u32) -> Self {
@@ -438,17 +450,7 @@ impl HooksFile {
 
     /// A hook must not be baked onto a build directory by accident.
     pub fn check_binary(&self) -> Result<()> {
-        // Safety first: past it, every directory `is_dev_build` reads is this
-        // user's or root's and closed to others.
-        check_binary_safe(self.hooks.binary(), self.euid)?;
-        anyhow::ensure!(
-            self.allow_dev_path || !is_dev_build(self.hooks.binary()),
-            "{} is a cargo build output; hooks pointing there break on the next \
-             build or clean. Install remux (cargo install --path .) and run that \
-             binary's `integrate`, or pass --allow-dev-path to use this one anyway",
-            self.hooks.binary().display()
-        );
-        Ok(())
+        check_hook_binary(self.hooks.binary(), self.allow_dev_path, self.euid)
     }
 
     /// The file to read and write, resolved ONCE per operation: the settings
@@ -494,6 +496,7 @@ impl HooksFile {
     }
 
     fn read(&self, path: PathBuf) -> Result<Loaded> {
+        check_regular(&path)?;
         let mut file = match std::fs::File::open(&path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -531,6 +534,7 @@ impl HooksFile {
         let path = self.target()?;
         check_owner(&path, self.euid)?;
         check_directory(&path, self.euid)?;
+        check_plain_file(&path)?;
         let read = self.read(path)?;
         let mut after = read.value.clone();
         let notes = edit(&mut after, &self.hooks);
@@ -796,6 +800,40 @@ pub fn uninstall_hooks(settings: &mut Value, hooks_for: &Hooks) -> Vec<String> {
     notes
 }
 
+/// Refuse to read `path` unless it is absent or a regular file: a FIFO or a
+/// device would block the read, or answer it with something else's bytes.
+pub fn check_regular(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    anyhow::ensure!(
+        meta.is_file(),
+        "{} is not a regular file; nothing was read or written",
+        path.display()
+    );
+    Ok(Some(meta))
+}
+
+/// Refuse to replace `path` unless it is absent or one regular file. A file
+/// with a second hard link would be detached from it by the rename, leaving
+/// the other name holding the old content.
+pub fn check_plain_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(meta) = check_regular(path)? else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        meta.nlink() == 1,
+        "{} has {} hard links; replacing it would detach the others, so nothing was \
+         written",
+        path.display(),
+        meta.nlink()
+    );
+    Ok(())
+}
+
 /// Replace `path` with `text` in one rename, keeping its permissions, so a
 /// crash leaves either the old file or the new one, never half of either. Only
 /// if `path` is still what was read (`read`, or absent for None) just before
@@ -809,6 +847,7 @@ pub fn write_atomically(
     mode_if_new: Option<u32>,
 ) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    check_plain_file(path)?;
     let dir = path
         .parent()
         .with_context(|| format!("{} has no directory", path.display()))?;
@@ -866,6 +905,15 @@ pub fn hooks_subtree(text: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sh_quote_still_quotes_a_bare_word_for_the_hook_commands() {
+        assert_eq!(sh_quote("/usr/bin/remux"), "'/usr/bin/remux'");
+        assert_eq!(
+            sh_unquote("'/usr/bin/remux'").as_deref(),
+            Some("/usr/bin/remux")
+        );
+    }
 
     /// The messaging set, defined here so the machinery is tested as
     /// machinery: nothing below depends on what the integration ships.

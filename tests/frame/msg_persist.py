@@ -184,7 +184,8 @@ try:
     check(mode == 0o600, f"7c mailbox.json is 0600 (got {oct(mode) if mode else None})")
     check("MSG:keep" in text, "7c mailbox.json holds the body")
     state = json.load(open(f"{rig.srv.rundir}/data/remux/state.json"))
-    check(sorted(state) == ["pane_cwds", "state"] and "MSG:keep" not in json.dumps(state),
+    check(sorted(state) == ["agent_sessions", "pane_cwds", "state"]
+          and "MSG:keep" not in json.dumps(state),
           f"7c state.json keeps its shape and holds no body (keys {sorted(state)})")
 
     # --- 7d ---------------------------------------------------------------

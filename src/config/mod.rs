@@ -173,6 +173,15 @@ pub struct GeneralConfig {
     /// the *remote* server's setting that applies. Clipboard *reads* are never
     /// served, whatever this is set to.
     pub allow_app_clipboard: bool,
+    /// When true (default), a pane's agent may report the session it is
+    /// running, and a restore types the agent's resume command into the pane.
+    /// When false, reports are refused and nothing is stored or typed, so no
+    /// session id reaches the disk. Server-read: `remux restart` applies it.
+    pub resume_agents: bool,
+    /// How long a restore waits between typing one pane's resume command and
+    /// the next, across every restored session, so several agents do not all
+    /// start at once.
+    pub resume_agent_delay_ms: u64,
 }
 
 impl Default for GeneralConfig {
@@ -184,6 +193,8 @@ impl Default for GeneralConfig {
             automatic_restore: true,
             mouse_auto_yank: true,
             allow_app_clipboard: true,
+            resume_agents: true,
+            resume_agent_delay_ms: 100,
         }
     }
 }
@@ -847,6 +858,23 @@ mod tests {
             StatusBarPosition::Bottom
         );
         assert!(config.general.default_shell.is_none());
+    }
+
+    #[test]
+    fn agent_resume_defaults_and_both_keys_parse() {
+        let config = Config::default();
+        assert!(config.general.resume_agents);
+        assert_eq!(config.general.resume_agent_delay_ms, 100);
+        let config: Config = toml::from_str(
+            r#"
+            [general]
+            resume_agents = false
+            resume_agent_delay_ms = 1500
+        "#,
+        )
+        .unwrap();
+        assert!(!config.general.resume_agents);
+        assert_eq!(config.general.resume_agent_delay_ms, 1500);
     }
 
     #[test]

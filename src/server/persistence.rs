@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::server::agent_session::AgentSessionRecord;
 use crate::server::session::ServerState;
 
 /// The command string for manual session save, used by the command dispatcher.
@@ -23,6 +24,10 @@ pub struct PersistedState {
     /// Mapping from PaneId to the current working directory of the pane's
     /// child process at the time of the save.
     pub pane_cwds: HashMap<u64, String>,
+    /// Mapping from PaneId to the session the pane's agent reported, which a
+    /// restore resumes. Absent from a file an older build wrote.
+    #[serde(default)]
+    pub agent_sessions: HashMap<u64, AgentSessionRecord>,
 }
 
 impl PersistedState {
@@ -30,12 +35,17 @@ impl PersistedState {
     ///
     /// `pane_cwds` maps PaneId to the current working directory of the child
     /// process running in that pane.
-    pub fn from_server(state: &ServerState, pane_cwds: &HashMap<u64, String>) -> Result<Self> {
+    pub fn from_server(
+        state: &ServerState,
+        pane_cwds: &HashMap<u64, String>,
+        agent_sessions: &HashMap<u64, AgentSessionRecord>,
+    ) -> Result<Self> {
         let json = serde_json::to_string(state)?;
         let cloned: ServerState = serde_json::from_str(&json)?;
         Ok(Self {
             state: cloned,
             pane_cwds: pane_cwds.clone(),
+            agent_sessions: agent_sessions.clone(),
         })
     }
 }
@@ -135,15 +145,34 @@ fn legacy_state_path() -> Option<PathBuf> {
 /// The state is first written to a temporary file, then renamed into place
 /// to avoid corruption from partial writes.
 pub fn save_state(state: &PersistedState) -> Result<()> {
-    let dir = data_dir();
+    save_state_in(&data_dir(), state)
+}
+
+/// [`save_state`] into `dir`.
+pub fn save_state_in(dir: &Path, state: &PersistedState) -> Result<()> {
+    let dir = dir.to_path_buf();
     create_private_dir(&dir)?;
 
     let state_path = dir.join("state.json");
     log::debug!("persistence: save_state path={:?}", state_path);
     let tmp_path = dir.join("state.json.tmp");
 
+    // 0600 whatever the umask: the file holds agent session ids, which name
+    // transcripts on disk. The temp file is created fresh, so a link planted
+    // at its name cannot redirect the write, and the rename closes up a file
+    // an older build left 0644.
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let json = serde_json::to_string_pretty(state)?;
-    std::fs::write(&tmp_path, json)?;
+    let _ = std::fs::remove_file(&tmp_path);
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp_path)?;
+    out.write_all(json.as_bytes())?;
+    drop(out);
     std::fs::rename(&tmp_path, &state_path)?;
     Ok(())
 }
@@ -562,13 +591,135 @@ mod tests {
         let mut cwds = HashMap::new();
         cwds.insert(1u64, "/home/user".to_string());
 
-        let persisted = PersistedState::from_server(&state, &cwds).unwrap();
+        let persisted = PersistedState::from_server(&state, &cwds, &HashMap::new()).unwrap();
 
         let json = serde_json::to_string(&persisted).unwrap();
         let loaded: PersistedState = serde_json::from_str(&json).unwrap();
 
         assert!(loaded.state.sessions.contains_key("test"));
         assert_eq!(loaded.pane_cwds.get(&1).unwrap(), "/home/user");
+    }
+
+    /// `state.json` holds agent session ids, so it is the user's alone,
+    /// whatever the umask, and a file an older build left 0644 is closed up
+    /// by the next save.
+    #[test]
+    fn state_json_is_written_0600_and_an_existing_file_is_closed_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let state =
+            PersistedState::from_server(&ServerState::new(), &HashMap::new(), &HashMap::new())
+                .unwrap();
+        save_state_in(dir.path(), &state).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+        let fresh = tempfile::tempdir().unwrap();
+        save_state_in(fresh.path(), &state).unwrap();
+        let mode = std::fs::metadata(fresh.path().join("state.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+    }
+
+    #[test]
+    fn the_agent_sessions_round_trip_and_an_old_file_loads_without_them() {
+        let state = ServerState::new();
+        let record = AgentSessionRecord::new(
+            "claude",
+            &crate::protocol::AgentSessionRef::Id("7f3c2a9e".into()),
+        );
+        let sessions = HashMap::from([(4u64, record.clone())]);
+        let persisted = PersistedState::from_server(&state, &HashMap::new(), &sessions).unwrap();
+        let json = serde_json::to_string(&persisted).unwrap();
+        assert!(
+            json.contains(
+                r#""agent_sessions":{"4":{"agent":"claude","kind":"Id","value":"7f3c2a9e"}}"#
+            ),
+            "{json}"
+        );
+        let loaded: PersistedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.agent_sessions.get(&4), Some(&record));
+
+        let mut old: serde_json::Value = serde_json::from_str(&json).unwrap();
+        old.as_object_mut().unwrap().remove("agent_sessions");
+        let loaded: PersistedState = serde_json::from_value(old).unwrap();
+        assert!(loaded.agent_sessions.is_empty());
+    }
+
+    /// A file a LATER build wrote, with a top-level key this build has never
+    /// heard of, still loads: that is what lets a downgrade, or an older
+    /// server on another machine, read today's `state.json`.
+    #[test]
+    fn an_unknown_top_level_key_is_ignored() {
+        let persisted =
+            PersistedState::from_server(&ServerState::new(), &HashMap::new(), &HashMap::new())
+                .unwrap();
+        let mut value = serde_json::to_value(&persisted).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("from_a_later_build".into(), serde_json::json!({"x": 1}));
+        let loaded: PersistedState = serde_json::from_value(value).unwrap();
+        assert!(loaded.agent_sessions.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_key_inside_the_server_state_is_ignored() {
+        let mut state = ServerState::new();
+        state
+            .create_session(
+                "s1",
+                None,
+                crate::config::BorderStyle::ZellijStyle,
+                Default::default(),
+            )
+            .unwrap();
+        let persisted =
+            PersistedState::from_server(&state, &HashMap::new(), &HashMap::new()).unwrap();
+        let mut value = serde_json::to_value(&persisted).unwrap();
+        value["state"]
+            .as_object_mut()
+            .unwrap()
+            .insert("from_a_later_build".into(), serde_json::json!(true));
+        value["state"]["sessions"]["s1"]
+            .as_object_mut()
+            .unwrap()
+            .insert("from_a_later_build".into(), serde_json::json!(true));
+        let loaded: PersistedState = serde_json::from_value(value).unwrap();
+        assert!(loaded.state.sessions.contains_key("s1"));
+    }
+
+    /// Both properties above hold only while no persisted type refuses
+    /// unknown fields, and the tests cover two structs out of many. The
+    /// attribute appears nowhere in the source but two doc comments in
+    /// `protocol.rs`.
+    #[test]
+    fn no_type_refuses_unknown_fields() {
+        let needle = concat!("deny_", "unknown_fields");
+        let mut hits = Vec::new();
+        let mut dirs = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for line in text.lines().filter(|l| l.contains(needle)) {
+                        let doc = line.trim_start().starts_with("///");
+                        if !(doc && path.ends_with("protocol.rs")) {
+                            hits.push(format!("{}: {}", path.display(), line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(hits.is_empty(), "{hits:#?}");
     }
 
     #[test]
@@ -585,7 +736,7 @@ mod tests {
         state.create_tab("s1", "tab2", Default::default()).unwrap();
 
         let cwds = HashMap::new();
-        let persisted = PersistedState::from_server(&state, &cwds).unwrap();
+        let persisted = PersistedState::from_server(&state, &cwds, &HashMap::new()).unwrap();
 
         assert!(persisted.state.sessions.contains_key("s1"));
         assert!(persisted.state.folders.contains_key("work"));
@@ -609,7 +760,8 @@ mod tests {
         let tab = &mut state.sessions.get_mut("floaty").unwrap().tabs[0];
         assert!(tab.toggle_zoom(crate::config::ZoomMode::Float));
         let floated = tab.focused_pane;
-        let persisted = PersistedState::from_server(&state, &HashMap::new()).unwrap();
+        let persisted =
+            PersistedState::from_server(&state, &HashMap::new(), &HashMap::new()).unwrap();
         std::fs::write(
             &state_path,
             serde_json::to_string_pretty(&persisted).unwrap(),
@@ -639,7 +791,8 @@ mod tests {
             .unwrap();
         let tab = &mut state.sessions.get_mut("old").unwrap().tabs[0];
         tab.zoomed_pane = Some(tab.focused_pane);
-        let persisted = PersistedState::from_server(&state, &HashMap::new()).unwrap();
+        let persisted =
+            PersistedState::from_server(&state, &HashMap::new(), &HashMap::new()).unwrap();
         let mut json: serde_json::Value = serde_json::to_value(&persisted).unwrap();
         let tabs = json["state"]["sessions"]["old"]["tabs"]
             .as_array_mut()
@@ -675,7 +828,7 @@ mod tests {
         let mut cwds = HashMap::new();
         cwds.insert(1u64, "/tmp".to_string());
 
-        let persisted = PersistedState::from_server(&state, &cwds).unwrap();
+        let persisted = PersistedState::from_server(&state, &cwds, &HashMap::new()).unwrap();
         let json = serde_json::to_string_pretty(&persisted).unwrap();
         std::fs::write(&state_path, &json).unwrap();
 
@@ -735,7 +888,8 @@ mod tests {
                 Default::default(),
             )
             .unwrap();
-        let persisted = PersistedState::from_server(&state, &HashMap::new()).unwrap();
+        let persisted =
+            PersistedState::from_server(&state, &HashMap::new(), &HashMap::new()).unwrap();
         std::fs::write(path, serde_json::to_string(&persisted).unwrap()).unwrap();
     }
 

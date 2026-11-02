@@ -11,6 +11,12 @@ Importing this module installs the check on `subprocess.Popen` and
 without each call site having to remember it. The check runs when the process is
 launched, because several tests set `os.environ["HOME"]` in `main()` after
 their imports.
+
+The variables each agent resolves its config directory from are dropped from
+this process's environment at import, and a remux launched with one pointing
+inside the real home is refused: `remux integrate` honours them ahead of HOME,
+so one inherited from the developer's shell would aim an install at the real
+`~/.claude` (or `~/.codex`, ...) whatever HOME says.
 """
 import os
 import pwd
@@ -21,6 +27,16 @@ REAL_HOMES = frozenset(
     os.path.realpath(p)
     for p in (os.path.expanduser("~"), pwd.getpwuid(os.getuid()).pw_dir)
 )
+
+AGENT_DIR_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR",
+                  "OPENCODE_CONFIG_DIR")
+for _var in AGENT_DIR_VARS:
+    os.environ.pop(_var, None)
+
+
+def _inside_real_home(path):
+    path = os.path.realpath(path)
+    return any(path == h or path.startswith(h + "/") for h in REAL_HOMES)
 
 
 def require_isolated_home(env=None):
@@ -34,6 +50,12 @@ def require_isolated_home(env=None):
             f"refusing to start remux with HOME={home!r}: that is the real home, "
             "so the server would read the real sessions. Point HOME at a "
             "throwaway directory together with the XDG_* directories.")
+    for var in AGENT_DIR_VARS:
+        value = env.get(var)
+        if value and os.path.isabs(value) and _inside_real_home(value):
+            raise RuntimeError(
+                f"refusing to start remux with {var}={value!r}: it is inside the real "
+                "home, so an install would write the developer's own agent config.")
 
 
 def throwaway_home(default):

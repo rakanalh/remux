@@ -1,0 +1,41 @@
+{
+  "theme": "dark",
+  "zeta": 1,
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo started >> /tmp/never-run"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "notify-send session-started"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo pre"
+          }
+        ]
+      }
+    ]
+  },
+  "alpha": {
+    "b": 2,
+    "a": 1
+  },
+  "model": "opus"
+}
