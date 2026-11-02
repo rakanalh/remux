@@ -161,7 +161,7 @@ The `sessions` panel with a remote connected, and the `files` panel:
 - **Names and states** — `remux agent name` gives a pane a name to send to, and `remux agent ls` lists the agents with their state (`idle`, `working`, `needs-input`).
 - **Across machines** — `devbox:alpha` reaches a pane on a [remote](#remote-sessions-ssh), forwarded over SSH.
 - **Claude Code hooks** — `remux integrate claude-messaging` installs hooks that hand an agent its mail at the end of a turn and beside its user's next prompt.
-- **Agents come back after a restart** — with `remux integrate <agent>-resume` installed, an agent reports the session it is running, and after `remux restart` (or a reboot) its pane comes back as a shell in the same directory with ` claude --resume <id>` (or the agent's equivalent) typed and running. Quitting the agent leaves an ordinary prompt. See [Resuming agents after a restart](#resuming-agents-after-a-restart).
+- **Agents come back after a restart** — with `remux integrate <agent>-resume` installed, an agent reports the session it is running, and after `remux restart` (or a reboot) its pane comes back as a shell in the same directory with ` claude --resume=<id>` (or the agent's equivalent) typed and running. Quitting the agent leaves an ordinary prompt. See [Resuming agents after a restart](#resuming-agents-after-a-restart).
 
 See [Messaging between agents](#messaging-between-agents) below. Full details: [https://rakanalh.github.io/remux/messaging/](https://rakanalh.github.io/remux/messaging/)
 
