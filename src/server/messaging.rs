@@ -231,15 +231,9 @@ impl Reply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitFrom {
     /// A pane on this server.
-    Pane { pane: PaneId, name: Option<String> },
-    /// A pane on the server at the other end of the peer link `link`, which
-    /// knows the message as `origin_id`.
-    Remote {
-        link: String,
-        pane: PaneId,
-        name: Option<String>,
-        origin_id: MsgId,
-    },
+    Pane { pane: PaneId },
+    /// A pane on the server at the other end of the peer link `link`.
+    Remote { link: String },
 }
 
 /// What a sender's share of a pane's queue, and of waits, is counted by.
@@ -253,7 +247,7 @@ pub enum SubmitKey {
 
 impl SubmitFrom {
     pub fn pane(pane: PaneId) -> Self {
-        SubmitFrom::Pane { pane, name: None }
+        SubmitFrom::Pane { pane }
     }
 
     pub fn key(&self) -> SubmitKey {
@@ -292,7 +286,7 @@ pub struct SubmitEntry {
     pub pane: PaneId,
     pub deliver: crate::protocol::Deliver,
     pub body: String,
-    /// The sender, for the envelope and its share of the queue.
+    /// The sender, for its share of the queue.
     pub from: SubmitFrom,
     pub enqueued_at: Instant,
     /// Waits while the agent is waiting on its user, rather than being
@@ -608,6 +602,17 @@ pub(crate) fn session_label(name: &str) -> String {
     }
 }
 
+/// [`session_label`] for a remote sender's session, which another server
+/// asserted. Empty stays empty: it is what a message stored before the
+/// session was kept holds, and the render then leaves it out.
+fn remote_session_label(name: &str) -> String {
+    if name.is_empty() {
+        String::new()
+    } else {
+        session_label(name)
+    }
+}
+
 /// Whether a message read from the file is one a send would have stored.
 fn valid_stored(msg: &Message, limits: &Limits) -> bool {
     let sender = match &msg.from {
@@ -797,12 +802,14 @@ impl Messaging {
         messages.sort_by_key(|m| m.id);
         let mut seen = HashSet::new();
         for mut msg in messages {
-            if let Sender::Pane { session, .. } = &mut msg.from {
-                let label = session_label(session);
-                if label != *session {
-                    *session = label;
-                    pruned.relabelled += 1;
-                }
+            let label = match &msg.from {
+                Sender::Pane { session, .. } => session_label(session),
+                Sender::Remote { session, .. } => remote_session_label(session),
+            };
+            let (Sender::Pane { session, .. } | Sender::Remote { session, .. }) = &mut msg.from;
+            if label != *session {
+                *session = label;
+                pruned.relabelled += 1;
             }
             let (Sender::Pane { name, .. } | Sender::Remote { name, .. }) = &mut msg.from;
             let unnamed = name
@@ -1600,7 +1607,17 @@ impl Messaging {
                 name,
                 session: session_label(&session),
             },
-            remote @ Sender::Remote { .. } => remote,
+            Sender::Remote {
+                host,
+                pane_id,
+                name,
+                session,
+            } => Sender::Remote {
+                host,
+                pane_id,
+                name,
+                session: remote_session_label(&session),
+            },
         };
         let limits = self.limits.clone();
         if body.len() > limits.max_body {
@@ -2200,6 +2217,7 @@ mod tests {
             host: host.into(),
             pane_id,
             name: None,
+            session: String::new(),
         }
     }
 
@@ -3114,13 +3132,8 @@ mod tests {
         Reply::new(client_id, tokio::sync::mpsc::unbounded_channel().0, None)
     }
 
-    fn from_remote(link: &str, pane: PaneId) -> SubmitFrom {
-        SubmitFrom::Remote {
-            link: link.into(),
-            pane,
-            name: None,
-            origin_id: 1,
-        }
+    fn from_remote(link: &str) -> SubmitFrom {
+        SubmitFrom::Remote { link: link.into() }
     }
 
     #[test]
@@ -3129,21 +3142,21 @@ mod tests {
             link_parked_max: 3,
             ..limits()
         });
-        let from_link = |id: MsgId, pane| SubmitEntry {
-            from: from_remote("rogue", pane),
+        let from_link = |id: MsgId| SubmitEntry {
+            from: from_remote("rogue"),
             ..entry(id, 10 + id, Some(7))
         };
         for id in 1..=3 {
-            assert_eq!(m.enqueue_submit(from_link(id, id), 8), Ok(()), "send {id}");
+            assert_eq!(m.enqueue_submit(from_link(id), 8), Ok(()), "send {id}");
         }
         assert_eq!(
-            m.enqueue_submit(from_link(4, 4), 8),
+            m.enqueue_submit(from_link(4), 8),
             Err(EnqueueRefusal::LinkFull {
                 link: "rogue".into(),
                 max: 3
             })
         );
-        assert!(m.park_refusal(7, &from_remote("rogue", 9)).is_some());
+        assert!(m.park_refusal(7, &from_remote("rogue")).is_some());
     }
 
     #[test]
@@ -3163,26 +3176,26 @@ mod tests {
     #[test]
     fn a_links_senders_share_one_slice_of_a_queue_whatever_pane_ids_they_claim() {
         let mut m = Messaging::new(limits());
-        let from_link = |id: MsgId, pane| SubmitEntry {
-            from: from_remote("rogue", pane),
+        let from_link = |id: MsgId| SubmitEntry {
+            from: from_remote("rogue"),
             ..entry(id, 5, None)
         };
         for id in 1..=4 {
-            assert_eq!(m.enqueue_submit(from_link(id, id), 8), Ok(()), "entry {id}");
+            assert_eq!(m.enqueue_submit(from_link(id), 8), Ok(()), "entry {id}");
         }
         assert_eq!(
-            m.enqueue_submit(from_link(5, 5), 8),
+            m.enqueue_submit(from_link(5), 8),
             Err(EnqueueRefusal::QueueFull),
             "a fifth from the link, under a fifth pane id"
         );
-        let deferred = |id: MsgId, pane| SubmitEntry {
+        let deferred = |id: MsgId| SubmitEntry {
             defer: true,
-            from: from_remote("other", pane),
+            from: from_remote("other"),
             ..entry(id, 6, None)
         };
-        assert_eq!(m.enqueue_submit(deferred(6, 1), 8), Ok(()));
+        assert_eq!(m.enqueue_submit(deferred(6), 8), Ok(()));
         assert_eq!(
-            m.enqueue_submit(deferred(7, 2), 8),
+            m.enqueue_submit(deferred(7), 8),
             Err(EnqueueRefusal::QueueFull),
             "one deferred per link and target, whatever pane id"
         );
@@ -3201,7 +3214,7 @@ mod tests {
         .unwrap();
         m.enqueue_submit(
             SubmitEntry {
-                from: from_remote("laptop", 40),
+                from: from_remote("laptop"),
                 ..entry(2, 5, None)
             },
             8,
@@ -3975,6 +3988,7 @@ mod tests {
             host: "-oProxyCommand".into(),
             pane_id: 1,
             name: None,
+            session: String::new(),
         };
         let f = file_of(vec![
             stored(1, 2, "ok"),
@@ -4029,6 +4043,47 @@ mod tests {
             })
             .collect();
         assert_eq!(sessions, ["s\u{FFFD}[2J", "main\u{FFFD}", "main"]);
+    }
+
+    #[test]
+    fn a_remote_senders_session_is_labelled_on_arrival_and_on_restore_and_empty_stays_empty() {
+        let remote_from = |session: &str| Sender::Remote {
+            host: "mini".into(),
+            pane_id: 9,
+            name: None,
+            session: session.into(),
+        };
+        let session_of = |msg: &Message| match &msg.from {
+            Sender::Remote { session, .. } => session.clone(),
+            Sender::Pane { .. } => unreachable!(),
+        };
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        for (n, session) in ["s\u{1b}[2J", ""].into_iter().enumerate() {
+            m.send_arrival(
+                remote_from(session),
+                2,
+                "hi".into(),
+                None,
+                arrival("mini", 100, n as MsgId + 1),
+                0,
+                t0,
+            )
+            .unwrap();
+        }
+        let got: Vec<String> = m.mailboxes[&2].messages.iter().map(session_of).collect();
+        assert_eq!(got, ["s\u{FFFD}[2J", ""]);
+        let mut hostile = stored(1, 2, "kept");
+        hostile.from = remote_from("x\u{202E}");
+        let (r, pruned) = Messaging::restore(
+            limits(),
+            file_of(vec![hostile]),
+            |_| true,
+            HashSet::new(),
+            0,
+        );
+        assert_eq!(pruned.relabelled, 1, "{pruned:?}");
+        assert_eq!(session_of(&r.mailboxes[&2].messages[0]), "x\u{FFFD}");
     }
 
     #[test]

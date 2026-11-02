@@ -129,7 +129,9 @@ pub struct SubmitRow {
     /// input it believes is not for it.
     pub focus_in: Option<bool>,
     pub while_working: Option<WhileWorking>,
-    /// Open the typed text with a line naming the message and its sender.
+    /// Parsed only to be reported and ignored: a typed message is always the
+    /// raw body. Declared because serde drops an unknown key silently, and a
+    /// user who set it should hear that it does nothing.
     pub envelope: Option<bool>,
 }
 
@@ -402,6 +404,11 @@ impl MessagingConfig {
             ));
         }
         for (command, row) in &self.submit {
+            if row.envelope.is_some() {
+                out.push(format!(
+                    "[messaging.submit.{command}] envelope is no longer read: a typed message is always the raw body"
+                ));
+            }
             if let Some(enter) = row.enter.as_deref().filter(|e| !valid_enter(e)) {
                 out.push(format!(
                     "[messaging.submit.{command}] enter = {enter:?} is not 1 to {MAX_ENTER_BYTES} control bytes; using \"\\r\""
@@ -626,7 +633,7 @@ mod tests {
     #[test]
     fn a_submit_row_parses_every_field() {
         let m = parse(
-            "[messaging.submit.aider]\nbracketed = \"off\"\nenter = \"\\n\"\nenter_delay_ms = 50\nfocus_in = true\nwhile_working = \"refuse\"\nenvelope = false",
+            "[messaging.submit.aider]\nbracketed = \"off\"\nenter = \"\\n\"\nenter_delay_ms = 50\nfocus_in = true\nwhile_working = \"refuse\"",
         );
         assert_eq!(
             m.submit["aider"],
@@ -636,10 +643,28 @@ mod tests {
                 enter_delay_ms: Some(50),
                 focus_in: Some(true),
                 while_working: Some(WhileWorking::Refuse),
-                envelope: Some(false),
+                envelope: None,
             }
         );
         assert!(m.problems().is_empty(), "{:?}", m.problems());
+    }
+
+    #[test]
+    fn a_stale_envelope_key_still_loads_and_is_reported_ignored() {
+        for value in ["true", "false"] {
+            let m = parse(&format!(
+                "[messaging.submit.claude]\nenter_delay_ms = 500\nenvelope = {value}"
+            ));
+            assert_eq!(m.submit["claude"].enter_delay_ms, Some(500), "{value}");
+            assert_eq!(
+                m.problems(),
+                vec![
+                    "[messaging.submit.claude] envelope is no longer read: a typed message is always the raw body"
+                        .to_string()
+                ],
+                "{value}"
+            );
+        }
     }
 
     #[test]

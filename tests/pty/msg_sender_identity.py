@@ -31,7 +31,7 @@ real client, so the process tree is the one a user or an agent has:
       people and a field can look like a column.
   9i  THE DEFINITION OF DONE: the client closes, `remux restart` restarts the
       server, a client re-attaches to the restored session, and in the
-      restored recipient pane `remux msg read` shows `#1 from lead (%<A>)`
+      restored recipient pane `remux msg read` shows `from lead (main), #1:`
       above `MSG:one`, a peek then shows every message Read, and a second
       read prints nothing and exits 0.
   9j  After the restart, A acknowledges B's mailbox with --all: the log's ack
@@ -410,7 +410,7 @@ try:
     # Piped through head so the header stays on screen however many cases
     # before this one sent B mail: the first message is the one asserted.
     type_line(child, pump, f"clear; {BIN} msg read | head -n 8", t=1.5)
-    header = f"#1 from lead (%{A}) in main at "
+    header = "from lead (main), #1:"
     ok = wait_for(pump, screen, header, timeout=8.0)
     rows = screen.display
     at = next((i for i, r in enumerate(rows) if header in r), None)
@@ -418,7 +418,7 @@ try:
     # zoomed pane is framed on both sides.
     col = rows[at].index(header) if at is not None else 0
     body_ok = at is not None and at + 1 < len(rows) and rows[at + 1][col:].rstrip(" │") == "    MSG:one"
-    check(ok and body_ok, f"9i after the restart, B's own read shows '#1 from lead (%{A})' above MSG:one")
+    check(ok and body_ok, f"9i after the restart, B's own read shows 'from lead (main), #1:' above MSG:one")
     if not (ok and body_ok):
         dump(screen, "9i read")
     states = [m["state"] for m in box(env, B)]

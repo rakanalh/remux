@@ -25,8 +25,9 @@ itself: a rogue peer is `peer_child`, a subprocess of the harness.
   1c  a second send reuses the link: ssh did not run again
   1d  B1 names itself beta: mini:beta is forwarded; mini:nosuch is
       remote_refused naming no_such_target, and stored nowhere
-  1e  A1 names itself lead: B stores from.name lead, and B1's text read
-      prints "from laptop:lead (laptop:%A1)"
+  1e  A1 names itself lead: B stores from.name lead and from.session main,
+      and B1's text read prints "from laptop:lead (main), #N:" with no pane
+      id
   1f  the harness's frame client on B sends a MsgSend with origin:
       origin_not_allowed, logged with the peer pid, nothing stored
   1g  the harness's frame client declares a peer: sender_unverified, not a
@@ -71,15 +72,18 @@ itself: a rogue peer is `peer_child`, a subprocess of the harness.
 
 The return path (Task 2), after 1n, with A's default `inbound = "replies"`:
 
-  2a  B1's context read names A's id in its reply line, not B's
+  2a  B1's context read shows the sender and B's own number; B1 answers by
+      that number with no target, and the reply reaches A1 as a reply to
+      A's id
   2b  B1 runs it: forwarded to laptop over the link A holds open (no second
       ssh); A1 holds it from mini's %B1, reply_to laptop's id, origin mini's
   2o  a second reply to the same id is delivered too (an id is not used up)
   2j  a reply by name is refused: replies go to a pane
   2k  a reply to a pane that never forwarded is refused, and stored nowhere
   2l  a reply naming an id not minted for that pane, or no id, is refused
-  2c  A1's read shows mini:beta, and its reply line names B's id
-  2d  A1 answers it: B1's copy has reply_to mini's id
+  2c  A1's read shows "from mini:beta (main), #N:"
+  2d  A1 answers it by A's number, with no target: B1's copy has reply_to
+      mini's id
   2e  auto over the inbound link is stored with the reason; submit is refused
   2h  B pushes the reply to the link's connection only
   2i  a reply's body is in no log; both sides log the hop
@@ -112,8 +116,8 @@ The return path (Task 2), after 1n, with A's default `inbound = "replies"`:
       id: after eight such refusals a reply that fits is still delivered
   2t  B with its own [remotes.laptop]: a reply still goes back over the link
       A holds open, and B runs no ssh
-  3a  a submit to a fakeagent on B is typed in, and its envelope names the
-      sender as laptop's pane with A's id in the reply hint
+  3a  a submit to a fakeagent on B is typed in as the raw body: nothing
+      names the sender or the message
   3b  submit --wait over the link answers when the agent's turn ends
   3c  a submit into a blocked agent is remote_refused agent_blocked; auto
       is stored with the reason
@@ -769,7 +773,7 @@ try:
     # --- 1b -----------------------------------------------------------------
     got = box(srv_b, B1)
     first = got[0] if got else {}
-    check(len(got) == 1 and first.get("from") == {"Remote": {"host": "laptop", "pane_id": A1, "name": None}}
+    check(len(got) == 1 and first.get("from") == {"Remote": {"host": "laptop", "pane_id": A1, "name": None, "session": "main"}}
           and first.get("origin") == {"host": "laptop", "id": first_id} and first.get("body") == "R:one",
           f"1b B1 holds it from laptop's %{A1}, origin laptop #{first_id} ({got})")
 
@@ -797,10 +801,11 @@ try:
     send_from_a1("mini:beta", "five")
     got = box(srv_b, B1)
     named = next((m for m in got if m["body"] == "R:five"), {})
-    check(named.get("from") == {"Remote": {"host": "laptop", "pane_id": A1, "name": "lead"}},
-          f"1e B stores the sender's name ({named.get('from')})")
+    check(named.get("from") == {"Remote": {"host": "laptop", "pane_id": A1, "name": "lead", "session": "main"}},
+          f"1e B stores the sender's name and session ({named.get('from')})")
     code, out, err = type_cli(cli_b, B1, f"'{BIN}' msg read --peek")
-    check(f"from laptop:lead (laptop:%{A1})" in out, f"1e B1's read prints the remote sender ({out[:300]!r})")
+    check(f"\nfrom laptop:lead (main), #{named.get('id')}:\n    R:five\n" in out and "%" not in out,
+          f"1e B1's read prints the remote sender and its session, no pane id ({out[:300]!r})")
 
     # --- 1f -----------------------------------------------------------------
     n_before = len(box(srv_b, B1))
@@ -852,7 +857,7 @@ try:
     got, _ = peer_frames([{"PeerLink": {"name": "rogue"}}, origin_send(B1, "R:rogue", origin(pane_id=9)),
                           origin_send(B1, "R:rogue2", origin(pane_id=9))])
     stored = next((m for m in box(srv_b, B1) if m["body"] == "R:rogue"), {})
-    check(codes(got)[:1] == ["MsgSent"] and stored.get("from") == {"Remote": {"host": "rogue", "pane_id": 9, "name": None}},
+    check(codes(got)[:1] == ["MsgSent"] and stored.get("from") == {"Remote": {"host": "rogue", "pane_id": 9, "name": None, "session": "main"}},
           f"1g4 an admitted peer's message is stored from its declared name ({got}, {stored.get('from')})")
     check(re.search(rf"peer link rogue: declared by client_id=\d+ peer_pid=\d+ under sshd={os.getpid()}", srv_b.log())
           is not None, "1g4 ...and B logs the declaration as the audit trail")
@@ -934,8 +939,13 @@ try:
     check(b_first is not None and b_first != first_id,
           f"2a B's id for the first forward ({b_first}) is not A's ({first_id}), so 2a can tell them apart")
     code, out, err = type_cli(cli_b, B1, f"'{BIN}' msg read --peek --format context")
-    check(f"Reply with: remux msg send laptop:%{A1} --reply-to {first_id} --stdin" in out,
-          f"2a B1's reply line names A's id {first_id} ({out[-400:]!r})")
+    check(f"\nfrom a pane on laptop (main), #{b_first}:\n    R:one\n" in out and "Reply with" not in out,
+          f"2a B1's read shows the sender and B's own number {b_first} ({out[-400:]!r})")
+    code, out, err = type_cli(cli_b, B1, f"printf 'RE:%s' bynum | '{BIN}' msg send --reply-to {b_first} --stdin --deliver mailbox")
+    bynum = next((m for m in box(srv_a, A1) if m["body"] == "RE:bynum"), {})
+    check(code == 0 and bynum.get("reply_to") == {"host": "laptop", "id": first_id},
+          f"2a B1's reply by number with no target reaches A1 as a reply to A's id {first_id} "
+          f"(exit {code}, out {out!r}, err {err!r}, got {bynum})")
 
     # --- 2b -----------------------------------------------------------------
     calls = shim_calls()
@@ -944,7 +954,7 @@ try:
     check(code == 0 and "forwarded to laptop" in out and shim_calls() == calls,
           f"2b B1's reply goes back over the link A holds open (exit {code}, out {out!r}, err {err!r}, ssh {shim_calls()} vs {calls})")
     got = next((m for m in box(srv_a, A1) if m["body"] == "RE:one"), {})
-    check(got.get("from") == {"Remote": {"host": "mini", "pane_id": B1, "name": "beta"}}
+    check(got.get("from") == {"Remote": {"host": "mini", "pane_id": B1, "name": "beta", "session": "main"}}
           and got.get("reply_to") == {"host": "laptop", "id": first_id}
           and got.get("origin") == {"host": "mini", "id": b_id},
           f"2b A1 holds it from mini's %{B1}, a reply to laptop #{first_id}, origin mini #{b_id} ({got})")
@@ -973,12 +983,11 @@ try:
           f"2l ...and one naming no id (exit {code}, err {err!r})")
 
     # --- 2c / 2d ------------------------------------------------------------
+    a_id = next((m["id"] for m in box(srv_a, A1) if m["body"] == "RE:one"), None)
     code, out, err = type_cli(cli_a, A1, f"'{BIN}' msg read --peek")
-    check(f"from mini:beta (mini:%{B1})" in out, f"2c A1's read names mini:beta ({out[-300:]!r})")
-    code, out, err = type_cli(cli_a, A1, f"'{BIN}' msg read --peek --format context")
-    check(f"Reply with: remux msg send mini:%{B1} --reply-to {b_id} --stdin" in out,
-          f"2c ...and its reply line names B's id {b_id}")
-    code, out, err = type_cli(cli_a, A1, f"printf 'RE:%s' back | '{BIN}' msg send mini:%{B1} --reply-to {b_id} --stdin --deliver mailbox")
+    check(f"\nfrom mini:beta (main), #{a_id}:\n    RE:one\n" in out and "%" not in out,
+          f"2c A1's read names mini:beta and its session, no pane id ({out[-300:]!r})")
+    code, out, err = type_cli(cli_a, A1, f"printf 'RE:%s' back | '{BIN}' msg send --reply-to {a_id} --stdin --deliver mailbox")
     back = next((m for m in box(srv_b, B1) if m["body"] == "RE:back"), {})
     check(code == 0 and back.get("reply_to") == {"host": "mini", "id": b_id},
           f"2d A1's answer reaches B1 as a reply to mini #{b_id} ({back.get('reply_to')})")
@@ -1248,9 +1257,8 @@ try:
     a_id = sent_id(out)
     check(code == 0 and f"to mini:%{BF}" in out and "typed into the pane" in out,
           f"3a a submit to mini:%BF is typed into the pane (exit {code}, out {out!r}, err {err!r})")
-    check("R:plain-three-a" in seen and f"(laptop:%{A1})" in seen
-          and f"reply: remux msg send laptop:%{A1} --reply-to {a_id}]" in seen,
-          f"3a the envelope names laptop's pane and A's id {a_id} ({seen[-400:]!r})")
+    check("R:plain-three-a" in seen and "remux message" not in seen and "laptop" not in seen,
+          f"3a the body arrives raw, with no envelope naming laptop or A's id {a_id} ({seen[-400:]!r})")
 
     # --- 3b -----------------------------------------------------------------
     check(wait_b_idle(BF), "3b BF is Idle before the next send")

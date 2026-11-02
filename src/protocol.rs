@@ -1838,6 +1838,11 @@ pub enum Sender {
         host: String,
         pane_id: PaneId,
         name: Option<String>,
+        /// The sender's session on its own server, from the link's
+        /// `Origin`. Empty in a message stored, or listed by a server,
+        /// before the session was kept.
+        #[serde(default)]
+        session: String,
     },
 }
 
@@ -3739,6 +3744,7 @@ mod tests {
                 host: "mini".into(),
                 pane_id: 9,
                 name: None,
+                session: "build".into(),
             },
         ] {
             let msg = Message {
@@ -3758,6 +3764,22 @@ mod tests {
             let json = serde_json::to_string(&msg).unwrap();
             assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn a_remote_sender_from_before_its_session_was_carried_still_decodes() {
+        let old: Sender =
+            serde_json::from_str(r#"{"Remote":{"host":"mini","pane_id":9,"name":"beta"}}"#)
+                .unwrap();
+        assert_eq!(
+            old,
+            Sender::Remote {
+                host: "mini".into(),
+                pane_id: 9,
+                name: Some("beta".into()),
+                session: String::new(),
+            }
+        );
     }
 
     #[test]

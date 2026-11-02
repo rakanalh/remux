@@ -1308,11 +1308,11 @@
 # focus_in         report focus (ESC[I) before the text (default false).
 # while_working    "queue" types it anyway, "mailbox" (default) leaves it
 #                  for the agent's hook, "refuse" refuses `--deliver submit`.
-# envelope         open the text with a line naming the message and its
-#                  sender, "# [remux message #7 from lead (%1), mark ...;
-#                  reply: ...]", and close it with "# [end of remux message
-#                  #7, mark ...]", so the agent can tell another agent's
-#                  message from its user's (default true).
+#
+# The text typed is the message's body and nothing else, exactly as if the
+# agent's user had typed it: nothing in it names the sender. Who sent what is
+# in the mailbox (`remux msg read --all`). An old `envelope` key in a row is
+# no longer read, and is reported in server.log.
 #
 # The shipped rows:
 #

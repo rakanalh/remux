@@ -153,15 +153,10 @@ def rx_chunks(log):
     return out
 
 
-def framed(msg_id, pane, body):
-    """A message typed wrapped, exactly, with a header and trailer mark that
-    must agree (msg_submit.py's `framed`, its defaults)."""
-    head = (re.escape(f"# [remux message #{msg_id} from %{pane}, mark ".encode())
-            + rb"(?P<mark>[0-9a-f]{16})"
-            + re.escape(f"; reply: remux msg send %{pane} --reply-to {msg_id}]".encode()))
-    tail = re.escape(f"# [end of remux message #{msg_id}, mark ".encode()) + rb"(?P=mark)\]"
-    return re.compile(re.escape(OPEN) + head + b"\n" + re.escape(body.encode()) + b"\n" + tail
-                      + re.escape(CLOSE), re.S)
+def framed(body):
+    """A message typed wrapped, exactly: the body alone inside the paste
+    (msg_submit.py's `framed`, its defaults)."""
+    return re.compile(re.escape(OPEN) + re.escape(body.encode()) + re.escape(CLOSE), re.S)
 
 
 def typed_then_entered(log, pattern, timeout=8.0):
@@ -380,7 +375,7 @@ try:
     check(waited(r) == ("Submitted", None, "Idle", False),
           f"7h a Submit --wait to bravo in other is Submitted and settles Idle, "
           f"not pane_closed_after_submit (got {r})")
-    check(sent.get("id") is not None and typed_then_entered(AGENT_LOG, framed(sent.get("id"), A, "GO:2500 after the move")),
+    check(sent.get("id") is not None and typed_then_entered(AGENT_LOG, framed("GO:2500 after the move")),
           f"7h ...and the agent read it framed, whole, then its Enter (reads {rx_chunks(AGENT_LOG)[-3:]})")
 
     # --- 7i ---------------------------------------------------------------

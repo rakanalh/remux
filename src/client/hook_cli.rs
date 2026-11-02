@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::client::cli_common::{ask, escape, pane_hint, CliError};
-use crate::client::msg_cli::{render_context, render_mark};
-use crate::protocol::{AgentSessionRef, ClientMessage, Message, PaneId, ServerMessage};
+use crate::client::msg_cli::render_mail;
+use crate::protocol::{AgentSessionRef, ClientMessage, PaneId, ServerMessage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum HookEvent {
@@ -405,10 +405,7 @@ async fn hook(event: HookEvent) -> Result<Delivery, String> {
         ));
     }
     let ids: Vec<_> = messages.iter().map(|m| m.id).collect();
-    // Rendered before the ack, which marks the mail: a render that failed
-    // after it would lose mail the model never saw.
-    let rendered =
-        render(&messages).ok_or("no random source answered, so the mail cannot be marked")?;
+    let rendered = render_mail(&messages);
     // A harness seam, in debug builds only: pause between the peek and the
     // ack for `REMUX_HOOK_DELAY_MS` (at most 3 s, inside the hook's deadline),
     // so a test can acknowledge the mailbox in between. A release build never
@@ -485,10 +482,6 @@ fn lose_the_reply(acked: Result<ServerMessage, CliError>) -> Result<ServerMessag
         return Err(CliError::Timeout);
     }
     acked
-}
-
-fn render(messages: &[Message]) -> Option<String> {
-    Some(render_context(messages, &render_mark()?))
 }
 
 /// What `remux agent session` reports: the agent's hook payload, or a
@@ -625,7 +618,7 @@ mod tests {
     use super::*;
     use crate::client::cli_common::CONNECT_DEADLINE;
     use crate::client::msg_cli::RENDER_PREAMBLE;
-    use crate::protocol::{MsgState, Sender};
+    use crate::protocol::{Message, MsgState, Sender};
 
     fn message(id: u64, from: Sender, body: &str) -> Message {
         Message {
@@ -655,7 +648,7 @@ mod tests {
 
     #[test]
     fn stop_output_is_a_block_with_the_render_as_reason() {
-        let rendered = render(&[from_pane(1), from_pane(2)]).unwrap();
+        let rendered = render_mail(&[from_pane(1), from_pane(2)]);
         let out = output_for(HookEvent::ClaudeStop, &rendered).unwrap();
         assert!(!out.contains('\n'), "one line on stdout: {out}");
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -666,11 +659,15 @@ mod tests {
             "the render verbatim, newlines and quotes too"
         );
         assert!(reason.starts_with(RENDER_PREAMBLE));
+        assert!(
+            reason.contains("\nfrom lead (main), #2:\n    line one\n    \"quoted\" line two\n"),
+            "{reason}"
+        );
     }
 
     #[test]
     fn prompt_output_wraps_the_render_in_hook_specific_output() {
-        let rendered = render(&[from_pane(1)]).unwrap();
+        let rendered = render_mail(&[from_pane(1)]);
         let out = output_for(HookEvent::ClaudePrompt, &rendered).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
@@ -704,10 +701,7 @@ mod tests {
 
     #[test]
     fn an_empty_mailbox_prints_nothing() {
-        assert_eq!(
-            output_for(HookEvent::ClaudeStop, &render(&[]).unwrap()),
-            None
-        );
+        assert_eq!(output_for(HookEvent::ClaudeStop, &render_mail(&[])), None);
     }
 
     #[test]
@@ -828,18 +822,18 @@ mod tests {
                 host: "mini".into(),
                 pane_id: 4,
                 name: Some("beta".into()),
+                session: "build".into(),
             },
             "hi",
         );
-        let out = output_for(HookEvent::ClaudeStop, &render(&[remote]).unwrap()).unwrap();
+        let out = output_for(HookEvent::ClaudeStop, &render_mail(&[remote])).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let reason = parsed["reason"].as_str().unwrap();
         assert!(
-            parsed["reason"]
-                .as_str()
-                .unwrap()
-                .contains("From: mini:beta (mini:%4)"),
+            reason.contains("\nfrom mini:beta (build), #3:\n    hi\n"),
             "{out}"
         );
+        assert!(!reason.contains('%'), "{out}");
     }
 
     #[test]

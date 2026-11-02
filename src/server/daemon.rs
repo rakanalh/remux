@@ -855,10 +855,7 @@ async fn handle_msg_send(
                         pane: to,
                         deliver: msg.deliver,
                         body,
-                        from: crate::server::messaging::SubmitFrom::Pane {
-                            pane: from.pane,
-                            name: from_name.clone(),
-                        },
+                        from: crate::server::messaging::SubmitFrom::Pane { pane: from.pane },
                         enqueued_at,
                         defer: msg.defer,
                         deadline,
@@ -1547,6 +1544,7 @@ async fn handle_inbound(
                 host: link.clone(),
                 pane_id: from_pane,
                 name: req.origin.name,
+                session: req.origin.session,
             },
             to,
             req.body,
@@ -2295,7 +2293,8 @@ async fn handle_peer_link(
 /// A `MsgSend` on a peer link: no pane to attribute, since the relay is
 /// sshd's child. The sender is the link's declared name and the origin's
 /// pane; `origin.host` is checked and never stored, so one connection names
-/// one host. Only mailbox delivery arrives over a link in this build.
+/// one host. A `submit` or `auto` over the link is typed into the target like
+/// a local one, as the raw body: nothing typed names the host it came from.
 #[allow(clippy::too_many_arguments)]
 async fn handle_link_send(
     client_id: u64,
@@ -2370,12 +2369,7 @@ async fn handle_link_send(
     } else {
         None
     };
-    let from = crate::server::messaging::SubmitFrom::Remote {
-        link: link.clone(),
-        pane: from_pane,
-        name: origin.name.clone(),
-        origin_id: origin.id,
-    };
+    let from = crate::server::messaging::SubmitFrom::Remote { link: link.clone() };
     let enqueued_at = std::time::Instant::now();
     let deadline = submit_deadline(enqueued_at, msg.defer, msg.timeout_ms);
     let wait_until = msg.wait.then(|| enqueued_at + wait_timeout(msg.timeout_ms));
@@ -2399,6 +2393,7 @@ async fn handle_link_send(
                     host: link.clone(),
                     pane_id: from_pane,
                     name: origin.name,
+                    session: origin.session,
                 },
                 to,
                 msg.body,
@@ -2860,15 +2855,6 @@ async fn step_submit(
             return;
         }
     };
-    // A mark per typing, never stored: the body was written before it.
-    let envelope = match rule.envelope.then(crate::client::msg_cli::render_mark) {
-        None => None,
-        Some(Some(mark)) => Some(crate::server::submit::envelope(id, &entry.from, &mark)),
-        Some(None) => {
-            let answer = settle(entry.deliver, SubmitRefusal::no_mark(pane));
-            return answer_untyped(entry, answer, None, store).await;
-        }
-    };
     let command = sample.command.clone().unwrap_or_default();
     let typed = type_text(
         id,
@@ -2876,7 +2862,6 @@ async fn step_submit(
         &sample,
         &command,
         &entry.body,
-        envelope.as_ref(),
         &rule,
         entry.deliver,
         config,
@@ -3317,7 +3302,6 @@ async fn type_text(
     sample: &PaneSample,
     command: &str,
     body: &str,
-    envelope: Option<&crate::server::submit::Envelope>,
     rule: &crate::server::submit::SubmitRule,
     deliver: Deliver,
     config: &Config,
@@ -3345,8 +3329,8 @@ async fn type_text(
     }
     // On a pty the master's termios requests reach the slave's settings. A
     // line-buffered terminal means a shell, `read` or a password prompt is
-    // reading: it would take the text as a line of its own the moment the
-    // envelope's newline arrives.
+    // reading: it would take the text as a line of its own the moment a
+    // newline in it arrives.
     match tcgetattr(master) {
         Ok(termios) if !termios.local_flags.contains(LocalFlags::ICANON) => {}
         _ => {
@@ -3389,14 +3373,7 @@ async fn type_text(
     else {
         return refuse(SubmitRefusal::not_read(pane));
     };
-    let (text, enter) = encode(
-        body,
-        framing,
-        paste_live,
-        rule.focus_in,
-        &rule.enter,
-        envelope,
-    );
+    let (text, enter) = encode(body, framing, rule.focus_in, &rule.enter);
     let bytes = text.len();
     let (probe, body) = split_probe(text, framing, rule.focus_in);
     let bracketed = framing == Framing::Bracketed;

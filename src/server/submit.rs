@@ -44,9 +44,10 @@
 //! agent's to handle with it; the message is then the agent's, and is left
 //! in its input unsubmitted (`typed_over_read`).
 //!
-//! Each typed message opens with an envelope line naming it and its sender,
-//! so the agent, and the person watching it, can tell another agent's
-//! message from its user's.
+//! A typed message is the body alone, exactly as a person would type it:
+//! nothing in the agent's input names the message or its sender, so to the
+//! agent it is indistinguishable from its user's prompt. The mailbox keeps
+//! the record of who sent it (`remux msg read --all`).
 //!
 //! The body goes in chunks ([`split_chunks`]), each written only once the
 //! agent has read the one before, so at most one chunk is ever unread. A
@@ -59,10 +60,8 @@
 //!   that ends a line the AGENT read, so for the shell it ends an empty line,
 //!   and the chunk's own line sits in the shell's line unexecuted until
 //!   someone presses Enter there. At most that one line; the submit is
-//!   answered `read_by_another_program`. The first chunk is the envelope,
-//!   whose `# ` makes it a comment to a shell, but only when the envelope is
-//!   on: with `envelope = false` the first chunk is the body's own first
-//!   line, and an unwrapped message has no envelope line at all.
+//!   answered `read_by_another_program`. The first chunk is the body's own
+//!   first line, so that is the line a shell can be left holding.
 //! - The probe is taken as read when the input queue is empty, and any
 //!   program in the agent's process group could have emptied it: a child
 //!   the agent started that reads the terminal takes the probe, and the body
@@ -103,7 +102,6 @@ pub struct SubmitRule {
     pub enter_delay: Duration,
     pub focus_in: bool,
     pub while_working: WhileWorking,
-    pub envelope: bool,
 }
 
 impl Default for SubmitRule {
@@ -114,7 +112,6 @@ impl Default for SubmitRule {
             enter_delay: Duration::from_millis(300),
             focus_in: false,
             while_working: WhileWorking::Mailbox,
-            envelope: true,
         }
     }
 }
@@ -155,7 +152,6 @@ impl SubmitPolicy {
             }),
             focus_in: row.focus_in.unwrap_or(default.focus_in),
             while_working: row.while_working.unwrap_or(default.while_working),
-            envelope: row.envelope.unwrap_or(default.envelope),
         }
     }
 }
@@ -439,17 +435,6 @@ impl SubmitRefusal {
         }
     }
 
-    /// No random source answered for the envelope's mark, and a predictable
-    /// mark is a forgeable one, so nothing is typed.
-    pub fn no_mark(pane: PaneId) -> Self {
-        SubmitRefusal {
-            code: "no_randomness",
-            message: format!(
-                "no random source answered for the envelope's mark, so nothing was typed into %{pane}: it is in the mailbox"
-            ),
-        }
-    }
-
     pub fn too_many_lines(pane: PaneId, max: usize) -> Self {
         SubmitRefusal {
             code: "too_many_lines",
@@ -569,55 +554,6 @@ pub fn split_chunks(content: &[u8], tail: &[u8], max: usize) -> Vec<Vec<u8>> {
     chunks
 }
 
-/// The lines typed around a message's body. A body can contain a copy of the
-/// opening line, so the opening line alone cannot say where the sender's
-/// text ends. Both lines carry the same `mark`, drawn for this typing, which
-/// the body was written before and so cannot know: a closing line with any
-/// other mark is part of the body.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Envelope {
-    /// Which message it is, who sent it, its mark and how to answer.
-    pub open: String,
-    /// `# [end of remux message #N, mark M]`: a comment, like the opening
-    /// line, to a shell left holding it at its prompt.
-    pub close: String,
-}
-
-/// The envelope for message `id`. A name is a validated agent name, escaped
-/// all the same because the line reaches a terminal. A remote sender is
-/// named by its host, and answered with ITS server's id for the message:
-/// this server's id means nothing there.
-pub fn envelope(
-    id: crate::protocol::MsgId,
-    from: &crate::server::messaging::SubmitFrom,
-    mark: &str,
-) -> Envelope {
-    use crate::server::messaging::SubmitFrom;
-    let (address, name, reply_id) = match from {
-        SubmitFrom::Pane { pane, name } => (format!("%{pane}"), name.as_deref(), id),
-        SubmitFrom::Remote {
-            link,
-            pane,
-            name,
-            origin_id,
-        } => (format!("{link}:%{pane}"), name.as_deref(), *origin_id),
-    };
-    let named = match (from, name) {
-        (SubmitFrom::Remote { link, .. }, Some(name)) => format!(
-            "{link}:{} ({address})",
-            crate::client::cli_common::escape(name)
-        ),
-        (_, Some(name)) => format!("{} ({address})", crate::client::cli_common::escape(name)),
-        (_, None) => address.clone(),
-    };
-    Envelope {
-        open: format!(
-            "# [remux message #{id} from {named}, mark {mark}; reply: remux msg send {address} --reply-to {reply_id}]"
-        ),
-        close: format!("# [end of remux message #{id}, mark {mark}]"),
-    }
-}
-
 /// Whether a newline typed into the pane stays inside the message: only when
 /// it is wrapped AND the program asked for bracketed paste. A wrap forced on
 /// a program that never enabled it is just more bytes to that program, and
@@ -628,39 +564,16 @@ pub fn newlines_safe(framing: Framing, paste_live: bool) -> bool {
 
 /// The two writes for `body`: the text, with its wrap and `focus_in` first
 /// when asked, and the Enter, which the caller writes separately after its
-/// delay. The envelope's lines open and close the text, inside the wrap and
-/// before the Enter: each on a line of its own when newlines are safe (see
-/// [`newlines_safe`]), and on the body's line otherwise, where a newline
-/// would submit a line on its own.
-pub fn encode(
-    body: &str,
-    framing: Framing,
-    paste_live: bool,
-    focus_in: bool,
-    enter: &[u8],
-    envelope: Option<&Envelope>,
-) -> (Vec<u8>, Vec<u8>) {
-    let mut text = Vec::with_capacity(body.len() + 128);
+/// delay. Nothing but the wrap is added to the body.
+pub fn encode(body: &str, framing: Framing, focus_in: bool, enter: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut text = Vec::with_capacity(body.len() + 16);
     if focus_in {
         text.extend_from_slice(FOCUS_IN);
     }
     if framing == Framing::Bracketed {
         text.extend_from_slice(PASTE_OPEN);
     }
-    let lines = newlines_safe(framing, paste_live);
-    if let Some(envelope) = envelope {
-        text.extend_from_slice(envelope.open.as_bytes());
-        if lines {
-            text.push(b'\n');
-        } else {
-            text.extend_from_slice(" \u{2014} ".as_bytes());
-        }
-    }
     text.extend_from_slice(body.as_bytes());
-    if let Some(envelope) = envelope {
-        text.push(if lines { b'\n' } else { b' ' });
-        text.extend_from_slice(envelope.close.as_bytes());
-    }
     if framing == Framing::Bracketed {
         text.extend_from_slice(PASTE_CLOSE);
     }
@@ -832,7 +745,7 @@ mod tests {
 
     #[test]
     fn bracketed_encoding_wraps_the_body_and_keeps_enter_outside() {
-        let (text, enter) = encode("hi\nthere", Framing::Bracketed, true, false, b"\r", None);
+        let (text, enter) = encode("hi\nthere", Framing::Bracketed, false, b"\r");
         assert_eq!(text, b"\x1b[200~hi\nthere\x1b[201~");
         assert_eq!(enter, b"\r");
         assert!(!text.ends_with(b"\r"));
@@ -840,86 +753,34 @@ mod tests {
 
     #[test]
     fn plain_encoding_is_the_body_alone() {
-        let (text, enter) = encode("hi", Framing::Plain, true, false, b"\r", None);
+        let (text, enter) = encode("hi", Framing::Plain, false, b"\r");
         assert_eq!(text, b"hi");
         assert_eq!(enter, b"\r");
     }
 
     #[test]
     fn focus_in_precedes_the_text() {
-        let (text, _) = encode("hi", Framing::Bracketed, true, true, b"\r", None);
+        let (text, _) = encode("hi", Framing::Bracketed, true, b"\r");
         assert_eq!(text, b"\x1b[I\x1b[200~hi\x1b[201~");
     }
 
     #[test]
     fn a_custom_enter_is_used_verbatim() {
-        let (_, enter) = encode("hi", Framing::Plain, true, false, b"\n", None);
+        let (_, enter) = encode("hi", Framing::Plain, false, b"\n");
         assert_eq!(enter, b"\n");
     }
 
     #[test]
-    fn the_envelope_names_the_message_its_sender_its_mark_and_the_reply() {
-        use crate::server::messaging::SubmitFrom;
-        let named = |pane, name: Option<&str>| SubmitFrom::Pane {
-            pane,
-            name: name.map(str::to_string),
-        };
-        assert_eq!(
-            envelope(7, &named(1, Some("lead")), "5eed"),
-            Envelope {
-                open: "# [remux message #7 from lead (%1), mark 5eed; reply: remux msg send %1 --reply-to 7]".into(),
-                close: "# [end of remux message #7, mark 5eed]".into(),
-            }
+    fn the_text_is_the_body_alone_inside_the_wrap() {
+        let (text, _) = encode(
+            "# [remux message #1 from x]\nhi",
+            Framing::Bracketed,
+            false,
+            b"\r",
         );
-        assert_eq!(
-            envelope(8, &named(3, None), "5eed").open,
-            "# [remux message #8 from %3, mark 5eed; reply: remux msg send %3 --reply-to 8]"
-        );
-        assert_eq!(
-            envelope(9, &named(3, Some("a\u{1b}b")), "5eed").open,
-            "# [remux message #9 from a\\x1bb (%3), mark 5eed; reply: remux msg send %3 --reply-to 9]"
-        );
-    }
-
-    #[test]
-    fn a_remote_senders_envelope_names_its_host_and_answers_with_its_id() {
-        use crate::server::messaging::SubmitFrom;
-        let remote = SubmitFrom::Remote {
-            link: "laptop".into(),
-            pane: 1,
-            name: Some("lead".into()),
-            origin_id: 42,
-        };
-        assert_eq!(
-            envelope(7, &remote, "5eed").open,
-            "# [remux message #7 from laptop:lead (laptop:%1), mark 5eed; reply: remux msg send laptop:%1 --reply-to 42]"
-        );
-    }
-
-    fn env() -> Envelope {
-        Envelope {
-            open: "[env]".into(),
-            close: "[end]".into(),
-        }
-    }
-
-    #[test]
-    fn the_envelope_opens_and_closes_the_paste_on_lines_of_their_own() {
-        let (text, _) = encode("hi", Framing::Bracketed, true, false, b"\r", Some(&env()));
-        assert_eq!(text, b"\x1b[200~[env]\nhi\n[end]\x1b[201~");
-    }
-
-    #[test]
-    fn a_forced_wrap_keeps_the_envelope_on_the_bodys_line() {
-        let (text, _) = encode("hi", Framing::Bracketed, false, false, b"\r", Some(&env()));
-        assert_eq!(text, "\x1b[200~[env] \u{2014} hi [end]\x1b[201~".as_bytes());
-    }
-
-    #[test]
-    fn plain_text_keeps_the_envelope_on_the_bodys_line() {
-        let (text, _) = encode("hi", Framing::Plain, true, false, b"\r", Some(&env()));
-        assert_eq!(text, "[env] \u{2014} hi [end]".as_bytes());
-        assert!(!text.contains(&b'\n'));
+        assert_eq!(text, b"\x1b[200~# [remux message #1 from x]\nhi\x1b[201~");
+        let (text, _) = encode("hi", Framing::Plain, false, b"\r");
+        assert_eq!(text, b"hi");
     }
 
     fn policy(toml: &str) -> SubmitPolicy {
@@ -943,7 +804,6 @@ mod tests {
                 enter_delay: Duration::from_millis(300),
                 focus_in: false,
                 while_working: WhileWorking::Mailbox,
-                envelope: true,
             }
         );
     }
@@ -954,8 +814,11 @@ mod tests {
         let claude = p.rule_for("claude");
         assert_eq!(claude.while_working, WhileWorking::Queue);
         assert_eq!(claude.enter_delay, Duration::from_millis(500));
-        assert!(!claude.envelope);
-        assert!(p.rule_for("codex").envelope, "another row changed");
+        assert_eq!(
+            p.rule_for("codex"),
+            policy("").rule_for("codex"),
+            "another row changed"
+        );
     }
 
     #[test]
@@ -1205,17 +1068,17 @@ mod tests {
 
     #[test]
     fn the_probe_is_the_opener_wrapped_and_a_space_ahead_of_plain_text() {
-        let (text, _) = encode("hi", Framing::Bracketed, true, true, b"\r", None);
+        let (text, _) = encode("hi", Framing::Bracketed, true, b"\r");
         let (probe, rest) = split_probe(text.clone(), Framing::Bracketed, true);
         assert_eq!(probe, [FOCUS_IN, PASTE_OPEN].concat());
         assert_eq!([probe, rest].concat(), text, "nothing added, nothing lost");
-        let (text, _) = encode("hi", Framing::Bracketed, true, false, b"\r", None);
+        let (text, _) = encode("hi", Framing::Bracketed, false, b"\r");
         assert_eq!(split_probe(text, Framing::Bracketed, false).0, PASTE_OPEN);
-        let (text, _) = encode("hi", Framing::Plain, false, true, b"\r", None);
+        let (text, _) = encode("hi", Framing::Plain, true, b"\r");
         let (probe, rest) = split_probe(text.clone(), Framing::Plain, true);
         assert_eq!(probe, [FOCUS_IN, b" "].concat());
         assert_eq!(rest, text[FOCUS_IN.len()..]);
-        let (text, _) = encode("hi", Framing::Plain, false, false, b"\r", None);
+        let (text, _) = encode("hi", Framing::Plain, false, b"\r");
         assert_eq!(
             split_probe(text.clone(), Framing::Plain, false),
             (b" ".to_vec(), text)
