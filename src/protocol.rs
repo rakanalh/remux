@@ -1329,6 +1329,10 @@ pub enum ServerMessage {
     ///
     /// `request` is the id the [`ClientMessage::ListLayouts`] carried.
     ///
+    /// It also answers [`ClientMessage::ListViewLayouts`], for a View: then
+    /// `layouts` are the names [`ClientMessage::ViewSetLayout`] accepts, never
+    /// `custom`, `current` is the View's layout, and `popup_open` is false.
+    ///
     /// `layouts` is also empty while the active tab's popup is open, and
     /// `popup_open` says so. The server ignores `LayoutSet` then, because
     /// the popup is the input target and a layout switch would act on it.
@@ -2771,7 +2775,8 @@ pub enum ClientAction {
     /// Open the agent switcher overlay: every pane running an agent, on every
     /// connected server.
     AgentQuickSwitch,
-    /// Open the layout switcher overlay for the active tab.
+    /// Open the layout switcher overlay for the active tab, or for the View
+    /// on screen.
     LayoutQuickSwitch,
     /// Open the tab picker that moves the focused pane to another tab of its
     /// session, or to a new one.
