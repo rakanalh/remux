@@ -409,6 +409,8 @@ The value is joined to its flag, or put after `--`, so that a stored value can n
 - **Ids stay out of the logs** — `server.log` and `client.log` name the agent, the pane and the length of the session id or path, never the value.
 - **Upgrading** — this needs protocol 22. Rebuild Remux on every machine and run `remux restart` on each.
 
+Full details: [https://rakanalh.github.io/remux/session-restore/](https://rakanalh.github.io/remux/session-restore/)
+
 ### Configuration file
 
 Remux reads `$XDG_CONFIG_HOME/remux/config.toml` when `XDG_CONFIG_HOME` is set to an absolute path, otherwise `~/.config/remux/config.toml` on Linux and `~/Library/Application Support/remux/config.toml` on macOS. A complete, fully-commented reference lives in [`config.sample.toml`](config.sample.toml) — every option is shown commented-out at its default value, so copying it verbatim reproduces the built-in defaults (the few options with no default value, such as `frame_bg`, are shown with an example value and marked as such):

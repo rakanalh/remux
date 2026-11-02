@@ -106,6 +106,8 @@ By default the server saves every session to disk after each structural change (
 Restore brings back the arrangement and the working directories, not the running programs or their scrollback. A pane that was running `vim` comes back as a shell in the same directory.
 :::
 
+The exception is an AI coding agent. With its integration installed, a pane that was running Claude Code, Codex, pi, omp or OpenCode comes back with the agent reopened on the same conversation: the server types the agent's resume command into the pane's new shell. See [Resuming agents after a restart](/remux/session-restore/).
+
 Two settings in `[general]` control this:
 
 ```toml

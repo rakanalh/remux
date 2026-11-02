@@ -154,6 +154,10 @@ Match something that disappears once the prompt is answered, such as a hint line
 
 The server log records why each pane was classified as it was, and which pattern matched. If a pane is stuck on "needs input" or never turns red, check `server.log` (see [Troubleshooting](/remux/troubleshooting/#logs)), adjust the pattern and run `remux restart`.
 
+## Resume after a restart
+
+A restart normally brings every pane back as a fresh shell. Install an agent's resume integration, such as `remux integrate claude-resume`, and a pane running that agent comes back with it reopened on the same conversation. It covers Claude Code, Codex, pi, omp and OpenCode; see [Resuming agents after a restart](/remux/session-restore/).
+
 ## Platform support
 
 Detection reads the pane's foreground process, so it sees `claude` running inside your shell. It works on **Linux and macOS**. What matters is the platform of the **server** running the pane: a macOS client attached to a Linux server detects fine, and the reverse too.
@@ -162,6 +166,7 @@ A server that cannot detect agents shows `<server>: no detection` in the list (f
 
 ## Related
 
+- [Resuming agents after a restart](/remux/session-restore/): reopen each agent's conversation after `remux restart`.
 - [Sidebars](/remux/sidebars/): dock the agents panel.
 - [Remotes](/remux/remotes/): see agents on other machines.
 - [Configuration reference](/remux/config-reference/#notifications): `[notifications]`.

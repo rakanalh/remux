@@ -7,7 +7,7 @@ description: Every remux subcommand and flag.
 remux [COMMAND]
 ```
 
-With no command, `remux` attaches you to a session. The other commands manage sessions and the server from a shell, `split` and `new-tab` open panes from a script running inside Remux, and `msg`, `agent` and `integrate` are for [agent messaging](/remux/messaging/).
+With no command, `remux` attaches you to a session. The other commands manage sessions and the server from a shell, `split` and `new-tab` open panes from a script running inside Remux, `msg` and `agent` are for [agent messaging](/remux/messaging/), and `integrate` installs a coding agent's hooks for [messaging](/remux/messaging/) or for [resuming it after a restart](/remux/session-restore/).
 
 | Command | Does |
 |---|---|
@@ -23,7 +23,7 @@ With no command, `remux` attaches you to a session. The other commands manage se
 | [`remux new-tab`](#remux-new-tab) | Open a new tab (from inside a pane) |
 | [`remux msg`](#remux-msg) | Leave messages for other panes and read your own |
 | [`remux agent`](#remux-agent) | Name panes and list the ones that can be sent to |
-| [`remux integrate`](#remux-integrate) | Install, check or remove a coding agent's hooks for messaging |
+| [`remux integrate`](#remux-integrate) | Install, check or remove a coding agent's hooks for messaging or session restore |
 
 Every command takes `-h`/`--help`. `remux -V` (or `--version`) prints the version.
 
@@ -105,7 +105,7 @@ remux restart
 Stops the server as `stop` does, then starts a new one. Saved sessions are restored when it starts. Run this after changing any server-side setting. See [Configuration](/remux/configuration/#client-settings-and-server-settings).
 
 :::caution
-A restarted server re-creates each saved pane with a fresh shell in the directory the pane was in. Programs that were running in the panes are not carried over.
+A restarted server re-creates each saved pane with a fresh shell in the directory the pane was in. Programs that were running in the panes are not carried over, except an AI coding agent whose resume integration is installed, which is reopened on its conversation. See [Resuming agents after a restart](/remux/session-restore/).
 :::
 
 ## `remux split`
@@ -196,6 +196,7 @@ remux agent ls [--json]
 remux agent status [TARGET] [--json]
 remux agent name <NAME | --clear> [--pane <PANE>]
 remux agent wait <TARGET> --state <idle|working|blocked> [--timeout <DUR>] [--json]
+remux agent session <AGENT> <--hook | --id <ID> | --path <PATH>> [--source <SOURCE>] [--pane <PANE>]
 ```
 
 | Command | Does |
@@ -204,14 +205,38 @@ remux agent wait <TARGET> --state <idle|working|blocked> [--timeout <DUR>] [--js
 | `status` | Show one pane, or every pane worth listing |
 | `name` | Give this pane the name other panes send to (`[a-z][a-z0-9_-]{0,31}`), or remove it with `--clear`. `--pane %N` names another pane, and only works from outside every pane. |
 | `wait` | Wait until a pane's agent is idle, working or blocked (waiting on its user). Exits 0 when it is, and also when the time runs out, saying so. `--timeout` defaults to `10m`. |
+| `session` | Run by an agent's hook or plugin, never by hand: a report typed at the prompt is refused. Reports the session the pane's agent is running, so that a restore resumes it. See below. |
+
+`remux agent session` is what the `<agent>-resume` integrations install. `<AGENT>` is `claude`, `codex`, `opencode`, `pi` or `omp`. It always exits 0 and prints nothing on stdout, and outside a pane it does nothing at all.
+
+| `agent session` flag | Meaning |
+|---|---|
+| `--hook` | Read the agent's hook payload from standard input |
+| `--id <ID>` | The session's id |
+| `--path <PATH>` | The session file's absolute path |
+| `--source <SOURCE>` | How the session started: `startup`, `resume`, `clear`, `compact`, `fork`, `new` or `select`. Read from the payload with `--hook`. |
+| `--pane <PANE>` | Another pane, `%N`. Only from outside every pane. |
+
+See [Resuming agents after a restart](/remux/session-restore/).
 
 ## `remux integrate`
 
 ```shell
-remux integrate [OPTIONS] claude-messaging
+remux integrate [OPTIONS] <HARNESS>
 ```
 
-Install, check or remove what a coding agent needs in its own files to use Remux messaging. `claude-messaging` is Claude Code's `Stop` and `UserPromptSubmit` hooks in `~/.claude/settings.json`, and the remux-messaging skill. Run it on the machine the agent runs on, as the user it runs as. With no flag, it installs.
+Install, check or remove what a coding agent needs in its own files to use Remux. Run it on the machine the agent runs on, as the user it runs as. With no flag, it installs.
+
+| `<HARNESS>` | Installs |
+|---|---|
+| `claude-messaging` | Claude Code's `Stop` and `UserPromptSubmit` hooks in `$CLAUDE_CONFIG_DIR/settings.json` (`~/.claude` by default), and the remux-messaging skill. See [Claude Code hooks](/remux/messaging/#claude-code-hooks). |
+| `claude-resume` | Claude Code's `SessionStart` hook that reports the session for restore after `remux restart`, in the same `settings.json` |
+| `codex-resume` | Codex's `SessionStart` hook in `$CODEX_HOME/hooks.json` (`~/.codex` by default), and `[features] hooks = true` in its `config.toml` |
+| `pi-resume` | pi's `remux-agent-session.ts` extension in `$PI_CODING_AGENT_DIR` (`~/.pi/agent` by default) |
+| `omp-resume` | omp's `remux-agent-session.ts` extension in `~/$PI_CONFIG_DIR/agent` (`~/.omp/agent` by default) |
+| `opencode-resume` | OpenCode 1.x and 2.x: a server plugin and a TUI plugin under `$OPENCODE_CONFIG_DIR/plugins/`, the TUI one also listed in its `tui.json(c)` for 1.x (`~/.config/opencode` by default) |
+
+The `-resume` targets refuse an agent config directory that does not exist yet: run the agent once first. See [Resuming agents after a restart](/remux/session-restore/).
 
 | Flag | Meaning |
 |---|---|
@@ -220,7 +245,7 @@ Install, check or remove what a coding agent needs in its own files to use Remux
 | `--uninstall` | Remove remux's hooks, and nothing of yours |
 | `--allow-dev-path` | Write hooks that run this binary even though it is a cargo build output (under a `target/` directory). Only for running a Remux built from source under `target/`; an installed binary never needs it. |
 
-See [Claude Code hooks](/remux/messaging/#claude-code-hooks).
+Every target takes these flags.
 
 ## Environment variables
 
