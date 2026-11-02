@@ -8951,6 +8951,21 @@ async fn run_client_loop(
                             active_view =
                                 active_view_id.and_then(|id| views.iter().position(|v| v.id == id));
 
+                            // A switcher for a deleted View would hold the
+                            // keyboard and offer a list no server applies.
+                            let switcher_view = input.layout_switch.as_ref().and_then(|ls| match ls.target() {
+                                LayoutTarget::View(id) => Some(id),
+                                LayoutTarget::Tab => None,
+                            });
+                            if switcher_view.is_some_and(|id| !views.iter().any(|v| v.id == id)) {
+                                log::debug!("layout switcher: closed, its view was deleted");
+                                input.layout_switch = None;
+                                input.mode = Mode::Normal;
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                            }
+
                             // A view this terminal just created: enter it now that the
                             // snapshot carries it (takes precedence over plain sync).
                             let entered = match pending_enter_view {
