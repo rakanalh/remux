@@ -56,10 +56,14 @@ files named in REAL_FILES are hashed before and after and must be unchanged
 (the user's own running agents can rewrite them, so a change is reported with
 the file's mtime).
 
-macOS claude is refused: under a throwaway CLAUDE_CONFIG_DIR, Claude Code's
-secure storage reads a Keychain service named for that dir and falls back to
-the plaintext file, but its write path, and its device-key store, can create
-Keychain items, and this harness never writes the Keychain.
+macOS claude is refused unless REMUX_REAL_E2E_KEYCHAIN=1 is also set: under a
+throwaway CLAUDE_CONFIG_DIR, Claude Code's secure storage reads a Keychain
+service named for that dir and falls back to the plaintext file, but its write
+path, and its device-key store, can create Keychain items. This harness never
+touches the Keychain itself; whoever sets that variable snapshots the login
+keychain before and after and deletes what the run created. On macOS the real
+~/.claude/.credentials.json is not compared (the user's live claude rewrites
+it); ~/.claude.json is compared instead.
 """
 import atexit
 import base64
@@ -612,8 +616,12 @@ def main():
     for agent in agents:
         spec = AGENTS[agent]
         if agent == "claude" and sys.platform == "darwin":
-            print("SKIP  claude on macOS: its secure storage can write Keychain items (see the docstring)")
-            continue
+            if os.environ.get("REMUX_REAL_E2E_KEYCHAIN") != "1":
+                print("SKIP  claude on macOS: its secure storage can write Keychain items (see the docstring); "
+                      "set REMUX_REAL_E2E_KEYCHAIN=1 to run it anyway")
+                continue
+            spec = dict(spec, real_files=[p for p in spec["real_files"] if not p.endswith("/.credentials.json")]
+                        + [f"{REAL_HOME}/.claude.json"])
         binary = real_binary(agent)
         if not binary:
             print(f"SKIP  {agent}: no real binary")
