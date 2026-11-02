@@ -1588,6 +1588,11 @@ pub struct LayoutSwitchOverlay {
     current: String,
     /// Why `layouts` is empty, shown in place of the list.
     why_empty: Option<&'static str>,
+    /// Whether a row of `layouts` is highlighted. False while `current` is not
+    /// in the list (a View arranged by hand reads `custom`, which is never
+    /// offered), so Enter closes the switcher instead of replacing that
+    /// arrangement with a layout the user never chose.
+    highlighted: bool,
     nav: crate::client::sidebar::nav::NavList,
 }
 
@@ -1600,12 +1605,17 @@ impl LayoutSwitchOverlay {
             layouts: None,
             current: String::new(),
             why_empty: None,
+            highlighted: false,
             nav: crate::client::sidebar::nav::NavList::new(),
         }
     }
 
     pub fn conn(&self) -> &ConnId {
         &self.conn
+    }
+
+    pub fn target(&self) -> LayoutTarget {
+        self.target
     }
 
     /// Take the server's list if it answers this open's request on the pinned
@@ -1625,21 +1635,35 @@ impl LayoutSwitchOverlay {
         if popup_open {
             self.why_empty = Some(POPUP_OPEN);
         }
-        let start = layouts.iter().position(|l| *l == current).unwrap_or(0);
-        self.nav.set_selected(start);
+        let start = layouts.iter().position(|l| *l == current);
+        self.highlighted = start.is_some();
+        self.nav.set_selected(start.unwrap_or(0));
         self.layouts = Some(layouts);
         self.current = current;
         true
     }
 
     fn navigate(&mut self, cmd: crate::client::sidebar::nav::NavKey) {
+        use crate::client::sidebar::nav::NavKey;
         let len = self.layouts.as_ref().map_or(0, Vec::len);
-        self.nav.apply(cmd, len);
+        if self.highlighted {
+            self.nav.apply(cmd, len);
+        } else if len > 0 {
+            self.highlighted = true;
+            let first = match cmd {
+                NavKey::Up | NavKey::Last => len - 1,
+                _ => 0,
+            };
+            self.nav.set_selected(first);
+        }
     }
 
     /// The confirm action for the highlighted layout, if the list has arrived
     /// and is not empty.
     fn choice(&self) -> Option<InputAction> {
+        if !self.highlighted {
+            return None;
+        }
         let name = self.layouts.as_ref()?.get(self.nav.selected())?;
         Some(InputAction::LayoutSwitchConfirm {
             conn: self.conn.clone(),
@@ -1664,14 +1688,19 @@ impl LayoutSwitchOverlay {
                 };
                 vec![SwitchRow::item(text, false)]
             }
-            Some(layouts) => layouts
-                .iter()
-                .enumerate()
-                .map(|(i, name)| {
-                    let marker = if *name == self.current { "* " } else { "  " };
-                    SwitchRow::item(format!("{marker}{name}"), i == self.nav.selected())
-                })
-                .collect(),
+            Some(layouts) => {
+                // Not one of `layouts`, so no key can highlight it.
+                let unlisted = (!self.current.is_empty() && !layouts.contains(&self.current))
+                    .then(|| SwitchRow::item(format!("* {} (current)", self.current), false));
+                unlisted
+                    .into_iter()
+                    .chain(layouts.iter().enumerate().map(|(i, name)| {
+                        let marker = if *name == self.current { "* " } else { "  " };
+                        let selected = self.highlighted && i == self.nav.selected();
+                        SwitchRow::item(format!("{marker}{name}"), selected)
+                    }))
+                    .collect()
+            }
         };
         render_switch_popup(" Switch Layout ", &rows, screen_cols, screen_rows, theme)
     }
@@ -6735,6 +6764,87 @@ mod tests {
             }
         );
         assert!(handler.layout_switch.is_none());
+    }
+
+    /// The text of every row the switcher paints, top to bottom.
+    fn layout_switch_rows(handler: &InputHandler) -> Vec<String> {
+        let theme = crate::config::theme::Theme::default();
+        let cmds = handler
+            .layout_switch
+            .as_ref()
+            .expect("open")
+            .render(80, 24, &theme);
+        let mut rows: Vec<(u16, String)> = cmds
+            .into_iter()
+            .filter(|c| c.text.trim_start().starts_with(['*', ' ']) && !c.text.trim().is_empty())
+            .map(|c| (c.y, c.text.trim().to_string()))
+            .collect();
+        rows.sort();
+        rows.into_iter().map(|(_, t)| t).collect()
+    }
+
+    fn custom_view_switch_handler() -> InputHandler {
+        let mut handler = InputHandler::with_defaults();
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Char('g'), KeyModifiers::ALT)),
+            InputAction::LayoutSwitchOpen
+        );
+        let request = open_layout_switch(&mut handler, LayoutTarget::View(5));
+        let overlay = handler.layout_switch.as_mut().expect("opened");
+        assert!(overlay.apply_from(
+            &ConnId::Local,
+            request,
+            layout_names(),
+            "custom".to_string(),
+            false
+        ));
+        handler
+    }
+
+    #[test]
+    fn alt_g_enter_on_a_hand_arranged_view_sends_nothing() {
+        let mut handler = custom_view_switch_handler();
+        assert!(
+            layout_switch_rows(&handler)
+                .iter()
+                .any(|r| r == "* custom (current)"),
+            "{:?}",
+            layout_switch_rows(&handler)
+        );
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::LayoutSwitchClose
+        );
+        assert!(handler.layout_switch.is_none());
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn the_first_move_on_a_hand_arranged_view_highlights_a_layout() {
+        let mut handler = custom_view_switch_handler();
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Char('j'), KeyModifiers::NONE)),
+            InputAction::LayoutSwitchUpdate
+        );
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::LayoutSwitchConfirm {
+                conn: ConnId::Local,
+                target: LayoutTarget::View(5),
+                name: "bsp".to_string()
+            }
+        );
+
+        let mut handler = custom_view_switch_handler();
+        handler.handle_key(make_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Char('l'), KeyModifiers::NONE)),
+            InputAction::LayoutSwitchConfirm {
+                conn: ConnId::Local,
+                target: LayoutTarget::View(5),
+                name: "monocle".to_string()
+            }
+        );
     }
 
     #[test]
