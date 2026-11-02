@@ -121,6 +121,13 @@ impl ServerView {
         }
     }
 
+    /// Switch to the automatic layout `mode`. A view keeps no saved manual
+    /// arrangement, so the custom tree is dropped rather than remembered.
+    fn set_layout(&mut self, mode: LayoutMode) {
+        self.layout = mode;
+        self.custom_tree = None;
+    }
+
     /// The stable id of the focused cell, or `0` when the view is empty.
     fn focused_id(&self) -> CellId {
         self.cells.get(self.focused).map(|c| c.id).unwrap_or(0)
@@ -885,8 +892,8 @@ impl ServerState {
     /// any custom tree.
     pub fn view_cycle_layout(&mut self, id: ViewId, enabled: &EnabledLayouts) {
         if let Some(v) = self.find_view_mut(id) {
-            v.layout = v.layout.next_enabled(enabled);
-            v.custom_tree = None;
+            let next = v.layout.next_enabled(enabled);
+            v.set_layout(next);
         }
     }
 
@@ -923,8 +930,7 @@ impl ServerState {
         if !enabled.allows(&mode) {
             return Err("disabled under [layouts]");
         }
-        v.layout = mode;
-        v.custom_tree = None;
+        v.set_layout(mode);
         Ok(true)
     }
 
