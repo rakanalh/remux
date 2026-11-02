@@ -30,10 +30,18 @@ What it covers:
      the popup is closed the list comes back
   9  in a View with two cells side by side, the switcher lists the View's
      layouts (grid absent, the current one marked); picking `rows` stacks the
-     cells, judged by the `stty size` each cell's own shell reports; the tab
-     underneath keeps its layout; server.log shows `ListViewLayouts` and
-     `ViewSetLayout` and no `ListLayouts` or `LayoutSet`; the client stays
-     alive
+     cells, judged by the `stty size` each cell's own shell reports;
+     server.log shows `ListViewLayouts` and `ViewSetLayout` and no
+     `ListLayouts` or `LayoutSet`; the client stays alive
+ 10  a View arranged by hand: the switcher shows `* custom (current)` with no
+     row highlighted, and Alt-g, Enter sends no `ViewSetLayout` and leaves
+     every cell's `stty size` as it was
+ 11  another client deletes the View while the switcher is open: the switcher
+     closes and typed keys reach the session's shell again
+ 12  with a fake REMOTE (an `ssh` shim running `remux relay` against a second
+     server) in the foreground, the View's switcher still lists and applies
+     through the LOCAL server: both messages are in the local server.log,
+     neither in the remote's, and the cells re-lay-out
 
 Run from the repo root:
     python3 tests/pty/layout_selector.py [-v]
@@ -43,7 +51,10 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import PROTOCOL_VERSION, Tui, sm_compose_view  # noqa: E402
+from pty_harness import (  # noqa: E402
+    BIN, PROTOCOL_VERSION, Tui, sm_compose_view, sm_goto, sm_goto_text, sm_open,
+)
+from harness import Client as WireClient, name_of  # noqa: E402
 
 RUN = "/tmp/rmx-lsel"
 VERBOSE = "-v" in sys.argv
@@ -402,10 +413,38 @@ def view_section():
                   and r_b < side_rows * 0.75,
                   detail)
 
+        # Hand-arrange the View: resize the focused (top) cell, which makes
+        # the View `custom`. Alt-g then Enter must leave that arrangement alone.
+        t.prefix(b"pR", 0.4)
+        for _ in range(3):
+            t.send(b"j", 0.3)
+        t.send(b"\x1b", 0.8)
+        arranged = report_sizes(t, 3, b"\x1bj")
+        check("view: the hand-arranged cells differ from plain rows",
+              len(arranged) == 2 and len(stacked) == 2
+              and [r for _, _, r, _ in arranged] != [r for _, _, r, _ in stacked],
+              f"rows {stacked}\narranged {arranged}")
+        sets_before = t.log("server").count("ViewSetLayout")
+        t.send(OPEN, 1.0)
+        items = popup_rows(t) or []
+        if VERBOSE:
+            t.dump("switcher on a hand-arranged view")
+        check("view: a hand-arranged View shows custom as current, unpickable",
+              "* custom (current)" in items and "* bsp" not in items, items)
+        t.send(b"\r", 1.0)
+        check("view: Enter on a hand-arranged View closes the switcher",
+              popup_rows(t) is None, "\n".join(t.rows_text()))
+        kept = report_sizes(t, 4, b"\x1bk")
+        check("view: Enter kept the hand arrangement",
+              len(kept) == 2 and [(r, c) for _, _, r, c in kept]
+              == [(r, c) for _, _, r, c in arranged],
+              f"arranged {arranged}\nafter Enter {kept}")
+        check("view: Enter sent no ViewSetLayout",
+              t.log("server").count("ViewSetLayout") == sets_before,
+              [ln for ln in t.log("server").splitlines() if "ViewSetLayout" in ln])
+
         t.prefix(b"wq", 1.2)
         check("view: left the view", not t.has("View 1"), "\n".join(t.rows_text()))
-        check("view: the tab underneath kept its own layout",
-              status_layout(t) == "bsp", t.rows_text()[-1])
         check("client is alive after the view checks", t.alive())
 
         server = t.log("server")
@@ -419,6 +458,154 @@ def view_section():
     finally:
         t.kill()
     check_logs(t, "view")
+
+
+def compose_local_view(t):
+    """Two local panes, `PA` and `PB`, composed into View 1 from a second tab,
+    so the cells are not session-visible. Returns whether the View is shown."""
+    t.send(b"printf 'P%s\\n' A\r", 0.5)
+    t.prefix(b"pv", 0.8)
+    t.send(b"printf 'P%s\\n' B\r", 0.5)
+    t.send(b"\x1bt", 0.8)
+    sm_compose_view(t, panes=(0, 1), settle=1.2)
+    return t.has("View 1")
+
+
+def deleted_view_section():
+    """Another client deletes the View while this one has its switcher open:
+    the switcher closes and the keyboard reaches the session's shell again."""
+    t = Tui(RUN, config=CONFIG).start()
+    try:
+        in_view = compose_local_view(t)
+        check("deleted view: a view is displayed", in_view, "\n".join(t.rows_text()))
+        if not in_view:
+            return
+        t.send(OPEN, 1.0)
+        check("deleted view: the switcher is open", popup_rows(t) is not None,
+              "\n".join(t.rows_text()))
+        other = WireClient(f"{RUN}/run/remux.sock")
+        other.hello()
+        views = [m["ViewList"]["views"] for m in other.drain(0.8) if name_of(m) == "ViewList"]
+        ids = [v["id"] for v in (views[-1] if views else [])]
+        check("deleted view: the other client sees one view", len(ids) == 1, views)
+        if ids:
+            other.send({"ViewDelete": {"id": ids[0]}})
+            other.drain(0.5)
+        other.close()
+        t.pump(1.5)
+        check("deleted view: the switcher closed", popup_rows(t) is None,
+              "\n".join(t.rows_text()))
+        t.send(b"printf 'K%s\\n' Z\r", 1.0)
+        check("deleted view: keys reach the shell again", t.has("KZ"),
+              "\n".join(t.rows_text()))
+        check("client is alive after the deleted-view checks", t.alive())
+    finally:
+        t.kill()
+    check_logs(t, "deleted view")
+
+
+REMOTE_RUN = "/tmp/rmx-lselr"
+
+
+def start_remote_server():
+    """A second isolated server, reached through an `ssh` shim that execs
+    `remux relay` against it, with one session `rbox`."""
+    import shutil
+    import subprocess
+    import time
+    shutil.rmtree(REMOTE_RUN, ignore_errors=True)
+    for d in ("run", "state", "data", "config", "home", "bin"):
+        os.makedirs(f"{REMOTE_RUN}/{d}", mode=0o700, exist_ok=True)
+    remote_env = {
+        "XDG_RUNTIME_DIR": f"{REMOTE_RUN}/run",
+        "XDG_STATE_HOME": f"{REMOTE_RUN}/state",
+        "XDG_DATA_HOME": f"{REMOTE_RUN}/data",
+        "XDG_CONFIG_HOME": f"{REMOTE_RUN}/config",
+        "HOME": f"{REMOTE_RUN}/home",
+    }
+    shim = f"{REMOTE_RUN}/bin/ssh"
+    with open(shim, "w") as f:
+        f.write("#!/bin/sh\n"
+                + "".join(f"export {k}={v}\n" for k, v in remote_env.items())
+                + f"exec {BIN} relay\n")
+    os.chmod(shim, 0o755)
+    env = {**os.environ, **remote_env, "SHELL": "/bin/sh", "ENV": "/dev/null",
+           "TERM": "xterm-256color"}
+    proc = subprocess.Popen([BIN, "server"], env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    sock = f"{REMOTE_RUN}/run/remux.sock"
+    for _ in range(200):
+        if os.path.exists(sock):
+            break
+        time.sleep(0.05)
+    time.sleep(0.3)
+    w = WireClient(sock)
+    w.hello()
+    w.send({"CreateSession": {"name": "rbox", "folder": None}})
+    w.drain(0.5)
+    w.close()
+    return proc
+
+
+def remote_view_section():
+    """With a REMOTE in the foreground, the View's switcher still asks and
+    tells the LOCAL server, where Views live."""
+    proc = start_remote_server()
+    config = CONFIG + '\n[remotes.mini]\nssh = "whatever"\nremux_path = "remux"\nauto_connect = true\n'
+    t = Tui(RUN, config=config,
+            extra_env={"PATH": f"{REMOTE_RUN}/bin:" + os.environ.get("PATH", "")}).start()
+    try:
+        in_view = compose_local_view(t)
+        check("remote: a view is displayed", in_view, "\n".join(t.rows_text()))
+        if not in_view:
+            return
+        t.prefix(b"wq", 1.2)
+        sm_open(t)
+        sm_goto(t, lambda r: r.depth == 0 and "mini" in r.text, "the mini server node")
+        t.send(b"l", 0.9)
+        sm_goto_text(t, "rbox")
+        t.send(b"\r", 1.5)
+        check("remote: the remote session is the foreground",
+              "rbox" in t.rows_text()[-1], t.rows_text()[-1])
+        sm_open(t)
+        sm_goto_text(t, "View 1")
+        t.send(b"\r", 1.5)
+        check("remote: back in the view", t.has("View 1"), "\n".join(t.rows_text()))
+        side = report_sizes(t, 5, b"\x1bl")
+        t.send(OPEN, 1.0)
+        items = popup_rows(t) or []
+        if VERBOSE:
+            t.dump("switcher in a view, remote foreground")
+        check("remote: the switcher lists the View's layouts",
+              [i[2:] for i in items] == EXPECTED, items)
+        pick(t, "rows", items)
+        t.pump(0.8)
+        stacked = report_sizes(t, 6, b"\x1bk")
+        check("remote: the View re-laid-out to rows",
+              len(side) == 2 and len(stacked) == 2
+              and stacked[0][1] == stacked[1][1] and stacked[0][0] < stacked[1][0]
+              and stacked[0][3] > side[0][3] * 1.5,
+              f"before {side}\nafter {stacked}")
+        local = t.log("server")
+        remote_log_path = f"{REMOTE_RUN}/state/remux/server.log"
+        remote = open(remote_log_path).read() if os.path.exists(remote_log_path) else ""
+        check("remote: this client attached to the remote's session",
+              'msg=Attach { session_name: "rbox" }' in remote, remote[-500:])
+        check("remote: ListViewLayouts and ViewSetLayout reached the LOCAL server",
+              "ListViewLayouts" in local and "ViewSetLayout" in local,
+              [ln for ln in local.splitlines() if "View" in ln][-6:])
+        check("remote: neither reached the remote server",
+              "ListViewLayouts" not in remote and "ViewSetLayout" not in remote,
+              [ln for ln in remote.splitlines() if "View" in ln][-6:])
+        check("client is alive after the remote checks", t.alive())
+    finally:
+        t.kill()
+        proc.terminate()
+        try:
+            proc.wait(5)
+        except Exception:
+            proc.kill()
+    check_logs(t, "remote")
 
 
 def check_logs(t, label):
@@ -435,6 +622,8 @@ def main():
     move_section()
     popup_section()
     view_section()
+    deleted_view_section()
+    remote_view_section()
 
     if FAILURES:
         print(f"\nFAILED: {len(FAILURES)}")
