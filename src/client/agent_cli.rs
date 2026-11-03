@@ -9,12 +9,12 @@
 use std::time::Duration;
 
 use crate::client::cli_common::{
-    ask, escape, forward_deadline, json_line, pane_hint, parse_pane, parse_pane_arg, parse_wait,
+    ask, escape, forward_deadline, json_line, pane_hint, parse_pane_arg, parse_wait,
     resolve_pane_arg, run_verb, unexpected, CliError, PaneArg, REPLY_DEADLINE,
 };
 use crate::client::hook_cli::{run_session, SessionInput};
 use crate::protocol::{
-    valid_name, Address, AgentState, ClientMessage, PaneId, PaneStatusEntry, ServerMessage,
+    valid_name, Address, AgentState, ClientMessage, PaneStatusEntry, ServerMessage,
 };
 
 #[derive(clap::Subcommand, Debug)]
@@ -94,9 +94,9 @@ pub enum AgentCmd {
         /// new or select. Read from the payload with --hook
         #[arg(long)]
         source: Option<String>,
-        /// Another pane, `%N`: only from outside every pane
-        #[arg(long, value_parser = parse_pane)]
-        pane: Option<PaneId>,
+        /// Another pane, by its name: only from outside every pane
+        #[arg(long, value_name = "NAME", value_parser = parse_pane_arg)]
+        pane: Option<PaneArg>,
     },
 }
 
@@ -190,7 +190,12 @@ async fn run(cmd: AgentCmd) -> Result<(), CliError> {
                 (None, Some(path)) => SessionInput::Path(path),
                 (None, None) => SessionInput::Hook,
             };
-            run_session(agent, input, source, pane).await;
+            // Like the rest of `agent session`, a name that resolves to no
+            // pane is reported nowhere: it prints nothing and exits 0.
+            match resolve_pane_arg(pane).await {
+                Ok(pane) => run_session(agent, input, source, pane).await,
+                Err(e) => log::debug!("cmd: agent session --pane not resolved: {}", e.stderr()),
+            }
             Ok(())
         }
         AgentCmd::Ls { json } => status(None, json).await,
@@ -397,7 +402,7 @@ fn render_table(panes: &[PaneStatusEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::is_invisible;
+    use crate::protocol::{is_invisible, PaneId};
 
     fn entry(pane_id: PaneId, name: Option<&str>) -> PaneStatusEntry {
         PaneStatusEntry {

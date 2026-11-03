@@ -353,7 +353,7 @@ A target is an agent's name, and `<remote>:` in front reaches an agent on anothe
 
 #### `remux agent`
 
-- `remux agent name <name>` gives this pane the name others send to, and `--clear` removes it. An agent that never names itself is named after its session (`build`, `build-2`, …) the first time it is listed by `agent ls`, sends, or is sent to from this machine, so every agent can be addressed. Asking for a name that remux gave another pane, and that no message has used yet, takes it from that pane, which is named afresh; a name a pane asked for, or one in use, is never taken. After `--clear` the pane gets a new auto name the next time it needs one.
+- `remux agent name <name>` gives this pane the name others send to, and `--clear` removes it. An agent that never names itself is named after its session (`build`, `build-2`, …) the first time it is listed by `agent ls`, sends, or is sent to from this machine, so every agent can be addressed. Asking for a name that remux gave another pane, and that no message has used yet, takes it from that pane, which is named afresh; a name a pane asked for, or one a message has gone out under or been sent to by name, is never taken. After `--clear` the pane gets a new auto name the next time it needs one.
 - `remux agent ls` lists every agent, named pane and pane with mail, each with its state: `idle`, `working`, or `needs-input`.
 - `remux agent status <target>` shows one pane, and `remux agent wait <target> --state idle` waits until its agent reaches a state.
 

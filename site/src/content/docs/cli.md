@@ -174,7 +174,7 @@ Leave a message in a pane's mailbox, read your own, or mark messages read. Run t
 | `--defer` | While the agent is waiting on its user, keep the message queued until it is not |
 | `--wait` | Once the message is typed, wait for the agent's turn to end and say how it ended |
 | `--timeout <DUR>` | How long `--defer` and `--wait` may take together: `30`, `30s`, `2m`, at most `1h`. Default: `10m`. |
-| `--reply-to <ID>` | The number of the message this one answers, as `msg read` shows it. With no `<TARGET>`, the reply goes to that message's sender. |
+| `--reply-to <ID>` | The number of the message this one answers, as `msg read` shows it. With no `<TARGET>`, the reply goes to that message's sender. With a `<TARGET>` that sent you that message, it is answered the same way; any other id is sent as given. |
 | `--json` | Print the answer as JSON |
 
 | `msg read` flag | Meaning |
@@ -196,7 +196,7 @@ remux agent ls [--json]
 remux agent status [TARGET] [--json]
 remux agent name <NAME | --clear> [--pane <NAME>]
 remux agent wait <TARGET> --state <idle|working|blocked> [--timeout <DUR>] [--json]
-remux agent session <AGENT> <--hook | --id <ID> | --path <PATH>> [--source <SOURCE>] [--pane <PANE>]
+remux agent session <AGENT> <--hook | --id <ID> | --path <PATH>> [--source <SOURCE>] [--pane <NAME>]
 ```
 
 | Command | Does |
@@ -215,7 +215,7 @@ remux agent session <AGENT> <--hook | --id <ID> | --path <PATH>> [--source <SOUR
 | `--id <ID>` | The session's id |
 | `--path <PATH>` | The session file's absolute path |
 | `--source <SOURCE>` | How the session started: `startup`, `resume`, `clear`, `compact`, `fork`, `new` or `select`. Read from the payload with `--hook`. |
-| `--pane <PANE>` | Another pane, `%N`. Only from outside every pane. |
+| `--pane <NAME>` | Another pane, by its name. Only from outside every pane. |
 
 See [Resuming agents after a restart](/remux/session-restore/).
 
