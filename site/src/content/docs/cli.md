@@ -157,14 +157,14 @@ Both commands are meant to be run **from inside a Remux pane**, by you or by a s
 ## `remux msg`
 
 ```shell
-remux msg send [OPTIONS] <TARGET> <TEXT | --stdin | --file <FILE>>
+remux msg send [OPTIONS] [TARGET] <TEXT | --stdin | --file <FILE>>
 remux msg read [OPTIONS]
-remux msg ack [--pane <PANE>] <IDS... | --all>
+remux msg ack [--pane <NAME>] <IDS... | --all>
 ```
 
 Leave a message in a pane's mailbox, read your own, or mark messages read. Run them from inside a pane: a send's sender is the pane the command runs in. See [Agent messaging](/remux/messaging/).
 
-`<TARGET>` is `%N`, a name, or either one after `host:` for a pane on a [remote](/remux/remotes/).
+`<TARGET>` is an agent's name, or `host:name` for an agent on a [remote](/remux/remotes/). Leave it out with `--reply-to` to answer that message's sender.
 
 | `msg send` flag | Meaning |
 |---|---|
@@ -174,18 +174,18 @@ Leave a message in a pane's mailbox, read your own, or mark messages read. Run t
 | `--defer` | While the agent is waiting on its user, keep the message queued until it is not |
 | `--wait` | Once the message is typed, wait for the agent's turn to end and say how it ended |
 | `--timeout <DUR>` | How long `--defer` and `--wait` may take together: `30`, `30s`, `2m`, at most `1h`. Default: `10m`. |
-| `--reply-to <ID>` | The id of the message this one answers |
+| `--reply-to <ID>` | The number of the message this one answers, as `msg read` shows it. With no `<TARGET>`, the reply goes to that message's sender. |
 | `--json` | Print the answer as JSON |
 
 | `msg read` flag | Meaning |
 |---|---|
-| `--pane <PANE>` | Read another pane's mailbox, `%N`. This marks nothing read. |
+| `--pane <NAME>` | Read another agent's mailbox, by its name. This marks nothing read. |
 | `--all` | Include messages already read |
 | `--peek` | Do not mark anything read |
 | `--wait <DUR>` | Wait this long for mail when there is none. Exits 0 with no output if nothing arrives. |
-| `--format <FORMAT>` | `text` (default), `json`, or `context`: one block per message for an agent's context |
+| `--format <FORMAT>` | `text` (default) or `json`. `context` is accepted and is the same as `text`. |
 
-`msg ack` takes message ids, or `--all` for every unread message, and `--pane <PANE>` for another pane's mailbox.
+`msg ack` takes message ids, or `--all` for every unread message, and `--pane <NAME>` for another agent's mailbox.
 
 `remux msg hook` is run by an agent's hooks, never by hand. [`remux integrate`](#remux-integrate) installs it.
 
@@ -194,7 +194,7 @@ Leave a message in a pane's mailbox, read your own, or mark messages read. Run t
 ```shell
 remux agent ls [--json]
 remux agent status [TARGET] [--json]
-remux agent name <NAME | --clear> [--pane <PANE>]
+remux agent name <NAME | --clear> [--pane <NAME>]
 remux agent wait <TARGET> --state <idle|working|blocked> [--timeout <DUR>] [--json]
 remux agent session <AGENT> <--hook | --id <ID> | --path <PATH>> [--source <SOURCE>] [--pane <PANE>]
 ```
@@ -203,7 +203,7 @@ remux agent session <AGENT> <--hook | --id <ID> | --path <PATH>> [--source <SOUR
 |---|---|
 | `ls` | List every agent, named pane and pane with mail. With `--json`, `tab_index` counts from 0; the table's `TAB` counts from 1. |
 | `status` | Show one pane, or every pane worth listing |
-| `name` | Give this pane the name other panes send to (`[a-z][a-z0-9_-]{0,31}`), or remove it with `--clear`. `--pane %N` names another pane, and only works from outside every pane. |
+| `name` | Give this pane the name other panes send to (`[a-z][a-z0-9_-]{0,31}`), or remove it with `--clear`. `--pane <NAME>` names another agent, and only works from outside every pane. An agent with no name of its own is listed under the one remux gave it after its session. |
 | `wait` | Wait until a pane's agent is idle, working or blocked (waiting on its user). Exits 0 when it is, and also when the time runs out, saying so. `--timeout` defaults to `10m`. |
 | `session` | Run by an agent's hook or plugin, never by hand: a report typed at the prompt is refused. Reports the session the pane's agent is running, so that a restore resumes it. See below. |
 
