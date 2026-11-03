@@ -37,7 +37,7 @@ remux msg read
 
 ## Addresses
 
-A target is an agent's name (`alpha`): one per pane, unique on a server, matching `[a-z][a-z0-9_-]{0,31}`. An agent names itself with `remux agent name`; one that never does is named after its session (`build`, `build-2`, …) the first time `remux agent ls` lists it, it sends, or it is sent to from this machine. Asking for a name remux gave another pane, and that no message has used yet, takes it from that pane, which is named afresh; a name a pane asked for, or one a message has gone out under or been sent to by name, is never taken. After `remux agent name --clear` the pane gets a new auto name when it next needs one. Names that read like an instruction from the user, such as `user`, `system` or `claude`, are refused.
+A target is an agent's name (`alpha`): one per pane, unique on a server, matching `[a-z][a-z0-9_-]{0,31}`. An agent names itself with `remux agent name`; one that never does is named after its session (`build`, `build-2`, …) the first time `remux agent ls` lists it, it sends, or it is sent to from this machine. An auto name can be claimed by another agent until it is first used (a message goes out under it, or something addresses it by name: a send, `agent status`, `agent wait`, `--pane`); claim your own name with `remux agent name` first. A name a pane asked for is never claimed. After `remux agent name --clear` the pane gets a new auto name when it next needs one. Names that read like an instruction from the user, such as `user`, `system` or `claude`, are refused.
 
 Put a host in front to reach an agent on another machine: `mini:alpha`. See [Other machines](#other-machines).
 

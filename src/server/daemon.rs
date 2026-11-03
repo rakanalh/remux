@@ -4261,11 +4261,16 @@ async fn resolve_target(
             ))));
         }
     }
-    store
-        .lock()
-        .await
+    let mut store = store.lock().await;
+    let pane = store
         .resolve(&address.target, |pane| live.contains(&pane))
-        .map_err(refused)
+        .map_err(refused)?;
+    // Watching an agent by its name (`agent status`, `agent wait`, and
+    // `--pane <name>`, which resolves through `agent status`) is a use of it.
+    if matches!(address.target, Target::Name(_)) {
+        store.name_used(pane);
+    }
+    Ok(pane)
 }
 
 /// `agent wait`: answer at once when `target`'s agent is already in `want`,

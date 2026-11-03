@@ -1904,9 +1904,7 @@ impl Messaging {
             // An auto name was never asked for: the pane holding it gives it
             // up, and is given a fresh one the next time it needs one.
             Some(&holder) if self.auto_held.contains(name) => {
-                log::info!(
-                    "msg: name {name} taken by %{pane} from %{holder}, which held it as an unused auto name"
-                );
+                log::info!("msg: auto name {name} moved from %{holder} to %{pane}");
                 self.names.remove(name);
                 self.auto_held.remove(name);
             }

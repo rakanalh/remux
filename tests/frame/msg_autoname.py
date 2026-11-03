@@ -24,7 +24,10 @@ an7. A pane that asks for a name an unused AUTO name holds takes it: the
      self-given name is never taken that way, and neither is an auto name in
      use (one a send went out under or found its target by): asking for
      either is name_taken.
+an7w. An auto name watched by name (`agent status <name>`; `agent wait` and
+     `--pane <name>` resolve the same way) is a use: it is never taken.
 an8. A pane with no name that is sent to by `%N` is named by that send.
+an9. `agent session --pane <name>` reaches the named pane.
 anz. No panic.
 
 Run: python3 tests/frame/msg_autoname.py   (RMX_RUNDIR overrides the run dir)
@@ -220,6 +223,24 @@ try:
     code, out, err = run_cli("agent", "name", "alpha", "--pane", f"%{P4}")
     check(code == 1 and "name_taken" in err,
           f"an7 ...nor is a self-given name (exit {code}, err {err!r})")
+
+    # --- an7w ---------------------------------------------------------------
+    # Watching an agent by its auto name is a use of it too.
+    Q = spawn("build", ["sleep", "1000"])
+    time.sleep(0.8)
+    q_name = wait_names({}).get(Q) or names().get(Q)
+    code, out, err = run_cli("agent", "status", q_name or "x")
+    code2, out2, err2 = run_cli("agent", "name", q_name or "x", "--pane", f"%{P4}")
+    check(q_name is not None and code == 0 and code2 == 1 and "name_taken" in err2 and names().get(Q) == q_name,
+          f"an7w an auto name watched by name (`agent status {q_name}`) is never taken "
+          f"(status exit {code}; name exit {code2}, err {err2!r})")
+
+    # --- an9 ----------------------------------------------------------------
+    code, out, err = run_cli("agent", "session", "claude", "--id", "an9-session", "--pane", q_name or "x")
+    time.sleep(0.5)
+    log = open(f"{RUNDIR}/state/remux/server.log").read()
+    check(code == 0 and out == "" and f"agent session: pane %{Q} " in log,
+          f"an9 `agent session --pane {q_name}` names the pane by its name (exit {code}, out {out!r})")
 
     # --- an8 ----------------------------------------------------------------
     T = spawn("build")
