@@ -65,7 +65,7 @@ pane run from the harness itself.
 8v.  clap's usage errors, which quote what was typed, show a format
      character and a C1 byte escaped, for `msg` and `agent` alike.
 8rn. `agent name user` (and every reserved word) exits 2 before anything is
-     sent, naming the six reserved words.
+     sent, naming the reserved words; `remux` is not one.
 8w.  `agent name`: a pane names itself, a taken name is refused naming its
      holder, --clear unnames, a bad name is bad_name, a pane naming ANOTHER
      pane is bad_address, an outside caller names a pane with --pane and is
@@ -73,6 +73,10 @@ pane run from the harness itself.
 8x.  `agent ls` / `agent status`: the JSON lists the names and unread
      counts, the table has its header, a name resolves to one row, and a
      missing, remote or malformed target is refused with its code.
+8sw. No verb prints a pane id: send by name and by %N, read, read --pane
+     <name>, a reply by number, the Stop hook, ack --pane <name>, agent
+     ls/status/name/wait, and every refusal reachable without a remote. The
+     one `%N` allowed is the caller's own, echoed in its refusal.
 8y.  A hostile AgentStatusList from the FAKE server shows name, session and
      command escaped in the table and in --json.
 8u.  An answer the verb does not expect is reported by its variant name, and
@@ -220,7 +224,9 @@ try:
 
     # --- 8a ---------------------------------------------------------------
     code, out, err = type_cli(A, f"{BIN} msg send %{B} \"$(printf 'MSG:%s' one)\"")
-    check(code == 0 and f"sent #1 to %{B}" in out, f"8a a send from %{A} exits 0 and says so (exit {code}, out {out!r}, err {err!r})")
+    check(code == 0 and re.match(r"sent #1 to main(-\d+)?: stored in its mailbox", out) is not None and "%" not in out,
+          f"8a a send from %{A} exits 0 and says so, naming the target by the name remux gave it "
+          f"(exit {code}, out {out!r}, err {err!r})")
     msgs = listed_json(B) or []
     check([(m["body"], m["from"]["Pane"]["pane_id"]) for m in msgs] == [("MSG:one", A)],
           f"8a %{B} holds MSG:one from %{A} (got {msgs})")
@@ -261,7 +267,8 @@ try:
     # --- 8f ---------------------------------------------------------------
     _, text_out, _ = type_cli(B, f"{BIN} msg read --peek")
     code, out, err = type_cli(B, f"{BIN} msg read --format context")
-    check(code == 0 and "\nfrom a pane in main, #1:\n    MSG:one\n" in out and "Reply with" not in out
+    check(code == 0 and re.search(r"\nfrom main(-\d+)? \(main\), #1:\n    MSG:one\n", out) is not None
+          and "Reply with" not in out
           and "mark" not in out and "%" not in out,
           f"8f --format context renders `from <sender> (<session>), #N:` and the body, no reply line, "
           f"no mark, no pane id (exit {code}, out {out!r})")
@@ -487,22 +494,22 @@ try:
           "8s ...and the server logs the disagreement")
 
     # --- 8rn --------------------------------------------------------------
-    reserved = ("user", "system", "claude", "remux", "human", "assistant", "anthropic", "operator", "developer")
+    reserved = ("user", "system", "claude", "human", "assistant", "anthropic", "operator", "developer")
     for word in reserved + ("lead-claude",):
         code, out, err = type_cli(A, f"{BIN} agent name {word}")
         check(code == 2 and err.startswith("remux: bad_name: ") and "reserved" in err
-              and all(w in err for w in reserved),
+              and all(w in err for w in reserved) and ", remux" not in err and "remux," not in err,
               f"8rn `agent name {word}` exits 2 before anything is sent, naming the reserved words "
               f"(exit {code}, err {err!r})")
 
     # --- 8w ---------------------------------------------------------------
     code, out, err = type_cli(A, f"{BIN} agent name alpha")
-    check(code == 0 and out.strip() == f'pane %{A} is now "alpha"', f"8w %{A} names itself alpha (exit {code}, out {out!r}, err {err!r})")
+    check(code == 0 and out.strip() == "named alpha (main)", f"8w %{A} names itself alpha (exit {code}, out {out!r}, err {err!r})")
     code, out, err = type_cli(B, f"{BIN} agent name alpha")
-    check(code == 1 and err.startswith("remux: name_taken: ") and f"%{A}" in err,
-          f"8w a taken name is refused and names its holder (exit {code}, err {err!r})")
+    check(code == 1 and err.startswith("remux: name_taken: ") and "held by another pane" in err and "%" not in err,
+          f"8w a taken name is refused, naming no pane id (exit {code}, err {err!r})")
     code, out, err = type_cli(A, f"{BIN} agent name --clear")
-    check(code == 0 and out.strip() == f"pane %{A} unnamed", f"8w --clear unnames (exit {code}, out {out!r})")
+    check(code == 0 and out.strip() == "name cleared (main)", f"8w --clear unnames (exit {code}, out {out!r})")
     code, out, err = type_cli(A, f"{BIN} agent name alpha")
     code, out, err = type_cli(A, f"{BIN} agent name Alpha")
     check(code == 2 and err.startswith("remux: bad_name: "),
@@ -511,7 +518,7 @@ try:
     check(code == 1 and err.startswith("remux: bad_address: "),
           f"8w a pane naming another pane is bad_address (exit {code}, err {err!r})")
     code, out, err, _ = run_cli("agent", "name", "beta", "--pane", f"%{B}")
-    check(code == 0 and out.strip() == f'pane %{B} is now "beta"', f"8w an outside caller names %{B} with --pane (exit {code}, out {out!r}, err {err!r})")
+    check(code == 0 and out.strip() == "named beta (main)", f"8w an outside caller names %{B} with --pane (exit {code}, out {out!r}, err {err!r})")
     code, out, err, _ = run_cli("agent", "name", "delta")
     check(code == 1 and err.startswith("remux: not_in_pane: "), f"8w ...and without --pane is not_in_pane (exit {code}, err {err!r})")
 
@@ -526,10 +533,10 @@ try:
           f"8x ls --json lists alpha and beta, with %{B}'s unread mail (exit {code}, got {panes})")
     code, out, err, _ = run_cli("agent", "ls")
     lines = out.splitlines()
-    check(code == 0 and lines and lines[0].split() == ["PANE", "SESSION", "TAB", "NAME", "COMMAND", "STATE", "UNREAD"]
-          and any(ln.split()[:1] == [f"%{A}"] and "alpha" in ln.split() for ln in lines[1:]),
-          f"8x ls prints the table under its header (exit {code}, out {out!r})")
-    row = next((ln.split() for ln in lines[1:] if ln.split()[:1] == [f"%{A}"]), [])
+    check(code == 0 and lines and lines[0].split() == ["NAME", "SESSION", "TAB", "COMMAND", "STATE", "UNREAD"]
+          and any(ln.split()[:1] == ["alpha"] for ln in lines[1:]) and "%" not in out,
+          f"8x ls prints the table under its header, by name, with no pane id (exit {code}, out {out!r})")
+    row = next((ln.split() for ln in lines[1:] if ln.split()[:1] == ["alpha"]), [])
     check(row[2:3] == [str(panes.get(A, {}).get("tab_index", -2) + 1)] and panes.get(A, {}).get("tab_index") == 0,
           f"8x the table's TAB counts from 1 while the JSON's tab_index counts from 0 (row {row})")
     code, out, err, _ = run_cli("agent", "status", "alpha", "--json")
@@ -543,6 +550,54 @@ try:
         code, out, err, _ = run_cli("agent", "status", *args)
         check(code == ecode and err.startswith(f"remux: {want}: "),
               f"8x status {args[0]} exits {ecode} with {want} (exit {code}, err {err!r})")
+
+    # --- 8sw: no pane id in any output -------------------------------------
+    # Every verb, run the way an agent or a person runs it; `%N` may appear
+    # only where the caller typed it. JSON (D2) is the one place that keeps
+    # `pane_id`, so no verb here asks for it.
+    code, out, err = type_cli(A, f"{BIN} agent name sweepa")
+    sweep = [("agent name (self)", code, out, err)]
+    code, out, err, _ = run_cli("agent", "name", "sweepb", "--pane", f"%{B}")
+    sweep.append(("agent name --pane", code, out, err))
+    code, out, err = type_cli(A, f"{BIN} msg send sweepb SW:one")
+    sweep.append(("msg send <name>", code, out, err))
+    code, out, err = type_cli(A, f"{BIN} msg send %{B} SW:two")
+    sweep.append(("msg send %N", code, out, err))
+    code, out, err = type_cli(B, f"{BIN} msg read --peek")
+    sweep.append(("msg read", code, out, err))
+    code, out, err, _ = run_cli("msg", "read", "--pane", "sweepb", "--peek")
+    sweep.append(("msg read --pane <name>", code, out, err))
+    sw_id = next((m["id"] for m in (listed_json(B) or []) if m["body"] == "SW:one"), None)
+    code, out, err = type_cli(B, f"printf 'SW:%s' re | {BIN} msg send --reply-to {sw_id} --stdin")
+    sweep.append(("msg send --reply-to", code, out, err))
+    with open(f"{RUNDIR}/stop.json", "w") as f:
+        f.write('{"hook_event_name":"Stop","stop_hook_active":false}')
+    code, out, err = type_cli(B, f"{BIN} msg hook claude-stop", stdin_file=f"{RUNDIR}/stop.json")
+    sweep.append(("msg hook claude-stop", code, out, err))
+    code, out, err, _ = run_cli("msg", "ack", "--pane", "sweepa", "--all")
+    sweep.append(("msg ack --pane <name>", code, out, err))
+    for args in (["agent", "ls"], ["agent", "status"], ["agent", "status", "sweepb"],
+                 ["agent", "wait", "sweepb", "--state", "idle", "--timeout", "1"]):
+        code, out, err, _ = run_cli(*args)
+        sweep.append((" ".join(args[:2]) + (" <name>" if len(args) > 2 else ""), code, out, err))
+    for label, line in (("refusal no_such_target", f"{BIN} msg send nosuch x"),
+                        ("refusal no_such_message", f"printf x | {BIN} msg send --reply-to 999 --stdin"),
+                        ("refusal name_taken", f"{BIN} agent name sweepb"),
+                        ("refusal bad_address (--pane in a pane)", f"{BIN} agent name y --pane sweepb")):
+        code, out, err = type_cli(A, line)
+        sweep.append((label, code, out, err))
+    for label, args in (("refusal not_in_pane", ["agent", "name", "z"]),
+                        ("refusal sender_unverified", ["msg", "send", "sweepb", "x"]),
+                        ("refusal --pane unknown name", ["msg", "read", "--pane", "nosuch"])):
+        code, out, err, _ = run_cli(*args)
+        sweep.append((label, code, out, err))
+    leaked = [(label, re.findall(r"%\d+", out + err)) for label, _, out, err in sweep
+              if re.search(r"%\d+", out + err)]
+    check(len(sweep) == 20 and all(code is not None for _, code, _, _ in sweep) and not leaked,
+          f"8sw no verb prints a pane id ({len(sweep)} verbs; leaked {leaked})")
+    code, out, err = type_cli(A, f"{BIN} msg send %9999 x")
+    check(code == 1 and re.findall(r"%\d+", out + err) == ["%9999"],
+          f"8sw ...except the caller's own %N, echoed in its refusal (exit {code}, err {err!r})")
 
     # --- 8l ---------------------------------------------------------------
     client_log = open(f"{RUNDIR}/state/remux/client.log").read()

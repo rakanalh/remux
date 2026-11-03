@@ -141,8 +141,13 @@ Task 3, the typing guard, through the queue and the submitter:
 3y. An agent that exits after a message was typed and Submitted: its pane
     closes. (Nothing of the message's may hold the terminal open.)
 3aa. An agent that takes the probe and hangs, then exits 0.5 s later, with a
-    multi-line body: the body is flushed before the exit, so bash runs no
-    line of it, then or on the next Enter.
+    multi-line body: read_by_another_program naming Ctrl-U, and bash runs
+    no line of it by itself. The one chunk written after the probe, the
+    body's FIRST line, may be left at bash's prompt (a documented residual:
+    nothing in a raw body makes it a comment), so the next Enter may run
+    the first line, and never the second. Whether the line reaches bash
+    before the flush is a race, so the case passes either way and records
+    which happened.
 3ab. A person's key while a slow agent is part-way through a long body: no
     byte of the body follows the key, the paste is closed before it, and the
     log says how many bytes were withdrawn.
@@ -160,7 +165,8 @@ Task 3, the typing guard, through the queue and the submitter:
     6 KB, to an agent that takes the probe and exits 0.3 s or 1.5 s later:
     read_by_another_program, and bash runs nothing, then or on the next
     Enter.
-3ai. sec-a's SLOWFIRST: the first lines are a command and a sleep: the same.
+3ai. sec-a's SLOWFIRST: the first lines are a command and a sleep: the same
+    contract as 3aa, the first line allowed after Enter, the second never.
 3aj. An agent that reads part of a padded body and exits: the line bash is
     left holding is the one being read, and it does not run until Enter.
 3ak. A 1,400-line body to an agent that reads at once is Submitted, well
@@ -2148,9 +2154,9 @@ try:
 
     # 3aa: sec-b's P6. The agent takes the probe, hangs, and exits 0.5 s
     # after: a multi-line body would run line by line in bash.
-    marker = f"{RUNDIR}/ran-3aa"
+    marker, first = f"{RUNDIR}/ran-3aa", f"{RUNDIR}/ran-3aa-first"
     B, log, ctl = bash_agent("3aa", "deaf-on-rx")
-    body = f"printf 'RAN:%s' 3aa > {marker}\nprintf 'RAN:%s' 3aa > {marker}"
+    body = f"printf 'RAN:%s' 3aa-first > {first}\nprintf 'RAN:%s' 3aa > {marker}"
     out = type_start(A, send(B, body, "Submit"))
     end = time.time() + 10
     while time.time() < end and not raw_chunks(log):
@@ -2159,12 +2165,16 @@ try:
     tell(ctl, log, "quit", timeout=2.0)
     r = wait_file(out, timeout=15)
     time.sleep(1.5)
-    before = ran(marker, "3aa")
+    before = ran(marker, "3aa") or ran(first, "3aa-first")
     cli.send({"InputToPane": {"pane_id": B, "data": list(b"\r")}})
     time.sleep(1.5)
-    check(outcome(r) == ("Error", "read_by_another_program") and not before and not ran(marker, "3aa"),
-          f"3aa an agent that takes the probe, hangs and exits: no line of a multi-line body runs in bash, "
-          f"then or on the next Enter (reply {r}, ran {before}, ran after Enter {ran(marker, '3aa')})")
+    message = (r or {}).get("Error", {}).get("message", "")
+    check(outcome(r) == ("Error", "read_by_another_program") and "Ctrl-U" in message and not before
+          and not ran(marker, "3aa"),
+          f"3aa an agent that takes the probe, hangs and exits: nothing runs by itself, the refusal names "
+          f"Ctrl-U, and the second line never runs, even after Enter (reply {r}, ran before Enter {before}, "
+          f"second line after Enter {ran(marker, '3aa')}; first line after Enter, allowed: "
+          f"{ran(first, '3aa-first')})")
 
     # 3ad: the agent reads the whole body and exits before its Enter. Nothing
     # is left to flush, and nothing can tell its read from the shell's.
@@ -2181,11 +2191,12 @@ try:
 
     def p6(case, mode, body, quit_after, want=("Error", "read_by_another_program")):
         """sec-a's P6 shape: bash runs the agent; `quit_after` seconds after
-        the agent read the probe, it exits; bash must run no line of `body`,
-        then or on the next Enter."""
-        marker = f"{RUNDIR}/ran-{case}"
+        the agent read the probe, it exits; bash must run no line of `body`
+        by itself, and the MARKER line never, even on the next Enter. A
+        FIRST line may run after Enter: the residual 3aa describes."""
+        marker, first = f"{RUNDIR}/ran-{case}", f"{RUNDIR}/ran-{case}-first"
         B, log, ctl = bash_agent(case, mode)
-        out = type_start(A, send(B, body.replace("MARKER", marker), "Submit"))
+        out = type_start(A, send(B, body.replace("MARKER", marker).replace("FIRST", first), "Submit"))
         end = time.time() + 10
         while time.time() < end and not raw_chunks(log):
             time.sleep(0.005)
@@ -2193,17 +2204,21 @@ try:
         tell(ctl, log, "quit", timeout=2.0)
         r = wait_file(out, timeout=30)
         time.sleep(1.5)
-        before = ran(marker, case)
+        before = ran(marker, case) or ran(first, f"{case}-first")
         cli.send({"InputToPane": {"pane_id": B, "data": list(b"\r")}})
         time.sleep(1.5)
-        check(outcome(r) == want and not before and not ran(marker, case),
-              f"{case} the agent exits {quit_after}s after the probe: {want}, and bash runs nothing, then or "
-              f"on the next Enter (reply {r}, ran {before}, ran after Enter {ran(marker, case)})")
+        message = (r or {}).get("Error", {}).get("message", "")
+        check(outcome(r) == want and "Ctrl-U" in message and not before and not ran(marker, case),
+              f"{case} the agent exits {quit_after}s after the probe: {want} naming Ctrl-U, bash runs nothing "
+              f"by itself, and the marker line never runs, even on the next Enter (reply {r}, ran before "
+              f"Enter {before}, marker after Enter {ran(marker, case)}; first line after Enter, allowed: "
+              f"{ran(first, f'{case}-first')})")
 
     pad = (": " + "p" * 98 + "\n") * 60
     for t in (0.3, 1.5):
         p6(f"3ah-{t}", "deaf-on-rx", pad + "printf 'RAN:%s' 3ah-" + str(t) + " > MARKER\nnext line", t)
-    p6("3ai", "deaf-on-rx", "printf 'RAN:%s' 3ai > MARKER\nsleep 2\n" + pad + "end", 0.3)
+    p6("3ai", "deaf-on-rx", "printf 'RAN:%s' 3ai-first > FIRST\nprintf 'RAN:%s' 3ai > MARKER\nsleep 2\n"
+       + pad + "end", 0.3)
     # A trickling agent quits part-way into the padding; the marker line is
     # the last, never reached.
     p6("3aj", "trickle:20", (": " + "q" * 28 + "\n") * 10 + "printf 'RAN:%s' 3aj > MARKER", 1.5)
@@ -2582,14 +2597,14 @@ try:
     time.sleep(1.0)
     tell(F_CTL, F_LOG, "block")
     out, err = proc.communicate(timeout=15)
-    check(proc.returncode == 0 and out.decode().strip() == f"%{F} is blocked",
+    check(proc.returncode == 0 and re.fullmatch(r"(main(-\d+)?|%\d+) is blocked", out.decode().strip()) is not None,
           f"7h `agent wait --state blocked` exits 0 once the agent asks (exit {proc.returncode}, "
           f"out {out!r}, err {err!r})")
     tell(F_CTL, F_LOG, "clear")
     check(wait_idle(F, 8), f"...the agent in %{F} settled Idle")
     done = subprocess.run([BIN, "agent", "wait", f"%{F}", "--state", "working", "--timeout", "1"],
                           env=env, capture_output=True, timeout=15)
-    check(done.returncode == 0 and done.stdout.decode().strip() == f"%{F} is not working (timed out; now idle)",
+    check(done.returncode == 0 and re.fullmatch(r"(main(-\d+)?|%\d+) is not working \(timed out; now idle\)", done.stdout.decode().strip()) is not None,
           f"7h ...and a wait that runs out exits 0 and says so (exit {done.returncode}, "
           f"out {done.stdout!r}, err {done.stderr!r})")
     check("panicked at" not in srv.log(), "7z no panic")

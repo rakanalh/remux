@@ -83,7 +83,8 @@ The return path (Task 2), after 1n, with A's default `inbound = "replies"`:
   2l  a reply naming an id not minted for that pane, or no id, is refused
   2c  A1's read shows "from mini:beta (main), #N:"
   2d  A1 answers it by A's number, with no target: B1's copy has reply_to
-      mini's id
+      mini's id; 2d' the same with the target named, `mini:%B1 --reply-to
+      <A's number>`: the number is still sent as mini's id
   2e  auto over the inbound link is stored with the reason; submit is refused
   2h  B pushes the reply to the link's connection only
   2i  a reply's body is in no log; both sides log the hop
@@ -556,7 +557,15 @@ def a_restart(config):
 
 
 def reply_from_b1(target, word, reply_to=None, deliver="mailbox"):
-    """A reply typed into B1, its body assembled by printf and piped in."""
+    """A reply typed into B1, its body assembled by printf and piped in.
+    `reply_to` is laptop's id for the message, which the cases name it by; B1
+    answers it by B's own number for it, as `msg read` shows B1, which the CLI
+    turns back into laptop's id. An id B1 holds no message for (one never
+    minted) is passed as it is."""
+    if reply_to is not None:
+        mine = [m["id"] for m in box(srv_b, B1)
+                if (m.get("origin") or {}).get("id") == reply_to and (m.get("origin") or {}).get("host") == "laptop"]
+        reply_to = mine[0] if mine else reply_to
     flag = f" --reply-to {reply_to}" if reply_to is not None else ""
     return type_cli(cli_b, B1, f"printf 'RE:%s' {word} | '{BIN}' msg send {target}{flag} --stdin --deliver {deliver}")
 
@@ -773,9 +782,23 @@ try:
     # --- 1b -----------------------------------------------------------------
     got = box(srv_b, B1)
     first = got[0] if got else {}
-    check(len(got) == 1 and first.get("from") == {"Remote": {"host": "laptop", "pane_id": A1, "name": None, "session": "main"}}
+    check(len(got) == 1 and first.get("from") == {"Remote": {"host": "laptop", "pane_id": A1, "name": "main", "session": "main"}}
           and first.get("origin") == {"host": "laptop", "id": first_id} and first.get("body") == "R:one",
           f"1b B1 holds it from laptop's %{A1}, origin laptop #{first_id} ({got})")
+    # A peer addressing a pane gives it no name: only B's own sends and
+    # listings do. A fresh pane nothing on B has listed, and B's saved file,
+    # since a listing would name it.
+    BZ = cli_spawn(srv_b)
+    time.sleep(0.5)
+    zcode, _, zerr = send_from_a1(f"mini:%{BZ}", "unnamed")
+    time.sleep(1.0)
+    try:
+        with open(f"{srv_b.rundir}/data/remux/mailbox.json") as f:
+            b_names = dict((p, n) for p, n in json.load(f)["names"])
+    except (OSError, ValueError, KeyError):
+        b_names = None
+    check(zcode == 0 and b_names is not None and BZ not in b_names,
+          f"1b ...and the peer's send to a fresh %BZ gave it no name on B (exit {zcode}, err {zerr!r}, names {b_names})")
 
     # --- 1c -----------------------------------------------------------------
     calls = shim_calls()
@@ -896,7 +919,7 @@ try:
 
     # --- 1k -----------------------------------------------------------------
     code, out, err = send_from_a1(f"mini:%{B1}", "kauto", deliver="auto")
-    check(code == 0 and f"to mini:%{B1}" in out and "stored in its mailbox" in out and "agent_not_ready" in out,
+    check(code == 0 and "to mini:beta: stored in its mailbox" in out and "agent_not_ready" in out and "%" not in out,
           f"1k --deliver auto to a pane running no agent is stored, agent_not_ready (exit {code}, out {out!r}, err {err!r})")
     code, out, err = send_from_a1(f"mini:%{B1}", "ksubmit", deliver="submit")
     check(code == 1 and "remote_refused" in err and "agent_not_ready" in err,
@@ -939,7 +962,7 @@ try:
     check(b_first is not None and b_first != first_id,
           f"2a B's id for the first forward ({b_first}) is not A's ({first_id}), so 2a can tell them apart")
     code, out, err = type_cli(cli_b, B1, f"'{BIN}' msg read --peek --format context")
-    check(f"\nfrom a pane on laptop (main), #{b_first}:\n    R:one\n" in out and "Reply with" not in out,
+    check(f"\nfrom laptop:main (main), #{b_first}:\n    R:one\n" in out and "Reply with" not in out,
           f"2a B1's read shows the sender and B's own number {b_first} ({out[-400:]!r})")
     code, out, err = type_cli(cli_b, B1, f"printf 'RE:%s' bynum | '{BIN}' msg send --reply-to {b_first} --stdin --deliver mailbox")
     bynum = next((m for m in box(srv_a, A1) if m["body"] == "RE:bynum"), {})
@@ -991,6 +1014,11 @@ try:
     back = next((m for m in box(srv_b, B1) if m["body"] == "RE:back"), {})
     check(code == 0 and back.get("reply_to") == {"host": "mini", "id": b_id},
           f"2d A1's answer reaches B1 as a reply to mini #{b_id} ({back.get('reply_to')})")
+    code, out, err = type_cli(cli_a, A1, f"printf 'RE:%s' explicit | '{BIN}' msg send mini:%{B1} --reply-to {a_id} --stdin --deliver mailbox")
+    explicit = next((m for m in box(srv_b, B1) if m["body"] == "RE:explicit"), {})
+    check(code == 0 and explicit.get("reply_to") == {"host": "mini", "id": b_id},
+          f"2d' with the target named too, A1's shown #{a_id} is still sent as mini's id #{b_id} "
+          f"(exit {code}, err {err!r}, reply_to {explicit.get('reply_to')})")
 
     # --- 2e -----------------------------------------------------------------
     code, out, err = reply_from_b1(f"laptop:%{A1}", "auto", first_id, deliver="auto")
@@ -1048,7 +1076,8 @@ try:
     a_restart(A_CONFIG + 'inbound = "any"\n')
     send_from_a1(f"mini:%{B1}", "redial-any")
     code, out, err = reply_from_b1("laptop:lead", "byname2", first_id)
-    check(code == 0 and f"to laptop:%{A1} (lead)" in out and "RE:byname2" in bodies(srv_a, A1),
+    check(code == 0 and "to laptop:lead: forwarded to laptop" in out and "%" not in out
+          and "RE:byname2" in bodies(srv_a, A1),
           f"2a' with inbound = any a reply by name reaches A1, as A resolved it (exit {code}, out {out!r}, err {err!r})")
     calls = shim_calls()
     code, out, err = reply_from_b1("laptop:nosuch", "nosuch", first_id)
@@ -1255,7 +1284,7 @@ try:
     code, out, err = send_from_a1(f"mini:%{BF}", "plain-three-a", deliver="submit")
     seen = fake_text(BF_LOG)
     a_id = sent_id(out)
-    check(code == 0 and f"to mini:%{BF}" in out and "typed into the pane" in out,
+    check(code == 0 and re.search(r"to mini:(%\d+|[a-z0-9-]+): typed into the pane", out) is not None,
           f"3a a submit to mini:%BF is typed into the pane (exit {code}, out {out!r}, err {err!r})")
     check("R:plain-three-a" in seen and "remux message" not in seen and "laptop" not in seen,
           f"3a the body arrives raw, with no envelope naming laptop or A's id {a_id} ({seen[-400:]!r})")
@@ -1794,8 +1823,8 @@ try:
           and shim_calls() <= calls + 1,
           f"6a agent status mini:delta is B's one entry, host mini, unread as on B (exit {code}, out {out[:200]!r}, err {err!r})")
     code, out, err = a_cli("agent status mini:delta")
-    check(code == 0 and f"mini:%{B9}" in out and "delta" in out,
-          f"6a ...and the table names the pane mini:%{B9} (exit {code}, out {out!r}, err {err!r})")
+    check(code == 0 and "mini:delta" in out and "%" not in out,
+          f"6a ...and the table names it mini:delta, with no pane id (exit {code}, out {out!r}, err {err!r})")
 
     # --- 6b -----------------------------------------------------------------
     t0 = time.time()
@@ -1804,7 +1833,7 @@ try:
     tell(BF3_CTL, BF3_LOG, "block")
     code, out, err = type_wait(base, 20)
     took = time.time() - t0
-    check(code == 0 and f"mini:%{BF3}" in out and "is blocked" in out and 1.0 <= took <= 5.0,
+    check(code == 0 and re.fullmatch(r"mini:(%\d+|[a-z0-9-]+) is blocked\n", out) is not None and 1.0 <= took <= 5.0,
           f"6b agent wait on a remote agent answers when it blocks ({took:.1f}s, exit {code}, out {out!r}, err {err!r})")
     code, out, err = a_cli(f"agent wait mini:%{BF3} --state blocked --timeout 10 --json")
     doc = doc_of(out)

@@ -9,8 +9,8 @@
 use std::time::Duration;
 
 use crate::client::cli_common::{
-    ask, escape, forward_deadline, json_line, pane_hint, parse_pane, parse_wait, run_verb,
-    unexpected, CliError, REPLY_DEADLINE,
+    ask, escape, forward_deadline, json_line, pane_hint, parse_pane, parse_pane_arg, parse_wait,
+    resolve_pane_arg, run_verb, unexpected, CliError, PaneArg, REPLY_DEADLINE,
 };
 use crate::client::hook_cli::{run_session, SessionInput};
 use crate::protocol::{
@@ -29,9 +29,9 @@ pub enum AgentCmd {
         /// Remove the pane's name
         #[arg(long)]
         clear: bool,
-        /// Another pane, `%N`: only from outside every pane
-        #[arg(long, value_parser = parse_pane)]
-        pane: Option<PaneId>,
+        /// Another pane, by its name: only from outside every pane
+        #[arg(long, value_name = "NAME", value_parser = parse_pane_arg)]
+        pane: Option<PaneArg>,
     },
     /// List every agent, named pane and pane with mail.
     Ls {
@@ -154,6 +154,7 @@ async fn run(cmd: AgentCmd) -> Result<(), CliError> {
                 "cmd: agent name pane={pane:?} {}",
                 if name.is_some() { "set" } else { "clear" }
             );
+            let pane = resolve_pane_arg(pane).await?;
             let answer = ask(
                 ClientMessage::AgentName {
                     name,
@@ -164,9 +165,13 @@ async fn run(cmd: AgentCmd) -> Result<(), CliError> {
             )
             .await?;
             match answer {
-                ServerMessage::AgentNamed { pane, name } => {
+                ServerMessage::AgentNamed {
+                    pane,
+                    name,
+                    session,
+                } => {
                     log::debug!("cmd: agent name answered AgentNamed(%{pane})");
-                    println!("{}", named_line(pane, name.as_deref()));
+                    println!("{}", named_line(name.as_deref(), session.as_deref()));
                     Ok(())
                 }
                 other => Err(unexpected(&other)),
@@ -205,6 +210,7 @@ async fn run(cmd: AgentCmd) -> Result<(), CliError> {
             let target: Address = target
                 .parse()
                 .map_err(|why: String| CliError::usage("bad_address", why))?;
+            let spelled = target.to_string();
             let want: AgentState = state.into();
             let timeout = wait_for(timeout);
             log::debug!(
@@ -242,9 +248,11 @@ async fn run(cmd: AgentCmd) -> Result<(), CliError> {
                         println!(
                             "{}",
                             waited_line(
-                                target.host.as_deref(),
-                                target.pane_id,
-                                target.name.as_deref(),
+                                &target_label(
+                                    target.host.as_deref(),
+                                    target.name.as_deref(),
+                                    &spelled
+                                ),
                                 want,
                                 state,
                                 timed_out
@@ -278,33 +286,39 @@ fn wait_word(state: Option<AgentState>) -> &'static str {
 }
 
 fn waited_line(
-    host: Option<&str>,
-    pane: PaneId,
-    name: Option<&str>,
+    target: &str,
     want: AgentState,
     state: Option<AgentState>,
     timed_out: bool,
 ) -> String {
-    let pane = pane_cell(host, pane);
-    let named = name
-        .map(|n| format!(" ({})", escape(n)))
-        .unwrap_or_default();
     if timed_out {
         format!(
-            "{pane}{named} is not {} (timed out; now {})",
+            "{target} is not {} (timed out; now {})",
             wait_word(Some(want)),
             wait_word(state)
         )
     } else {
-        format!("{pane}{named} is {}", wait_word(state))
+        format!("{target} is {}", wait_word(state))
     }
 }
 
-/// A pane as an address names it: `%7` here, `mini:%7` on another server.
-fn pane_cell(host: Option<&str>, pane: PaneId) -> String {
+/// An agent as an address names it: `alpha` here, `mini:alpha` on another
+/// server, `-` for one with no name (`mini:-`). Never a pane id.
+pub(crate) fn name_cell(host: Option<&str>, name: Option<&str>) -> String {
+    let name = name.map_or_else(|| "-".to_string(), escape);
     match host {
-        Some(host) => format!("{}:%{pane}", escape(host)),
-        None => format!("%{pane}"),
+        Some(host) => format!("{}:{name}", escape(host)),
+        None => name,
+    }
+}
+
+/// How an answer names the agent a command was about: by its name, or, when
+/// it has none, as the caller spelled it, which is the caller's own word and
+/// so may be a `%N` it typed.
+pub(crate) fn target_label(host: Option<&str>, name: Option<&str>, spelled: &str) -> String {
+    match name {
+        Some(_) => name_cell(host, name),
+        None => escape(spelled),
     }
 }
 
@@ -331,10 +345,13 @@ async fn status(target: Option<Address>, json: bool) -> Result<(), CliError> {
     }
 }
 
-fn named_line(pane: PaneId, name: Option<&str>) -> String {
+fn named_line(name: Option<&str>, session: Option<&str>) -> String {
+    let session = session
+        .map(|s| format!(" ({})", escape(s)))
+        .unwrap_or_default();
     match name {
-        Some(name) => format!("pane %{pane} is now \"{}\"", escape(name)),
-        None => format!("pane %{pane} unnamed"),
+        Some(name) => format!("named {}{session}", escape(name)),
+        None => format!("name cleared{session}"),
     }
 }
 
@@ -350,17 +367,13 @@ fn state_word(state: Option<AgentState>) -> &'static str {
 /// A column-aligned table, header first. Fields are escaped before they are
 /// measured, so the padding matches what the terminal shows.
 fn render_table(panes: &[PaneStatusEntry]) -> String {
-    let header = [
-        "PANE", "SESSION", "TAB", "NAME", "COMMAND", "STATE", "UNREAD",
-    ]
-    .map(String::from);
+    let header = ["NAME", "SESSION", "TAB", "COMMAND", "STATE", "UNREAD"].map(String::from);
     let mut rows = vec![header.to_vec()];
     for p in panes {
         rows.push(vec![
-            pane_cell(p.host.as_deref(), p.pane_id),
+            name_cell(p.host.as_deref(), p.name.as_deref()),
             escape(&p.session),
             p.tab_index.saturating_add(1).to_string(),
-            p.name.as_deref().map_or_else(|| "-".to_string(), escape),
             p.command.as_deref().map_or_else(|| "-".to_string(), escape),
             state_word(p.state).to_string(),
             p.unread.to_string(),
@@ -408,10 +421,11 @@ mod tests {
         let table = render_table(&[entry(3, None), claude]);
         assert_eq!(
             table,
-            "PANE  SESSION  TAB  NAME   COMMAND  STATE        UNREAD\n\
-             %3    main     1    -      -        -            0\n\
-             %12   main     1    alpha  claude   needs-input  3\n"
+            "NAME   SESSION  TAB  COMMAND  STATE        UNREAD\n\
+             -      main     1    -        -            0\n\
+             alpha  main     1    claude   needs-input  3\n"
         );
+        assert!(!table.contains('%'), "no pane id: {table}");
     }
 
     #[test]
@@ -448,79 +462,68 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_entry_shows_its_host_in_the_pane_column() {
+    fn a_remote_entry_shows_its_host_in_the_name_column() {
         let mut remote = entry(7, Some("beta"));
         remote.host = Some("mini".into());
-        let table = render_table(&[entry(3, None), remote]);
+        let mut nameless = entry(8, None);
+        nameless.host = Some("mini".into());
+        let table = render_table(&[entry(3, None), remote, nameless]);
         assert_eq!(
             table,
-            "PANE     SESSION  TAB  NAME  COMMAND  STATE  UNREAD\n\
-             %3       main     1    -     -        -      0\n\
-             mini:%7  main     1    beta  -        -      0\n"
+            "NAME       SESSION  TAB  COMMAND  STATE  UNREAD\n\
+             -          main     1    -        -      0\n\
+             mini:beta  main     1    -        -      0\n\
+             mini:-     main     1    -        -      0\n"
         );
     }
 
     #[test]
     fn the_waited_line_names_the_host() {
+        let beta = target_label(Some("mini"), Some("beta"), "mini:%7");
         assert_eq!(
             waited_line(
-                Some("mini"),
-                7,
-                Some("beta"),
+                &beta,
                 AgentState::NeedsInput,
                 Some(AgentState::NeedsInput),
                 false
             ),
-            "mini:%7 (beta) is blocked"
+            "mini:beta is blocked"
         );
+        let far = target_label(Some("m\u{1b}"), Some("x"), "m:x");
         assert_eq!(
-            waited_line(
-                Some("m\u{1b}"),
-                7,
-                None,
-                AgentState::Idle,
-                Some(AgentState::Idle),
-                false
-            ),
-            "m\\x1b:%7 is idle",
+            waited_line(&far, AgentState::Idle, Some(AgentState::Idle), false),
+            "m\\x1b:x is idle",
             "the host is the far side's word too, so it is escaped"
         );
     }
 
     #[test]
+    fn a_target_with_no_name_is_shown_as_the_caller_spelled_it() {
+        assert_eq!(target_label(None, None, "%3"), "%3");
+        assert_eq!(target_label(Some("mini"), None, "mini:%3"), "mini:%3");
+        assert_eq!(target_label(None, Some("lead"), "%3"), "lead");
+    }
+
+    #[test]
     fn the_waited_line_says_whether_the_state_came() {
+        let lead = target_label(None, Some("lead"), "lead");
         assert_eq!(
-            waited_line(
-                None,
-                3,
-                Some("lead"),
-                AgentState::Idle,
-                Some(AgentState::Idle),
-                false
-            ),
-            "%3 (lead) is idle"
+            waited_line(&lead, AgentState::Idle, Some(AgentState::Idle), false),
+            "lead is idle"
         );
         assert_eq!(
-            waited_line(
-                None,
-                3,
-                None,
-                AgentState::Idle,
-                Some(AgentState::Working),
-                true
-            ),
-            "%3 is not idle (timed out; now working)"
+            waited_line(&lead, AgentState::Idle, Some(AgentState::Working), true),
+            "lead is not idle (timed out; now working)"
         );
+        let odd = target_label(None, Some("a\u{1b}"), "x");
         assert_eq!(
             waited_line(
-                None,
-                3,
-                Some("a\u{1b}"),
+                &odd,
                 AgentState::NeedsInput,
                 Some(AgentState::NeedsInput),
                 false
             ),
-            "%3 (a\\x1b) is blocked"
+            "a\\x1b is blocked"
         );
     }
 
@@ -560,9 +563,21 @@ mod tests {
     }
 
     #[test]
-    fn the_named_line_escapes_the_name() {
-        assert_eq!(named_line(3, Some("alpha")), "pane %3 is now \"alpha\"");
-        assert_eq!(named_line(3, None), "pane %3 unnamed");
-        assert_eq!(named_line(3, Some("a\u{1b}")), "pane %3 is now \"a\\x1b\"");
+    fn the_named_line_names_the_session_and_escapes_both() {
+        assert_eq!(
+            named_line(Some("alpha"), Some("Remux")),
+            "named alpha (Remux)"
+        );
+        assert_eq!(named_line(None, Some("Remux")), "name cleared (Remux)");
+        assert_eq!(
+            named_line(Some("a\u{1b}"), Some("s\u{1b}")),
+            "named a\\x1b (s\\x1b)"
+        );
+        assert_eq!(
+            named_line(Some("alpha"), None),
+            "named alpha",
+            "an older server"
+        );
+        assert_eq!(named_line(None, None), "name cleared");
     }
 }

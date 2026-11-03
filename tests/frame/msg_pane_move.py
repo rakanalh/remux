@@ -282,7 +282,7 @@ try:
     time.sleep(0.5)
 
     r = type_send(B, {"AgentName": {"name": "bravo"}})
-    check(r == {"AgentNamed": {"pane": B, "name": "bravo"}}, f"setup: B names itself bravo (got {r})")
+    check(r == {"AgentNamed": {"pane": B, "name": "bravo", "session": "main"}}, f"setup: B names itself bravo (got {r})")
 
     # --- 7a ---------------------------------------------------------------
     r = type_send(A, send_to({"Name": "bravo"}, "MOVE:before"))

@@ -419,6 +419,8 @@ mod tests {
                 names: vec![(3, "alpha".into())],
                 messages: Vec::new(),
                 minted: Vec::new(),
+                auto_names: Default::default(),
+                auto_held: Vec::new(),
             }
         }
 

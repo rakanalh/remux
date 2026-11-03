@@ -23,13 +23,14 @@
 use std::io::Read;
 use std::time::Duration;
 
+use crate::client::agent_cli::target_label;
 use crate::client::cli_common::{
-    ask, escape, escape_keeping_tabs, forward_deadline, json_line, pane_hint, parse_pane,
-    parse_wait, run_verb, unexpected, CliError, REPLY_DEADLINE,
+    ask, escape, escape_keeping_tabs, forward_deadline, json_line, pane_hint, parse_pane_arg,
+    parse_wait, resolve_pane_arg, run_verb, unexpected, CliError, PaneArg, REPLY_DEADLINE,
 };
 use crate::protocol::{
     valid_host, Address, AgentState, ClientMessage, Deliver, Delivery, Message, MsgId, MsgRef,
-    PaneId, Sender, ServerMessage, Target,
+    Sender, ServerMessage, Target,
 };
 
 /// The most a body source is read, whatever the server's own limit: past it
@@ -75,10 +76,10 @@ pub enum MsgCmd {
         /// 10m by default
         #[arg(long, value_parser = parse_wait, value_name = "DUR", requires = "waits")]
         timeout: Option<Duration>,
-        /// The message this one answers. With no target, the number `msg
-        /// read` shows, and the reply goes to that message's sender. With a
-        /// target, the id is sent as given: for a message from another
-        /// machine, that is its `origin.id` in `msg read --format json`
+        /// The number of the message this one answers, as `msg read` shows
+        /// it. With no target, the reply goes to that message's sender. With
+        /// a target that sent you that message, it is answered the same way;
+        /// any other id is sent as given
         #[arg(long, value_name = "ID")]
         reply_to: Option<MsgId>,
         /// Print the answer as JSON
@@ -87,9 +88,9 @@ pub enum MsgCmd {
     },
     /// Read a mailbox: this pane's, or another's with --pane (a peek).
     Read {
-        /// Another pane's mailbox, `%N`; reading it marks nothing
-        #[arg(long, value_parser = parse_pane)]
-        pane: Option<PaneId>,
+        /// Another agent's mailbox, by its name; reading it marks nothing
+        #[arg(long, value_name = "NAME", value_parser = parse_pane_arg)]
+        pane: Option<PaneArg>,
         /// Include messages already read
         #[arg(long)]
         all: bool,
@@ -119,9 +120,9 @@ pub enum MsgCmd {
         /// Mark every unread message
         #[arg(long, conflicts_with = "ids")]
         all: bool,
-        /// Another pane's mailbox, `%N`
-        #[arg(long, value_parser = parse_pane)]
-        pane: Option<PaneId>,
+        /// Another agent's mailbox, by its name
+        #[arg(long, value_name = "NAME", value_parser = parse_pane_arg)]
+        pane: Option<PaneArg>,
     },
 }
 
@@ -187,15 +188,26 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
             // A reply by number names the message by THIS server's id; the
             // id the reply carries is the one its sender's server minted.
             let by_number = target.is_none().then_some(reply_to).flatten();
+            let mut sender_label = None;
             let (to, reply_to) = match (target, reply_to) {
-                (Some(target), reply_to) => (
-                    target
+                (Some(target), reply_to) => {
+                    let to = target
                         .parse::<Address>()
-                        .map_err(|why: String| CliError::usage("bad_address", why))?,
-                    reply_to,
-                ),
+                        .map_err(|why: String| CliError::usage("bad_address", why))?;
+                    let reply_to = match reply_to {
+                        // Best effort: a mailbox that cannot be read leaves
+                        // the id as given, which is what it was before.
+                        Some(id) => Some(match own_mail().await {
+                            Ok(mail) => reply_id_for(&mail, id, &to),
+                            Err(_) => id,
+                        }),
+                        None => None,
+                    };
+                    (to, reply_to)
+                }
                 (None, Some(id)) => {
-                    let (to, origin_id) = reply_route(id).await?;
+                    let (to, origin_id, label) = reply_route(id).await?;
+                    sender_label = label;
                     (to, Some(origin_id))
                 }
                 (None, None) => {
@@ -206,6 +218,13 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                 }
             };
             let body = read_body(text, stdin, file)?;
+            // How the answer names the target: the caller's own spelling, or,
+            // for a reply by number, the sender's name. Never an id the
+            // caller did not type.
+            let spelled = match by_number {
+                None => Some(escape(&to.to_string())),
+                Some(_) => sender_label,
+            };
             log::debug!(
                 "cmd: msg send to={:?} deliver={deliver:?} bytes={} defer={defer} wait={wait} \
                  timeout={:?}",
@@ -231,7 +250,7 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
             )
             .await
             .map_err(|e| match (e, by_number) {
-                (CliError::Timeout, _) => send_timeout(&to),
+                (CliError::Timeout, _) => send_timeout(to.host.is_some(), spelled.as_deref()),
                 (CliError::Refused { code, .. }, Some(id)) if code == "no_such_target" => {
                     CliError::Refused {
                         code,
@@ -273,8 +292,13 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                             sent_line(
                                 id,
                                 to.host.as_deref(),
-                                to.pane_id,
-                                to.name.as_deref(),
+                                &match &to.name {
+                                    Some(_) =>
+                                        target_label(to.host.as_deref(), to.name.as_deref(), ""),
+                                    None => spelled.clone().unwrap_or_else(|| {
+                                        format!("the sender of message {}", by_number.unwrap_or(0))
+                                    }),
+                                },
                                 outcome
                             )
                         );
@@ -295,6 +319,7 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                 "cmd: msg read pane={pane:?} all={all} peek={peek} wait={:?}",
                 wait.map(|w| w.as_millis())
             );
+            let pane = resolve_pane_arg(pane).await?;
             let cap = Duration::from_millis(crate::server::daemon::MAX_WAIT_MS);
             let deadline = wait.map_or(REPLY_DEADLINE, |w| w.min(cap) + REPLY_DEADLINE);
             let answer = ask(
@@ -347,6 +372,7 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                 ));
             }
             log::debug!("cmd: msg ack pane={pane:?} ids={} all={all}", ids.len());
+            let pane = resolve_pane_arg(pane).await?;
             let answer = ask(
                 ClientMessage::MsgAck {
                     pane,
@@ -503,12 +529,13 @@ fn send_deadline(deliver: Deliver, defer: bool, wait: bool, timeout: Option<Dura
 
 /// A send with no answer in time: the server may have stored the message,
 /// and typed it, so sending it again could deliver it twice.
-fn send_timeout(to: &Address) -> CliError {
-    let check = match (&to.host, &to.target) {
-        (None, Target::Pane(pane)) => format!("`remux msg read --pane %{pane} --all`"),
-        _ => {
-            format!("`remux agent status {to}` for its pane, then `remux msg read --pane %N --all`")
-        }
+/// `spelled` is the target as the caller named it, or `None` for a reply by
+/// number to a sender with no name.
+fn send_timeout(remote: bool, spelled: Option<&str>) -> CliError {
+    let check = match spelled {
+        Some(to) if remote => format!("`remux agent status {to}`"),
+        Some(to) => format!("`remux msg read --pane {to} --all`"),
+        None => "`remux agent ls`".to_string(),
     };
     CliError::SendTimeout(format!(
         "the server did not answer in time, so the outcome is unknown: check {check} before re-sending"
@@ -557,17 +584,10 @@ fn advice(reason: &str) -> Option<&'static str> {
     })
 }
 
-fn sent_line(
-    id: MsgId,
-    host: Option<&str>,
-    pane: PaneId,
-    name: Option<&str>,
-    outcome: Outcome,
-) -> String {
+/// `to` is the target as [`target_label`] names it, already escaped, and
+/// `host` the machine it is on, when not this one.
+fn sent_line(id: MsgId, host: Option<&str>, to: &str, outcome: Outcome) -> String {
     let host = host.map(escape);
-    let named = name
-        .map(|n| format!(" ({})", escape(n)))
-        .unwrap_or_default();
     // The agent read these before a person's key or a prompt stopped the
     // Enter: the text is in its input, so "stored" would send someone to the
     // mailbox for a message that is on the agent's screen.
@@ -582,9 +602,7 @@ fn sent_line(
         Delivery::Forwarded => match &host {
             Some(host) => {
                 return format!(
-                    "sent #{id} to {host}:%{pane}{}: forwarded to {host}, stored in its mailbox{}",
-                    name.map(|n| format!(" ({})", escape(n)))
-                        .unwrap_or_default(),
+                    "sent #{id} to {to}: forwarded to {host}, stored in its mailbox{}",
                     outcome
                         .reason
                         .as_deref()
@@ -633,11 +651,7 @@ fn sent_line(
     } else {
         format!(" ({})", why.join("; "))
     };
-    let to = match &host {
-        Some(host) => format!("{host}:%{pane}"),
-        None => format!("%{pane}"),
-    };
-    format!("sent #{id} to {to}{named}: {how}{ended}{why}{advice}")
+    format!("sent #{id} to {to}: {how}{ended}{why}{advice}")
 }
 
 /// The body under its header: every line indented four spaces and escaped,
@@ -691,21 +705,58 @@ fn header(msg: &Message) -> String {
     format!("from {who}, #{}:", msg.id)
 }
 
-/// A session as a header shows it: escaped, and with `#` and its look-alikes
-/// escaped too, since a session is the one field of a header that may hold
-/// one. A header's only `#` is then its number, which a session named
-/// `x), #12:` cannot fake.
+/// The characters a session could fake a header's own punctuation with:
+/// `#`, which only the number may hold, and the fullwidth and small forms
+/// of `#`, `(`, `)`, `,` and `:`, which a reader takes for the ASCII ones.
+const HEADER_LOOKALIKES: [char; 11] = [
+    '#', '\u{FF03}', '\u{FE5F}', '\u{FF08}', '\u{FF09}', '\u{FF0C}', '\u{FF1A}', '\u{FE59}',
+    '\u{FE5A}', '\u{FE50}', '\u{FE55}',
+];
+
+/// A session as a header shows it: escaped, and with each of
+/// [`HEADER_LOOKALIKES`] escaped too, since a session is the one field of a
+/// header that may hold them. A header's only `#` is then its number, which
+/// a session named `x), #12:` cannot fake, in ASCII or in fullwidth.
 fn session_shown(session: &str) -> String {
     escape(session)
-        .replace('#', "\\x23")
-        .replace('\u{FF03}', "\\u{ff03}")
-        .replace('\u{FE5F}', "\\u{fe5f}")
+        .chars()
+        .map(|c| match c {
+            '#' => "\\x23".to_string(),
+            c if HEADER_LOOKALIKES.contains(&c) => format!("\\u{{{:x}}}", c as u32),
+            c => c.to_string(),
+        })
+        .collect()
 }
 
 /// Where a reply to message `id` goes, and the id it answers: the caller's
 /// own mailbox is peeked for it, so only mail the caller received can be
 /// answered this way.
-async fn reply_route(id: MsgId) -> Result<(Address, MsgId), CliError> {
+async fn reply_route(id: MsgId) -> Result<(Address, MsgId, Option<String>), CliError> {
+    let messages = own_mail().await?;
+    let msg = messages
+        .iter()
+        .find(|m| m.id == id)
+        .ok_or_else(|| CliError::Refused {
+            code: "no_such_message".into(),
+            message: format!("message {id} is not in your mailbox"),
+        })?;
+    let (to, origin_id) = reply_address(msg).ok_or_else(|| CliError::Refused {
+        code: "bad_address".into(),
+        message: format!("the sender of message {id} is on a host no address can name"),
+    })?;
+    let label = match &msg.from {
+        Sender::Pane { name, .. } => name
+            .as_deref()
+            .map(|name| target_label(None, Some(name), "")),
+        Sender::Remote { host, name, .. } => name
+            .as_deref()
+            .map(|name| target_label(Some(host), Some(name), "")),
+    };
+    Ok((to, origin_id, label))
+}
+
+/// The caller's own mailbox, every message in it, marking nothing.
+async fn own_mail() -> Result<Vec<Message>, CliError> {
     let answer = ask(
         ClientMessage::MsgRead {
             pane: None,
@@ -717,20 +768,41 @@ async fn reply_route(id: MsgId) -> Result<(Address, MsgId), CliError> {
         REPLY_DEADLINE,
     )
     .await?;
-    let ServerMessage::MsgList { messages, .. } = answer else {
-        return Err(unexpected(&answer));
+    match answer {
+        ServerMessage::MsgList { messages, .. } => Ok(messages),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// The id a reply to `id` carries when the caller also named its target
+/// `to`: when the caller's own message `id` came from `to`, the id its
+/// sender's server knows it by, as a reply by number sends; otherwise `id`
+/// as given, which a script may have taken from `--format json`'s
+/// `origin.id`.
+fn reply_id_for(mail: &[Message], id: MsgId, to: &Address) -> MsgId {
+    mail.iter()
+        .find(|msg| msg.id == id && sent_by(msg, to))
+        .map_or(id, |msg| {
+            msg.origin.as_ref().map_or(msg.id, |origin| origin.id)
+        })
+}
+
+/// Whether `to` names the pane that sent `msg`, by its id or its name.
+fn sent_by(msg: &Message, to: &Address) -> bool {
+    let (host, pane_id, name) = match &msg.from {
+        Sender::Pane { pane_id, name, .. } => (None, *pane_id, name.as_deref()),
+        Sender::Remote {
+            host,
+            pane_id,
+            name,
+            ..
+        } => (Some(host.as_str()), *pane_id, name.as_deref()),
     };
-    let msg = messages
-        .iter()
-        .find(|m| m.id == id)
-        .ok_or_else(|| CliError::Refused {
-            code: "no_such_message".into(),
-            message: format!("message {id} is not in your mailbox"),
-        })?;
-    reply_address(msg).ok_or_else(|| CliError::Refused {
-        code: "bad_address".into(),
-        message: format!("the sender of message {id} is on a host no address can name"),
-    })
+    to.host.as_deref() == host
+        && match &to.target {
+            Target::Pane(pane) => *pane == pane_id,
+            Target::Name(wanted) => name == Some(wanted.as_str()),
+        }
 }
 
 /// The address of `msg`'s sender and the id a reply to it carries, or `None`
@@ -948,24 +1020,24 @@ mod tests {
 
     #[test]
     fn the_sent_line_says_how_the_turn_ended() {
-        let line = |o| sent_line(4, None, 2, None, o);
+        let line = |o| sent_line(4, None, "alpha", o);
         assert_eq!(
             line(outcome(Delivery::Submitted, None)),
-            "sent #4 to %2: typed into the pane"
+            "sent #4 to alpha: typed into the pane"
         );
         assert_eq!(
             line(Outcome {
                 final_state: Some(AgentState::Idle),
                 ..outcome(Delivery::Submitted, None)
             }),
-            "sent #4 to %2: typed into the pane; idle, answered after 2.1s"
+            "sent #4 to alpha: typed into the pane; idle, answered after 2.1s"
         );
         assert_eq!(
             line(Outcome {
                 final_state: Some(AgentState::NeedsInput),
                 ..outcome(Delivery::Submitted, None)
             }),
-            "sent #4 to %2: typed into the pane; asking for input, answered after 2.1s"
+            "sent #4 to alpha: typed into the pane; asking for input, answered after 2.1s"
         );
         assert_eq!(
             line(Outcome {
@@ -974,11 +1046,11 @@ mod tests {
                 timeout: Some(Duration::from_secs(600)),
                 ..outcome(Delivery::Submitted, None)
             }),
-            "sent #4 to %2: typed into the pane (timed out after 600s; last state working)"
+            "sent #4 to alpha: typed into the pane (timed out after 600s; last state working)"
         );
         assert_eq!(
             line(outcome(Delivery::Submitted, Some("agent_prompt_stalled"))),
-            "sent #4 to %2: typed into the pane (agent_prompt_stalled). It was typed and \
+            "sent #4 to alpha: typed into the pane (agent_prompt_stalled). It was typed and \
              submitted: do not send it again; look at the pane."
         );
         assert_eq!(
@@ -987,30 +1059,52 @@ mod tests {
                 timeout: Some(Duration::from_secs(30)),
                 ..outcome(Delivery::Mailbox, Some("agent_blocked"))
             }),
-            "sent #4 to %2: stored in its mailbox (agent_blocked; timed out after 30s)"
+            "sent #4 to alpha: stored in its mailbox (agent_blocked; timed out after 30s)"
         );
         assert_eq!(
             line(outcome(Delivery::Mailbox, Some("agent_working"))),
-            "sent #4 to %2: stored in its mailbox (agent_working)"
+            "sent #4 to alpha: stored in its mailbox (agent_working)"
         );
     }
 
     #[test]
     fn a_message_the_agent_read_is_not_reported_as_stored() {
-        let line = |reason| sent_line(4, None, 2, None, outcome(Delivery::Mailbox, Some(reason)));
+        let line = |reason| sent_line(4, None, "alpha", outcome(Delivery::Mailbox, Some(reason)));
         assert_eq!(
             line("typed_over_read"),
-            "sent #4 to %2: typed into the pane, not submitted (typed_over_read)"
+            "sent #4 to alpha: typed into the pane, not submitted (typed_over_read)"
         );
         assert_eq!(
             line("agent_blocked_read"),
-            "sent #4 to %2: typed into the pane, not submitted (agent_blocked_read)"
+            "sent #4 to alpha: typed into the pane, not submitted (agent_blocked_read)"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_send_names_the_host_and_the_agent() {
+        assert_eq!(
+            sent_line(
+                7,
+                Some("mini"),
+                "mini:alpha",
+                outcome(Delivery::Forwarded, None)
+            ),
+            "sent #7 to mini:alpha: forwarded to mini, stored in its mailbox"
+        );
+        assert_eq!(
+            sent_line(
+                7,
+                Some("mini"),
+                "mini:alpha",
+                outcome(Delivery::Forwarded, Some("inbound_mailbox_only"))
+            ),
+            "sent #7 to mini:alpha: forwarded to mini, stored in its mailbox (inbound_mailbox_only)"
         );
     }
 
     #[test]
     fn an_answer_that_needs_action_says_what_to_do() {
-        let line = |delivery, reason| sent_line(4, None, 2, None, outcome(delivery, Some(reason)));
+        let line = |delivery, reason| sent_line(4, None, "alpha", outcome(delivery, Some(reason)));
         let cases = [
             (Delivery::Mailbox, "read_by_another_program", "Ctrl-U"),
             (
@@ -1047,17 +1141,23 @@ mod tests {
 
     #[test]
     fn a_send_timeout_says_how_to_check_before_resending() {
-        let pane: Address = "%4".parse().unwrap();
-        let named: Address = "lead".parse().unwrap();
-        let by_pane = send_timeout(&pane).stderr();
+        let by_name = send_timeout(false, Some("lead")).stderr();
         assert!(
-            by_pane.contains("outcome is unknown")
-                && by_pane.contains("`remux msg read --pane %4 --all` before re-sending"),
-            "{by_pane}"
+            by_name.contains("outcome is unknown")
+                && by_name.contains("`remux msg read --pane lead --all` before re-sending"),
+            "{by_name}"
         );
-        let by_name = send_timeout(&named).stderr();
-        assert!(by_name.contains("`remux agent status lead`"), "{by_name}");
-        assert_eq!(send_timeout(&pane).exit_code(), 1);
+        let remote = send_timeout(true, Some("mini:lead")).stderr();
+        assert!(
+            remote.contains("`remux agent status mini:lead`"),
+            "{remote}"
+        );
+        let nameless = send_timeout(false, None).stderr();
+        assert!(
+            nameless.contains("`remux agent ls`") && !nameless.contains('%'),
+            "{nameless}"
+        );
+        assert_eq!(send_timeout(false, None).exit_code(), 1);
     }
 
     fn hostile() -> Message {
@@ -1165,13 +1265,20 @@ mod tests {
         far.id = 9;
         let mut wide = remote(Some("beta"), "z), \u{FF03}14: \u{FE5F}15:");
         wide.id = 11;
-        for (msg, id) in [(msg, 7), (far, 9), (wide, 11)] {
+        let mut full = remote(
+            Some("beta"),
+            "z\u{FF09}\u{FF0C} \u{FF03}16\u{FF1A}\u{FE5A}\u{FE50} \u{FE5F}17\u{FE55}\u{FF08}\u{FE59}",
+        );
+        full.id = 12;
+        for (msg, id) in [(msg, 7), (far, 9), (wide, 11), (full, 12)] {
             let rendered = render_mail(&[msg]);
             let header = rendered.lines().nth(1).unwrap_or("");
-            assert_eq!(
-                header.matches(['#', '\u{FF03}', '\u{FE5F}']).count(),
-                1,
-                "{header}"
+            assert_eq!(header.matches('#').count(), 1, "{header}");
+            assert!(
+                !header
+                    .chars()
+                    .any(|c| c != '#' && HEADER_LOOKALIKES.contains(&c)),
+                "a look-alike is shown as itself: {header}"
             );
             assert!(header.ends_with(&format!(", #{id}:")), "{header}");
         }
@@ -1244,6 +1351,30 @@ mod tests {
                 },
                 41
             ))
+        );
+    }
+
+    #[test]
+    fn a_reply_with_a_target_translates_only_a_number_that_target_sent() {
+        let mut far = remote(Some("beta"), "build");
+        far.origin = Some(MsgRef {
+            host: Some("mini".into()),
+            id: 41,
+        });
+        let mail = [far];
+        let to = |s: &str| s.parse::<Address>().unwrap();
+        assert_eq!(reply_id_for(&mail, 4, &to("mini:%9")), 41);
+        assert_eq!(reply_id_for(&mail, 4, &to("mini:beta")), 41);
+        assert_eq!(
+            reply_id_for(&mail, 4, &to("mini:gamma")),
+            4,
+            "another sender"
+        );
+        assert_eq!(reply_id_for(&mail, 4, &to("beta")), 4, "another machine");
+        assert_eq!(
+            reply_id_for(&mail, 41, &to("mini:beta")),
+            41,
+            "an origin id, as given"
         );
     }
 

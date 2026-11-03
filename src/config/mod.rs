@@ -1393,16 +1393,16 @@ mod tests {
     #[test]
     fn a_remote_named_like_a_reserved_word_is_reported_by_name_and_kept() {
         let mut config: Config = toml::from_str(
-            "[remotes.claude-box]\nssh = \"c\"\n[remotes.remux-dev]\nssh = \"r\"\n[remotes.mini]\nssh = \"m\"",
+            "[remotes.claude-box]\nssh = \"c\"\n[remotes.user-dev]\nssh = \"r\"\n[remotes.mini]\nssh = \"m\"",
         )
         .unwrap();
         let problems = config.check_remotes();
         assert!(
             problems.iter().any(|p| p.contains("[remotes.claude-box]"))
-                && problems.iter().any(|p| p.contains("[remotes.remux-dev]")),
+                && problems.iter().any(|p| p.contains("[remotes.user-dev]")),
             "{problems:?}"
         );
-        for key in ["claude-box", "remux-dev", "mini"] {
+        for key in ["claude-box", "user-dev", "mini"] {
             assert!(config.remotes.contains_key(key), "{key} was dropped");
         }
     }

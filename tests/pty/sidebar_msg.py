@@ -16,6 +16,8 @@ set by the agent, not typed into a shell before it.
   3c  the agent reads its mail silently: the badge is gone within 1.5 s
   3d  the name cleared: the suffix is gone; a 32-character name with unread
       mail: the label is cut and the badge still holds the right edge
+  3u  the unnamed agent, once `remux agent ls` lists it, reads
+      "claude @main" (or main-N): the name remux gave it after its session
   3e  Alt+a: the switcher's row for the agent carries " @alpha"
   3z  no panic; the client is alive
 
@@ -237,6 +239,13 @@ def main():
         w.to_pane(b, "clear\n")
         y, text = wait_row(pump, screen, lambda t: "@" not in t and "claude" in t, timeout=3)
         check("3d a cleared name: the suffix is gone", "@" not in text and "claude" in text, text)
+        # --- 3u -----------------------------------------------------------
+        subprocess.run([BIN, "agent", "ls"], env=env(), capture_output=True, timeout=10)
+        y, text = wait_row(pump, screen, lambda t: "@main" in t, timeout=3)
+        check("3u an unnamed agent, once listed, reads \"claude @main\" or \"@main-N\": the name remux gave it",
+              "claude @main" in text and "*" not in text, text)
+        w.to_pane(b, "clear\n")
+        wait_row(pump, screen, lambda t: "@" not in t and "claude" in t, timeout=3)
         w.to_pane(b, "long\n")
         wait_row(pump, screen, lambda t: "@abc" in t, timeout=3)
         w.to_pane(a, f"""'{BIN}' msg send {LONG_NAME} --deliver mailbox "$(printf 'M:%s' three)"\n""")

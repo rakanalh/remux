@@ -770,11 +770,11 @@ async fn handle_msg_send(
         Ok(to) => to,
         Err(refusal) => return Some(ServerMessage::refused(refusal.code(), refusal.message())),
     };
-    let (session, to_in_a_tab, from_popup, to_popup) = {
+    let (session, to_session, from_popup, to_popup) = {
         let st = state.lock().await;
         (
             st.locate_pane(from.pane).map(|(session, _)| session),
-            st.locate_pane(to).is_some(),
+            st.locate_pane(to).map(|(session, _)| session),
             st.is_popup(from.pane),
             st.is_popup(to),
         )
@@ -788,13 +788,26 @@ async fn handle_msg_send(
     let Some(session) = session else {
         return Some(ServerMessage::refused(
             "sender_unverified",
-            format!("pane %{} is closing", from.pane),
+            "your pane is closing".to_string(),
         ));
     };
-    if !to_in_a_tab {
-        let refusal = Refusal::NoSuchTarget(format!("%{to}"));
-        return Some(ServerMessage::refused(refusal.code(), refusal.message()));
-    }
+    let Some(to_session) = to_session else {
+        return Some(ServerMessage::refused(
+            "no_such_target",
+            format!("no such target: {} is in no tab", msg.to),
+        ));
+    };
+    let from_name = {
+        let mut store = store.lock().await;
+        name_pane(&mut store, to, &to_session);
+        let named = name_pane(&mut store, from.pane, &session).or(from_name);
+        // A name a send goes out under, or is addressed to, is in use.
+        store.name_used(from.pane);
+        if matches!(msg.to.target, Target::Name(_)) {
+            store.name_used(to);
+        }
+        named
+    };
 
     let bytes = msg.body.len();
     let submit = msg.deliver != Deliver::Mailbox;
@@ -1100,7 +1113,7 @@ async fn forwarding_sender(
         Some(session) => Ok((from.pane, session)),
         None => Err(Box::new(ServerMessage::refused(
             "sender_unverified",
-            format!("pane %{} is closing", from.pane),
+            "your pane is closing".to_string(),
         ))),
     }
 }
@@ -1149,7 +1162,8 @@ async fn reply_over_inbound(
         };
     let (minted, from_name) = {
         let mut store = store.lock().await;
-        let from_name = store.name_of(from_pane).map(str::to_string);
+        let from_name = name_pane(&mut store, from_pane, &session);
+        store.name_used(from_pane);
         let sender = Sender::Pane {
             pane_id: from_pane,
             name: from_name.clone(),
@@ -1531,10 +1545,17 @@ async fn handle_inbound(
             return refuse(refusal.code(), refusal.message());
         }
     };
+    // A pane is never named for a peer: only this machine's own sends and
+    // listings give a name.
     if state.lock().await.locate_pane(to).is_none() {
         charged(store, link.clone()).await;
-        let refusal = Refusal::NoSuchTarget(format!("%{to}"));
-        return refuse(refusal.code(), refusal.message());
+        return refuse(
+            "no_such_target",
+            format!("no such target: {} is in no tab", spelled(&req.to)),
+        );
+    }
+    if matches!(req.to, Target::Name(_)) {
+        store.lock().await.name_used(to);
     }
     let bytes = req.body.len();
     let (sent, answered) = {
@@ -1680,7 +1701,8 @@ async fn forward_send(
     };
     let (minted, from_name) = {
         let mut store = store.lock().await;
-        let from_name = store.name_of(from_pane).map(str::to_string);
+        let from_name = name_pane(&mut store, from_pane, &session);
+        store.name_used(from_pane);
         let sender = Sender::Pane {
             pane_id: from_pane,
             name: from_name.clone(),
@@ -2104,9 +2126,7 @@ fn forward_unknown(id: MsgId, host: &str, target: &Target, reason: &str) -> Serv
     log::info!("msg: id={id} outcome unknown: {reason}");
     let look = match target {
         Target::Pane(pane) => format!("`remux msg read --pane %{pane} --all` on {host}"),
-        Target::Name(name) => {
-            format!("`remux msg read --pane %N --all` on {host}, for the pane named {name}")
-        }
+        Target::Name(name) => format!("`remux msg read --pane {name} --all` on {host}"),
     };
     ServerMessage::refused(
         "forward_unknown",
@@ -2353,9 +2373,15 @@ async fn handle_link_send(
         Ok(to) => to,
         Err(refusal) => return Some(ServerMessage::refused(refusal.code(), refusal.message())),
     };
+    // A pane is never named for a peer, as in `handle_inbound`.
     if state.lock().await.locate_pane(to).is_none() {
-        let refusal = Refusal::NoSuchTarget(format!("%{to}"));
-        return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+        return Some(ServerMessage::refused(
+            "no_such_target",
+            format!("no such target: {} is in no tab", spelled(&msg.to.target)),
+        ));
+    }
+    if matches!(msg.to.target, Target::Name(_)) {
+        store.lock().await.name_used(to);
     }
     let bytes = msg.body.len();
     let from_pane = origin.pane_id;
@@ -2578,12 +2604,9 @@ async fn run_submitter(
             .await
             .take_overdue_submits(std::time::Instant::now());
         for entry in late {
-            let answer = crate::server::submit::overdue(
-                entry.deliver,
-                entry.pane,
-                entry.id,
-                entry.waiting_on,
-            );
+            let to = submit_label(entry.pane, store).await;
+            let answer =
+                crate::server::submit::overdue(entry.deliver, &to, entry.id, entry.waiting_on);
             reply_submit(entry, answer, None, store).await;
         }
         let heads = store.lock().await.submit_heads();
@@ -2725,7 +2748,11 @@ fn answer_submit_wait(
         }
         WaitStep::Stalled => {
             log::info!("msg: id={id} wait stalled after {after}ms");
-            let refusal = SubmitRefusal::stalled(pane, id, wait.machine.cfg().stall);
+            let refusal = SubmitRefusal::stalled(
+                name.as_deref().unwrap_or("the agent"),
+                id,
+                wait.machine.cfg().stall,
+            );
             match wait.deliver {
                 Deliver::Auto => submitted_because(id, pane, name.clone(), refusal.code),
                 _ => ServerMessage::refused(refusal.code, refusal.message),
@@ -2757,6 +2784,7 @@ async fn step_submit(
     };
 
     let (pane, id) = (head.pane, head.id);
+    let to = submit_label(pane, store).await;
     let sample = sample_pane(pane, state, panes, config).await;
     let rule = submit_policy(config).rule_for(sample.command.as_deref().unwrap_or(""));
     let agent_state = sample.state;
@@ -2769,7 +2797,7 @@ async fn step_submit(
         return hold_while_blocked(pane, id, store).await;
     }
     if let Some(answer) = precheck(
-        pane,
+        &to,
         sample.live,
         sample.command.is_some(),
         agent_state,
@@ -2780,13 +2808,13 @@ async fn step_submit(
     let working = std::time::Duration::from_millis(config.agents.working_ms);
     let now = std::time::Instant::now();
     if working_first(sample.last_human_input, now, working)
-        && answer_working(pane, id, agent_state, &rule, head.deliver, store).await
+        && answer_working(pane, &to, id, agent_state, &rule, head.deliver, store).await
     {
         return;
     }
     let attended = pane_attended(pane, state, clients).await;
     if attended && !config.messaging.submit_when_attended {
-        let answer = settle(head.deliver, SubmitRefusal::attended(pane));
+        let answer = settle(head.deliver, SubmitRefusal::attended(&to));
         return answer_head(pane, id, answer, None, store).await;
     }
     let guard = config.messaging.typing_guard();
@@ -2799,7 +2827,7 @@ async fn step_submit(
     ) {
         GuardVerdict::Ready => {}
         GuardVerdict::Expired if !head.defer => {
-            let answer = settle(head.deliver, SubmitRefusal::human_typing(pane));
+            let answer = settle(head.deliver, SubmitRefusal::human_typing(&to));
             return answer_head(pane, id, answer, None, store).await;
         }
         // A deferred submit outlasts the guard's cap: its own deadline ends
@@ -2811,7 +2839,7 @@ async fn step_submit(
             return;
         }
     }
-    if answer_working(pane, id, agent_state, &rule, head.deliver, store).await {
+    if answer_working(pane, &to, id, agent_state, &rule, head.deliver, store).await {
         return;
     }
     // Claimed before anything is typed, so a read that took the message first
@@ -2842,7 +2870,7 @@ async fn step_submit(
     let entry = match claim {
         Claim::Typing(entry) => entry,
         Claim::OutOfTime(entry) => {
-            let answer = overdue(entry.deliver, pane, id, entry.waiting_on);
+            let answer = overdue(entry.deliver, &to, id, entry.waiting_on);
             reply_submit(entry, answer, None, store).await;
             mark_submit_dirty();
             return;
@@ -2859,6 +2887,7 @@ async fn step_submit(
     let typed = type_text(
         id,
         pane,
+        &to,
         &sample,
         &command,
         &entry.body,
@@ -2881,7 +2910,7 @@ async fn step_submit(
             return answer_untyped(entry, answer, policy, store).await;
         }
         Err(TextRefusal::Blocked) => {
-            let answer = settle(entry.deliver, SubmitRefusal::blocked(pane));
+            let answer = settle(entry.deliver, SubmitRefusal::blocked(&to));
             return answer_untyped(entry, answer, None, store).await;
         }
         Err(TextRefusal::Refuse(refusal)) => {
@@ -2904,6 +2933,7 @@ async fn step_submit(
         let _ends = TypingEnds(Arc::clone(&text.typing));
         let outcome = deliver_text(
             pane,
+            &to,
             pgid,
             agent,
             &command,
@@ -3018,8 +3048,9 @@ async fn hold_while_blocked(pane: PaneId, id: MsgId, store: &'static Mutex<Messa
     if new {
         log::info!("msg: id={id} submit waiting: agent_blocked");
     }
+    let to = submit_label(pane, store).await;
     for entry in behind {
-        let answer = settle(entry.deliver, SubmitRefusal::blocked(pane));
+        let answer = settle(entry.deliver, SubmitRefusal::blocked(&to));
         reply_submit(entry, answer, None, store).await;
     }
 }
@@ -3075,9 +3106,13 @@ async fn requeue_untyped(
     unsubmit_and_dirty(&mut st, entry.pane, entry.id);
     entry.reply = st.end_typing(entry.pane);
     let id = entry.id;
-    if let Some(from) = entry.from.local_pane().filter(|&from| st.is_closed(from)) {
+    if entry
+        .from
+        .local_pane()
+        .is_some_and(|from| st.is_closed(from))
+    {
         drop(st);
-        let refusal = SubmitRefusal::sender_closed(from, id);
+        let refusal = SubmitRefusal::sender_closed(id);
         let answer = settle(entry.deliver, refusal);
         reply_submit(entry, answer, None, store).await;
         mark_submit_dirty();
@@ -3099,17 +3134,36 @@ async fn requeue_untyped(
     mark_submit_dirty();
 }
 
+/// A target as its caller spelled it: a name, or a `%N` the caller typed.
+fn spelled(target: &Target) -> String {
+    match target {
+        Target::Name(name) => name.clone(),
+        Target::Pane(pane) => format!("%{pane}"),
+    }
+}
+
+/// How a submit's answers name its target: by the name the send gave it.
+/// Read once, before any other lock is taken for the step.
+async fn submit_label(pane: PaneId, store: &Mutex<Messaging>) -> String {
+    store
+        .lock()
+        .await
+        .name_of(pane)
+        .map_or_else(|| "the agent".to_string(), str::to_string)
+}
+
 /// Answer `pane`'s head by its row's `while_working`, if the agent is working
 /// and the row does not type into it. Returns whether it was answered.
 async fn answer_working(
     pane: PaneId,
+    to: &str,
     id: MsgId,
     agent_state: Option<AgentState>,
     rule: &crate::server::submit::SubmitRule,
     deliver: Deliver,
     store: &'static Mutex<Messaging>,
 ) -> bool {
-    let Some(answer) = crate::server::submit::on_working(pane, agent_state, rule, deliver) else {
+    let Some(answer) = crate::server::submit::on_working(to, agent_state, rule, deliver) else {
         return false;
     };
     answer_head(pane, id, answer, Some(working_policy(rule)), store).await;
@@ -3299,6 +3353,7 @@ enum TextRefusal {
 async fn type_text(
     id: MsgId,
     pane: PaneId,
+    to: &str,
     sample: &PaneSample,
     command: &str,
     body: &str,
@@ -3317,7 +3372,7 @@ async fn type_text(
 
     let mut ps = panes.lock().await;
     let Some(pd) = ps.get_mut(&pane).filter(|pd| !pd.exited) else {
-        return refuse(SubmitRefusal::closed(pane));
+        return refuse(SubmitRefusal::closed(to));
     };
     if pd.last_human_input != sample.last_human_input {
         return Err(TextRefusal::HumanTyped);
@@ -3325,7 +3380,7 @@ async fn type_text(
     let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
     let pgid = sample.pgid;
     if pgid.is_none() || nix::unistd::tcgetpgrp(master).ok() != pgid {
-        return refuse(SubmitRefusal::not_ready(pane));
+        return refuse(SubmitRefusal::not_ready(to));
     }
     // On a pty the master's termios requests reach the slave's settings. A
     // line-buffered terminal means a shell, `read` or a password prompt is
@@ -3337,7 +3392,7 @@ async fn type_text(
             return refuse(SubmitRefusal {
                 code: "agent_not_reading",
                 message: format!(
-                    "%{pane}'s terminal is line-buffered, so its agent is not the one reading: its message is in the mailbox"
+                    "{to}'s terminal is line-buffered, so its agent is not the one reading: its message is in the mailbox"
                 ),
             })
         }
@@ -3347,7 +3402,7 @@ async fn type_text(
     if agent_state == AgentState::NeedsInput {
         return Err(TextRefusal::Blocked);
     }
-    if let Some(answer) = on_working(pane, Some(agent_state), rule, deliver) {
+    if let Some(answer) = on_working(to, Some(agent_state), rule, deliver) {
         return Err(TextRefusal::Working(answer));
     }
     let framing = match rule.bracketed {
@@ -3371,7 +3426,7 @@ async fn type_text(
         .and_then(open_slave)
         .filter(|slave| is_the_slave(slave, pd.pty.slave_dev))
     else {
-        return refuse(SubmitRefusal::not_read(pane));
+        return refuse(SubmitRefusal::not_read(to));
     };
     let (text, enter) = encode(body, framing, rule.focus_in, &rule.enter);
     let bytes = text.len();
@@ -3381,7 +3436,7 @@ async fn type_text(
     let content = body.strip_suffix(tail).unwrap_or(&body);
     let chunks = split_chunks(content, tail, CHUNK_MAX);
     if chunks.len() > MAX_CHUNKS {
-        return refuse(SubmitRefusal::too_many_lines(pane, MAX_CHUNKS));
+        return refuse(SubmitRefusal::too_many_lines(to, MAX_CHUNKS));
     }
     let typing = Arc::new(SubmitTyping {
         id,
@@ -3621,6 +3676,7 @@ enum Typed {
 #[allow(clippy::too_many_arguments)]
 async fn deliver_text(
     pane: PaneId,
+    to: &str,
     pgid: Option<nix::unistd::Pid>,
     agent: Option<nix::unistd::Pid>,
     command: &str,
@@ -3660,18 +3716,18 @@ async fn deliver_text(
         if !probe_written {
             match written.try_recv() {
                 Ok(true) => probe_written = true,
-                Ok(false) | Err(TryRecvError::Closed) => break Err(SubmitRefusal::not_read(pane)),
+                Ok(false) | Err(TryRecvError::Closed) => break Err(SubmitRefusal::not_read(to)),
                 Err(TryRecvError::Empty) => {}
             }
         }
         {
             let ps = panes.lock().await;
             let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
-                break Err(SubmitRefusal::closed(pane));
+                break Err(SubmitRefusal::closed(to));
             };
             if !agent_reads(pd, pgid, agent) {
                 agent_reading = false;
-                break Err(SubmitRefusal::not_read(pane));
+                break Err(SubmitRefusal::not_read(to));
             }
             let read = probe_written && unread_input(slave) == Some(0);
             if read {
@@ -3687,7 +3743,7 @@ async fn deliver_text(
                 if submit_state(pd, command, rules, now) == AgentState::NeedsInput {
                     typing.end();
                     close_paste(pd);
-                    return Typed::Untyped(SubmitRefusal::blocked(pane));
+                    return Typed::Untyped(SubmitRefusal::blocked(to));
                 }
                 written = pd.send_tracked(chunks[0].clone(), Arc::clone(&typing.cancel));
                 typing.last_sent.store(chunks.len() == 1, Ordering::SeqCst);
@@ -3696,7 +3752,7 @@ async fn deliver_text(
             read_once = read;
         }
         if tokio::time::Instant::now() >= deadline {
-            break Err(SubmitRefusal::not_read(pane));
+            break Err(SubmitRefusal::not_read(to));
         }
         tokio::time::sleep(CONSUME_POLL).await;
     };
@@ -3724,7 +3780,7 @@ async fn deliver_text(
     let mut prompt_checked = tokio::time::Instant::now();
     let refusal = loop {
         if taken_over() {
-            let refusal = SubmitRefusal::typed_over(pane);
+            let refusal = SubmitRefusal::typed_over(to);
             return if typing.all_read.load(Ordering::SeqCst) {
                 Typed::Read(refusal)
             } else {
@@ -3738,7 +3794,7 @@ async fn deliver_text(
             match tokio::time::timeout(CHUNK_POLL, &mut written).await {
                 Ok(Ok(true)) => done = true,
                 Ok(Ok(false) | Err(_)) if !taken_over() => {
-                    break SubmitRefusal::stopped_reading(pane)
+                    break SubmitRefusal::stopped_reading(to)
                 }
                 _ => {}
             }
@@ -3747,12 +3803,12 @@ async fn deliver_text(
         {
             let ps = panes.lock().await;
             let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
-                break SubmitRefusal::closed(pane);
+                break SubmitRefusal::closed(to);
             };
             human |= typed_after(pd);
             if !agent_reads(pd, pgid, agent) {
                 agent_reading = false;
-                break SubmitRefusal::read_by_another(pane);
+                break SubmitRefusal::read_by_another(to);
             }
             let unread = unread_input(slave);
             let empty = done && unread == Some(0);
@@ -3763,7 +3819,7 @@ async fn deliver_text(
                     if next == chunks.len() && empty {
                         typing.all_read.store(true, Ordering::SeqCst);
                     }
-                    break SubmitRefusal::blocked(pane);
+                    break SubmitRefusal::blocked(to);
                 }
             }
             if let (Some(n), Some(before)) = (unread, level) {
@@ -3795,7 +3851,7 @@ async fn deliver_text(
                 Some(at) if tick >= at && empty && read_once => {
                     typing.end();
                     if human {
-                        break SubmitRefusal::typed_over(pane);
+                        break SubmitRefusal::typed_over(to);
                     }
                     pd.send_input(enter);
                     return Typed::Submitted;
@@ -3804,13 +3860,11 @@ async fn deliver_text(
             }
         }
         match enter_at {
-            None if tick >= body_deadline => break SubmitRefusal::too_slow(pane, BODY_CAP),
+            None if tick >= body_deadline => break SubmitRefusal::too_slow(to, BODY_CAP),
             None if tick.duration_since(progress_at) >= CONSUME_DEADLINE => {
-                break SubmitRefusal::stopped_reading(pane)
+                break SubmitRefusal::stopped_reading(to)
             }
-            Some(at) if tick >= at + CONSUME_DEADLINE => {
-                break SubmitRefusal::stopped_reading(pane)
-            }
+            Some(at) if tick >= at + CONSUME_DEADLINE => break SubmitRefusal::stopped_reading(to),
             _ => {}
         }
         if enter_at.is_some() {
@@ -3826,7 +3880,7 @@ async fn deliver_text(
         return Typed::Read(refusal);
     }
     if withdraw(&typing, &mut written, !done, agent_reading, pane, panes).await {
-        return Typed::Refused(SubmitRefusal::typed_over(pane));
+        return Typed::Refused(SubmitRefusal::typed_over(to));
     }
     Typed::Refused(refusal)
 }
@@ -3977,7 +4031,7 @@ async fn mailbox_of(
         (None, Err(why)) => {
             return Err(Box::new(ServerMessage::refused(
                 "not_in_pane",
-                format!("not in a pane ({}): pass --pane %N", why.reason()),
+                format!("not in a pane ({}): pass --pane <name>", why.reason()),
             )))
         }
     };
@@ -4006,7 +4060,7 @@ async fn check_addressable(
     if !live || !in_a_tab {
         return Err(Box::new(ServerMessage::refused(
             "no_such_target",
-            format!("no such target: %{pane}"),
+            "no such target: the pane has closed or is in no tab",
         )));
     }
     Ok(())
@@ -4030,13 +4084,10 @@ async fn handle_agent_name(
         return refused;
     }
     let pane = match (request.pane, &caller) {
-        (Some(_), Ok(found)) => {
+        (Some(_), Ok(_)) => {
             return ServerMessage::refused(
                 "bad_address",
-                format!(
-                    "--pane is for callers outside a pane; you are %{}",
-                    found.pane
-                ),
+                "--pane is for callers outside a pane; you are in one: leave it out",
             )
         }
         (Some(pane), Err(_)) => pane,
@@ -4044,7 +4095,7 @@ async fn handle_agent_name(
         (None, Err(why)) => {
             return ServerMessage::refused(
                 "not_in_pane",
-                format!("not in a pane ({}): pass --pane %N", why.reason()),
+                format!("not in a pane ({}): pass --pane <name>", why.reason()),
             )
         }
     };
@@ -4062,6 +4113,11 @@ async fn handle_agent_name(
             ServerMessage::AgentNamed {
                 pane,
                 name: request.name,
+                session: state
+                    .lock()
+                    .await
+                    .locate_pane(pane)
+                    .map(|(session, _)| session),
             }
         }
         Err(refusal) => ServerMessage::refused(refusal.code(), refusal.message()),
@@ -4091,13 +4147,10 @@ async fn handle_agent_session(
         return refused;
     }
     let pane = match (report.pane, &caller) {
-        (Some(_), Ok(found)) => {
+        (Some(_), Ok(_)) => {
             return ServerMessage::refused(
                 "bad_address",
-                format!(
-                    "--pane is for callers outside a pane; you are %{}",
-                    found.pane
-                ),
+                "--pane is for callers outside a pane; you are in one: leave it out",
             )
         }
         (None, Ok(found)) if found.parent_is_shell => {
@@ -4111,7 +4164,7 @@ async fn handle_agent_session(
         (None, Err(why)) => {
             return ServerMessage::refused(
                 "not_in_pane",
-                format!("not in a pane ({}): pass --pane %N", why.reason()),
+                format!("not in a pane ({}): pass --pane <name>", why.reason()),
             )
         }
     };
@@ -4160,7 +4213,7 @@ async fn handle_agent_session(
             }
             ServerMessage::AgentSessionStored { pane, outcome }
         }
-        Ok(None) => ServerMessage::refused("no_such_target", format!("no such target: %{pane}")),
+        Ok(None) => ServerMessage::refused("no_such_target", "no such target: the pane has closed"),
         Err(refusal) => {
             log::info!(
                 "agent session: pane %{pane} {:?} {kind} {bytes} bytes source={source} -> {}{}",
@@ -4242,13 +4295,13 @@ async fn handle_agent_wait(
     if !sample.live {
         return Some(ServerMessage::refused(
             "no_such_target",
-            format!("no such target: %{pane}"),
+            format!("no such target: {}", loggable(&target.to_string())),
         ));
     }
     let Some(now_state) = sample.state else {
         return Some(ServerMessage::refused(
             "agent_not_ready",
-            format!("%{pane} is not running an agent this server knows"),
+            format!("{} is not running an agent", loggable(&target.to_string())),
         ));
     };
     let name = store.lock().await.name_of(pane).map(str::to_string);
@@ -4347,9 +4400,9 @@ async fn step_state_waits(
             }
             (live, _) => {
                 let (code, why) = if live {
-                    ("agent_not_ready", format!("the agent in %{pane} exited"))
+                    ("agent_not_ready", "its agent exited")
                 } else {
-                    ("no_such_target", format!("pane %{pane} closed"))
+                    ("no_such_target", "the pane closed")
                 };
                 for wait in st.take_state_waits(pane) {
                     log::info!(
@@ -4396,6 +4449,9 @@ async fn peer_agent_refusal(
 
 async fn handle_agent_status(
     target: Option<Address>,
+    // Whether a listed pane with no name is given one: a local listing, never
+    // a peer's.
+    name_unnamed: bool,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -4450,7 +4506,7 @@ async fn handle_agent_status(
                     let why = if st.is_popup(pane_id) {
                         POPUP_REFUSED.to_string()
                     } else {
-                        format!("no such target: %{pane_id}")
+                        "no such target: the pane is in no tab".to_string()
                     };
                     return ServerMessage::refused("no_such_target", why);
                 }
@@ -4468,6 +4524,13 @@ async fn handle_agent_status(
                 unread,
                 host: None,
             });
+        }
+    }
+    // Named once the state lock is let go: nothing takes the store under it.
+    if name_unnamed {
+        let mut store = store.lock().await;
+        for entry in entries.iter_mut().filter(|entry| entry.name.is_none()) {
+            entry.name = name_pane(&mut store, entry.pane_id, &entry.session);
         }
     }
     ServerMessage::AgentStatusList {
@@ -4588,7 +4651,7 @@ async fn handle_msg_read(
         Some((Err(_), _)) => {
             return Some(ServerMessage::refused(
                 "no_such_target",
-                format!("pane %{pane} closed while waiting"),
+                "the pane closed while waiting",
             ))
         }
         Some((Ok((id, superseded)), wait_ms)) => {
@@ -6605,13 +6668,22 @@ async fn handle_client_message(
                     match peer_agent_refusal(link, target.is_none(), config, messaging()).await {
                         Some(refusal) => refusal,
                         None => {
-                            handle_agent_status(target, state, panes, clients, config, messaging())
-                                .await
+                            handle_agent_status(
+                                target,
+                                false,
+                                state,
+                                panes,
+                                clients,
+                                config,
+                                messaging(),
+                            )
+                            .await
                         }
                     },
                 ),
                 (None, None) => Some(
-                    handle_agent_status(target, state, panes, clients, config, messaging()).await,
+                    handle_agent_status(target, true, state, panes, clients, config, messaging())
+                        .await,
                 ),
             };
             if let Some(answer) = answer {
@@ -10238,6 +10310,17 @@ static AGENTS_DIRTY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 /// call while holding any server lock.
 fn mark_agents_dirty() {
     AGENTS_DIRTY.notify_one();
+}
+
+/// [`Messaging::ensure_named`], pushing the agents list when it gave `pane`
+/// a name, so the panel shows an auto name as soon as one is issued.
+fn name_pane(store: &mut Messaging, pane: PaneId, session: &str) -> Option<String> {
+    let had = store.name_of(pane).is_some();
+    let name = store.ensure_named(pane, session);
+    if !had && name.is_some() {
+        mark_agents_dirty();
+    }
+    name
 }
 
 /// Push a pane's new name to the session tree and the agents list. The caller
@@ -16662,7 +16745,7 @@ async fn reap_panes(
                 );
                 let _ = waiter.tx.send(ServerMessage::refused(
                     "no_such_target",
-                    format!("pane %{pane_id} closed while waiting"),
+                    "the pane closed while waiting",
                 ));
             }
             let orphans = store.take_submits_from(pane_id);
@@ -16679,8 +16762,7 @@ async fn reap_panes(
                     pane_id: entry.pane,
                     name: store.name_of(entry.pane).map(str::to_string),
                 };
-                let refusal =
-                    crate::server::submit::SubmitRefusal::sender_closed(pane_id, entry.id);
+                let refusal = crate::server::submit::SubmitRefusal::sender_closed(entry.id);
                 let answer = crate::server::submit::settle(entry.deliver, refusal);
                 let message = answer_submit(entry.id, resolved, answer, None);
                 send_reply(entry.id, entry.reply, message);
@@ -16692,7 +16774,7 @@ async fn reap_panes(
                 );
                 wait.reply.send(ServerMessage::refused(
                     "no_such_target",
-                    format!("pane %{pane_id} closed while waited on"),
+                    "the pane closed while it was waited on",
                 ));
             }
             let name = store.name_of(pane_id).map(str::to_string);
@@ -16713,7 +16795,7 @@ async fn reap_panes(
             for reply in replies {
                 reply.send(ServerMessage::refused(
                     "no_such_target",
-                    format!("pane %{pane_id} closed while its message was queued"),
+                    "the pane closed while the message was waiting to be typed",
                 ));
             }
             let (dropped, name) = store.drop_pane(pane_id);

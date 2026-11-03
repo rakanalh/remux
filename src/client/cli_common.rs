@@ -200,11 +200,63 @@ pub(crate) fn pane_hint() -> Option<PaneId> {
     parse_pane(&std::env::var("REMUX_PANE").ok()?).ok()
 }
 
+/// A `--pane` argument: an agent's name, or a pane id (`%N`, or bare digits),
+/// which is accepted but documented nowhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PaneArg {
+    Id(PaneId),
+    Name(String),
+}
+
+pub(crate) fn parse_pane_arg(s: &str) -> Result<PaneArg, String> {
+    if s.starts_with('%') || s.bytes().all(|b| b.is_ascii_digit()) {
+        return parse_pane(s).map(PaneArg::Id);
+    }
+    if crate::protocol::valid_name(s) {
+        Ok(PaneArg::Name(s.to_string()))
+    } else {
+        Err(format!("{} is not an agent's name", escape(s)))
+    }
+}
+
+/// The pane a `--pane` argument names. A name is looked up with an
+/// `AgentStatus` for it, since the requests that take a pane carry its id.
+pub(crate) async fn resolve_pane_arg(arg: Option<PaneArg>) -> Result<Option<PaneId>, CliError> {
+    let name = match arg {
+        None => return Ok(None),
+        Some(PaneArg::Id(pane)) => return Ok(Some(pane)),
+        Some(PaneArg::Name(name)) => name,
+    };
+    let missing = format!("no pane named {name}");
+    let target = crate::protocol::Address {
+        host: None,
+        target: crate::protocol::Target::Name(name),
+    };
+    match ask(
+        ClientMessage::AgentStatus {
+            target: Some(target),
+            req: None,
+        },
+        REPLY_DEADLINE,
+    )
+    .await?
+    {
+        ServerMessage::AgentStatusList { panes, .. } => match panes.first() {
+            Some(entry) => Ok(Some(entry.pane_id)),
+            None => Err(CliError::Refused {
+                code: "no_such_target".into(),
+                message: missing,
+            }),
+        },
+        other => Err(unexpected(&other)),
+    }
+}
+
 pub(crate) fn parse_pane(s: &str) -> Result<PaneId, String> {
     s.strip_prefix('%')
         .unwrap_or(s)
         .parse()
-        .map_err(|_| format!("{s:?} is not a pane: use %N"))
+        .map_err(|_| format!("{s:?} is not a pane"))
 }
 
 /// `30`, `30s`, `500ms`, `2m`, `1h`; a bare number is seconds.

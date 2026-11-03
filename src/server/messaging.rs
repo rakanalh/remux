@@ -96,24 +96,32 @@ impl Refusal {
                     crate::protocol::bad_name_reason(name)
                 )
             }
-            Refusal::NameTaken { name, holder } => format!("name {name:?} is held by %{holder}"),
-            Refusal::NoSuchTarget(target) => format!("no such target: {target}"),
+            Refusal::NameTaken { name, .. } => {
+                format!("{name:?} is held by another pane (see remux agent ls)")
+            }
+            Refusal::NoSuchTarget(target) if target.is_empty() => {
+                "no such target: the pane has closed".to_string()
+            }
+            Refusal::NoSuchTarget(target) if target.starts_with('%') => {
+                format!("no such target: {target}")
+            }
+            Refusal::NoSuchTarget(target) => format!("no pane named {target}"),
             Refusal::MessageTooLarge { bytes, max } => {
                 format!("message is {bytes} bytes; the limit is {max}")
             }
             Refusal::MailboxFull {
-                pane,
+                pane: _,
                 full: Full::Messages { count, max },
-            } => format!("the mailbox of %{pane} is full ({count} of {max} messages)"),
+            } => format!("the recipient's mailbox is full ({count} of {max} messages)"),
             Refusal::MailboxFull {
-                pane,
+                pane: _,
                 full: Full::Bytes {
                     held,
                     incoming,
                     max,
                 },
             } => format!(
-                "the mailbox of %{pane} is full ({held} bytes held, {incoming} more would pass the {max}-byte limit)"
+                "the recipient's mailbox is full ({held} bytes held, {incoming} more would pass the {max}-byte limit)"
             ),
             Refusal::RateLimited { per_10s } => {
                 format!("rate limited: at most {per_10s} sends per 10s")
@@ -457,6 +465,12 @@ pub struct Messaging {
     /// when each expires. Persisted, since a reply routinely outlives a
     /// restart of the server it answers.
     minted: HashMap<(String, PaneId), VecDeque<MintedId>>,
+    /// How many auto names each slug has issued. Only grows, and is
+    /// persisted, so an auto name is never reissued to another pane.
+    auto_names: BTreeMap<String, u32>,
+    /// The names held now that were issued by [`Messaging::ensure_named`]
+    /// rather than asked for: a pane that asks for one of these takes it.
+    auto_held: HashSet<String>,
 }
 
 /// One id minted for a forward: when it expires, and how many replies to it
@@ -491,6 +505,14 @@ pub struct MailboxFile {
     /// which a reply over that link must name (see [`Messaging::check_reply`]).
     #[serde(default)]
     pub minted: Vec<Minted>,
+    /// How many auto names each slug has issued (see
+    /// [`Messaging::ensure_named`]), so a closed pane's auto name is never
+    /// issued again.
+    #[serde(default)]
+    pub auto_names: BTreeMap<String, u32>,
+    /// The names held that are auto names, which a self-given name evicts.
+    #[serde(default)]
+    pub auto_held: Vec<String>,
 }
 
 /// An id minted for a message forwarded from `pane` over `link`.
@@ -613,6 +635,56 @@ fn remote_session_label(name: &str) -> String {
     }
 }
 
+/// The longest an auto name's slug is, leaving room for `-<count>` inside
+/// a name's 32 characters.
+const MAX_SLUG: usize = 28;
+
+/// How many counts [`Messaging::ensure_named`] tries before it gives up.
+/// Each taken one was a name a pane gave itself, so in practice the first
+/// or second is free.
+const MAX_AUTO_TRIES: usize = 64;
+
+/// The highest count a restore keeps. A real server issues nowhere near it;
+/// a file holding more was edited, and a count near `u32::MAX` would leave
+/// no room to grow.
+const MAX_RESTORED_AUTO_COUNT: u32 = 1_000_000;
+
+/// The slug an unnamed pane in `session` is auto-named from: lowercase, each
+/// run of anything outside `[a-z0-9]` one `-`, no `-` at either end, `s-`
+/// ahead of a leading digit, at most [`MAX_SLUG`] characters. `agent` when
+/// nothing is left or a part of it is reserved.
+fn auto_slug(session: &str) -> String {
+    let mut slug = String::new();
+    for c in session.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    if slug.starts_with(|c: char| c.is_ascii_digit()) {
+        slug.insert_str(0, "s-");
+    }
+    slug.truncate(MAX_SLUG);
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() || crate::protocol::reserved_part(slug).is_some() {
+        "agent".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+/// The `n`th auto name for `slug`: the slug itself first, then `slug-n`,
+/// cut so the whole stays a valid name's length.
+fn auto_name(slug: &str, n: u32) -> String {
+    if n <= 1 {
+        return slug.to_string();
+    }
+    let suffix = format!("-{n}");
+    let keep = slug.len().min(32usize.saturating_sub(suffix.len()));
+    format!("{}{suffix}", slug[..keep].trim_end_matches('-'))
+}
+
 /// Whether a message read from the file is one a send would have stored.
 fn valid_stored(msg: &Message, limits: &Limits) -> bool {
     let sender = match &msg.from {
@@ -699,6 +771,8 @@ impl Messaging {
             state_waits: BTreeMap::new(),
             in_flight: HashMap::new(),
             minted: HashMap::new(),
+            auto_names: BTreeMap::new(),
+            auto_held: HashSet::new(),
         }
     }
 
@@ -774,6 +848,12 @@ impl Messaging {
                     .collect();
                 minted.sort_by_key(|m| m.id);
                 minted
+            },
+            auto_names: self.auto_names.clone(),
+            auto_held: {
+                let mut held: Vec<String> = self.auto_held.iter().cloned().collect();
+                held.sort();
+                held
             },
         }
     }
@@ -870,6 +950,17 @@ impl Messaging {
                     });
             }
         }
+        store.auto_names = file
+            .auto_names
+            .into_iter()
+            .filter(|(slug, _)| auto_slug(slug) == *slug)
+            .map(|(slug, issued)| (slug, issued.min(MAX_RESTORED_AUTO_COUNT)))
+            .collect();
+        store.auto_held = file
+            .auto_held
+            .into_iter()
+            .filter(|name| store.names.contains_key(name))
+            .collect();
         store.closed = closed;
         (store, pruned)
     }
@@ -886,7 +977,7 @@ impl Messaging {
     /// never park on a pane that has already gone.
     pub fn park(&mut self, waiter: Waiter) -> Result<(WaiterId, Option<Waiter>), Refusal> {
         if self.closed.contains(&waiter.pane) {
-            return Err(Refusal::NoSuchTarget(format!("%{}", waiter.pane)));
+            return Err(Refusal::NoSuchTarget(String::new()));
         }
         let earlier = self
             .waiters
@@ -1645,7 +1736,7 @@ impl Messaging {
             )));
         }
         if self.closed.contains(&to) {
-            return Err(Refusal::NoSuchTarget(format!("%{to}")));
+            return Err(Refusal::NoSuchTarget(String::new()));
         }
 
         self.drop_old_windows(now);
@@ -1790,6 +1881,7 @@ impl Messaging {
         let Some(name) = name else {
             let before = self.names.len();
             self.names.retain(|_, holder| *holder != pane);
+            self.forget_released_auto_names();
             if self.names.len() != before {
                 self.touched();
             }
@@ -1799,10 +1891,25 @@ impl Messaging {
             return Err(Refusal::BadName(name.to_string()));
         }
         if self.closed.contains(&pane) {
-            return Err(Refusal::NoSuchTarget(format!("%{pane}")));
+            return Err(Refusal::NoSuchTarget(String::new()));
         }
         match self.names.get(name) {
-            Some(&holder) if holder == pane => return Ok(()),
+            Some(&holder) if holder == pane => {
+                // Asked for by name, so it is no longer an auto name.
+                if self.auto_held.remove(name) {
+                    self.touched();
+                }
+                return Ok(());
+            }
+            // An auto name was never asked for: the pane holding it gives it
+            // up, and is given a fresh one the next time it needs one.
+            Some(&holder) if self.auto_held.contains(name) => {
+                log::info!(
+                    "msg: name {name} taken by %{pane} from %{holder}, which held it as an unused auto name"
+                );
+                self.names.remove(name);
+                self.auto_held.remove(name);
+            }
             Some(&holder) => {
                 return Err(Refusal::NameTaken {
                     name: name.to_string(),
@@ -1813,8 +1920,58 @@ impl Messaging {
         }
         self.names.retain(|_, holder| *holder != pane);
         self.names.insert(name.to_string(), pane);
+        self.forget_released_auto_names();
         self.touched();
         Ok(())
+    }
+
+    /// `pane`'s auto name, if it has one, is in use: it sent under it, or a
+    /// send found it by it. From then on it is held like a name the pane
+    /// asked for, because whoever is writing to it expects it to stay put.
+    pub fn name_used(&mut self, pane: PaneId) {
+        let used = self
+            .name_of(pane)
+            .filter(|name| self.auto_held.contains(*name))
+            .map(str::to_string);
+        if let Some(name) = used {
+            self.auto_held.remove(&name);
+            self.touched();
+        }
+    }
+
+    /// Drop from `auto_held` every name no pane holds any more.
+    fn forget_released_auto_names(&mut self) {
+        let names = &self.names;
+        self.auto_held.retain(|name| names.contains_key(name));
+    }
+
+    /// `pane`'s name, giving it one when it has none, so that every agent
+    /// can be addressed and every sender named without a setup step. The
+    /// name is a slug of its session (`build`, then `build-2`, `build-3`),
+    /// and a self-given name replaces it as any name is replaced. A slug's
+    /// count only grows, so a closed pane's auto name is never issued to
+    /// another pane. `None` for a pane that has closed, and for one no free
+    /// name could be found for in [`MAX_AUTO_TRIES`], which leaves it unnamed
+    /// rather than hold the store while a count that can no longer grow is
+    /// tried for ever.
+    pub fn ensure_named(&mut self, pane: PaneId, session: &str) -> Option<String> {
+        if let Some(name) = self.name_of(pane) {
+            return Some(name.to_string());
+        }
+        if self.closed.contains(&pane) {
+            return None;
+        }
+        let slug = auto_slug(session);
+        let issued = self.auto_names.entry(slug.clone()).or_insert(0);
+        let name = (0..MAX_AUTO_TRIES).find_map(|_| {
+            *issued = issued.saturating_add(1);
+            let name = auto_name(&slug, *issued);
+            (!self.names.contains_key(&name) && valid_name(&name)).then_some(name)
+        })?;
+        self.names.insert(name.clone(), pane);
+        self.auto_held.insert(name.clone());
+        self.touched();
+        Some(name)
     }
 
     pub fn name_of(&self, pane: PaneId) -> Option<&str> {
@@ -1873,6 +2030,7 @@ impl Messaging {
             .map_or(0, |mb| mb.messages.len());
         let named = self.name_of(pane).map(str::to_string);
         self.names.retain(|_, holder| *holder != pane);
+        self.forget_released_auto_names();
         self.rate.remove(&SenderKey::Pane(pane));
         self.minted.retain(|(_, from), _| *from != pane);
         self.closed.insert(pane);
@@ -2798,7 +2956,7 @@ mod tests {
         m.drop_pane(7);
         assert_eq!(
             m.send(pane(1), 7, "late".into(), None, 0, t0),
-            Err(Refusal::NoSuchTarget("%7".into()))
+            Err(Refusal::NoSuchTarget(String::new()))
         );
         assert!(
             m.read(7, true, false, 0).is_empty(),
@@ -2813,7 +2971,7 @@ mod tests {
         m.drop_pane(7);
         assert_eq!(
             m.set_name(7, Some("ghost")),
-            Err(Refusal::NoSuchTarget("%7".into()))
+            Err(Refusal::NoSuchTarget(String::new()))
         );
         assert_eq!(m.pane_named("ghost"), None);
         assert_eq!(
@@ -3920,6 +4078,8 @@ mod tests {
             names: Vec::new(),
             messages,
             minted: Vec::new(),
+            auto_names: BTreeMap::new(),
+            auto_held: Vec::new(),
         }
     }
 
@@ -4046,6 +4206,215 @@ mod tests {
     }
 
     #[test]
+    fn a_slug_is_the_session_lowercased_with_each_odd_run_one_dash() {
+        assert_eq!(auto_slug("build"), "build");
+        assert_eq!(auto_slug("Build"), "build");
+        assert_eq!(auto_slug("my  big__session!"), "my-big-session");
+    }
+
+    #[test]
+    fn a_slug_has_no_dash_at_either_end() {
+        assert_eq!(auto_slug("--edge--"), "edge");
+        assert_eq!(auto_slug("  x  "), "x");
+    }
+
+    #[test]
+    fn a_slug_that_starts_with_a_digit_gets_a_letter_ahead_of_it() {
+        assert_eq!(auto_slug("2024 work!"), "s-2024-work");
+    }
+
+    #[test]
+    fn a_slug_is_cut_to_leave_room_for_a_count() {
+        let slug = auto_slug(&"a".repeat(40));
+        assert_eq!(slug.len(), MAX_SLUG);
+        assert_eq!(auto_slug(&format!("{}-b", "a".repeat(27))), "a".repeat(27));
+    }
+
+    #[test]
+    fn an_empty_or_reserved_slug_is_agent() {
+        assert_eq!(auto_slug(""), "agent");
+        assert_eq!(auto_slug("\u{2764}\u{FE0F}"), "agent");
+        assert_eq!(auto_slug("claude-work"), "agent");
+        assert_eq!(auto_slug("User"), "agent");
+    }
+
+    #[test]
+    fn remux_is_not_reserved_so_the_main_session_names_its_agents_after_itself() {
+        assert_eq!(auto_slug("Remux"), "remux");
+    }
+
+    #[test]
+    fn every_auto_name_is_a_valid_name() {
+        for session in ["build", "2024 work!", "", &"z".repeat(60), "a-"] {
+            for n in [1, 2, 9, 10, 999, 1_000_000, u32::MAX] {
+                let name = auto_name(&auto_slug(session), n);
+                assert!(valid_name(&name), "{session:?} #{n}: {name:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_first_auto_name_is_the_slug_and_later_ones_are_counted() {
+        let mut m = Messaging::new(limits());
+        assert_eq!(m.ensure_named(1, "build").as_deref(), Some("build"));
+        assert_eq!(m.ensure_named(2, "build").as_deref(), Some("build-2"));
+        assert_eq!(m.ensure_named(1, "build").as_deref(), Some("build"), "kept");
+        assert_eq!(m.ensure_named(3, "Remux").as_deref(), Some("remux"));
+        assert_eq!(m.pane_named("build-2"), Some(2));
+    }
+
+    #[test]
+    fn a_closed_panes_auto_name_is_never_issued_again() {
+        let mut m = Messaging::new(limits());
+        m.ensure_named(1, "build");
+        m.ensure_named(2, "build");
+        m.drop_pane(2);
+        assert_eq!(m.ensure_named(3, "build").as_deref(), Some("build-3"));
+        assert_eq!(
+            m.ensure_named(2, "build"),
+            None,
+            "a closed pane is not named"
+        );
+    }
+
+    #[test]
+    fn a_self_given_name_evicts_an_auto_holder_and_never_a_self_given_one() {
+        let mut m = Messaging::new(limits());
+        assert_eq!(m.ensure_named(1, "lead").as_deref(), Some("lead"));
+        m.set_name(2, Some("lead")).unwrap();
+        assert_eq!(m.pane_named("lead"), Some(2), "the auto holder gave it up");
+        assert_eq!(m.name_of(1), None);
+        assert_eq!(
+            m.ensure_named(1, "lead").as_deref(),
+            Some("lead-2"),
+            "the evicted pane gets a fresh auto name when it next needs one"
+        );
+        assert_eq!(
+            m.set_name(3, Some("lead")),
+            Err(Refusal::NameTaken {
+                name: "lead".into(),
+                holder: 2
+            }),
+            "a self-given name is never evicted"
+        );
+        m.set_name(1, Some("lead-2")).unwrap();
+        assert_eq!(
+            m.set_name(3, Some("lead-2")),
+            Err(Refusal::NameTaken {
+                name: "lead-2".into(),
+                holder: 1
+            }),
+            "an auto name its holder asked for is self-given now"
+        );
+    }
+
+    #[test]
+    fn an_auto_name_in_use_is_never_taken() {
+        let mut m = Messaging::new(limits());
+        m.ensure_named(1, "build");
+        m.name_used(1);
+        assert_eq!(
+            m.set_name(2, Some("build")),
+            Err(Refusal::NameTaken {
+                name: "build".into(),
+                holder: 1
+            })
+        );
+        assert_eq!(m.snapshot().auto_held, Vec::<String>::new());
+    }
+
+    #[test]
+    fn which_names_are_auto_survives_a_restart() {
+        let mut m = Messaging::new(limits());
+        m.ensure_named(1, "lead");
+        m.set_name(2, Some("alpha")).unwrap();
+        let file = m.snapshot();
+        assert_eq!(file.auto_held, vec!["lead".to_string()]);
+        let (mut r, _) = Messaging::restore(limits(), file, |_| true, HashSet::new(), 0);
+        r.set_name(3, Some("lead")).unwrap();
+        assert_eq!(
+            r.set_name(3, Some("alpha")).map(|_| ()),
+            Err(Refusal::NameTaken {
+                name: "alpha".into(),
+                holder: 2
+            })
+        );
+    }
+
+    #[test]
+    fn a_self_given_name_replaces_an_auto_name_and_frees_it() {
+        let mut m = Messaging::new(limits());
+        m.ensure_named(1, "build");
+        m.ensure_named(2, "build");
+        m.set_name(2, Some("alpha")).unwrap();
+        assert_eq!(m.pane_named("build-2"), None);
+        assert_eq!(m.ensure_named(2, "build").as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn an_auto_name_skips_a_name_a_pane_gave_itself() {
+        let mut m = Messaging::new(limits());
+        m.set_name(9, Some("build")).unwrap();
+        assert_eq!(m.ensure_named(1, "build").as_deref(), Some("build-2"));
+    }
+
+    #[test]
+    fn a_restore_clamps_a_count_no_server_could_have_issued() {
+        let mut file = file_of(Vec::new());
+        file.auto_names = BTreeMap::from([("build".into(), u32::MAX), ("ok".into(), 7)]);
+        let (mut r, _) = Messaging::restore(limits(), file, |_| true, HashSet::new(), 0);
+        assert_eq!(
+            r.snapshot().auto_names,
+            BTreeMap::from([("build".into(), MAX_RESTORED_AUTO_COUNT), ("ok".into(), 7)])
+        );
+        let next = auto_name("build", MAX_RESTORED_AUTO_COUNT + 1);
+        assert_eq!(r.ensure_named(1, "build").as_deref(), Some(next.as_str()));
+    }
+
+    #[test]
+    fn a_count_that_can_no_longer_grow_leaves_the_pane_unnamed_and_returns() {
+        let mut m = Messaging::new(limits());
+        m.auto_names.insert("build".into(), u32::MAX);
+        let last = auto_name("build", u32::MAX);
+        m.set_name(9, Some(&last)).unwrap();
+        assert_eq!(m.ensure_named(1, "build"), None);
+        assert_eq!(m.name_of(1), None);
+    }
+
+    #[test]
+    fn the_auto_name_counts_survive_a_restart() {
+        let mut m = Messaging::new(limits());
+        m.ensure_named(1, "build");
+        m.ensure_named(2, "build");
+        let file = m.snapshot();
+        assert_eq!(file.auto_names.get("build"), Some(&2));
+        let json = serde_json::to_string(&file).unwrap();
+        let back: MailboxFile = serde_json::from_str(&json).unwrap();
+        let (mut r, _) = Messaging::restore(limits(), back, |p| p == 1, HashSet::new(), 0);
+        assert_eq!(r.name_of(1), Some("build"));
+        assert_eq!(r.ensure_named(3, "build").as_deref(), Some("build-3"));
+    }
+
+    #[test]
+    fn a_mailbox_file_from_before_auto_names_still_loads() {
+        let mut file = serde_json::to_value(file_of(Vec::new())).unwrap();
+        file.as_object_mut().unwrap().remove("auto_names");
+        let back: MailboxFile = serde_json::from_value(file).unwrap();
+        assert!(back.auto_names.is_empty());
+    }
+
+    #[test]
+    fn a_restore_drops_a_count_whose_slug_could_not_be_a_slug() {
+        let mut file = file_of(Vec::new());
+        file.auto_names = BTreeMap::from([("build".into(), 4), ("Bad Slug".into(), 2)]);
+        let (r, _) = Messaging::restore(limits(), file, |_| true, HashSet::new(), 0);
+        assert_eq!(
+            r.snapshot().auto_names,
+            BTreeMap::from([("build".into(), 4)])
+        );
+    }
+
+    #[test]
     fn a_remote_senders_session_is_labelled_on_arrival_and_on_restore_and_empty_stays_empty() {
         let remote_from = |session: &str| Sender::Remote {
             host: "mini".into(),
@@ -4133,7 +4502,7 @@ mod tests {
         );
         assert_eq!(
             r.send(pane(1), 7, "y".into(), None, 0, Instant::now()),
-            Err(Refusal::NoSuchTarget("%7".into())),
+            Err(Refusal::NoSuchTarget(String::new())),
             "the closed set was not carried"
         );
     }
@@ -4175,11 +4544,37 @@ mod tests {
             assert_eq!(r.code(), code);
             assert!(!r.message().is_empty());
         }
-        assert!(Refusal::NameTaken {
+        let taken = Refusal::NameTaken {
             name: "alpha".into(),
-            holder: 3
+            holder: 3,
         }
-        .message()
-        .contains("%3"));
+        .message();
+        assert_eq!(
+            taken,
+            "\"alpha\" is held by another pane (see remux agent ls)"
+        );
+    }
+
+    #[test]
+    fn no_refusal_names_a_pane_the_caller_did_not() {
+        assert_eq!(
+            Refusal::NoSuchTarget("alpha".into()).message(),
+            "no pane named alpha"
+        );
+        assert_eq!(
+            Refusal::NoSuchTarget("%4".into()).message(),
+            "no such target: %4",
+            "a %N the caller typed is echoed"
+        );
+        assert_eq!(
+            Refusal::NoSuchTarget(String::new()).message(),
+            "no such target: the pane has closed"
+        );
+        let full = Refusal::MailboxFull {
+            pane: 9,
+            full: Full::Messages { count: 3, max: 3 },
+        }
+        .message();
+        assert!(!full.contains('%'), "{full}");
     }
 }

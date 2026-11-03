@@ -1217,8 +1217,14 @@ pub enum ServerMessage {
     },
     /// The answer to a [`ClientMessage::MsgAck`]: how many messages it marked.
     MsgAcked { pane: PaneId, count: usize },
-    /// The answer to a [`ClientMessage::AgentName`]: the pane's name now.
-    AgentNamed { pane: PaneId, name: Option<String> },
+    /// The answer to a [`ClientMessage::AgentName`]: the pane's name now,
+    /// and the session it is in, which the CLI prints beside it.
+    AgentNamed {
+        pane: PaneId,
+        name: Option<String>,
+        #[serde(default)]
+        session: Option<String>,
+    },
     /// The answer to a [`ClientMessage::AgentStatus`], sorted by pane id.
     AgentStatusList {
         panes: Vec<PaneStatusEntry>,
@@ -1634,8 +1640,8 @@ impl std::fmt::Display for Address {
 /// and a host is written to the log.
 ///
 /// A host any of whose `-`/`_` parts is a reserved word is refused as a name
-/// is (see [`reserved_part`]): `From: user:%1` would read as a message from the
-/// user. Compared without case, because a host keeps its capitals.
+/// is (see [`reserved_part`]): `from user:alpha` would read as a message from
+/// the user. Compared without case, because a host keeps its capitals.
 pub fn valid_host(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('.')
@@ -1765,14 +1771,17 @@ pub fn hidden_chars(s: &str) -> impl Iterator<Item = (usize, char)> + '_ {
 }
 
 /// Words no pane's name may be, or contain as a part. Mail is rendered
-/// `From: <name> (%N)`, and a pane named `user`, or `claude-user`, would forge
-/// the one sender a model trusts most. A part is what `-` and `_` separate, so
-/// `user1` and `users` are names and `my-user` is not.
-pub const RESERVED_NAMES: [&str; 9] = [
+/// `from <name> (<session>), #N:`, and a pane named `user`, or `claude-user`,
+/// would forge the one sender a model trusts most. A part is what `-` and `_`
+/// separate, so `user1` and `users` are names and `my-user` is not.
+///
+/// `remux` is not among them: it names the tool, not a party a model trusts
+/// over another agent, and an unnamed agent is auto-named after its session,
+/// which for many users is `Remux`.
+pub const RESERVED_NAMES: [&str; 8] = [
     "user",
     "system",
     "claude",
-    "remux",
     "human",
     "assistant",
     "anthropic",

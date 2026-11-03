@@ -252,13 +252,13 @@ try:
 
     # --- 9a ---------------------------------------------------------------
     code, out, err = run_in_pane(child, pump, f"{BIN} agent name alpha")
-    check(code == 0 and out.strip() == f'pane %{B} is now "alpha"', f"9a B names itself alpha (exit {code}, out {out!r}, err {err!r})")
+    check(code == 0 and out.strip() == "named alpha (main)", f"9a B names itself alpha (exit {code}, out {out!r}, err {err!r})")
     child.send(b"\x1bk")
     pump(0.6)
     got = ident(child, pump, screen, "a2")
     check(got is not None and got[1] == A, f"setup: Alt+k focuses A again (got {got})")
     code, out, err = run_in_pane(child, pump, f"{BIN} agent name lead")
-    check(code == 0 and out.strip() == f'pane %{A} is now "lead"', f"9a A names itself lead (exit {code}, out {out!r}, err {err!r})")
+    check(code == 0 and out.strip() == "named lead (main)", f"9a A names itself lead (exit {code}, out {out!r}, err {err!r})")
     code, out, _ = outside(env, "agent", "ls", "--json")
     try:
         names = {str(p["pane_id"]): p["name"] for p in json.loads(out)["panes"]}
@@ -268,7 +268,7 @@ try:
 
     # --- 9b ---------------------------------------------------------------
     code, out, err = run_in_pane(child, pump, f"""REMUX_PANE=%{B} {BIN} msg send alpha "$(printf 'MSG:%s' one)" """)
-    check(code == 0 and out.startswith(f"sent #1 to %{B} (alpha)"), f"9b the send under REMUX_PANE=%{B} is #1 (exit {code}, out {out!r}, err {err!r})")
+    check(code == 0 and out.startswith("sent #1 to alpha: "), f"9b the send under REMUX_PANE=%{B} is #1 (exit {code}, out {out!r}, err {err!r})")
     m = arrived(env, B, "MSG:one")
     frm = (m or {}).get("from", {}).get("Pane", {})
     check(m is not None and str(frm.get("pane_id")) == A and frm.get("name") == "lead",

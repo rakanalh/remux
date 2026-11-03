@@ -60,8 +60,12 @@
 //!   that ends a line the AGENT read, so for the shell it ends an empty line,
 //!   and the chunk's own line sits in the shell's line unexecuted until
 //!   someone presses Enter there. At most that one line; the submit is
-//!   answered `read_by_another_program`. The first chunk is the body's own
-//!   first line, so that is the line a shell can be left holding.
+//!   answered `read_by_another_program`, whose message says to clear it with
+//!   Ctrl-U. An agent that exits right after reading the probe leaves the
+//!   body's FIRST line there, and since a typed body is raw, nothing makes
+//!   that line a comment: an Enter in that shell runs it. Whether it reaches
+//!   the shell before the flush is a race the server cannot win every time
+//!   (`msg_submit.py` 3aa/3ai pin the contract either way).
 //! - The probe is taken as read when the input queue is empty, and any
 //!   program in the agent's process group could have emptied it: a child
 //!   the agent started that reads the terminal takes the probe, and the body
@@ -91,7 +95,7 @@ use crate::config::messaging::{
     shipped_rows, valid_enter, Bracketed, MessagingConfig, SubmitRow, WhileWorking,
     MAX_ENTER_DELAY_MS, MIN_ENTER_DELAY_MS,
 };
-use crate::protocol::{AgentState, Deliver, PaneId};
+use crate::protocol::{AgentState, Deliver};
 
 /// How to type into one agent: its `[messaging.submit.<command>]` row,
 /// merged over the shipped row and the defaults.
@@ -239,13 +243,13 @@ pub fn settle(deliver: Deliver, refusal: SubmitRefusal) -> Answer {
 /// reached the head of its queue and so never waited on anything itself.
 pub fn overdue(
     deliver: Deliver,
-    pane: PaneId,
+    to: &str,
     id: crate::protocol::MsgId,
     waiting_on: Option<&'static str>,
 ) -> Answer {
     match deliver {
         Deliver::Auto => Answer::TimedOut(waiting_on.unwrap_or("submit_timeout")),
-        _ => Answer::Refuse(SubmitRefusal::out_of_time(pane, id)),
+        _ => Answer::Refuse(SubmitRefusal::out_of_time(to, id)),
     }
 }
 
@@ -265,19 +269,19 @@ pub fn waits_while_blocked(
 /// foreground is an agent, and the agent is not waiting on its user. `None`
 /// means go on to the guard.
 pub fn precheck(
-    pane: PaneId,
+    to: &str,
     live: bool,
     agent: bool,
     state: Option<AgentState>,
     deliver: Deliver,
 ) -> Option<Answer> {
     if !live {
-        return Some(settle(deliver, SubmitRefusal::closed(pane)));
+        return Some(settle(deliver, SubmitRefusal::closed(to)));
     }
     if !agent {
-        return Some(settle(deliver, SubmitRefusal::not_ready(pane)));
+        return Some(settle(deliver, SubmitRefusal::not_ready(to)));
     }
-    (state == Some(AgentState::NeedsInput)).then(|| settle(deliver, SubmitRefusal::blocked(pane)))
+    (state == Some(AgentState::NeedsInput)).then(|| settle(deliver, SubmitRefusal::blocked(to)))
 }
 
 /// Whether the bottom of an agent's screen looks like a selector waiting on
@@ -341,7 +345,7 @@ pub fn working_first(
 
 /// What the row says to do with an agent that is working.
 pub fn on_working(
-    pane: PaneId,
+    to: &str,
     state: Option<AgentState>,
     rule: &SubmitRule,
     deliver: Deliver,
@@ -352,7 +356,7 @@ pub fn on_working(
     match rule.while_working {
         WhileWorking::Queue => None,
         WhileWorking::Mailbox => Some(Answer::Mailbox("agent_working")),
-        WhileWorking::Refuse => Some(settle(deliver, SubmitRefusal::working(pane))),
+        WhileWorking::Refuse => Some(settle(deliver, SubmitRefusal::working(to))),
     }
 }
 
@@ -370,55 +374,54 @@ pub struct SubmitRefusal {
     pub message: String,
 }
 
+/// Each constructor takes `to`, the target as the sender knows it: its name,
+/// or the caller's own spelling. A pane id the server assigned is never put
+/// into a refusal.
 impl SubmitRefusal {
-    pub fn not_ready(pane: PaneId) -> Self {
+    pub fn not_ready(to: &str) -> Self {
         SubmitRefusal {
             code: "agent_not_ready",
-            message: format!(
-                "%{pane} is not running an agent this server knows: its message is in the mailbox"
-            ),
+            message: format!("{to} is not running an agent: its message is in the mailbox"),
         }
     }
 
-    pub fn closed(pane: PaneId) -> Self {
+    pub fn closed(to: &str) -> Self {
         SubmitRefusal {
             code: "no_such_target",
-            message: format!("pane %{pane} closed"),
+            message: format!("{to} closed"),
         }
     }
 
-    pub fn blocked(pane: PaneId) -> Self {
+    pub fn blocked(to: &str) -> Self {
         SubmitRefusal {
             code: "agent_blocked",
-            message: format!(
-                "%{pane} is waiting on its user's answer: its message is in the mailbox"
-            ),
+            message: format!("{to} is waiting on its user's answer: its message is in the mailbox"),
         }
     }
 
-    pub fn attended(pane: PaneId) -> Self {
+    pub fn attended(to: &str) -> Self {
         SubmitRefusal {
             code: "pane_attended",
             message: format!(
-                "a client is looking at %{pane}, and this server does not type into an attended pane: its message is in the mailbox"
+                "a client is looking at {to}, and this server does not type into an attended pane: its message is in the mailbox"
             ),
         }
     }
 
-    pub fn out_of_time(pane: PaneId, id: crate::protocol::MsgId) -> Self {
+    pub fn out_of_time(to: &str, id: crate::protocol::MsgId) -> Self {
         SubmitRefusal {
             code: "submit_timeout",
             message: format!(
-                "message #{id} waited too long to be typed into %{pane}, so it was not typed: it is in the mailbox"
+                "message #{id} waited too long to be typed into {to}, so it was not typed: it is in the mailbox"
             ),
         }
     }
 
-    pub fn not_read(pane: PaneId) -> Self {
+    pub fn not_read(to: &str) -> Self {
         SubmitRefusal {
             code: "agent_did_not_read",
             message: format!(
-                "%{pane}'s agent did not read the message, so it was not submitted: it is in the mailbox"
+                "{to} did not read the message, so it was not submitted: it is in the mailbox"
             ),
         }
     }
@@ -426,39 +429,39 @@ impl SubmitRefusal {
     /// The agent read the probe and then stopped part-way through the body.
     /// What it read before it stopped is in its input, unsubmitted, which a
     /// person must clear: sending it again would type it twice.
-    pub fn stopped_reading(pane: PaneId) -> Self {
+    pub fn stopped_reading(to: &str) -> Self {
         SubmitRefusal {
             code: "agent_did_not_read",
             message: format!(
-                "%{pane}'s agent stopped reading the message part-way, so it was not submitted: what it read may be left in its input, unsent; clear that there, and do not send it again with submit. It is in the mailbox"
+                "{to} stopped reading the message part-way, so it was not submitted: what it read may be left in its input, unsent; clear that there, and do not send it again with submit. It is in the mailbox"
             ),
         }
     }
 
-    pub fn too_many_lines(pane: PaneId, max: usize) -> Self {
+    pub fn too_many_lines(to: &str, max: usize) -> Self {
         SubmitRefusal {
             code: "too_many_lines",
             message: format!(
-                "the message has more lines than the {max} this server types into %{pane}, so it was not typed: it is in the mailbox"
+                "the message has more lines than the {max} this server types into {to}, so it was not typed: it is in the mailbox"
             ),
         }
     }
 
-    pub fn too_slow(pane: PaneId, cap: Duration) -> Self {
+    pub fn too_slow(to: &str, cap: Duration) -> Self {
         SubmitRefusal {
             code: "agent_too_slow",
             message: format!(
-                "%{pane}'s agent was still reading the message after {}s, so it was not submitted, and the part it read is left in its input: clear that before pressing Enter there. It is in the mailbox",
+                "{to} was still reading the message after {}s, so it was not submitted, and the part it read is left in its input: clear that before pressing Enter there. It is in the mailbox",
                 cap.as_secs()
             ),
         }
     }
 
-    pub fn read_by_another(pane: PaneId) -> Self {
+    pub fn read_by_another(to: &str) -> Self {
         SubmitRefusal {
             code: "read_by_another_program",
             message: format!(
-                "%{pane}'s agent stopped reading before it read the message, and another program may have read it instead; a line of it may be waiting at the shell prompt: clear it with Ctrl-U before pressing Enter. It is in the mailbox"
+                "{to} stopped reading before it read the message, and another program may have read it instead; a line of it may be waiting at the shell prompt: clear it with Ctrl-U before pressing Enter. It is in the mailbox"
             ),
         }
     }
@@ -466,49 +469,49 @@ impl SubmitRefusal {
     /// `--wait` saw nothing reach the pane after the prompt's echo. The
     /// message was submitted, so it is not in the mailbox to be read again:
     /// it is marked submitted there.
-    pub fn stalled(pane: PaneId, id: crate::protocol::MsgId, stall: Duration) -> Self {
+    pub fn stalled(to: &str, id: crate::protocol::MsgId, stall: Duration) -> Self {
         SubmitRefusal {
             code: "agent_prompt_stalled",
             message: format!(
-                "%{pane}'s agent showed no sign of taking up message #{id} for {}s after it was \
+                "{to} showed no sign of taking up message #{id} for {}s after it was \
                  submitted. It was typed and submitted, so do not send it again; look at the pane",
                 stall.as_secs_f64()
             ),
         }
     }
 
-    pub fn sender_closed(from: PaneId, id: crate::protocol::MsgId) -> Self {
+    pub fn sender_closed(id: crate::protocol::MsgId) -> Self {
         SubmitRefusal {
             code: "sender_closed",
             message: format!(
-                "pane %{from}, which sent message #{id}, closed before it was typed, so it was not typed: it is in the mailbox"
+                "the pane that sent message #{id} closed before it was typed, so it was not typed: it is in the mailbox"
             ),
         }
     }
 
-    pub fn typed_over(pane: PaneId) -> Self {
+    pub fn typed_over(to: &str) -> Self {
         SubmitRefusal {
             code: "human_typing",
             message: format!(
-                "someone typed into %{pane} while its message was being typed, so it was not submitted: it is in the mailbox"
+                "someone typed into {to} while its message was being typed, so it was not submitted: it is in the mailbox"
             ),
         }
     }
 
-    pub fn human_typing(pane: PaneId) -> Self {
+    pub fn human_typing(to: &str) -> Self {
         SubmitRefusal {
             code: "human_typing",
             message: format!(
-                "someone kept typing into %{pane}, so the message was not typed: it is in the mailbox"
+                "someone kept typing into {to}, so the message was not typed: it is in the mailbox"
             ),
         }
     }
 
-    pub fn working(pane: PaneId) -> Self {
+    pub fn working(to: &str) -> Self {
         SubmitRefusal {
             code: "agent_working",
             message: format!(
-                "%{pane} is working and its policy refuses to type into it: its message is in the mailbox"
+                "{to} is working and its policy refuses to type into it: its message is in the mailbox"
             ),
         }
     }
@@ -716,15 +719,14 @@ mod tests {
     /// The whole policy for a pane nobody is typing into, in the order the
     /// submitter asks it then. `None` means type it.
     fn decide(
-        pane: PaneId,
+        to: &str,
         live: bool,
         agent: bool,
         state: Option<AgentState>,
         rule: &SubmitRule,
         deliver: Deliver,
     ) -> Option<Answer> {
-        precheck(pane, live, agent, state, deliver)
-            .or_else(|| on_working(pane, state, rule, deliver))
+        precheck(to, live, agent, state, deliver).or_else(|| on_working(to, state, rule, deliver))
     }
 
     #[test]
@@ -926,7 +928,7 @@ mod tests {
             (true, true, Some(Idle), &refuse, Submit, "inject"),
         ] {
             assert_eq!(
-                code(decide(5, live, agent, state, rule, deliver)),
+                code(decide("alpha", live, agent, state, rule, deliver)),
                 want,
                 "{live} {agent} {state:?} {:?} {deliver:?}",
                 rule.while_working
@@ -1138,21 +1140,25 @@ mod tests {
             Answer::TimedOut(reason) => format!("timed_out:{reason}"),
         };
         assert_eq!(
-            code(overdue(Deliver::Submit, 5, 9, Some("agent_blocked"))),
+            code(overdue(Deliver::Submit, "alpha", 9, Some("agent_blocked"))),
             "refuse:submit_timeout"
         );
         assert_eq!(
-            code(overdue(Deliver::Auto, 5, 9, Some("agent_blocked"))),
+            code(overdue(Deliver::Auto, "alpha", 9, Some("agent_blocked"))),
             "timed_out:agent_blocked"
         );
         assert_eq!(
-            code(overdue(Deliver::Auto, 5, 9, None)),
+            code(overdue(Deliver::Auto, "alpha", 9, None)),
             "timed_out:submit_timeout",
             "never a head, so it waited on nothing of its own"
         );
-        match overdue(Deliver::Submit, 5, 9, None) {
+        match overdue(Deliver::Submit, "alpha", 9, None) {
             Answer::Refuse(r) => {
-                assert!(r.message.contains("#9") && r.message.contains("in the mailbox"))
+                assert!(
+                    r.message.contains("#9")
+                        && r.message.contains("alpha")
+                        && r.message.contains("in the mailbox")
+                )
             }
             other => panic!("{other:?}"),
         }

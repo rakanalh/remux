@@ -1280,8 +1280,9 @@
 # stall_ms = 5000
 # settle_ms = 1000
 #
-# This server's name on the servers it sends to (their `From: laptop:%1`),
-# which must be a valid host name. The machine's hostname when unset:
+# This server's name on the servers it sends to, where its mail reads
+# `from laptop:alpha (build), #3:`. It must be a valid host name. The
+# machine's hostname when unset:
 # host_name = "laptop"
 #
 # How the server dials a `[remotes.<name>]` to send to it (`remux msg send
@@ -1388,8 +1389,8 @@
 # dials. It is the same trust a remote view already has.
 #
 # To send messages to a remote (`remux msg send mini:alpha`), its key must be a
-# valid host name: no leading - or ., and none of user, system, claude, remux,
-# human, assistant, anthropic, operator or developer as a part between - and _.
+# valid host name: no leading - or ., and none of user, system, claude, human,
+# assistant, anthropic, operator or developer as a part between - and _.
 # A remote whose key is not can still be connected to; messaging refuses it,
 # and the logs name it at startup.
 #
