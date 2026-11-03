@@ -1838,6 +1838,14 @@ impl Messaging {
         true
     }
 
+    /// Who sent message `id` in `pane`'s mailbox, as the mailbox records it.
+    pub fn sender_of(&self, pane: PaneId, id: MsgId) -> Option<Sender> {
+        self.mailboxes
+            .get(&pane)
+            .and_then(|mb| mb.messages.iter().find(|m| m.id == id))
+            .map(|m| m.from.clone())
+    }
+
     /// Undo [`Self::mark_submitted`] when the typing it claimed did not
     /// happen, so the message waits in the mailbox again. Only a message that
     /// is still Submitted moves back.

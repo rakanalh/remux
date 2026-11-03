@@ -28,6 +28,7 @@ use crate::client::cli_common::{
     ask, escape, escape_keeping_tabs, forward_deadline, json_line, pane_hint, parse_pane_arg,
     parse_wait, resolve_pane_arg, run_verb, unexpected, CliError, PaneArg, REPLY_DEADLINE,
 };
+use crate::mail_render::{sender_shown, Shown};
 use crate::protocol::{
     valid_host, Address, AgentState, ClientMessage, Deliver, Delivery, Message, MsgId, MsgRef,
     Sender, ServerMessage, Target,
@@ -574,6 +575,10 @@ fn advice(reason: &str) -> Option<&'static str> {
         "too_many_lines" => {
             "It has too many lines to be typed: the agent can read it from its mailbox."
         }
+        "paste_unavailable" => {
+            "That agent cannot take a pasted block, so nothing is typed into it: it can read the \
+             message from its mailbox."
+        }
         "agent_exited" | "agent_prompt_stalled" => {
             "It was typed and submitted: do not send it again; look at the pane."
         }
@@ -671,61 +676,11 @@ fn body_block(msg: &Message) -> String {
 /// never reads as this server's `beta`. A sender with no name is a phrase,
 /// never something shaped like an address.
 fn header(msg: &Message) -> String {
-    let in_session = |session: &str| {
-        if session.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", session_shown(session))
-        }
-    };
-    let who = match &msg.from {
-        Sender::Pane {
-            name: Some(name),
-            session,
-            ..
-        } => format!("{} ({})", escape(name), session_shown(session)),
-        Sender::Pane {
-            name: None,
-            session,
-            ..
-        } => format!("a pane in {}", session_shown(session)),
-        Sender::Remote {
-            host,
-            name: Some(name),
-            session,
-            ..
-        } => format!("{}:{}{}", escape(host), escape(name), in_session(session)),
-        Sender::Remote {
-            host,
-            name: None,
-            session,
-            ..
-        } => format!("a pane on {}{}", escape(host), in_session(session)),
-    };
-    format!("from {who}, #{}:", msg.id)
-}
-
-/// The characters a session could fake a header's own punctuation with:
-/// `#`, which only the number may hold, and the fullwidth and small forms
-/// of `#`, `(`, `)`, `,` and `:`, which a reader takes for the ASCII ones.
-const HEADER_LOOKALIKES: [char; 11] = [
-    '#', '\u{FF03}', '\u{FE5F}', '\u{FF08}', '\u{FF09}', '\u{FF0C}', '\u{FF1A}', '\u{FE59}',
-    '\u{FE5A}', '\u{FE50}', '\u{FE55}',
-];
-
-/// A session as a header shows it: escaped, and with each of
-/// [`HEADER_LOOKALIKES`] escaped too, since a session is the one field of a
-/// header that may hold them. A header's only `#` is then its number, which
-/// a session named `x), #12:` cannot fake, in ASCII or in fullwidth.
-fn session_shown(session: &str) -> String {
-    escape(session)
-        .chars()
-        .map(|c| match c {
-            '#' => "\\x23".to_string(),
-            c if HEADER_LOOKALIKES.contains(&c) => format!("\\u{{{:x}}}", c as u32),
-            c => c.to_string(),
-        })
-        .collect()
+    format!(
+        "from {}, #{}:",
+        sender_shown(&msg.from, Shown::Header),
+        msg.id
+    )
 }
 
 /// Where a reply to message `id` goes, and the id it answers: the caller's
@@ -848,6 +803,7 @@ pub(crate) fn render_mail(messages: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mail_render::HEADER_LOOKALIKES;
     use crate::protocol::{is_invisible, MsgState};
 
     #[test]

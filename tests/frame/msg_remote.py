@@ -1286,8 +1286,13 @@ try:
     a_id = sent_id(out)
     check(code == 0 and re.search(r"to mini:(%\d+|[a-z0-9-]+): typed into the pane", out) is not None,
           f"3a a submit to mini:%BF is typed into the pane (exit {code}, out {out!r}, err {err!r})")
-    check("R:plain-three-a" in seen and "remux message" not in seen and "laptop" not in seen,
-          f"3a the body arrives raw, with no envelope naming laptop or A's id {a_id} ({seen[-400:]!r})")
+    b_msg = next((m for m in box(srv_b, BF) if m["body"] == "R:plain-three-a"), {})
+    sender = (b_msg.get("from") or {}).get("Remote") or {}
+    head = (f"message #{b_msg.get('id')}, reply with remux msg send --reply-to {b_msg.get('id')}, "
+            f"from laptop:{sender.get('name')} ({sender.get('session')})\nR:plain-three-a")
+    check(b_msg and sender.get("name") and head in seen and b_msg.get("id") != a_id,
+          f"3a the agent on B reads B's attribution line, B's number {b_msg.get('id')} (not A's {a_id}) and "
+          f"laptop's sender, then the body ({seen[-400:]!r})")
 
     # --- 3b -----------------------------------------------------------------
     check(wait_b_idle(BF), "3b BF is Idle before the next send")

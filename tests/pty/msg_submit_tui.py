@@ -297,9 +297,19 @@ try:
         probe, closed, joined = found
         enter = got[closed + 1] if closed + 1 < len(got) else None
         gap = (enter[0] - got[closed][0]) / 1e6 if enter else None
-        framed = re.fullmatch(re.escape(OPEN) + rb"GO:hello" + re.escape(CLOSE), joined, re.S)
+        sid = re.search(r"sent #(\d+) ", out)
+        code_a, out_a, _ = outside(env, "agent", "status", f"%{A}", "--json")
+        try:
+            row = json.loads(out_a)["panes"][0]
+        except (ValueError, KeyError, IndexError):
+            row = {}
+        head = (f"message #{sid and sid.group(1)}, reply with remux msg send --reply-to {sid and sid.group(1)}, "
+                f"from {row.get('name')} ({row.get('session')})\n")
+        framed = sid is not None and re.fullmatch(
+            re.escape(OPEN) + re.escape(head.encode()) + rb"GO:hello" + re.escape(CLOSE), joined, re.S)
         check(framed and enter is not None and enter[1] == b"\r" and gap >= 290,
-              f"D1 B read the message as one paste, then the Enter alone {gap and round(gap)} ms later "
+              f"D1 B read the attribution and the message as one paste, then the Enter alone "
+              f"{gap and round(gap)} ms later "
               f"(paste {joined!r}, then {enter and enter[1]!r})")
     else:
         check(False, f"D1 B read the message (reads {[d[:16] for _, d in got]})")

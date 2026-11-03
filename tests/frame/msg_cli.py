@@ -949,6 +949,14 @@ try:
     code, out, err, _ = send(F, "--deliver submit", "MSG:typed")
     check(code == 0 and "typed into the pane" in out and agent_read(F_LOG, "MSG:typed"),
           f"9a --deliver submit types the message and says so (exit {code}, out {out!r}, err {err!r})")
+    sid = re.match(r"sent #(\d+) ", out)
+    held = next((m for m in (listed_json(F) or []) if m["body"] == "MSG:typed"), {})
+    who = (held.get("from") or {}).get("Pane") or {}
+    head = (f"message #{sid and sid.group(1)}, reply with remux msg send --reply-to {sid and sid.group(1)}, "
+            f"from {who.get('name')} ({who.get('session')})\nMSG:typed")
+    check(sid is not None and who.get("name") and str(held.get("id")) == sid.group(1) and agent_read(F_LOG, head),
+          f"9a ...under the attribution line the server built: its number and the sender it recorded "
+          f"(want {head!r})")
     wait_state(F, "Idle")
     code, out, err, _ = send(F, "--deliver submit --json", "MSG:json")
     doc = json.loads(out) if code == 0 and out.strip() else {}

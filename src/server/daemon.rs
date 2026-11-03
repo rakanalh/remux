@@ -2314,7 +2314,8 @@ async fn handle_peer_link(
 /// sshd's child. The sender is the link's declared name and the origin's
 /// pane; `origin.host` is checked and never stored, so one connection names
 /// one host. A `submit` or `auto` over the link is typed into the target like
-/// a local one, as the raw body: nothing typed names the host it came from.
+/// a local one, under an attribution line naming the link's host and the
+/// origin's name and session.
 #[allow(clippy::too_many_arguments)]
 async fn handle_link_send(
     client_id: u64,
@@ -2848,7 +2849,7 @@ async fn step_submit(
     // in-flight mark are one section, so the next pass cannot see this head
     // again, and a head the sample took too long over is not typed.
     enum Claim {
-        Typing(crate::server::messaging::SubmitEntry),
+        Typing(crate::server::messaging::SubmitEntry, Option<Sender>),
         OutOfTime(crate::server::messaging::SubmitEntry),
         AlreadyRead(crate::server::messaging::SubmitEntry),
     }
@@ -2862,13 +2863,14 @@ async fn step_submit(
         } else if st.mark_submitted(pane, id) {
             st.begin_typing(pane, entry.reply.take());
             mark_agents_dirty();
-            Claim::Typing(entry)
+            let from = st.sender_of(pane, id);
+            Claim::Typing(entry, from)
         } else {
             Claim::AlreadyRead(entry)
         }
     };
-    let entry = match claim {
-        Claim::Typing(entry) => entry,
+    let (entry, from) = match claim {
+        Claim::Typing(entry, from) => (entry, from),
         Claim::OutOfTime(entry) => {
             let answer = overdue(entry.deliver, &to, id, entry.waiting_on);
             reply_submit(entry, answer, None, store).await;
@@ -2884,12 +2886,16 @@ async fn step_submit(
         }
     };
     let command = sample.command.clone().unwrap_or_default();
+    // Who sent it, typed above the body, as a read of the mailbox names
+    // them, under this server's number for it.
+    let attribution = from.map(|from| crate::mail_render::attribution(id, &from));
     let typed = type_text(
         id,
         pane,
         &to,
         &sample,
         &command,
+        attribution.as_deref(),
         &entry.body,
         &rule,
         entry.deliver,
@@ -3356,6 +3362,7 @@ async fn type_text(
     to: &str,
     sample: &PaneSample,
     command: &str,
+    attribution: Option<&str>,
     body: &str,
     rule: &crate::server::submit::SubmitRule,
     deliver: Deliver,
@@ -3364,8 +3371,8 @@ async fn type_text(
 ) -> Result<(bool, usize, Vec<u8>, TypedText), TextRefusal> {
     use crate::config::messaging::Bracketed;
     use crate::server::submit::{
-        encode, multi_line_refusal, newlines_safe, on_working, split_chunks, split_probe, Framing,
-        SubmitRefusal, PASTE_CLOSE,
+        encode, newlines_safe, on_working, split_chunks, split_probe, Framing, SubmitRefusal,
+        PASTE_CLOSE,
     };
     use nix::sys::termios::{tcgetattr, LocalFlags};
     let refuse = |refusal| Err(TextRefusal::Refuse(refusal));
@@ -3411,11 +3418,8 @@ async fn type_text(
         Bracketed::Auto if pd.screen.bracketed_paste => Framing::Bracketed,
         Bracketed::Auto => Framing::Plain,
     };
-    let paste_live = pd.screen.bracketed_paste;
-    if !newlines_safe(framing, paste_live) {
-        if let Some(refusal) = multi_line_refusal(body) {
-            return refuse(refusal);
-        }
+    if !newlines_safe(framing, pd.screen.bracketed_paste) {
+        return refuse(SubmitRefusal::paste_unavailable(to));
     }
     // The terminal from the slave side, where its input queue is: without
     // it nothing can tell whether the agent read the message.
@@ -3428,14 +3432,23 @@ async fn type_text(
     else {
         return refuse(SubmitRefusal::not_read(to));
     };
-    let (text, enter) = encode(body, framing, rule.focus_in, &rule.enter);
+    let head = attribution.unwrap_or("");
+    let joined = crate::server::submit::with_attribution(attribution, body);
+    let (text, enter) = encode(&joined, framing, rule.focus_in, &rule.enter);
     let bytes = text.len();
     let (probe, body) = split_probe(text, framing, rule.focus_in);
     let bracketed = framing == Framing::Bracketed;
     let tail = if bracketed { PASTE_CLOSE } else { &[] };
     let content = body.strip_suffix(tail).unwrap_or(&body);
     let chunks = split_chunks(content, tail, CHUNK_MAX);
-    if chunks.len() > MAX_CHUNKS {
+    // The attribution line's own chunks are not counted against the budget,
+    // so it never costs a sender a line of their own.
+    let head_chunks = if !head.is_empty() {
+        split_chunks(head.as_bytes(), &[], CHUNK_MAX).len()
+    } else {
+        0
+    };
+    if chunks.len() > MAX_CHUNKS + head_chunks {
         return refuse(SubmitRefusal::too_many_lines(to, MAX_CHUNKS));
     }
     let typing = Arc::new(SubmitTyping {

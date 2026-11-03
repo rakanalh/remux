@@ -44,10 +44,17 @@
 //! agent's to handle with it; the message is then the agent's, and is left
 //! in its input unsubmitted (`typed_over_read`).
 //!
-//! A typed message is the body alone, exactly as a person would type it:
-//! nothing in the agent's input names the message or its sender, so to the
-//! agent it is indistinguishable from its user's prompt. The mailbox keeps
-//! the record of who sent it (`remux msg read --all`).
+//! A typed message opens with one attribution line, then the body on the
+//! next: `message #3, reply with remux msg send --reply-to 3, from alpha (Remux)`
+//! (`mail_render::attribution`). The number and the reply command are the
+//! server's and come first; the session, the one free-text field, comes
+//! last and is escaped down to one word no shell expands. A message is
+//! typed only where newlines are safe (a live bracketed paste); anywhere
+//! else it is refused `paste_unavailable` and stays in the mailbox, so the
+//! attribution line always stands alone. A body can hold a copy of the
+//! line, so the line says who sent the message only as the FIRST line of
+//! the typed text, which nothing in the body can change; the mailbox stays
+//! the record (`remux msg read --all`).
 //!
 //! The body goes in chunks ([`split_chunks`]), each written only once the
 //! agent has read the one before, so at most one chunk is ever unread. A
@@ -62,10 +69,14 @@
 //!   someone presses Enter there. At most that one line; the submit is
 //!   answered `read_by_another_program`, whose message says to clear it with
 //!   Ctrl-U. An agent that exits right after reading the probe leaves the
-//!   body's FIRST line there, and since a typed body is raw, nothing makes
-//!   that line a comment: an Enter in that shell runs it. Whether it reaches
-//!   the shell before the flush is a race the server cannot win every time
-//!   (`msg_submit.py` 3aa/3ai pin the contract either way).
+//!   ATTRIBUTION line there, never a line of the body: an Enter in that
+//!   shell runs a command called `message` (in sh and bash the rest is a
+//!   comment; in zsh, where it is not by default, the rest is inert words),
+//!   and nothing a sender chose. Whether it reaches the shell before the
+//!   flush is a race the server cannot win every time (`msg_submit.py`
+//!   3aa/3ai pin that no body line runs either way; `msg_attribution_shell`
+//!   that the line is inert in sh, bash and zsh with and without
+//!   interactive_comments).
 //! - The probe is taken as read when the input queue is empty, and any
 //!   program in the agent's process group could have emptied it: a child
 //!   the agent started that reads the terminal takes the probe, and the body
@@ -360,7 +371,10 @@ pub fn on_working(
     }
 }
 
-/// How the body is wrapped.
+/// How the body is wrapped. A submit types only `Bracketed` text into a live
+/// paste (see [`newlines_safe`]) and refuses the rest `paste_unavailable`;
+/// `Plain` is still worked out, so that the refusal can say why, and
+/// `encode`/`split_probe` keep handling it as their own unit tests pin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Framing {
     Bracketed,
@@ -507,6 +521,20 @@ impl SubmitRefusal {
         }
     }
 
+    /// The pane's program has bracketed paste off, or a wrap is forced over
+    /// a program that never asked for one: a newline in what is typed would
+    /// submit a line on its own. A message is typed as its attribution line
+    /// and the body on separate lines, and on one line the attribution would
+    /// not be inert at a shell, so nothing is typed.
+    pub fn paste_unavailable(to: &str) -> Self {
+        SubmitRefusal {
+            code: "paste_unavailable",
+            message: format!(
+                "{to} cannot take a pasted block, so nothing was typed: its message is in the mailbox"
+            ),
+        }
+    }
+
     pub fn working(to: &str) -> Self {
         SubmitRefusal {
             code: "agent_working",
@@ -583,13 +611,14 @@ pub fn encode(body: &str, framing: Framing, focus_in: bool, enter: &[u8]) -> (Ve
     (text, enter.to_vec())
 }
 
-/// Why `body` cannot be typed where newlines are not safe (see
-/// [`newlines_safe`]): each newline would submit a line of it on its own.
-pub fn multi_line_refusal(body: &str) -> Option<SubmitRefusal> {
-    body.contains('\n').then(|| SubmitRefusal {
-        code: "bad_body",
-        message: "the pane's program cannot take a pasted block, so a message of more than one line cannot be typed into it; it is in the mailbox".to_string(),
-    })
+/// The text a message is typed as: its attribution line, then the body on
+/// the next line. Only typed where newlines are safe (see
+/// [`newlines_safe`]), so the line always stands alone.
+pub fn with_attribution(attribution: Option<&str>, body: &str) -> String {
+    match attribution {
+        Some(attribution) => format!("{attribution}\n{body}"),
+        None => body.to_string(),
+    }
 }
 
 /// How `--wait` reads a pane after the Enter.
@@ -783,6 +812,27 @@ mod tests {
         assert_eq!(text, b"\x1b[200~# [remux message #1 from x]\nhi\x1b[201~");
         let (text, _) = encode("hi", Framing::Plain, false, b"\r");
         assert_eq!(text, b"hi");
+    }
+
+    #[test]
+    fn the_attribution_line_leads_on_its_own_line() {
+        let head = "message #3, reply with remux msg send --reply-to 3, from alpha (Remux)";
+        assert_eq!(
+            with_attribution(Some(head), "hi\nthere"),
+            format!("{head}\nhi\nthere")
+        );
+        assert_eq!(with_attribution(None, "hi"), "hi");
+    }
+
+    #[test]
+    fn a_pane_that_cannot_take_a_paste_is_refused_to_the_mailbox() {
+        let r = SubmitRefusal::paste_unavailable("alpha");
+        assert_eq!(r.code, "paste_unavailable");
+        assert!(r.message.contains("alpha") && r.message.contains("in the mailbox"));
+        assert!(matches!(
+            settle(Deliver::Auto, r),
+            Answer::Mailbox("paste_unavailable")
+        ));
     }
 
     fn policy(toml: &str) -> SubmitPolicy {
@@ -1165,12 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_line_body_is_refused_plain() {
-        assert_eq!(
-            multi_line_refusal("one\ntwo").map(|r| r.code),
-            Some("bad_body")
-        );
-        assert_eq!(multi_line_refusal("one line"), None);
+    fn newlines_are_safe_only_in_a_live_paste() {
         assert!(newlines_safe(Framing::Bracketed, true));
         assert!(!newlines_safe(Framing::Bracketed, false));
         assert!(!newlines_safe(Framing::Plain, true));

@@ -153,10 +153,15 @@ def rx_chunks(log):
     return out
 
 
-def framed(body):
-    """A message typed wrapped, exactly: the body alone inside the paste
+def framed(body, msg_id, sender):
+    """A message typed wrapped, exactly: the attribution line the server
+    builds, with the message's id and the sender's name and session as the
+    server holds them (read back with `agent status`), then the body
     (msg_submit.py's `framed`, its defaults)."""
-    return re.compile(re.escape(OPEN) + re.escape(body.encode()) + re.escape(CLOSE), re.S)
+    row = status_of(sender)
+    head = (f"message #{msg_id}, reply with remux msg send --reply-to {msg_id}, "
+            f"from {row.get('name')} ({row.get('session')})\n")
+    return re.compile(re.escape(OPEN) + re.escape(head.encode() + body.encode()) + re.escape(CLOSE), re.S)
 
 
 def typed_then_entered(log, pattern, timeout=8.0):
@@ -375,7 +380,7 @@ try:
     check(waited(r) == ("Submitted", None, "Idle", False),
           f"7h a Submit --wait to bravo in other is Submitted and settles Idle, "
           f"not pane_closed_after_submit (got {r})")
-    check(sent.get("id") is not None and typed_then_entered(AGENT_LOG, framed("GO:2500 after the move")),
+    check(sent.get("id") is not None and typed_then_entered(AGENT_LOG, framed("GO:2500 after the move", sent.get("id"), A)),
           f"7h ...and the agent read it framed, whole, then its Enter (reads {rx_chunks(AGENT_LOG)[-3:]})")
 
     # --- 7i ---------------------------------------------------------------

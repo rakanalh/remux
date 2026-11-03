@@ -93,7 +93,10 @@ impl LinksConfig {
 /// Below this a ping is noise; only a harness wants it.
 pub const MIN_PING_MS: u64 = 1_000;
 
-/// Whether a typed message is wrapped in bracketed paste.
+/// Whether a typed message is wrapped in bracketed paste. A message is
+/// typed only into a live paste (see `submit::newlines_safe`), so `Auto` and
+/// `On` both type exactly when the program has paste on, and `Off` never
+/// types: its messages wait in the mailbox (`paste_unavailable`).
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Bracketed {
@@ -129,8 +132,8 @@ pub struct SubmitRow {
     /// input it believes is not for it.
     pub focus_in: Option<bool>,
     pub while_working: Option<WhileWorking>,
-    /// Parsed only to be reported and ignored: a typed message is always the
-    /// raw body. Declared because serde drops an unknown key silently, and a
+    /// Parsed only to be reported and ignored: a typed message always opens
+    /// with its attribution line. Declared because serde drops an unknown key silently, and a
     /// user who set it should hear that it does nothing.
     pub envelope: Option<bool>,
 }
@@ -404,9 +407,14 @@ impl MessagingConfig {
             ));
         }
         for (command, row) in &self.submit {
+            if row.bracketed == Some(Bracketed::Off) {
+                out.push(format!(
+                    "[messaging.submit.{command}] bracketed = \"off\": nothing will be typed into {command}; its messages go to the mailbox"
+                ));
+            }
             if row.envelope.is_some() {
                 out.push(format!(
-                    "[messaging.submit.{command}] envelope is no longer read: a typed message is always the raw body"
+                    "[messaging.submit.{command}] envelope is no longer read: a typed message always opens with one attribution line"
                 ));
             }
             if let Some(enter) = row.enter.as_deref().filter(|e| !valid_enter(e)) {
@@ -633,12 +641,12 @@ mod tests {
     #[test]
     fn a_submit_row_parses_every_field() {
         let m = parse(
-            "[messaging.submit.aider]\nbracketed = \"off\"\nenter = \"\\n\"\nenter_delay_ms = 50\nfocus_in = true\nwhile_working = \"refuse\"",
+            "[messaging.submit.aider]\nbracketed = \"on\"\nenter = \"\\n\"\nenter_delay_ms = 50\nfocus_in = true\nwhile_working = \"refuse\"",
         );
         assert_eq!(
             m.submit["aider"],
             SubmitRow {
-                bracketed: Some(Bracketed::Off),
+                bracketed: Some(Bracketed::On),
                 enter: Some("\n".into()),
                 enter_delay_ms: Some(50),
                 focus_in: Some(true),
@@ -647,6 +655,15 @@ mod tests {
             }
         );
         assert!(m.problems().is_empty(), "{:?}", m.problems());
+    }
+
+    #[test]
+    fn bracketed_off_is_reported_as_never_typing() {
+        let m = parse("[messaging.submit.aider]\nbracketed = \"off\"\n[messaging.submit.b]\nbracketed = \"on\"");
+        assert_eq!(
+            m.problems(),
+            vec!["[messaging.submit.aider] bracketed = \"off\": nothing will be typed into aider; its messages go to the mailbox".to_string()]
+        );
     }
 
     #[test]
@@ -659,7 +676,7 @@ mod tests {
             assert_eq!(
                 m.problems(),
                 vec![
-                    "[messaging.submit.claude] envelope is no longer read: a typed message is always the raw body"
+                    "[messaging.submit.claude] envelope is no longer read: a typed message always opens with one attribution line"
                         .to_string()
                 ],
                 "{value}"

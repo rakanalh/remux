@@ -4,7 +4,9 @@
 
 mod client;
 mod config;
+mod escape;
 mod integrate;
+mod mail_render;
 mod paths;
 mod protocol;
 mod relay;

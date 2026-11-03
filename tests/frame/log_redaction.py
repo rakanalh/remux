@@ -404,6 +404,20 @@ def run_submit(srv, result):
         spawner.close()
         return
     result["submit_agent"] = agent
+    # Typed only where a pasted block is safe: the fakeagent starts with
+    # bracketed paste off.
+    end = time.time() + 6.0
+    while not os.path.exists(log_path) and time.time() < end:
+        time.sleep(0.05)
+    fakeagent.tell(ctl, log_path, "paste-on")
+    # The mode switch is output, which reads as work for a while: a submit
+    # to a working agent waits in the mailbox.
+    end = time.time() + 8.0
+    while time.time() < end:
+        spawner.send({"AgentStatus": {"target": {"host": None, "target": {"Pane": agent}}}})
+        rows = [m for m in spawner.drain(0.5) if name_of(m) == "AgentStatusList"]
+        if rows and any(p.get("state") == "Idle" for p in rows[-1]["AgentStatusList"]["panes"]):
+            break
     in_file, out_file = f"{RUNDIR}/submit-in.json", f"{RUNDIR}/submit-out.json"
     with open(in_file, "w") as f:
         json.dump({"MsgSend": {"to": {"host": None, "target": {"Pane": agent}},

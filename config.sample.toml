@@ -1302,18 +1302,24 @@
 # A row changes only the fields it names; the rest keep the shipped row, or
 # the default below for a command with none.
 #
-# bracketed        "auto" (as the agent asked, read when typing), "on", "off".
-#                  With it off, a message of more than one line is refused.
+# bracketed        "auto" (default), "on", "off". A message is typed only
+#                  into a live bracketed paste, which the agent turns on
+#                  itself (claude and codex do). "auto" and "on" both type
+#                  exactly then: "on" no longer forces a wrap on a program
+#                  that never asked for one. "off", and any agent with paste
+#                  off, get nothing typed: the message waits in the mailbox
+#                  (`paste_unavailable`), and server.log says so at startup.
 # enter            the bytes that submit the text (default "\r"), written
 # enter_delay_ms   this long after it (default 300), outside the paste.
 # focus_in         report focus (ESC[I) before the text (default false).
 # while_working    "queue" types it anyway, "mailbox" (default) leaves it
 #                  for the agent's hook, "refuse" refuses `--deliver submit`.
 #
-# The text typed is the message's body and nothing else, exactly as if the
-# agent's user had typed it: nothing in it names the sender. Who sent what is
-# in the mailbox (`remux msg read --all`). An old `envelope` key in a row is
-# no longer read, and is reported in server.log.
+# The text typed opens with one line naming the message and its sender,
+# then the body on the next line:
+#   message #3, reply with remux msg send --reply-to 3, from alpha (Remux)
+# The mailbox is the record of who sent what (`remux msg read --all`). An old
+# `envelope` key in a row is no longer read, and is reported in server.log.
 #
 # The shipped rows:
 #
