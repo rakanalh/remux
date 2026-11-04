@@ -340,7 +340,10 @@ impl Pty {
         // SAFETY: `fd` comes from `self.master_fd`, which `&self` keeps alive
         // for the whole of this function.
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        let async_fd = AsyncFd::with_interest(borrowed, Interest::READABLE)
+        // SAFETY: the same `&self` borrow keeps `master_fd` open and unchanged
+        // until this function returns, and `async_fd` is a local dropped first.
+        let async_fd = unsafe { AsyncFd::register_with_interest(borrowed, Interest::READABLE) }
+            .map_err(std::io::Error::from)
             .context("AsyncFd creation failed")?;
 
         let mut buf = vec![0u8; 4096];
@@ -1150,13 +1153,16 @@ pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedRecei
         // Owning it closes the hole at the root: `AsyncFd` deregisters before it
         // drops the inner descriptor, so the fd NUMBER cannot be reissued while
         // any registration for it still exists.
-        let async_fd = match AsyncFd::with_interest(master_fd, Interest::READABLE) {
-            Ok(fd) => fd,
-            Err(e) => {
-                log::error!("start_reader: failed to create AsyncFd: {e}");
-                return;
-            }
-        };
+        // SAFETY: `async_fd` owns `master_fd`, so the descriptor stays open and
+        // unchanged until the `AsyncFd` itself is dropped.
+        let async_fd =
+            match unsafe { AsyncFd::register_with_interest(master_fd, Interest::READABLE) } {
+                Ok(fd) => fd,
+                Err(e) => {
+                    log::error!("start_reader: failed to create AsyncFd: {e}");
+                    return;
+                }
+            };
 
         // Once per task, not once per occurrence. The fallback fires on a timer, so
         // an unconditional warning would write a line per pane per second for the
@@ -1297,13 +1303,16 @@ pub fn start_writer(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedSende
     let (tx, mut rx) = mpsc::unbounded_channel::<WriteJob>();
 
     let handle = tokio::spawn(async move {
-        let async_fd = match AsyncFd::with_interest(master_fd, Interest::WRITABLE) {
-            Ok(fd) => fd,
-            Err(e) => {
-                log::error!("start_writer: failed to create AsyncFd: {e}");
-                return;
-            }
-        };
+        // SAFETY: `async_fd` owns `master_fd`, so the descriptor stays open and
+        // unchanged until the `AsyncFd` itself is dropped.
+        let async_fd =
+            match unsafe { AsyncFd::register_with_interest(master_fd, Interest::WRITABLE) } {
+                Ok(fd) => fd,
+                Err(e) => {
+                    log::error!("start_writer: failed to create AsyncFd: {e}");
+                    return;
+                }
+            };
 
         // See the reader: once per task, because the fallback runs on a timer.
         let mut warned_fallback = false;

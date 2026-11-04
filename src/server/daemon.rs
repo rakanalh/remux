@@ -19991,6 +19991,28 @@ mod popup_tests {
             out
         }
 
+        /// The panes run real shells, and each shell's startup output pushes
+        /// frames for some time after the pane exists. A baseline taken with
+        /// `drain` can therefore miss frames that then land in the count that
+        /// follows it. This drains until no frame arrives for a quiet window,
+        /// bounded by a deadline so that a pane that never goes quiet fails
+        /// the test instead of hanging it.
+        async fn drain_until_quiet(&mut self) {
+            const QUIET: std::time::Duration = std::time::Duration::from_millis(200);
+            const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+            let end = tokio::time::Instant::now() + DEADLINE;
+            loop {
+                match tokio::time::timeout(QUIET, self.rx.recv()).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => return,
+                }
+                assert!(
+                    tokio::time::Instant::now() < end,
+                    "the panes did not go quiet within {DEADLINE:?}"
+                );
+            }
+        }
+
         async fn finish(self) {
             let ids: Vec<PaneId> = self.panes.lock().await.keys().copied().collect();
             reap_panes(&ids, &self.panes, &self.clients).await;
@@ -20296,7 +20318,7 @@ mod popup_tests {
             let mut rig = Rig::new(100, 30, want, dir.path()).await;
             let (_left, middle, _right) = three_panes_popup_up(&rig, dir.path()).await;
 
-            rig.drain();
+            rig.drain_until_quiet().await;
             press(&rig, u16::MAX, u16::MAX, false).await;
             assert_eq!(focus_and_popup(&rig).await, (middle, false), "{want:?}");
             assert_eq!(renders(&rig.drain()), 1, "the frame without the popup");
@@ -20329,7 +20351,7 @@ mod popup_tests {
             .get_mut(&CLIENT)
             .unwrap()
             .set_scroll(middle, 3);
-        rig.drain();
+        rig.drain_until_quiet().await;
 
         press(&rig, u16::MAX, u16::MAX, false).await;
 
@@ -20405,7 +20427,7 @@ mod popup_tests {
         let dir = tempfile::tempdir().expect("dir");
         let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
         three_panes_popup_up(&rig, dir.path()).await;
-        rig.drain();
+        rig.drain_until_quiet().await;
 
         rig.command(RemuxCommand::PaneFocusRight).await;
 
@@ -20428,7 +20450,7 @@ mod popup_tests {
                 .unwrap()
                 .tabs[0]
                 .popup_visible = true;
-            rig.drain();
+            rig.drain_until_quiet().await;
             press(&rig, x, 5, false).await;
             assert_eq!(renders(&rig.drain()), 1, "click at x={x}");
             assert!(!focus_and_popup(&rig).await.1);
@@ -20869,7 +20891,7 @@ mod popup_tests {
         let mut rig = Rig::new(100, 30, None, dir.path()).await;
         rig.command(RemuxCommand::PopupToggle(None)).await;
         let popup = rig.popup_of(0).await.expect("popup");
-        rig.drain();
+        rig.drain_until_quiet().await;
 
         let send = |rig: &Rig, cols, rows| {
             let (state, panes, clients, config, pf) = (
