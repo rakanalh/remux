@@ -1,6 +1,6 @@
 ---
 title: Sidebars
-description: Dock sessions, agents and files panels to the left, right or bottom edge.
+description: Dock sessions, agents, views and files panels to the left, right or bottom edge.
 ---
 
 A sidebar is a strip of panels docked to one edge of your terminal. It is drawn by the client, not the server: it is not a pane, it belongs to no session, and the panes simply get whatever space is left once every visible sidebar has taken its slice.
@@ -63,7 +63,7 @@ Sizes are clamped so the panes keep at least 20 columns and 5 rows. A sidebar th
 
 | Field | Default | Meaning |
 |---|---|---|
-| `plugin` | — (required) | Which plugin to show: `sessions`, `agents`, `files` or `placeholder`. |
+| `plugin` | — (required) | Which plugin to show: `sessions`, `agents`, `views`, `files` or `placeholder`. |
 | `weight` | `1` | This panel's share of the sidebar relative to its siblings. Weights of 2 and 1 split the sidebar two thirds and one third. |
 | `editor` | unset | `files` only: the editor to open files with, overriding the server's `$EDITOR`. Ignored by every other plugin. |
 
@@ -105,6 +105,19 @@ The first line is the agent's name: `session · tab`, using the tab's name once 
 `j`/`k`/`g`/`G` move and `Enter` jumps to that pane, wherever it is. See [Agents](/remux/agents/) for how detection works and how to configure it.
 
 ![The agents panel docked beside the panes](../../assets/screenshots/sidebar-agents.png)
+
+### views
+
+Every [View](/remux/views/) on the local server, in the order they were created. Each view takes two lines:
+
+```
+* review
+  2 cells · grid
+```
+
+The first line is the view's name. The view this client has on screen is marked with `*` and a full-width band across both lines; with no view on screen, nothing is marked. The second line, dim, is the number of cells and the layout, followed by ` · zoomed` while a cell is zoomed. The list follows views created, renamed or deleted from any client, and the mark follows you as you enter, switch and leave views.
+
+`j`/`k`/`g`/`G` move and `Enter` enters the selected view. `Enter` on the view already on screen moves the keyboard to its cells. To create, rename or delete views, use the [session manager](/remux/sessions/).
 
 ### files
 
@@ -161,7 +174,7 @@ Focusing a collapsed sidebar (`Alt-h`/`Alt-l`, or `Ctrl-a b b`) expands it.
 
 With the mouse, click a row to select it, click the collapse button to collapse a sidebar, and click a collapsed strip to expand it (see [Collapse to a strip](#collapse-to-a-strip)).
 
-A right click on a row of the `sessions`, `agents` or `files` panel selects it and opens a [context menu](/remux/keybindings/#context-menu) for that row: switch, rename or kill a session, switch, rename or close a tab, jump to, zoom or close an agent's pane, open a file in a split or copy a path. The `placeholder` panel and rows that have no action, such as a server or a pane row of the sessions panel, open no menu.
+A right click on a row of the `sessions`, `agents` or `files` panel selects it and opens a [context menu](/remux/keybindings/#context-menu) for that row: switch, rename or kill a session, switch, rename or close a tab, jump to, zoom or close an agent's pane, open a file in a split or copy a path. The `views` and `placeholder` panels and rows that have no action, such as a server or a pane row of the sessions panel, open no menu.
 
 :::tip
 There are no default keys that jump straight into a sidebar, but the actions exist. Bind them under `[keybindings.command.b]` if you want them:

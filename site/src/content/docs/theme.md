@@ -163,7 +163,7 @@ session_name_fg = "#94e2d5"
 | `search_count_fg/bg` | The `(n/m)` search-match counter |
 | `search_match_fg/bg`, `search_current_fg/bg` | Search highlights: every match, and the current one |
 | `whichkey_fg`, `whichkey_bg`, `whichkey_key_fg` | The which-key popup and its key column |
-| `sidebar_current_bg` | The agents panel's band for the pane you are in. Keep it distinct from `sidebar_selection_bg`; the selection wins on a row that is both. |
+| `sidebar_current_bg` | The agents panel's band for the pane you are in, and the views panel's band for the view on screen. Keep it distinct from `sidebar_selection_bg`; the selection wins on a row that is both. |
 | `sidebar_selection_bg` | The full-width band behind a sidebar panel's selected row (both lines of an agent) |
 | `sidebar_dim_fg` | Panel header titles and an agent row's second line |
 | `sidebar_header_bg` | The full-width header bar of a panel that does not have the keyboard |

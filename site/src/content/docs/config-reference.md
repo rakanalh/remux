@@ -182,7 +182,7 @@ Panels stack inside their sidebar in the order written.
 
 | Option | Type | Default | Meaning |
 |---|---|---|---|
-| `plugin` | string | none (required) | `sessions`, `files`, `agents` or `placeholder`. An unknown name is skipped with a warning. `browser` is accepted as an old name for `files`. |
+| `plugin` | string | none (required) | `sessions`, `files`, `agents`, `views` or `placeholder`. An unknown name is skipped with a warning. `browser` is accepted as an old name for `files`. |
 | `weight` | integer | `1` | This panel's share of the sidebar relative to its siblings. |
 | `editor` | string | unset | `files` only: the editor to open a file with. Unset uses the server's `$EDITOR`, then `vi`. |
 | `command` | string | unset | **Deprecated and ignored**, with a warning. Use `editor`. |
