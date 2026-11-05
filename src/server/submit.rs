@@ -264,6 +264,66 @@ pub fn overdue(
     }
 }
 
+/// The answers an `auto` message is typed later after: each is a state of
+/// the pane that passes (the agent works, waits on its user, is not started
+/// yet, a person types, or the hold on one of those ran out) and in each
+/// nothing of the message was written. Every other answer stays final:
+/// `pane_attended` is the server's policy for a pane a person looks at, and
+/// typing the moment they look away is what that policy exists to prevent;
+/// `paste_unavailable`, `too_many_lines` and `agent_not_reading` do not pass
+/// on their own; the rest come after the agent read some of the text, which
+/// a second typing would duplicate.
+pub const RETRY_CODES: [&str; 5] = [
+    "agent_blocked",
+    "agent_working",
+    "agent_not_ready",
+    "human_typing",
+    "submit_timeout",
+];
+
+/// The code an `auto` message waits on to be typed later, or `None` when
+/// `answer` is final.
+pub fn retry_code(deliver: Deliver, answer: &Answer) -> Option<&'static str> {
+    let code = match answer {
+        Answer::Mailbox(code) | Answer::TimedOut(code) => *code,
+        Answer::Refuse(_) => return None,
+    };
+    (deliver == Deliver::Auto && RETRY_CODES.contains(&code)).then_some(code)
+}
+
+/// The longest a retry is kept: an hour, as for any wait a sender can ask
+/// for, and never past its message's expiry.
+pub const RETRY_FOR: Duration = Duration::from_secs(3600);
+
+/// When a retry made at `now` (`now_ms` on the mailbox's clock) of a message
+/// expiring at `expires_ms` is given up.
+pub fn retry_deadline(now: Instant, now_ms: u64, expires_ms: u64) -> Instant {
+    now + RETRY_FOR.min(Duration::from_millis(expires_ms.saturating_sub(now_ms)))
+}
+
+/// Why a retry head waits on its pane's state, for the two states that
+/// answer even a deferred head at once: no agent in the foreground, and an
+/// agent working under a row that does not type into a working agent.
+/// `working_first` is [`working_first`]'s verdict, so that a person's
+/// keystroke echo is not taken for work. `None` means go on as any head.
+pub fn retry_hold(
+    live: bool,
+    agent: bool,
+    state: Option<AgentState>,
+    rule: &SubmitRule,
+    working_first: bool,
+) -> Option<&'static str> {
+    if !live {
+        return None;
+    }
+    if !agent {
+        return Some("agent_not_ready");
+    }
+    let types_while_working = rule.while_working == WhileWorking::Queue;
+    (state == Some(AgentState::Working) && !types_while_working && working_first)
+        .then_some("agent_working")
+}
+
 /// Whether a submit waits instead of being answered `agent_blocked`: it was
 /// deferred, and the agent is there and waiting on its user. Only that wait
 /// is deferred; a pane that is not running an agent is answered at once.
@@ -1352,6 +1412,78 @@ mod tests {
     /// A turn that ends before the quiet point leaves no output after it, so
     /// it reads as a stall: the machine cannot tell such a turn from the
     /// prompt's own echo and redraw.
+    #[test]
+    fn only_a_passing_state_of_an_auto_message_is_retried() {
+        use Deliver::*;
+        for code in RETRY_CODES {
+            assert_eq!(retry_code(Auto, &Answer::Mailbox(code)), Some(code));
+            assert_eq!(retry_code(Auto, &Answer::TimedOut(code)), Some(code));
+            assert_eq!(retry_code(Submit, &Answer::Mailbox(code)), None);
+            assert_eq!(retry_code(Mailbox, &Answer::Mailbox(code)), None);
+        }
+        for code in [
+            "pane_attended",
+            "paste_unavailable",
+            "too_many_lines",
+            "inbound_mailbox_only",
+            "no_such_target",
+            "agent_not_reading",
+            "agent_did_not_read",
+            "agent_too_slow",
+            "read_by_another_program",
+            "typed_over_read",
+            "agent_blocked_read",
+            "already_read",
+            "sender_closed",
+            "queue_full",
+        ] {
+            assert_eq!(retry_code(Auto, &Answer::Mailbox(code)), None, "{code}");
+        }
+        let refused = Answer::Refuse(SubmitRefusal::blocked("a"));
+        assert_eq!(retry_code(Auto, &refused), None);
+    }
+
+    #[test]
+    fn a_retry_lasts_an_hour_at_most_and_never_past_its_message() {
+        let now = Instant::now();
+        let hour = Duration::from_secs(3600);
+        assert_eq!(retry_deadline(now, 1_000, 1_000 + 86_400_000), now + hour);
+        assert_eq!(
+            retry_deadline(now, 1_000, 61_000),
+            now + Duration::from_secs(60)
+        );
+        assert_eq!(retry_deadline(now, 5_000, 1_000), now, "already expired");
+    }
+
+    #[test]
+    fn a_retry_holds_on_no_agent_and_on_work_its_row_does_not_type_into() {
+        let mailbox = SubmitRule::default();
+        let queue = SubmitRule {
+            while_working: WhileWorking::Queue,
+            ..SubmitRule::default()
+        };
+        let working = Some(AgentState::Working);
+        assert_eq!(retry_hold(false, false, None, &mailbox, true), None);
+        assert_eq!(
+            retry_hold(true, false, None, &mailbox, true),
+            Some("agent_not_ready")
+        );
+        assert_eq!(
+            retry_hold(true, true, working, &mailbox, true),
+            Some("agent_working")
+        );
+        assert_eq!(retry_hold(true, true, working, &queue, true), None);
+        assert_eq!(
+            retry_hold(true, true, working, &mailbox, false),
+            None,
+            "a keystroke's echo is not work"
+        );
+        let idle = Some(AgentState::Idle);
+        assert_eq!(retry_hold(true, true, idle, &mailbox, true), None);
+        let blocked = Some(AgentState::NeedsInput);
+        assert_eq!(retry_hold(true, true, blocked, &mailbox, true), None);
+    }
+
     #[test]
     fn a_turn_inside_the_echo_window_is_a_known_gap() {
         let outputs: Vec<u64> = (50..=1050).step_by(100).collect();

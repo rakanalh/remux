@@ -878,6 +878,7 @@ async fn handle_msg_send(
                         put_back: 0,
                         waiting_on: None,
                         wait_until,
+                        retry: false,
                     },
                     config.messaging.submit_queue_len(),
                 ),
@@ -2461,6 +2462,7 @@ async fn handle_link_send(
                         put_back: 0,
                         waiting_on: None,
                         wait_until,
+                        retry: false,
                     },
                     config.messaging.submit_queue_len(),
                 ),
@@ -2579,10 +2581,16 @@ fn mark_submit_dirty() {
 /// wait ends at most this late, inside the windows' tolerance.
 const SUBMIT_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How often the submitter looks again when only retries wait. Nobody waits
+/// on a retry's answer, and a pane can stay busy for its whole hour, so it is
+/// sampled at this pace rather than [`SUBMIT_TICK`]'s.
+const RETRY_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Type queued messages into their panes, in order per pane, holding each
 /// while its pane is not ready. Runs for the life of the server. Woken by
 /// [`SUBMIT_DIRTY`], and every [`SUBMIT_TICK`] while anything is queued or
-/// mid-typing; idle, it parks on the `Notify` and costs nothing.
+/// mid-typing, or [`RETRY_TICK`] while only retries are; idle, it parks on
+/// the `Notify` and costs nothing.
 async fn run_submitter(
     state: Arc<Mutex<ServerState>>,
     panes: Arc<Mutex<HashMap<PaneId, PaneData>>>,
@@ -2591,14 +2599,22 @@ async fn run_submitter(
 ) {
     let store = messaging();
     loop {
-        let has_work = store.lock().await.has_submit_work();
-        if has_work {
-            tokio::select! {
-                _ = SUBMIT_DIRTY.notified() => {}
-                _ = tokio::time::sleep(SUBMIT_TICK) => {}
+        let tick = {
+            let st = store.lock().await;
+            if st.has_submit_work() {
+                Some(SUBMIT_TICK)
+            } else {
+                st.has_retries().then_some(RETRY_TICK)
             }
-        } else {
-            SUBMIT_DIRTY.notified().await;
+        };
+        match tick {
+            Some(tick) => {
+                tokio::select! {
+                    _ = SUBMIT_DIRTY.notified() => {}
+                    _ = tokio::time::sleep(tick) => {}
+                }
+            }
+            None => SUBMIT_DIRTY.notified().await,
         }
         let late = store
             .lock()
@@ -2785,10 +2801,39 @@ async fn step_submit(
     };
 
     let (pane, id) = (head.pane, head.id);
+    if head.retry && end_read_retry(pane, id, store).await {
+        return;
+    }
     let to = submit_label(pane, store).await;
     let sample = sample_pane(pane, state, panes, config).await;
     let rule = submit_policy(config).rule_for(sample.command.as_deref().unwrap_or(""));
     let agent_state = sample.state;
+    let working = std::time::Duration::from_millis(config.agents.working_ms);
+    let now = std::time::Instant::now();
+    let human_quiet = working_first(sample.last_human_input, now, working);
+    if head.retry {
+        let held = crate::server::submit::retry_hold(
+            sample.live,
+            sample.command.is_some(),
+            agent_state,
+            &rule,
+            human_quiet,
+        );
+        if let Some(code) = held {
+            let behind = |deliver| {
+                precheck(
+                    &to,
+                    sample.live,
+                    sample.command.is_some(),
+                    agent_state,
+                    deliver,
+                )
+                .or_else(|| crate::server::submit::on_working(&to, agent_state, &rule, deliver))
+                .unwrap_or(Answer::Mailbox(code))
+            };
+            return hold_retry(pane, id, code, behind, store).await;
+        }
+    }
     if waits_while_blocked(
         sample.live,
         sample.command.is_some(),
@@ -2806,11 +2851,7 @@ async fn step_submit(
     ) {
         return answer_head(pane, id, answer, None, store).await;
     }
-    let working = std::time::Duration::from_millis(config.agents.working_ms);
-    let now = std::time::Instant::now();
-    if working_first(sample.last_human_input, now, working)
-        && answer_working(pane, &to, id, agent_state, &rule, head.deliver, store).await
-    {
+    if human_quiet && answer_working(pane, &to, id, agent_state, &rule, head.deliver, store).await {
         return;
     }
     let attended = pane_attended(pane, state, clients).await;
@@ -2833,9 +2874,34 @@ async fn step_submit(
         }
         // A deferred submit outlasts the guard's cap: its own deadline ends
         // it, in the sweep.
+        // A retry head waits for the person however long they type, so an
+        // entry behind it whose own wait ran out is answered here, as it
+        // would be at the head.
         GuardVerdict::Wait(_) | GuardVerdict::Expired => {
-            if store.lock().await.set_waiting(pane, id, "human_typing") {
+            let (new, behind) = {
+                let mut st = store.lock().await;
+                let behind = if head.retry {
+                    st.take_live_behind(pane, id, |e| {
+                        !e.defer
+                            && guard_wait(
+                                sample.last_human_input,
+                                attended,
+                                e.enqueued_at,
+                                now,
+                                &guard,
+                            ) == GuardVerdict::Expired
+                    })
+                } else {
+                    Vec::new()
+                };
+                (st.set_waiting(pane, id, "human_typing"), behind)
+            };
+            if new {
                 log::info!("msg: id={id} submit waiting: human_typing");
+            }
+            for entry in behind {
+                let answer = settle(entry.deliver, SubmitRefusal::human_typing(&to));
+                reply_submit(entry, answer, None, store).await;
             }
             return;
         }
@@ -2913,15 +2979,15 @@ async fn step_submit(
         }
         Err(TextRefusal::Working(answer)) => {
             let policy = Some(working_policy(&rule));
-            return answer_untyped(entry, answer, policy, store).await;
+            return answer_untyped(entry, answer, policy, Retry::Allowed, store).await;
         }
         Err(TextRefusal::Blocked) => {
             let answer = settle(entry.deliver, SubmitRefusal::blocked(&to));
-            return answer_untyped(entry, answer, None, store).await;
+            return answer_untyped(entry, answer, None, Retry::Allowed, store).await;
         }
         Err(TextRefusal::Refuse(refusal)) => {
             let answer = settle(entry.deliver, refusal);
-            return answer_untyped(entry, answer, None, store).await;
+            return answer_untyped(entry, answer, None, Retry::Allowed, store).await;
         }
     };
     let (pgid, agent) = (sample.pgid, sample.agent);
@@ -2982,6 +3048,7 @@ async fn step_submit(
                 };
                 match answer {
                     None => log::info!("msg: id={id} waiting for %{pane}'s turn to end"),
+                    Some(_) if entry.retry => {}
                     Some((reply, name)) => {
                         let message = ServerMessage::MsgSent {
                             req: None,
@@ -3023,14 +3090,13 @@ async fn step_submit(
             Typed::Untyped(refusal) if entry.defer && refusal.code == "agent_blocked" => {
                 requeue_untyped(entry, true, store).await
             }
-            Typed::Untyped(refusal) | Typed::Refused(refusal) => {
-                if refusal.code == "agent_did_not_read" {
-                    log::info!(
-                        "msg: id={id} not read by %{pane}; typed text discarded, left in the mailbox"
-                    );
-                }
-                let answer = settle(entry.deliver, refusal);
-                answer_untyped(entry, answer, None, store).await;
+            // Once the body was written the agent may have read some of it,
+            // and typing it again would put that part in twice.
+            Typed::Untyped(refusal) => {
+                not_typed(entry, refusal, Retry::Allowed, store).await;
+            }
+            Typed::Refused(refusal) => {
+                not_typed(entry, refusal, Retry::Never, store).await;
             }
         }
         typing.disarm();
@@ -3071,11 +3137,30 @@ fn unsubmit_and_dirty(st: &mut Messaging, pane: PaneId, id: MsgId) {
     }
 }
 
+/// Answer an entry whose typing `refusal` stopped.
+async fn not_typed(
+    entry: crate::server::messaging::SubmitEntry,
+    refusal: crate::server::submit::SubmitRefusal,
+    retry: Retry,
+    store: &'static Mutex<Messaging>,
+) {
+    if refusal.code == "agent_did_not_read" {
+        log::info!(
+            "msg: id={} not read by %{}; typed text discarded, left in the mailbox",
+            entry.id,
+            entry.pane
+        );
+    }
+    let answer = crate::server::submit::settle(entry.deliver, refusal);
+    answer_untyped(entry, answer, None, retry, store).await;
+}
+
 /// Answer an entry that was claimed but not written with `answer`.
 async fn answer_untyped(
     entry: crate::server::messaging::SubmitEntry,
     answer: crate::server::submit::Answer,
     policy: Option<String>,
+    retry: Retry,
     store: &'static Mutex<Messaging>,
 ) {
     let reply = {
@@ -3083,10 +3168,11 @@ async fn answer_untyped(
         unsubmit_and_dirty(&mut st, entry.pane, entry.id);
         st.end_typing(entry.pane)
     };
-    reply_submit(
+    answer_or_retry(
         crate::server::messaging::SubmitEntry { reply, ..entry },
         answer,
         policy,
+        retry,
         store,
     )
     .await;
@@ -3223,21 +3309,135 @@ async fn answer_head(
     }
 }
 
-/// Answer `entry`'s parked send with `answer`, logged once.
+/// Answer `entry`'s parked send with `answer`, logged once, and keep an
+/// `auto` message that could not be typed to be typed later.
 async fn reply_submit(
     entry: crate::server::messaging::SubmitEntry,
     answer: crate::server::submit::Answer,
     policy: Option<String>,
     store: &'static Mutex<Messaging>,
 ) {
+    answer_or_retry(entry, answer, policy, Retry::Allowed, store).await;
+}
+
+/// Whether an answer that leaves a message in the mailbox may still have it
+/// typed later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    Allowed,
+    Never,
+}
+
+/// [`reply_submit`], with `retry` saying whether the message may be typed
+/// later. The sender is answered first and exactly as before: a retry never
+/// holds a send's answer. A retry entry itself has nobody to answer, so its
+/// answer is only logged, and only when its outcome changes.
+async fn answer_or_retry(
+    mut entry: crate::server::messaging::SubmitEntry,
+    answer: crate::server::submit::Answer,
+    policy: Option<String>,
+    retry: Retry,
+    store: &'static Mutex<Messaging>,
+) {
+    use crate::server::submit::{retry_code, retry_deadline};
+    let code = retry_code(entry.deliver, &answer).filter(|_| retry == Retry::Allowed);
+    let now = std::time::Instant::now();
+    let id = entry.id;
+    if entry.retry {
+        let mut st = store.lock().await;
+        let unread = st.unread_expiry(entry.pane, id, now_ms()).is_some();
+        match code {
+            Some(code) if unread && now < entry.deadline => {
+                if entry.waiting_on != Some(code) {
+                    log::info!("msg: id={id} retry pending ({code})");
+                    entry.waiting_on = Some(code);
+                }
+                st.requeue_retry(entry);
+            }
+            _ => {
+                let why = match answer {
+                    _ if !unread => "no longer unread",
+                    _ if now >= entry.deadline => "out of time",
+                    crate::server::submit::Answer::Refuse(ref refusal) => refusal.code,
+                    crate::server::submit::Answer::Mailbox(code)
+                    | crate::server::submit::Answer::TimedOut(code) => code,
+                };
+                log::info!("msg: id={id} retry ended ({why}); it stays in the mailbox");
+            }
+        }
+        return;
+    }
     let name = store.lock().await.name_of(entry.pane).map(str::to_string);
     let resolved = Resolved {
         host: None,
         pane_id: entry.pane,
         name,
     };
-    let message = answer_submit(entry.id, resolved, answer, policy);
-    send_reply(entry.id, entry.reply, message);
+    let message = answer_submit(id, resolved, answer, policy);
+    send_reply(id, entry.reply.take(), message);
+    let Some(code) = code else {
+        return;
+    };
+    let mut st = store.lock().await;
+    let Some(expires_ms) = st.unread_expiry(entry.pane, id, now_ms()) else {
+        return;
+    };
+    log::info!("msg: id={id} retry pending ({code})");
+    st.requeue_retry(crate::server::messaging::SubmitEntry {
+        enqueued_at: now,
+        defer: true,
+        deadline: retry_deadline(now, now_ms(), expires_ms),
+        reply: None,
+        had_reply: false,
+        put_back: 0,
+        waiting_on: Some(code),
+        wait_until: None,
+        retry: true,
+        ..entry
+    });
+}
+
+/// End retry head `id` of `pane` when its message is no longer unread: read,
+/// acked or expired. Checked before the pane is sampled, so that a retry the
+/// hooks delivered costs no sample and is never held. Returns whether it
+/// ended.
+async fn end_read_retry(pane: PaneId, id: MsgId, store: &'static Mutex<Messaging>) -> bool {
+    let mut st = store.lock().await;
+    if st.unread_expiry(pane, id, now_ms()).is_some() {
+        return false;
+    }
+    if st.pop_submit(pane, id).is_some() {
+        log::info!("msg: id={id} retry ended (no longer unread); it stays in the mailbox");
+    }
+    true
+}
+
+/// Hold `pane`'s retry head `id` while its pane is in a state that answers
+/// any other head at once (`code`). The entries behind it that are not
+/// retries are answered now, each with `answer` for its own delivery, as
+/// they would be at the head; those that may be retried become retries
+/// behind this one, so the order of what is typed is kept.
+async fn hold_retry(
+    pane: PaneId,
+    id: MsgId,
+    code: &'static str,
+    answer: impl Fn(Deliver) -> crate::server::submit::Answer,
+    store: &'static Mutex<Messaging>,
+) {
+    let (new, behind) = {
+        let mut st = store.lock().await;
+        (
+            st.set_waiting(pane, id, code),
+            st.take_live_behind(pane, id, |_| true),
+        )
+    };
+    if new {
+        log::info!("msg: id={id} retry pending ({code})");
+    }
+    for entry in behind {
+        let answer = answer(entry.deliver);
+        reply_submit(entry, answer, None, store).await;
+    }
 }
 
 /// Send a submit's answer through its parked reply, or note that the sender
@@ -16766,7 +16966,7 @@ async fn reap_panes(
                     orphans.len()
                 );
             }
-            for entry in orphans {
+            for entry in orphans.into_iter().filter(|e| !e.retry) {
                 let resolved = Resolved {
                     host: None,
                     pane_id: entry.pane,
@@ -17944,6 +18144,7 @@ mod tests {
                 put_back: 0,
                 waiting_on: None,
                 wait_until: None,
+                retry: false,
             };
             st.enqueue_submit(queued, 8).unwrap();
             assert!(st.submit_heads().iter().all(|h| h.pane != pane));

@@ -317,6 +317,11 @@ pub struct SubmitEntry {
     /// Sent with `--wait`: once submitted, it is answered when the agent's
     /// turn ends, or at this time at the latest.
     pub wait_until: Option<Instant>,
+    /// An `auto` message whose sender was already answered that it is in the
+    /// mailbox, kept to be typed once the agent can take it. It has no reply,
+    /// waits as a deferred entry does, and is typed only while it is still
+    /// unread.
+    pub retry: bool,
 }
 
 /// A submitted message whose sender asked to hear how the agent's turn
@@ -351,6 +356,7 @@ pub struct SubmitHead {
     pub deliver: crate::protocol::Deliver,
     pub enqueued_at: Instant,
     pub defer: bool,
+    pub retry: bool,
 }
 
 /// Why a submit could not be queued.
@@ -1158,10 +1164,14 @@ impl Messaging {
         if entry.wait_until.is_some() && self.waits_from(&key) >= (cap / 2).max(1) {
             return Err(EnqueueRefusal::QueueFull);
         }
+        // Retries are left out of every count: each is an unread message the
+        // mailbox already bounds, and its sender was answered long ago, so a
+        // pane with retries pending must not refuse a live send queue_full.
         let queue = self.submit_queues.entry(entry.pane).or_default();
-        let own = queue.iter().filter(|e| e.from.key() == key).count();
-        let deferred = entry.defer && queue.iter().any(|e| e.defer && e.from.key() == key);
-        if queue.len() >= cap || own >= (cap / 2).max(1) || deferred {
+        let live = || queue.iter().filter(|e| !e.retry);
+        let own = live().filter(|e| e.from.key() == key).count();
+        let deferred = entry.defer && live().any(|e| e.defer && e.from.key() == key);
+        if live().count() >= cap || own >= (cap / 2).max(1) || deferred {
             if queue.is_empty() {
                 self.submit_queues.remove(&entry.pane);
             }
@@ -1180,6 +1190,53 @@ impl Messaging {
             .push_front(entry);
     }
 
+    /// Put `entry` back in its pane's queue as a retry, in id order, which is
+    /// the order its pane's messages were sent in: it may have been taken
+    /// from behind a head, or be the head itself.
+    pub fn requeue_retry(&mut self, entry: SubmitEntry) {
+        let queue = self.submit_queues.entry(entry.pane).or_default();
+        let at = queue.partition_point(|e| e.id < entry.id);
+        queue.insert(at, entry);
+    }
+
+    /// When message `id` in `pane`'s mailbox expires, if it is still unread
+    /// and has not expired: the only state in which a retry may type it.
+    pub fn unread_expiry(&self, pane: PaneId, id: MsgId, now_ms: u64) -> Option<u64> {
+        self.mailboxes
+            .get(&pane)
+            .and_then(|mb| mb.messages.iter().find(|m| m.id == id))
+            .filter(|m| m.state == MsgState::Queued && m.expires_ms > now_ms)
+            .map(|m| m.expires_ms)
+    }
+
+    /// Remove, in order, every entry behind `pane`'s head `head` that is not
+    /// a retry and that `due` picks. Called when a retry head is held: each
+    /// such entry would be answered at the head now, and must not wait behind
+    /// a retry that may be held for an hour.
+    pub fn take_live_behind(
+        &mut self,
+        pane: PaneId,
+        head: MsgId,
+        due: impl Fn(&SubmitEntry) -> bool,
+    ) -> Vec<SubmitEntry> {
+        let Some(queue) = self
+            .submit_queues
+            .get_mut(&pane)
+            .filter(|q| q.front().is_some_and(|e| e.id == head))
+        else {
+            return Vec::new();
+        };
+        let Some(head) = queue.pop_front() else {
+            return Vec::new();
+        };
+        let (kept, taken): (VecDeque<_>, VecDeque<_>) = std::mem::take(queue)
+            .into_iter()
+            .partition(|e| e.retry || !due(e));
+        *queue = kept;
+        queue.push_front(head);
+        taken.into()
+    }
+
     /// The oldest entry of each pane that is not mid-typing. A head that must
     /// wait holds its pane: nothing behind it is returned.
     pub fn submit_heads(&self) -> Vec<SubmitHead> {
@@ -1193,6 +1250,7 @@ impl Messaging {
                 deliver: e.deliver,
                 enqueued_at: e.enqueued_at,
                 defer: e.defer,
+                retry: e.retry,
             })
             .collect()
     }
@@ -1295,13 +1353,19 @@ impl Messaging {
         self.in_flight.remove(&pane).flatten()
     }
 
-    /// Whether the submitter has anything to do: a queued entry, a pane
-    /// mid-typing, or a turn being waited on.
+    /// Whether the submitter has anything to do that someone is waiting on: a
+    /// queued entry other than a retry, a pane mid-typing, or a turn being
+    /// waited on. Retries alone are [`Self::has_retries`].
     pub fn has_submit_work(&self) -> bool {
-        !self.submit_queues.is_empty()
+        self.submit_queues.values().flatten().any(|e| !e.retry)
             || !self.in_flight.is_empty()
             || !self.submit_waits.is_empty()
             || !self.state_waits.is_empty()
+    }
+
+    /// Whether any retry is queued.
+    pub fn has_retries(&self) -> bool {
+        self.submit_queues.values().flatten().any(|e| e.retry)
     }
 
     /// Park a caller waiting for an agent's state. Refused past
@@ -3084,6 +3148,7 @@ mod tests {
             put_back: 0,
             waiting_on: None,
             wait_until: None,
+            retry: false,
         }
     }
 
@@ -3270,6 +3335,7 @@ mod tests {
         let waiting = |id: MsgId, pane: PaneId, client: u64| SubmitEntry {
             from: SubmitFrom::pane(40),
             wait_until: Some(Instant::now() + std::time::Duration::from_secs(60)),
+            retry: false,
             ..entry(id, pane, Some(client))
         };
         // A queue of 4 is a share of 2: one parked and one queued fill it,
@@ -3703,6 +3769,119 @@ mod tests {
             "pane 6's queue is gone with its only entry"
         );
         assert!(m.take_submits_from(40).is_empty());
+    }
+
+    fn retry_of(id: MsgId, pane: PaneId) -> SubmitEntry {
+        SubmitEntry {
+            retry: true,
+            defer: true,
+            deliver: crate::protocol::Deliver::Auto,
+            ..entry(id, pane, None)
+        }
+    }
+
+    #[test]
+    fn a_retry_is_put_back_in_id_order() {
+        let mut m = Messaging::new(limits());
+        m.enqueue_submit(entry(2, 5, None), 8).unwrap();
+        m.enqueue_submit(entry(4, 5, None), 8).unwrap();
+        m.requeue_retry(retry_of(3, 5));
+        m.requeue_retry(retry_of(1, 5));
+        m.requeue_retry(retry_of(5, 5));
+        let ids: Vec<MsgId> = m.submit_queues[&5].iter().map(|e| e.id).collect();
+        assert_eq!(ids, [1, 2, 3, 4, 5]);
+        assert_eq!(m.submit_heads()[0].id, 1);
+        assert!(m.submit_heads()[0].retry);
+    }
+
+    #[test]
+    fn retries_alone_are_not_live_work_and_take_no_share_of_the_queue() {
+        let mut m = Messaging::new(limits());
+        assert!(!m.has_retries() && !m.has_submit_work());
+        for id in 1..=4 {
+            m.requeue_retry(SubmitEntry {
+                from: SubmitFrom::pane(9),
+                ..retry_of(id, 5)
+            });
+        }
+        assert!(m.has_retries());
+        assert!(!m.has_submit_work(), "retries alone tick slowly");
+        let same_sender = |id| SubmitEntry {
+            from: SubmitFrom::pane(9),
+            ..entry(id, 5, None)
+        };
+        assert_eq!(m.enqueue_submit(same_sender(10), 2), Ok(()));
+        assert!(m.has_submit_work());
+        assert_eq!(
+            m.enqueue_submit(same_sender(11), 2),
+            Err(EnqueueRefusal::QueueFull),
+            "the live share still counts"
+        );
+        let deferred = SubmitEntry {
+            defer: true,
+            from: SubmitFrom::pane(8),
+            ..entry(12, 5, None)
+        };
+        let mut m = Messaging::new(limits());
+        m.requeue_retry(SubmitEntry {
+            from: SubmitFrom::pane(8),
+            ..retry_of(1, 5)
+        });
+        assert_eq!(
+            m.enqueue_submit(deferred, 8),
+            Ok(()),
+            "a pending retry does not use up its sender's one deferral"
+        );
+    }
+
+    #[test]
+    fn take_live_behind_leaves_the_head_and_the_retries() {
+        let mut m = Messaging::new(limits());
+        m.requeue_retry(retry_of(1, 5));
+        m.enqueue_submit(entry(2, 5, None), 8).unwrap();
+        m.requeue_retry(retry_of(3, 5));
+        m.enqueue_submit(
+            SubmitEntry {
+                defer: true,
+                ..entry(4, 5, None)
+            },
+            8,
+        )
+        .unwrap();
+        m.enqueue_submit(entry(6, 5, None), 8).unwrap();
+        assert!(
+            m.take_live_behind(5, 3, |_| true).is_empty(),
+            "3 is not the head"
+        );
+        let taken: Vec<MsgId> = m
+            .take_live_behind(5, 1, |e| e.id != 6)
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(taken, [2, 4]);
+        let left: Vec<MsgId> = m.submit_queues[&5].iter().map(|e| e.id).collect();
+        assert_eq!(left, [1, 3, 6]);
+    }
+
+    #[test]
+    fn only_an_unread_unexpired_message_can_be_retried() {
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        let unread = send(&mut m, "unread", t0).unwrap();
+        let acked = send(&mut m, "acked", t0).unwrap();
+        let typed = send(&mut m, "typed", t0).unwrap();
+        m.ack(2, &[acked]);
+        m.mark_submitted(2, typed);
+        let expires = m.unread_expiry(2, unread, 0);
+        assert!(expires.is_some());
+        assert_eq!(m.unread_expiry(2, acked, 0), None);
+        assert_eq!(m.unread_expiry(2, typed, 0), None);
+        assert_eq!(m.unread_expiry(3, unread, 0), None, "another pane");
+        assert_eq!(
+            m.unread_expiry(2, unread, expires.unwrap()),
+            None,
+            "expired"
+        );
     }
 
     #[test]
