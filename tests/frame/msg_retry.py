@@ -29,6 +29,10 @@ R7. A send behind a held retry is answered at once, as it would be at the
     head: with a retry held on `agent_working`, a second `auto` send is
     answered `agent_working` without waiting for the server's hold, and the
     two are typed in order once the work ends.
+R8. The same behind a retry held on a person typing: a second `auto` send
+    is answered `human_typing` when its own wait runs out, not at the
+    server's longer hold, and the two are typed in order once the person
+    stops.
 R9. No panic, and no message body in the log.
 
 Run: python3 tests/frame/msg_retry.py   (RMX_RUNDIR overrides the run dir)
@@ -423,6 +427,28 @@ try:
     b_at = wait_typed(F_LOG, "BEHIND:second", start, timeout=12.0)
     check(a_at is not None and b_at is not None and a_at < b_at,
           f"R7 ...and both are typed in order once the work ends ({a_at}, {b_at})")
+
+    # --- R8 -----------------------------------------------------------------
+    check(wait_state(F, "Idle"), "R8 the agent is Idle again")
+    stop = threading.Event()
+    t = threading.Thread(target=typer, args=(stop,))
+    t.start()
+    time.sleep(0.6)
+    start = len(rx_chunks(F_LOG))
+    r1, _ = type_send(A, send(F, "GUARD:first", "Auto"))
+    time.sleep(1.5)
+    r2, took = type_send(A, send(F, "GUARD:second", "Auto"))
+    still_typing = t.is_alive()
+    time.sleep(1.0)
+    stop.set()
+    t.join()
+    check(outcome(r1) == ("Mailbox", "human_typing"), f"R8 the first is stored human_typing ({r1})")
+    check(outcome(r2) == ("Mailbox", "human_typing") and took < 5.0 and still_typing,
+          f"R8 a send behind its retry is answered human_typing at its own cap ({took:.1f}s, {r2})")
+    a_at = wait_typed(F_LOG, "GUARD:first", start, timeout=12.0)
+    b_at = wait_typed(F_LOG, "GUARD:second", start, timeout=12.0)
+    check(a_at is not None and b_at is not None and a_at < b_at,
+          f"R8 ...and both are typed in order once the person stops ({a_at}, {b_at})")
 
     # --- R9 -----------------------------------------------------------------
     log = srv.log()
