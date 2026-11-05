@@ -688,7 +688,8 @@ impl SidebarPlugin for FilesPlugin {
             PluginEvent::SessionTree { .. }
             | PluginEvent::Agents { .. }
             | PluginEvent::FocusedPane { .. }
-            | PluginEvent::PaneTitle { .. } => {}
+            | PluginEvent::PaneTitle { .. }
+            | PluginEvent::Views { .. } => {}
         }
     }
 

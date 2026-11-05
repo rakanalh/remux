@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use crossterm::event::{KeyEvent, MouseEventKind};
 
 use super::nav::{self, ListLayout, NavKey, NavList};
-use super::{blank_grid, draw_text, draw_text_with, PluginAction, PluginEvent, SidebarPlugin};
+use super::{blank_grid, draw_text, draw_text_with, fit, PluginAction, PluginEvent, SidebarPlugin};
 use crate::client::context_menu::{MenuAction, MenuItem};
 use crate::client::registry::ConnId;
 use crate::client::tree_model::JumpTarget;
@@ -159,18 +159,6 @@ impl AgentRow {
 /// per character on every terminal, which a panel 20 columns wide needs.
 fn badge(unread: usize) -> Option<String> {
     (unread > 0).then(|| format!("*{unread}"))
-}
-
-/// `text` cut to at most `width` display columns.
-fn fit(text: &str, width: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
-    let mut used = 0;
-    text.chars()
-        .take_while(|&c| {
-            used += UnicodeWidthChar::width(c).unwrap_or(0);
-            used <= width
-        })
-        .collect()
 }
 
 /// The colour a state's marker is drawn in.
@@ -703,7 +691,9 @@ impl SidebarPlugin for AgentsPlugin {
                     .collect();
                 self.tab_names.insert(conn.clone(), names);
             }
-            PluginEvent::FocusedCwd { .. } | PluginEvent::DirectoryListing { .. } => {}
+            PluginEvent::FocusedCwd { .. }
+            | PluginEvent::DirectoryListing { .. }
+            | PluginEvent::Views { .. } => {}
             PluginEvent::PaneTitle { template } => {
                 self.roster.set_pane_title(template.clone());
                 self.rebuild();

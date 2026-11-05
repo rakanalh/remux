@@ -377,6 +377,34 @@ impl ClientView {
     }
 }
 
+/// What a request to enter view `id` comes to, given the cache as it is now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewEntry {
+    /// No cached view has that id: it was deleted after the requester's list
+    /// was built.
+    Gone,
+    /// The view at this cache index is already on screen.
+    OnScreen(usize),
+    /// Enter the view at this cache index.
+    Enter(usize),
+}
+
+/// Resolve a request to enter view `id` BY ID against the cache `ids`, in cache
+/// order. A requester's list (the session manager's rows, a sidebar panel's)
+/// can be one `ViewList` behind the cache, so an index from it could name a
+/// different view.
+pub fn resolve_view_entry(
+    ids: impl IntoIterator<Item = ViewId>,
+    active_view: Option<usize>,
+    id: ViewId,
+) -> ViewEntry {
+    match ids.into_iter().position(|v| v == id) {
+        None => ViewEntry::Gone,
+        Some(idx) if active_view == Some(idx) => ViewEntry::OnScreen(idx),
+        Some(idx) => ViewEntry::Enter(idx),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------------
@@ -1379,6 +1407,28 @@ pub fn draw_status_bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_view_missing_from_the_cache_is_gone() {
+        assert_eq!(resolve_view_entry([4, 7], Some(0), 9), ViewEntry::Gone);
+        assert_eq!(resolve_view_entry([], None, 4), ViewEntry::Gone);
+    }
+
+    #[test]
+    fn the_displayed_view_is_on_screen_and_any_other_is_entered() {
+        assert_eq!(
+            resolve_view_entry([4, 7], Some(1), 7),
+            ViewEntry::OnScreen(1)
+        );
+        assert_eq!(resolve_view_entry([4, 7], Some(1), 4), ViewEntry::Enter(0));
+        assert_eq!(resolve_view_entry([4, 7], None, 7), ViewEntry::Enter(1));
+    }
+
+    #[test]
+    fn entry_resolves_by_id_after_the_cache_reorders() {
+        // The requester saw view 7 at index 1; the cache now holds it at 0.
+        assert_eq!(resolve_view_entry([7, 9], None, 7), ViewEntry::Enter(0));
+    }
 
     fn name_info(title: Option<&str>) -> crate::protocol::PaneNameInfo {
         crate::protocol::PaneNameInfo {

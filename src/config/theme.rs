@@ -227,7 +227,8 @@ pub struct ThemeConfig {
     /// lives here beside the chip colors it shapes.
     pub tab_style: TabStyle,
     /// Background of the full-width bar on the agents panel row whose pane the
-    /// user is currently in. Must stay distinct from the selection band
+    /// user is currently in, and on the views panel row of the view on screen.
+    /// Must stay distinct from the selection band
     /// (`sidebar_selection_bg`): the two marks are shown together while the user
     /// scrolls the list, and one that matched the band would read as a second
     /// cursor.

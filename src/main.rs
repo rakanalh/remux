@@ -1837,13 +1837,15 @@ async fn handle_plugin_action(
     renderer: &mut Renderer,
     theme: &crate::config::theme::CompositorTheme,
     focused_pane_rect: Option<&crate::protocol::PaneRect>,
-    views: &[crate::client::view::ClientView],
+    views: &mut [crate::client::view::ClientView],
     active_view: &mut Option<usize>,
     active_view_id: &mut Option<ViewId>,
     mouse_grab: &mut Option<MouseGrab>,
     last_local_session: &mut Option<String>,
     current_attached: &mut Option<(ConnId, String)>,
     previous_attached: &mut Option<(ConnId, String)>,
+    input: &InputHandler,
+    view_paint: ViewPaint<'_>,
 ) -> Result<()> {
     use crate::client::sidebar::PluginAction;
     let (c, r) = renderer.size();
@@ -1887,8 +1889,80 @@ async fn handle_plugin_action(
             )
             .await?;
         }
+        PluginAction::EnterView(id) => {
+            let ViewPaint {
+                whichkey,
+                theme: client_theme,
+                border_style,
+                which_key_position,
+                viewport_top,
+            } = view_paint;
+            use crate::client::view::{resolve_view_entry, ViewEntry};
+            match resolve_view_entry(views.iter().map(|v| v.id), *active_view, id) {
+                ViewEntry::Gone => {
+                    log::warn!("views panel: view {id} is gone; not entering it");
+                    chrome.paint(renderer, c, r, theme, focused_pane_rect)?;
+                    renderer.flush()?;
+                }
+                ViewEntry::OnScreen(idx) => {
+                    // Already on screen. Re-entering would Detach and
+                    // re-subscribe for nothing; the user asked to be IN the
+                    // view, so only the keyboard moves to its cells.
+                    chrome.leave_sidebar();
+                    paint_view(
+                        renderer,
+                        chrome,
+                        &views[idx],
+                        input,
+                        whichkey,
+                        client_theme,
+                        theme,
+                        border_style,
+                        which_key_position,
+                        viewport_top,
+                        focused_pane_rect,
+                    )?;
+                    renderer.flush()?;
+                }
+                ViewEntry::Enter(idx) => {
+                    enter_view(
+                        mgr,
+                        views,
+                        active_view,
+                        active_view_id,
+                        chrome,
+                        mouse_grab,
+                        idx,
+                        current_attached,
+                        renderer,
+                        input,
+                        whichkey,
+                        client_theme,
+                        theme,
+                        border_style,
+                        which_key_position,
+                        viewport_top,
+                        focused_pane_rect,
+                    )
+                    .await?;
+                    renderer.flush()?;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// What [`enter_view`] and [`paint_view`] need beyond the state a plugin
+/// action already touches, so that a sidebar panel can enter a view through
+/// the same path as the switcher and the session manager.
+#[derive(Clone, Copy)]
+struct ViewPaint<'a> {
+    whichkey: &'a WhichKeyPopup,
+    theme: &'a crate::config::theme::Theme,
+    border_style: &'a crate::config::BorderStyle,
+    which_key_position: &'a crate::config::WhichKeyPosition,
+    viewport_top: usize,
 }
 
 /// Open the rename prompt for `what`. Enter applies the name to that entity, not
@@ -1933,13 +2007,14 @@ async fn run_menu_action(
     renderer: &mut Renderer,
     theme: &crate::config::theme::CompositorTheme,
     focused_pane_rect: Option<&crate::protocol::PaneRect>,
-    views: &[crate::client::view::ClientView],
+    views: &mut [crate::client::view::ClientView],
     active_view: &mut Option<usize>,
     active_view_id: &mut Option<ViewId>,
     mouse_grab: &mut Option<MouseGrab>,
     last_local_session: &mut Option<String>,
     current_attached: &mut Option<(ConnId, String)>,
     previous_attached: &mut Option<(ConnId, String)>,
+    view_paint: ViewPaint<'_>,
 ) -> Result<()> {
     use crate::client::context_menu::MenuAction;
     use crate::client::sidebar::PluginAction;
@@ -1964,6 +2039,8 @@ async fn run_menu_action(
                 last_local_session,
                 current_attached,
                 previous_attached,
+                input,
+                view_paint,
             )
             .await?;
         }
@@ -1982,6 +2059,8 @@ async fn run_menu_action(
                 last_local_session,
                 current_attached,
                 previous_attached,
+                input,
+                view_paint,
             )
             .await?;
             match *then {
@@ -2037,6 +2116,8 @@ async fn run_menu_action(
                 last_local_session,
                 current_attached,
                 previous_attached,
+                input,
+                view_paint,
             )
             .await?;
         }
@@ -3341,6 +3422,7 @@ async fn enter_view(
     }
     *active_view = Some(target_idx);
     *active_view_id = Some(views[target_idx].id);
+    broadcast_views(chrome, views, *active_view_id);
     // A view OPENS on its cells: whatever the user was doing in a panel, the
     // thing they just asked for is the view, so the keyboard goes there. They
     // can step back into the sidebar with a directional key. `leave_sidebar`
@@ -3841,6 +3923,7 @@ async fn leave_active_view(
         unsubscribe_view_cells(mgr, &views[av]).await?;
         *active_view = None;
         *active_view_id = None;
+        broadcast_views(chrome, views, None);
         // Symmetric with `enter_view`: the screen goes back to the content, so
         // focus does too. This is a real transition now, not a tidy-up of an
         // unreachable state -- a panel CAN hold the keyboard inside a view --
@@ -3851,6 +3934,32 @@ async fn leave_active_view(
         *mouse_grab = None;
     }
     Ok(())
+}
+
+/// Tell the views panels which views exist and which one this client shows.
+///
+/// Called after every write of `active_view_id` as well as after every change
+/// to the cache, because entering and leaving a view are client-side and no
+/// `ViewList` arrives to carry the new mark.
+fn broadcast_views(
+    chrome: &mut crate::client::chrome::Chrome,
+    views: &[crate::client::view::ClientView],
+    active: Option<ViewId>,
+) {
+    let rows = views
+        .iter()
+        .map(|v| crate::client::sidebar::ViewRowInfo {
+            id: v.id,
+            name: v.name.clone(),
+            cells: v.cells.len(),
+            layout: v.layout_name().to_string(),
+            zoomed: v.zoomed,
+        })
+        .collect();
+    chrome.broadcast(&crate::client::sidebar::PluginEvent::Views {
+        views: rows,
+        active,
+    });
 }
 
 /// The client's view cache in the session manager's plain shape: each view's
@@ -4062,6 +4171,9 @@ async fn run_client_loop(
             .map(|info| crate::client::view::ClientView::from_info(info, None))
             .collect();
     }
+    // The startup `ViewList` was captured during the handshake and never
+    // reaches the loop's `ViewList` arm, so the panels are fed from the seed.
+    broadcast_views(&mut chrome, &views, active_view_id);
     // A view this terminal created (via `w n` / `w a`→new) and should enter as
     // soon as the resulting `ViewList` carries it. Set from the `ViewCreated`
     // ack (creator-only), consumed by the `ViewList` sync.
@@ -4129,6 +4241,7 @@ async fn run_client_loop(
     // meaning for the first: the two subscriptions are independent on the wire,
     // and a client may configure either panel without the other.
     let mut wants_agents = chrome.wants_agents();
+    let mut wants_views = chrome.wants_views();
     let mut agents_subscribed: std::collections::HashSet<ConnId> = std::collections::HashSet::new();
     // Every subscribed connection's latest agent list, so the switcher opens
     // with the list already on screen when a panel keeps it subscribed.
@@ -4195,13 +4308,20 @@ async fn run_client_loop(
                     &mut renderer,
                     &compositor_theme,
                     focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
-                    &views,
+                    &mut views,
                     &mut active_view,
                     &mut active_view_id,
                     &mut mouse_grab,
                     &mut last_local_session,
                     &mut current_attached,
                     &mut previous_attached,
+                    ViewPaint {
+                        whichkey: &whichkey,
+                        theme: &theme,
+                        border_style: &view_border_style,
+                        which_key_position: &which_key_position,
+                        viewport_top,
+                    },
                 )
                 .await?;
             }
@@ -4401,13 +4521,21 @@ async fn run_client_loop(
                                             &mut renderer,
                                             &compositor_theme,
                                             focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
-                                            &views,
+                                            &mut views,
                                             &mut active_view,
                                             &mut active_view_id,
                                             &mut mouse_grab,
                                             &mut last_local_session,
                                             &mut current_attached,
                                             &mut previous_attached,
+                                            &input,
+                                            ViewPaint {
+                                                whichkey: &whichkey,
+                                                theme: &theme,
+                                                border_style: &view_border_style,
+                                                which_key_position: &which_key_position,
+                                                viewport_top,
+                                            },
                                         )
                                         .await?;
                                         continue;
@@ -5895,19 +6023,17 @@ async fn run_client_loop(
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
                                         mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
-                                        // BY ID against the cache as it is NOW: the
-                                        // manager's rows can be one `ViewList` behind it,
-                                        // so an index would be the wrong view.
-                                        let target = views.iter().position(|v| v.id == id);
-                                        match target {
-                                            None => {
+                                        use crate::client::view::{resolve_view_entry, ViewEntry};
+                                        let entry = resolve_view_entry(views.iter().map(|v| v.id), active_view, id);
+                                        match entry {
+                                            ViewEntry::Gone => {
                                                 log::warn!("session manager: view {id} is gone; not entering it");
                                             }
-                                            Some(idx) if active_view == Some(idx) => {
+                                            ViewEntry::OnScreen(_) => {
                                                 // Already on screen: re-entering would
                                                 // Detach and re-subscribe for nothing.
                                             }
-                                            Some(idx) => {
+                                            ViewEntry::Enter(idx) => {
                                                 enter_view(
                                                     mgr,
                                                     &mut views,
@@ -5948,7 +6074,7 @@ async fn run_client_loop(
                                                 focused_pane_rect.as_ref(),
                                             )?;
                                         }
-                                        if let (Some(cell_id), Some(_)) = (entered_cell, target) {
+                                        if let (Some(cell_id), false) = (entered_cell, entry == ViewEntry::Gone) {
                                             // Focus is server-owned: the `ViewList` this
                                             // produces is what moves it on screen.
                                             mgr.send(&ConnId::Local, ClientMessage::ViewSetFocus { id, cell_id }).await?;
@@ -6741,6 +6867,7 @@ async fn run_client_loop(
                                     unsubscribe_view_cells(mgr, &views[av]).await?;
                                     active_view = None;
                                     active_view_id = None;
+                                    broadcast_views(&mut chrome, &views, None);
                                     // The screen goes back to the content, so
                                     // focus and any mouse grab do too -- same
                                     // reset `leave_active_view` performs, which
@@ -7408,13 +7535,21 @@ async fn run_client_loop(
                                 &mut renderer,
                                 &compositor_theme,
                                 focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
-                                &views,
+                                &mut views,
                                 &mut active_view,
                                 &mut active_view_id,
                                 &mut mouse_grab,
                                 &mut last_local_session,
                                 &mut current_attached,
                                 &mut previous_attached,
+                                &input,
+                                ViewPaint {
+                                    whichkey: &whichkey,
+                                    theme: &theme,
+                                    border_style: &view_border_style,
+                                    which_key_position: &which_key_position,
+                                    viewport_top,
+                                },
                             )
                             .await?;
                             if repaint_for_focus {
@@ -8952,6 +9087,7 @@ async fn run_client_loop(
                             // the new cache in any branch below (enter/leave/diff).
                             active_view =
                                 active_view_id.and_then(|id| views.iter().position(|v| v.id == id));
+                            broadcast_views(&mut chrome, &views, active_view_id);
 
                             // A switcher for a deleted View would hold the
                             // keyboard and offer a list no server applies.
@@ -9021,6 +9157,7 @@ async fn run_client_loop(
                                     }
                                     active_view = None;
                                     active_view_id = None;
+                                    broadcast_views(&mut chrome, &views, None);
                                     // The screen goes back to the content, so
                                     // focus and any mouse grab do too -- same
                                     // reset `leave_active_view` performs, which
@@ -9086,6 +9223,26 @@ async fn run_client_loop(
                                         focused_pane_rect.as_ref(),
                                     )?;
                                 }
+                            }
+
+                            // With no view displayed, no branch above repaints, yet the
+                            // list in a views panel changed. The overlays below paint
+                            // after this, so they stay on top.
+                            if wants_views && !entered && active_view.is_none() {
+                                let (tc, tr) = renderer.size();
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref())?;
+                                relay_overlays(
+                                    &mut renderer,
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                    tc,
+                                    tr,
+                                )?;
+                                renderer.flush()?;
                             }
 
                             // Live-update an OPEN switcher's Views section so another
@@ -9244,6 +9401,8 @@ async fn run_client_loop(
                     chrome.broadcast(&crate::client::sidebar::PluginEvent::PaneTitle {
                         template: new_config.appearance.pane_title.clone(),
                     });
+                    // The rebuilt panels have never seen a `ViewList`.
+                    broadcast_views(&mut chrome, &views, active_view_id);
                     // The rebuild starts from the config default; the frame has
                     // to go back to the style the client is actually drawing
                     // with, which a runtime `ToggleStyle` may have flipped away
@@ -9325,6 +9484,7 @@ async fn run_client_loop(
                     // The same for the agents push, for the same reasons.
                     let wanted_agents_before = wants_agents;
                     wants_agents = chrome.wants_agents();
+                    wants_views = chrome.wants_views();
                     let switcher_open = input.agent_switch.is_some();
                     let push_before = wanted_agents_before || switcher_open || notify_before;
                     let push_after = wants_agents || switcher_open || notifier.config().enabled;

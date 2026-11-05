@@ -23,6 +23,7 @@ pub mod files;
 pub mod nav;
 pub mod placeholder;
 pub mod sessions;
+pub mod views;
 
 /// What the client should do after handing an event to a plugin.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,26 @@ pub enum PluginAction {
     /// is "that node's current focus", and the server is the one that knows
     /// what that is.
     JumpTo(JumpTarget),
+    /// Put this view on screen.
+    ///
+    /// An id, not an index, because the panel's rows can be one `ViewList`
+    /// behind the client's cache: the client resolves it against the cache as it
+    /// is at dispatch time, and an index would name whichever view moved into
+    /// that slot.
+    EnterView(crate::protocol::ViewId),
+}
+
+/// One view as the `views` panel lists it. A plain summary of a
+/// [`crate::client::view::ClientView`], which cannot be compared because its
+/// layout types are not `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewRowInfo {
+    pub id: crate::protocol::ViewId,
+    pub name: String,
+    pub cells: usize,
+    /// The word the view's own status bar shows, so the two agree.
+    pub layout: String,
+    pub zoomed: bool,
 }
 
 /// Data pushed to plugins by the client. One variant per plugin family; later
@@ -137,6 +158,18 @@ pub enum PluginEvent {
         /// panel can never pair one machine's home with another machine's path
         /// -- see [`crate::protocol::ServerMessage::DirectoryListing`].
         home: Option<String>,
+    },
+    /// The LOCAL server's views, and the one this client has on screen.
+    ///
+    /// Built by the client from its own view cache, never relayed from a
+    /// server message, so a panel cannot be handed a remote's list (views live
+    /// on the local server only). The list and the mark travel together because
+    /// both come from the same client state: entering or leaving a view sends
+    /// this with an unchanged list and a new `active`, since no `ViewList`
+    /// arrives for a client-side transition.
+    Views {
+        views: Vec<ViewRowInfo>,
+        active: Option<crate::protocol::ViewId>,
     },
 }
 
@@ -292,6 +325,16 @@ pub trait SidebarPlugin: Send {
     fn wants_agents(&self) -> bool {
         false
     }
+
+    /// Whether this panel shows [`PluginEvent::Views`].
+    ///
+    /// A REPAINT gate only. The server pushes `ViewList` to every client
+    /// unasked, so there is no subscription behind this flag and nothing to
+    /// reconcile per connection. It decides whether a `ViewList` that changed
+    /// nothing else on screen must still repaint the chrome.
+    fn wants_views(&self) -> bool {
+        false
+    }
 }
 
 /// Resolve a `[[sidebar.panel]]` entry to a plugin instance.
@@ -342,6 +385,7 @@ the server's $EDITOR.",
         "placeholder" => Some(Box::new(placeholder::PlaceholderPlugin::new())),
         "sessions" => Some(Box::new(sessions::SessionsPlugin::new())),
         "agents" => Some(Box::new(agents::AgentsPlugin::new())),
+        "views" => Some(Box::new(views::ViewsPlugin::new())),
         "files" => Some(Box::new(files::FilesPlugin::new(cfg.editor.clone()))),
         "browser" => {
             log::warn!(
@@ -353,6 +397,18 @@ rename it in your config."
         }
         _ => None,
     }
+}
+
+/// `text` cut to at most `width` display columns.
+pub fn fit(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut used = 0;
+    text.chars()
+        .take_while(|&c| {
+            used += UnicodeWidthChar::width(c).unwrap_or(0);
+            used <= width
+        })
+        .collect()
 }
 
 /// A `rows` x `cols` grid of spaces on `bg`.

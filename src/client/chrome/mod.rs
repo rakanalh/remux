@@ -753,6 +753,14 @@ impl Chrome {
             .any(|s| s.panels.iter().any(|p| p.plugin.wants_agents()))
     }
 
+    /// Whether any configured panel lists the views. See
+    /// [`crate::client::sidebar::SidebarPlugin::wants_views`].
+    pub fn wants_views(&self) -> bool {
+        self.sidebars
+            .iter()
+            .any(|s| s.panels.iter().any(|p| p.plugin.wants_views()))
+    }
+
     /// Index of the first visible sidebar on `edge`, if any. Consumed by the
     /// navigation task (Task 7).
     pub fn sidebar_on(&self, edge: SidebarEdge, term_cols: u16, term_rows: u16) -> Option<usize> {

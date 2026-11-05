@@ -382,7 +382,8 @@ impl SidebarPlugin for SessionsPlugin {
             | PluginEvent::FocusedCwd { .. }
             | PluginEvent::FocusedPane { .. }
             | PluginEvent::DirectoryListing { .. }
-            | PluginEvent::PaneTitle { .. } => {}
+            | PluginEvent::PaneTitle { .. }
+            | PluginEvent::Views { .. } => {}
         }
     }
 }
