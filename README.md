@@ -404,7 +404,16 @@ Each takes `--status`, `--dry-run` and `--uninstall`, like `claude-messaging`, a
 
 The value is joined to its flag, or put after `--`, so that a stored value can never be read as another option of the agent. pi's parser does not take a joined value, and its value is always an absolute path, so it is passed as a separate word.
 
-`[general] resume_agents = false` turns it all off: reports are refused and nothing is stored or typed. `resume_agent_delay_ms` (default 100) spaces the typed commands out. Both are read by the server, so they need `remux restart`.
+`[general] resume_agents = false` turns it all off: reports are refused and nothing is stored or typed. `resume_agent_delay_ms` (default 100) spaces the typed commands out.
+
+`[general.resume_agent_args]` adds words to an agent's resume command, keyed by agent name and empty by default. They go after the program and before the session reference, so with the setting below a restart types `claude --dangerously-skip-permissions --resume=<id>`, and every restored Claude session skips its permission prompts. Each word is quoted for the shell. An entry with a word holding a backslash or a control character cannot be typed safely, so it is dropped with a warning in `server.log` and that agent resumes without its extra words. A key that names no agent is warned about and never used. The words come before the session reference, so `--` or a flag that takes a value and is left without one swallows or demotes that reference: the agent then starts a different session while the pane still holds the old id. The placement is tested against a stub, not the real agents, so check that yours accepts the word there (for codex it comes before the `resume` subcommand). Claude is understood to refuse `--dangerously-skip-permissions` under root, which is untested here, so check that too if your panes run as root.
+
+```toml
+[general.resume_agent_args]
+claude = ["--dangerously-skip-permissions"]
+```
+
+All three are read by the server, so they need `remux restart`.
 
 - **OpenCode 1.x and 2.x** — one install serves both, so upgrading OpenCode needs no reinstall. 2.x finds the TUI plugin's directory by itself, and 1.x reads the `tui.json(c)` entry. Under 2.x only the full TUI reports, because 2.x runs server plugins in one background service that every TUI on the machine shares: an `opencode mini` or `opencode run` session is not resumed, and neither is a TUI started with `--server`, whose session is on another machine. Under 1.x, `opencode --mini` and `opencode run` report as well. 2.x copies `tui.json` into a new `cli.json` the first time it starts, so `--uninstall` also takes Remux's entry out of `cli.json`.
 - **Only the agent in the pane** — a report typed at the prompt is refused, and so is a nested run: a `claude -p` or a subagent inside the pane's Claude, a `codex exec` inside its Codex, an omp started from omp's own shell tool. Another agent's session in a pane is never replaced while it runs.

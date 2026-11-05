@@ -182,6 +182,12 @@ pub struct GeneralConfig {
     /// the next, across every restored session, so several agents do not all
     /// start at once.
     pub resume_agent_delay_ms: u64,
+    /// Extra words for a restored resume line, keyed by agent name, placed
+    /// after the program and before the session reference, so a flag that takes
+    /// a value would swallow that reference. [`Config::parse`] drops an entry
+    /// with a word that cannot be typed safely into a shell. Server-read:
+    /// `remux restart` applies it.
+    pub resume_agent_args: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Default for GeneralConfig {
@@ -195,6 +201,7 @@ impl Default for GeneralConfig {
             allow_app_clipboard: true,
             resume_agents: true,
             resume_agent_delay_ms: 100,
+            resume_agent_args: std::collections::HashMap::new(),
         }
     }
 }
@@ -641,6 +648,9 @@ impl Config {
         for problem in config.check_remotes() {
             log::warn!("{problem}");
         }
+        for problem in config.check_resume_agent_args() {
+            log::warn!("{problem}");
+        }
         config.warn_unknown_pane_title_placeholders();
         for problem in config.messaging.problems() {
             log::warn!("{problem}");
@@ -660,6 +670,33 @@ impl Config {
             );
         }
         Ok(config)
+    }
+
+    /// Drop every `[general.resume_agent_args]` entry with a word that cannot
+    /// be typed safely, so that agent resumes without its extra words and keeps
+    /// its session record. One line per dropped entry and per key that names no
+    /// agent. A line never holds a word: the words are the user's text.
+    fn check_resume_agent_args(&mut self) -> Vec<String> {
+        let mut problems = Vec::new();
+        self.general.resume_agent_args.retain(|agent, words| {
+            if !crate::server::agent_session::is_known_agent(agent) {
+                problems.push(format!(
+                    "[general.resume_agent_args] {agent:?} names no agent, so it is never used"
+                ));
+            }
+            let typable = words
+                .iter()
+                .all(|word| crate::server::agent_session::typable(word));
+            if !typable {
+                problems.push(format!(
+                    "[general.resume_agent_args] {agent:?} dropped: a word holds a backslash or \
+                     a control character, so that agent resumes without its extra words"
+                ));
+            }
+            typable
+        });
+        problems.sort();
+        problems
     }
 
     /// One line per `[messaging.submit.<command>]` row whose command is not in
@@ -861,20 +898,74 @@ mod tests {
     }
 
     #[test]
-    fn agent_resume_defaults_and_both_keys_parse() {
+    fn agent_resume_defaults_and_every_key_parses() {
         let config = Config::default();
         assert!(config.general.resume_agents);
         assert_eq!(config.general.resume_agent_delay_ms, 100);
+        assert!(config.general.resume_agent_args.is_empty());
         let config: Config = toml::from_str(
             r#"
             [general]
             resume_agents = false
             resume_agent_delay_ms = 1500
+
+            [general.resume_agent_args]
+            claude = ["--dangerously-skip-permissions"]
+            not-an-agent = ["--whatever"]
         "#,
         )
         .unwrap();
         assert!(!config.general.resume_agents);
         assert_eq!(config.general.resume_agent_delay_ms, 1500);
+        assert_eq!(
+            config.general.resume_agent_args["claude"],
+            ["--dangerously-skip-permissions"]
+        );
+    }
+
+    #[test]
+    fn a_resume_agent_args_entry_with_an_untypable_word_is_dropped() {
+        for bad in [
+            r#""a\u0003b""#,
+            r#""a\rb""#,
+            r#""a\nb""#,
+            r#""a\\b""#,
+            "'x\\'",
+        ] {
+            let mut config: Config = toml::from_str(&format!(
+                "[general.resume_agent_args]\n\
+                 claude = [\"--fine\", {bad}]\n\
+                 codex = [\"--yolo\"]\n"
+            ))
+            .unwrap();
+            let problems = config.check_resume_agent_args();
+            assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
+            assert!(problems[0].contains("\"claude\""), "{problems:?}");
+            assert!(!problems[0].contains("--fine"), "{problems:?}");
+            assert!(
+                !config.general.resume_agent_args.contains_key("claude"),
+                "{bad}"
+            );
+            assert_eq!(config.general.resume_agent_args["codex"], ["--yolo"]);
+        }
+    }
+
+    #[test]
+    fn config_parse_applies_the_resume_agent_args_check() {
+        let config =
+            Config::parse("[general.resume_agent_args]\nclaude = [\"a\\u0003b\"]\n").unwrap();
+        assert!(config.general.resume_agent_args.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_resume_agent_args_key_is_warned_about_and_kept() {
+        let mut config: Config =
+            toml::from_str("[general.resume_agent_args]\ncluade = [\"--x\"]\nclaude = [\"--y\"]\n")
+                .unwrap();
+        let problems = config.check_resume_agent_args();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("\"cluade\""), "{problems:?}");
+        assert_eq!(config.general.resume_agent_args.len(), 2);
     }
 
     #[test]

@@ -122,6 +122,11 @@ impl Refusal {
 const MAX_ID: usize = 128;
 const MAX_PATH: usize = 4096;
 
+/// Whether `agent` is one remux can resume.
+pub fn is_known_agent(agent: &str) -> bool {
+    takes_paths(agent).is_some()
+}
+
 /// Whether `agent` names its sessions by file. Such an agent may still send an
 /// id when it has no file yet.
 fn takes_paths(agent: &str) -> Option<bool> {
@@ -142,14 +147,19 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'@' | b'-'))
 }
 
-/// Absolute, so it can never start with `-`. No backslash: the typed line is
-/// quoted for POSIX shells, and fish reads `\'` inside single quotes as an
-/// escaped quote, which would end the quoting early in a fish pane.
+/// Whether `text` stays one word when the restore types it into a pane's shell.
+/// No backslash: the typed line is quoted for POSIX shells, and fish reads `\'`
+/// inside single quotes as an escaped quote, which would end the quoting early
+/// in a fish pane. No control character: the tty acts on one before the shell
+/// parses anything, so `^C` inside a word discards the line and the rest of the
+/// word runs as a command.
+pub fn typable(text: &str) -> bool {
+    !text.contains('\\') && !text.chars().any(char::is_control)
+}
+
+/// Absolute, so it can never start with `-`.
 fn valid_path(path: &str) -> bool {
-    path.len() <= MAX_PATH
-        && path.starts_with('/')
-        && !path.contains('\\')
-        && !path.chars().any(char::is_control)
+    path.len() <= MAX_PATH && path.starts_with('/') && typable(path)
 }
 
 /// Whether a report of `reference` from `agent` may be kept at all. The id
@@ -228,16 +238,20 @@ pub fn dedupe(
     winners
 }
 
-/// The command that resumes `record`'s session, one argv word each. `None`
-/// for an agent this server does not know, which [`validate`] refuses.
-pub fn plan(record: &AgentSessionRecord) -> Option<Vec<String>> {
+/// The command that resumes `record`'s session, one argv word each, with the
+/// agent's entry in `extra_args` after the program word. `None` for an agent
+/// this server does not know, which [`validate`] refuses.
+pub fn plan(
+    record: &AgentSessionRecord,
+    extra_args: &HashMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
     let value = record.value.clone();
     // The value is joined to its flag, or follows `--`, wherever the agent's
     // parser takes that form, so that even a valid value is never read as an
     // option. pi takes neither (0.73's parser matches `--session` exactly),
     // but it consumes the next argument as the value whatever it is, so
     // `--session <v>` cannot be read as two options either.
-    let words = match record.agent.as_str() {
+    let mut words: Vec<String> = match record.agent.as_str() {
         "claude" => vec!["claude".into(), format!("--resume={value}")],
         "codex" => vec!["codex".into(), "resume".into(), "--".into(), value],
         // omp has no `--session`, and takes the value only joined to the flag.
@@ -246,14 +260,19 @@ pub fn plan(record: &AgentSessionRecord) -> Option<Vec<String>> {
         "opencode" => vec!["opencode".into(), format!("--session={value}")],
         _ => return None,
     };
+    let extra = extra_args.get(&record.agent).map_or(&[][..], Vec::as_slice);
+    words.splice(1..1, extra.iter().cloned());
     Some(words)
 }
 
 /// What a restore types into the respawned shell to resume `record`. The
 /// leading space keeps the line out of the history of a shell that sets
 /// `ignorespace` or `HIST_IGNORE_SPACE`, and the `\r` submits it.
-pub fn typed_line(record: &AgentSessionRecord) -> Option<String> {
-    let words: Vec<String> = plan(record)?
+pub fn typed_line(
+    record: &AgentSessionRecord,
+    extra_args: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    let words: Vec<String> = plan(record, extra_args)?
         .iter()
         .map(|w| crate::shell_word::sh_word(w))
         .collect();
@@ -431,26 +450,127 @@ mod tests {
         ];
         for (agent, reference, want) in cases {
             assert_eq!(
-                plan(&record(agent, reference)),
+                plan(&record(agent, reference), &HashMap::new()),
                 Some(want.iter().map(|w| w.to_string()).collect()),
                 "{agent}"
             );
         }
-        assert_eq!(plan(&record("vim", id(UUID))), None);
+        assert_eq!(plan(&record("vim", id(UUID)), &HashMap::new()), None);
+    }
+
+    fn args(entries: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        entries
+            .iter()
+            .map(|(agent, words)| {
+                (
+                    agent.to_string(),
+                    words.iter().map(|w| w.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn extra_args_go_after_the_program_and_before_the_session() {
+        let extra = args(&[
+            ("claude", &["--dangerously-skip-permissions"]),
+            ("codex", &["--yolo"]),
+            ("pi", &["--a", "--b"]),
+        ]);
+        let resume = format!("--resume={UUID}");
+        let cases = [
+            (
+                "claude",
+                id(UUID),
+                vec!["claude", "--dangerously-skip-permissions", resume.as_str()],
+            ),
+            (
+                "codex",
+                id(UUID),
+                vec!["codex", "--yolo", "resume", "--", UUID],
+            ),
+            (
+                "pi",
+                path("/home/u/s.jsonl"),
+                vec!["pi", "--a", "--b", "--session", "/home/u/s.jsonl"],
+            ),
+        ];
+        for (agent, reference, want) in cases {
+            assert_eq!(
+                plan(&record(agent, reference), &extra),
+                Some(want.iter().map(|w| w.to_string()).collect()),
+                "{agent}"
+            );
+        }
+        assert_eq!(
+            typed_line(&record("claude", id(UUID)), &extra).as_deref(),
+            Some(format!(" claude --dangerously-skip-permissions --resume={UUID}\r").as_str())
+        );
+    }
+
+    #[test]
+    fn extra_args_reach_only_the_agent_they_are_configured_for() {
+        let only_codex = args(&[("codex", &["--yolo"])]);
+        assert_eq!(
+            typed_line(&record("claude", id(UUID)), &only_codex).as_deref(),
+            Some(format!(" claude --resume={UUID}\r").as_str())
+        );
+        let only_claude = args(&[("claude", &["--dangerously-skip-permissions"])]);
+        assert_eq!(
+            typed_line(&record("codex", id(UUID)), &only_claude).as_deref(),
+            Some(format!(" codex resume -- {UUID}\r").as_str())
+        );
+    }
+
+    #[test]
+    fn a_configured_word_stays_one_shell_word() {
+        let extra = args(&[("claude", &["--note=a b; rm -rf $HOME", "it's"])]);
+        assert_eq!(
+            typed_line(&record("claude", id(UUID)), &extra).as_deref(),
+            Some(
+                format!(" claude '--note=a b; rm -rf $HOME' 'it'\\''s' --resume={UUID}\r").as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn a_backslash_or_control_character_is_not_typable() {
+        for bad in [
+            r"\'; touch x; #",
+            "a\u{3}b",
+            "a\rb",
+            "a\nb",
+            "a\u{15}b",
+            "a\u{1b}b",
+        ] {
+            assert!(!typable(bad), "{bad:?}");
+        }
+        for good in [
+            "--dangerously-skip-permissions",
+            "a b; rm -rf $HOME",
+            "it's",
+            "",
+        ] {
+            assert!(typable(good), "{good:?}");
+        }
     }
 
     #[test]
     fn the_typed_line_is_space_prefixed_quoted_and_submitted() {
         assert_eq!(
-            typed_line(&record("claude", id(UUID))).as_deref(),
+            typed_line(&record("claude", id(UUID)), &HashMap::new()).as_deref(),
             Some(format!(" claude --resume={UUID}\r").as_str())
         );
         assert_eq!(
-            typed_line(&record("pi", path("/home/u/my sessions/it's.jsonl"))).as_deref(),
+            typed_line(
+                &record("pi", path("/home/u/my sessions/it's.jsonl")),
+                &HashMap::new()
+            )
+            .as_deref(),
             Some(" pi --session '/home/u/my sessions/it'\\''s.jsonl'\r")
         );
         assert_eq!(
-            typed_line(&record("omp", path("/home/u/a b.jsonl"))).as_deref(),
+            typed_line(&record("omp", path("/home/u/a b.jsonl")), &HashMap::new()).as_deref(),
             Some(" omp '--resume=/home/u/a b.jsonl'\r")
         );
     }
@@ -506,7 +626,7 @@ mod tests {
     fn the_value_is_never_a_word_of_its_own_after_a_bare_flag() {
         let value = "abc";
         for agent in ["claude", "codex", "opencode", "omp"] {
-            let argv = plan(&record(agent, id(value))).unwrap();
+            let argv = plan(&record(agent, id(value)), &HashMap::new()).unwrap();
             let at = argv.iter().position(|w| w.ends_with(value)).unwrap();
             assert!(
                 argv[at].contains('=') || argv[at - 1] == "--",

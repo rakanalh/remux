@@ -77,6 +77,21 @@
 # once, in milliseconds (default: 100).
 # resume_agent_delay_ms = 100
 
+# Extra words for an agent's resume command, keyed by agent name (claude, codex,
+# pi, omp, opencode), typed after the program and before the session reference.
+# Empty by default. Each word is quoted for the shell. An entry with a word
+# holding a backslash or a control character is dropped with a warning, and that
+# agent resumes without its extra words. A key that names no agent is warned
+# about and never used. `--` or a flag left without its value swallows or demotes
+# the session reference, so the agent starts another session while the pane still
+# holds the old id. The placement is tested against a stub, not the real agents,
+# so check that yours accepts a word there. Claude is understood to refuse
+# `--dangerously-skip-permissions` under root (untested here). This example makes
+# every restored Claude session skip its permission prompts, so set it only if
+# you accept that for every pane a restore brings back.
+# [general.resume_agent_args]
+# claude = ["--dangerously-skip-permissions"]
+
 # -----------------------------------------------------------------------------
 # APPEARANCE
 # -----------------------------------------------------------------------------

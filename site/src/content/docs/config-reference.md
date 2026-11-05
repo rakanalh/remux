@@ -19,6 +19,7 @@ Server-side. Needs `remux restart`.
 | `allow_app_clipboard` | bool | `true` | Let programs in a pane set your clipboard with OSC 52. Clipboard reads are never served, whatever this is set to. |
 | `resume_agents` | bool | `true` | Let an AI agent in a pane report its session, and type the agent's resume command into the pane's restored shell, such as ` claude --resume=<id>`. `false` refuses reports, so nothing is stored or typed. Needs `remux restart`. See [Resuming agents after a restart](/remux/session-restore/). |
 | `resume_agent_delay_ms` | integer | `100` | Milliseconds a restore waits between typing one pane's resume command and the next, across every restored session, so several agents do not all start at once. Needs `remux restart`. |
+| `resume_agent_args` | table of string arrays | empty | Extra words for an agent's resume command, keyed by agent name, as a `[general.resume_agent_args]` table: `claude = ["--dangerously-skip-permissions"]` types ` claude --dangerously-skip-permissions --resume=<id>`. The words go before the session reference, so `--` or a flag left without its value swallows or demotes it, and the pane can end up holding an id it is not running. An entry with a word holding a backslash or a control character is dropped with a warning, and that agent resumes without its extra words. A key that names no agent is warned about and never used. Needs `remux restart`. See [Resuming agents after a restart](/remux/session-restore/). |
 
 ## `[appearance]`
 

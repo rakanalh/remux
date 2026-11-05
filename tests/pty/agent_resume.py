@@ -65,6 +65,14 @@ re_reported  the resumed stub reports `resume` with its session: the restart
 disabled  with `resume_agents = false` the hook's report is refused
           `disabled` (one stderr line, exit 0, nothing on stdout), state.json
           holds no record, and the restart runs no stub.
+extra_args  `[general.resume_agent_args]` names claude, codex and an unknown
+          agent: the stub's argv is claude's word and then `--resume=<id>`,
+          with nothing from the other two entries. fast pins the unconfigured
+          line, so the two together cover both directions.
+bad_extra_args  claude's entry holds a control character and codex's a
+          backslash: both are dropped with a warning naming the agent and not
+          the word, claude resumes with plain `--resume=<id>`, and the record
+          survives a second restart. `cluade` is warned about as no agent.
 
 The hook is installed by `remux integrate claude-resume`, with
 `CLAUDE_CONFIG_DIR` unset so that it lands in `$HOME/.claude/settings.json`,
@@ -602,6 +610,37 @@ def disabled(rig):
     check(runs == [], f"disabled: the restart ran no stub (got {runs})")
 
 
+def extra_args(rig):
+    start_agent(rig)
+    check(rig.wait(lambda: not no_record(rig)), "extra_args: state.json holds the record")
+    runs = restart_and_collect(rig, wait=12.0)
+    check(runs == [["--dangerously-skip-permissions", f"--resume={SESSION_ID}", ""]],
+          f"extra_args: the configured word comes before --resume=<id> (got {runs})")
+    log = rig.t.log("server")
+    check(re.search(r'typed resume for pane %\d+ agent="claude" \(\d+ bytes\)', log) is not None,
+          "extra_args: server.log names the typed resume")
+    check(SESSION_ID not in log, "extra_args: server.log never holds the id")
+
+
+def bad_extra_args(rig):
+    first, second = restart_twice(rig, "resumed-stays")
+    plain = [f"--resume={SESSION_ID}", ""]
+    check(first == [plain], f"bad_extra_args: the first restart resumed it plainly (got {first})")
+    check(second == [plain, plain],
+          f"bad_extra_args: the second restart resumed it plainly (got {second})")
+    held = lambda: any(r.get("value") == SESSION_ID
+                       for r in (rig.state() or {}).get("agent_sessions", {}).values())
+    check(rig.wait(held), f"bad_extra_args: state.json still holds the record "
+                          f"(got {(rig.state() or {}).get('agent_sessions')})")
+    log = rig.t.log("server")
+    for agent in ("claude", "codex"):
+        check(f'[general.resume_agent_args] "{agent}" dropped' in log,
+              f"bad_extra_args: server.log says {agent}'s entry was dropped")
+    check('[general.resume_agent_args] "cluade" names no agent' in log,
+          "bad_extra_args: server.log says cluade names no agent")
+    check("zzword" not in log, "bad_extra_args: server.log never holds a configured word")
+
+
 def duplicate(rig):
     t = rig.t
     check(rig.wait(lambda: t.has("$ ")), "duplicate: the pane shows a prompt")
@@ -630,7 +669,15 @@ MODES = {"fast": fast, "duplicate": duplicate, "never_reported": never_reported,
          "setsid": setsid,
          "slow_rc": (slow_rc, "", {"ENV": os.path.join(FIXTURES, "slow_rc.sh")}),
          "slow_rc_zsh": (slow_rc_zsh, "", {"SHELL": "/bin/zsh", "ZDOTDIR": ZDOTDIR}),
-         "disabled": (disabled, "resume_agents = false\n")}
+         "disabled": (disabled, "resume_agents = false\n"),
+         "extra_args": (extra_args, '[general.resume_agent_args]\n'
+                                    'claude = ["--dangerously-skip-permissions"]\n'
+                                    'codex = ["--from-codex"]\n'
+                                    'not-an-agent = ["--from-nobody"]\n'),
+         "bad_extra_args": (bad_extra_args, '[general.resume_agent_args]\n'
+                                            'claude = ["zzword\\u0003b"]\n'
+                                            'codex = ["zzword\\\\b"]\n'
+                                            'cluade = ["--zzword"]\n')}
 
 
 def main():

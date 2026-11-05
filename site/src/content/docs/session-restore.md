@@ -63,18 +63,22 @@ The value is joined to its flag, or put after `--`, so that a stored value can n
 
 ## Settings
 
-Two settings in `[general]`:
+Three settings in `[general]`:
 
 ```toml
 [general]
 resume_agents = true          # default: true
 resume_agent_delay_ms = 100   # default: 100
+
+[general.resume_agent_args]   # default: empty
+claude = ["--dangerously-skip-permissions"]
 ```
 
 - `resume_agents = false` turns it all off: reports are refused and nothing is stored or typed.
 - `resume_agent_delay_ms` spaces the typed commands out, so several agents do not all start at once.
+- `[general.resume_agent_args]` adds words to an agent's resume command, keyed by agent name. They go after the program and before the session reference, so the example above types `claude --dangerously-skip-permissions --resume=<id>`, and every restored Claude session skips its permission prompts. Each word is quoted for the shell. An entry with a word holding a backslash or a control character cannot be typed safely, so it is dropped with a warning in `server.log` and that agent resumes without its extra words. A key that names no agent is warned about and never used. The words come before the session reference, so `--` or a flag that takes a value and is left without one swallows or demotes that reference: the agent then starts a different session while the pane still holds the old id. The placement is tested against a stub, not the real agents, so check that yours accepts the word there (for codex it comes before the `resume` subcommand). Claude is understood to refuse `--dangerously-skip-permissions` under root, which is untested here, so check that too if your panes run as root.
 
-Both are read by the server, so they need `remux restart`. See the [config reference](/remux/config-reference/#general).
+All three are read by the server, so they need `remux restart`. See the [config reference](/remux/config-reference/#general).
 
 ## How it behaves
 

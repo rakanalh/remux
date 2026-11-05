@@ -17837,7 +17837,7 @@ async fn materialize_session(
             if *typed > 0 {
                 tokio::time::sleep(resume_gap(config.general.resume_agent_delay_ms)).await;
             }
-            type_resume(*pane_id, record, panes).await;
+            type_resume(*pane_id, record, &config.general.resume_agent_args, panes).await;
             confirm_resume_by_foreground(*pane_id, record.clone(), state, panes, config, dormant);
             *typed += 1;
         }
@@ -18018,9 +18018,10 @@ fn confirm_resume_by_foreground(
 async fn type_resume(
     pane_id: PaneId,
     record: &AgentSessionRecord,
+    extra_args: &HashMap<String, Vec<String>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
 ) {
-    let Some(line) = crate::server::agent_session::typed_line(record) else {
+    let Some(line) = crate::server::agent_session::typed_line(record, extra_args) else {
         log::warn!("agent session: pane %{pane_id} holds an unknown agent; not resumed");
         return;
     };
