@@ -309,13 +309,16 @@ pub fn retry_deadline(
     sender_bound.map_or(own, |bound| own.min(bound))
 }
 
-/// Whether a head that meets a person's keys waits for them to stop rather
-/// than ending. Every live head waits, as the typing guard always has. A
-/// retry waits only when it was last held on its agent's prompt
-/// (`agent_blocked`), where the keys are the person answering it; anywhere
-/// else they are a draft.
-pub fn retry_waits_for_keys(retry: bool, waiting_on: Option<&'static str>) -> bool {
-    !retry || waiting_on == Some("agent_blocked")
+/// Whether a person typed after `draft_after`, which ends a retry: a message
+/// typed once they pause is submitted with their draft as one prompt. Compared
+/// on every pass and not left to the typing guard, because a short burst can
+/// fall between two passes and its window can run out before the next one.
+/// Keys from before the anchor may be the answer to a prompt, so they only run
+/// out the guard's window.
+pub fn retry_met_a_draft(last_human_input: Option<Instant>, draft_after: Option<Instant>) -> bool {
+    last_human_input
+        .zip(draft_after)
+        .is_some_and(|(key, after)| key > after)
 }
 
 /// Why a retry head waits on its pane's state, for the one state that answers
@@ -1461,13 +1464,17 @@ mod tests {
     }
 
     #[test]
-    fn only_a_retry_held_on_a_prompt_waits_for_a_persons_keys() {
-        assert!(retry_waits_for_keys(false, None));
-        assert!(retry_waits_for_keys(false, Some("agent_working")));
-        assert!(retry_waits_for_keys(true, Some("agent_blocked")));
-        assert!(!retry_waits_for_keys(true, Some("agent_working")));
-        assert!(!retry_waits_for_keys(true, Some("submit_timeout")));
-        assert!(!retry_waits_for_keys(true, None));
+    fn only_a_key_after_the_anchor_is_a_draft() {
+        let anchor = Instant::now();
+        let later = anchor + Duration::from_millis(1);
+        assert!(retry_met_a_draft(Some(later), Some(anchor)));
+        assert!(!retry_met_a_draft(Some(anchor), Some(anchor)));
+        assert!(!retry_met_a_draft(Some(anchor), Some(later)));
+        assert!(!retry_met_a_draft(None, Some(anchor)));
+        assert!(
+            !retry_met_a_draft(Some(later), None),
+            "keys on a prompt are not a draft"
+        );
     }
 
     #[test]

@@ -322,6 +322,10 @@ pub struct SubmitEntry {
     /// waits as a deferred entry does, and is typed only while it is still
     /// unread.
     pub retry: bool,
+    /// A key later than this is a person's own draft, and ends a retry. `None`
+    /// while the agent's prompt is up, where keys may be the answer to it, so
+    /// a retry on a prompt is anchored by the first pass that sees it gone.
+    pub draft_after: Option<Instant>,
 }
 
 /// A submitted message whose sender asked to hear how the agent's turn
@@ -357,6 +361,7 @@ pub struct SubmitHead {
     pub enqueued_at: Instant,
     pub defer: bool,
     pub retry: bool,
+    pub draft_after: Option<Instant>,
     pub waiting_on: Option<&'static str>,
 }
 
@@ -1211,15 +1216,10 @@ impl Messaging {
     }
 
     /// Remove, in order, every entry behind `pane`'s head `head` that is not
-    /// a retry and that `due` picks. Called when a retry head is held: each
-    /// such entry would be answered at the head now, and must not wait behind
-    /// a retry that may be held for an hour.
-    pub fn take_live_behind(
-        &mut self,
-        pane: PaneId,
-        head: MsgId,
-        due: impl Fn(&SubmitEntry) -> bool,
-    ) -> Vec<SubmitEntry> {
+    /// a retry. Called when a retry head is held: each such entry would be
+    /// answered at the head now, and must not wait behind a retry that may be
+    /// held for an hour.
+    pub fn take_live_behind(&mut self, pane: PaneId, head: MsgId) -> Vec<SubmitEntry> {
         let Some(queue) = self
             .submit_queues
             .get_mut(&pane)
@@ -1230,9 +1230,8 @@ impl Messaging {
         let Some(head) = queue.pop_front() else {
             return Vec::new();
         };
-        let (kept, taken): (VecDeque<_>, VecDeque<_>) = std::mem::take(queue)
-            .into_iter()
-            .partition(|e| e.retry || !due(e));
+        let (kept, taken): (VecDeque<_>, VecDeque<_>) =
+            std::mem::take(queue).into_iter().partition(|e| e.retry);
         *queue = kept;
         queue.push_front(head);
         taken.into()
@@ -1252,6 +1251,7 @@ impl Messaging {
                 enqueued_at: e.enqueued_at,
                 defer: e.defer,
                 retry: e.retry,
+                draft_after: e.draft_after,
                 waiting_on: e.waiting_on,
             })
             .collect()
@@ -1323,6 +1323,18 @@ impl Messaging {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Set the anchor of `pane`'s head `id`, if it is still the head.
+    pub fn set_draft_after(&mut self, pane: PaneId, id: MsgId, at: Option<Instant>) {
+        if let Some(entry) = self
+            .submit_queues
+            .get_mut(&pane)
+            .and_then(|q| q.front_mut())
+            .filter(|e| e.id == id)
+        {
+            entry.draft_after = at;
         }
     }
 
@@ -3151,6 +3163,7 @@ mod tests {
             waiting_on: None,
             wait_until: None,
             retry: false,
+            draft_after: None,
         }
     }
 
@@ -3338,6 +3351,7 @@ mod tests {
             from: SubmitFrom::pane(40),
             wait_until: Some(Instant::now() + std::time::Duration::from_secs(60)),
             retry: false,
+            draft_after: None,
             ..entry(id, pane, Some(client))
         };
         // A queue of 4 is a share of 2: one parked and one queued fill it,
@@ -3851,18 +3865,11 @@ mod tests {
         )
         .unwrap();
         m.enqueue_submit(entry(6, 5, None), 8).unwrap();
-        assert!(
-            m.take_live_behind(5, 3, |_| true).is_empty(),
-            "3 is not the head"
-        );
-        let taken: Vec<MsgId> = m
-            .take_live_behind(5, 1, |e| e.id != 6)
-            .iter()
-            .map(|e| e.id)
-            .collect();
-        assert_eq!(taken, [2, 4]);
+        assert!(m.take_live_behind(5, 3).is_empty(), "3 is not the head");
+        let taken: Vec<MsgId> = m.take_live_behind(5, 1).iter().map(|e| e.id).collect();
+        assert_eq!(taken, [2, 4, 6]);
         let left: Vec<MsgId> = m.submit_queues[&5].iter().map(|e| e.id).collect();
-        assert_eq!(left, [1, 3, 6]);
+        assert_eq!(left, [1, 3]);
     }
 
     #[test]
