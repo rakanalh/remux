@@ -10,8 +10,8 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 use super::layout::{
-    self, find_neighbor, relocate_pane_to_edge, swap_panes, Direction, EnabledLayouts,
-    FocusDirection, GridLayout, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
+    self, find_neighbor, relocate_pane_to_edge, swap_panes, CustomLayout, Direction,
+    EnabledLayouts, FocusDirection, GridLayout, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
 };
 use crate::config::{BorderStyle, ZoomMode};
 use crate::protocol::{
@@ -349,6 +349,32 @@ impl Tab {
                 .layout_mode
                 .build_tree(&self.pane_order, self.focused_pane);
             self.replace_layout(tree);
+        }
+    }
+
+    /// Swap the focused pane with `neighbor`. Focus stays on the moved pane.
+    ///
+    /// Under an automatic layout the swap is made in `pane_order` and the
+    /// layout stays automatic. When the shown tree is not what the automatic
+    /// layout builds from `pane_order`, a rebuild would revert more than the
+    /// swap, so the swap is made in the tree and the tab ejects to Custom.
+    pub fn swap_focused_with(&mut self, neighbor: PaneId, area: Rect) {
+        let focused = self.focused_pane;
+        if let Some(swap) = layout::swap_in_build_order(
+            &self.layout_mode,
+            &self.pane_order,
+            focused,
+            &self.layout,
+            area,
+            focused,
+            neighbor,
+        ) {
+            self.pane_order.swap(swap.i, swap.j);
+            self.layout_mode = swap.mode;
+            self.replace_layout(swap.tree);
+        } else if swap_panes(&mut self.layout, focused, neighbor) && self.layout_mode.is_automatic()
+        {
+            self.layout_mode = LayoutMode::Custom(CustomLayout);
         }
     }
 
@@ -1008,8 +1034,9 @@ impl ServerState {
 
     /// Move cell `cell_id` in view `id` toward `dir`: swap with the spatial
     /// neighbor in `dir` if one exists, else relocate to that edge. Mirrors the
-    /// client's `PaneMove` semantics. `area` is the reference geometry the
-    /// neighbor search runs in.
+    /// tab's `PaneMove` semantics: under an automatic layout a swap reorders
+    /// `cells` and keeps the layout, while a relocate ejects to Custom. `area`
+    /// is the reference geometry the neighbor search runs in.
     ///
     /// Phase-2 TODO: `area` is supplied by the daemon from the min across
     /// currently-connected clients, so the same `ViewMoveCell` can pick a
@@ -1024,22 +1051,33 @@ impl ServerState {
             return;
         }
         let had_tree = v.custom_tree.is_some();
-        if !had_tree {
-            v.custom_tree = Some(v.auto_tree());
-        }
-        let moved = {
-            let tree = v.custom_tree.as_ref().unwrap();
-            if let Some(neighbor) = find_neighbor(tree, area, cell_id, dir.clone(), 0) {
-                swap_panes(v.custom_tree.as_mut().unwrap(), cell_id, neighbor)
-            } else if let Some(new_tree) = relocate_pane_to_edge(tree, cell_id, dir) {
-                v.custom_tree = Some(new_tree);
-                true
-            } else {
-                false
+        let mut tree = v.custom_tree.take().unwrap_or_else(|| v.auto_tree());
+        let moved = match find_neighbor(&tree, area, cell_id, dir.clone(), 0) {
+            Some(neighbor) => {
+                if !had_tree {
+                    let order: Vec<CellId> = v.cells.iter().map(|c| c.id).collect();
+                    let focused = v.focused_id();
+                    if let Some(swap) = layout::swap_in_build_order(
+                        &v.layout, &order, focused, &tree, area, cell_id, neighbor,
+                    ) {
+                        v.cells.swap(swap.i, swap.j);
+                        v.layout = swap.mode;
+                        v.focused = v.index_of_id(focused).unwrap_or(v.focused);
+                        return;
+                    }
+                }
+                swap_panes(&mut tree, cell_id, neighbor)
             }
+            None => match relocate_pane_to_edge(&tree, cell_id, dir) {
+                Some(relocated) => {
+                    tree = relocated;
+                    true
+                }
+                None => false,
+            },
         };
-        if !moved && !had_tree {
-            v.custom_tree = None;
+        if moved || had_tree {
+            v.custom_tree = Some(tree);
         }
     }
 
@@ -2099,6 +2137,123 @@ mod tests {
         st.view_remove_cell(id, c1);
         assert!(st.views[0].cells.is_empty());
         assert!(st.views[0].custom_tree.is_none());
+    }
+
+    fn four_cell_grid_view() -> (ServerState, ViewId, Vec<CellId>) {
+        let mut st = ServerState::new();
+        let id = st.view_create("V".into(), &EnabledLayouts::default());
+        st.view_add_cells(id, (1..=4).map(|p| (ConnDescriptor::Local, p)).collect());
+        st.view_set_layout(id, "grid", &EnabledLayouts::default())
+            .expect("grid");
+        let ids = st.views[0].cells.iter().map(|c| c.id).collect();
+        (st, id, ids)
+    }
+
+    const VIEW_AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 120,
+        height: 40,
+    };
+
+    #[test]
+    fn view_move_to_a_neighbor_reorders_cells_and_keeps_grid() {
+        let (mut st, id, ids) = four_cell_grid_view();
+        st.views[0].focused = 2;
+        st.view_move_cell(id, ids[2], FocusDirection::Up, VIEW_AREA);
+        let v = &st.views[0];
+        assert_eq!(v.layout_name(), "grid");
+        assert!(v.custom_tree.is_none());
+        let order: Vec<CellId> = v.cells.iter().map(|c| c.id).collect();
+        assert_eq!(order, vec![ids[2], ids[1], ids[0], ids[3]]);
+        assert_eq!(v.focused, 0, "focus follows the moved cell");
+        assert_eq!(v.focused_id(), ids[2]);
+    }
+
+    #[test]
+    fn view_move_of_an_unfocused_cell_keeps_focus_on_the_focused_cell() {
+        let (mut st, id, ids) = four_cell_grid_view();
+        st.views[0].focused = 3;
+        st.view_move_cell(id, ids[0], FocusDirection::Right, VIEW_AREA);
+        let v = &st.views[0];
+        assert_eq!(v.layout_name(), "grid");
+        assert_eq!(v.focused_id(), ids[3]);
+    }
+
+    #[test]
+    fn view_move_at_the_edge_relocates_and_ejects_to_custom() {
+        let (mut st, id, ids) = four_cell_grid_view();
+        st.views[0].focused = 0;
+        st.view_move_cell(id, ids[0], FocusDirection::Up, VIEW_AREA);
+        let v = &st.views[0];
+        assert_eq!(v.layout_name(), "custom");
+        let order: Vec<CellId> = v.cells.iter().map(|c| c.id).collect();
+        assert_eq!(order, ids, "a relocate does not reorder cells");
+    }
+
+    #[test]
+    fn view_move_in_a_custom_view_swaps_in_the_tree() {
+        let (mut st, id, ids) = four_cell_grid_view();
+        {
+            let v = st.find_view_mut(id).unwrap();
+            v.custom_tree = Some(v.auto_tree());
+            v.focused = 2;
+        }
+        st.view_move_cell(id, ids[2], FocusDirection::Up, VIEW_AREA);
+        let v = &st.views[0];
+        assert_eq!(v.layout_name(), "custom");
+        let order: Vec<CellId> = v.cells.iter().map(|c| c.id).collect();
+        assert_eq!(order, ids);
+        let rects = layout::compute_layout(v.custom_tree.as_ref().unwrap(), VIEW_AREA, 0);
+        let top_left = rects.iter().find(|(_, r)| r.x == 0 && r.y == 0).unwrap().0;
+        assert_eq!(top_left, ids[2]);
+    }
+
+    fn four_pane_tab(mode: LayoutMode) -> Tab {
+        let mut tab = Tab::with_pane(1, "t", 1, mode);
+        tab.pane_order = vec![1, 2, 3, 4];
+        tab.focused_pane = 3;
+        tab.rebuild_if_automatic();
+        tab
+    }
+
+    #[test]
+    fn tab_swap_with_a_neighbor_keeps_the_automatic_layout() {
+        for mode in [
+            LayoutMode::Grid(GridLayout),
+            LayoutMode::Bsp(layout::BspLayout),
+        ] {
+            let mut tab = four_pane_tab(mode);
+            let name = tab.layout_mode.name().to_string();
+            let before = layout::compute_layout(&tab.layout, VIEW_AREA, 0);
+            let neighbor = find_neighbor(&tab.layout, VIEW_AREA, 3, FocusDirection::Up, 0)
+                .expect("a pane above 3");
+            tab.swap_focused_with(neighbor, VIEW_AREA);
+            assert_eq!(tab.layout_mode.name(), name);
+            assert_eq!(tab.focused_pane, 3);
+            let after = layout::compute_layout(&tab.layout, VIEW_AREA, 0);
+            let rect_of = |rects: &[(PaneId, Rect)], p| rects.iter().find(|r| r.0 == p).unwrap().1;
+            assert_eq!(rect_of(&after, 3), rect_of(&before, neighbor), "[{name}]");
+            assert_eq!(rect_of(&after, neighbor), rect_of(&before, 3), "[{name}]");
+            tab.rebuild_if_automatic();
+            assert_eq!(
+                layout::compute_layout(&tab.layout, VIEW_AREA, 0),
+                after,
+                "[{name}] a later rebuild keeps the swap"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_swap_in_a_drifted_automatic_tree_ejects_to_custom() {
+        let mut tab = four_pane_tab(LayoutMode::Grid(GridLayout));
+        if let LayoutNode::Split { ratio, .. } = &mut tab.layout {
+            *ratio = 0.3;
+        }
+        let neighbor = find_neighbor(&tab.layout, VIEW_AREA, 3, FocusDirection::Up, 0).unwrap();
+        tab.swap_focused_with(neighbor, VIEW_AREA);
+        assert_eq!(tab.layout_mode.name(), "custom");
+        assert_eq!(tab.pane_order, vec![1, 2, 3, 4]);
     }
 
     /// The names `view_cycle_layout` visits from `id`'s current layout, in
@@ -3312,7 +3467,7 @@ mod popup_invariant_tests {
                 if let Some(neighbor) =
                     find_neighbor(&tab.layout, AREA, tab.focused_pane, dir.clone(), 0)
                 {
-                    swap_panes(&mut tab.layout, tab.focused_pane, neighbor);
+                    tab.swap_focused_with(neighbor, AREA);
                 } else if let Some(new_tree) =
                     relocate_pane_to_edge(&tab.layout, tab.focused_pane, dir.clone())
                 {

@@ -8387,7 +8387,8 @@ async fn handle_command(
     // invariant.** While the active tab's popup is visible it is the input
     // target, so a layout-mutating command would run with the popup as its
     // subject -- and
-    // `PaneMove*` (swap_panes / relocate_pane_to_edge), `SetMaster` (promotes a
+    // `PaneMove*` (`Tab::swap_focused_with` swaps in `pane_order` or the tree,
+    // `relocate_pane_to_edge` restructures the tree), `SetMaster` (promotes a
     // pane), `LayoutNext` (rebuilds from `pane_order`) and the stack ops
     // (splice nodes) would each be a route for the popup pane to get captured by
     // the layout. Blocking them here means no such command can ever run with a
@@ -8944,16 +8945,7 @@ async fn handle_command(
                             direction.clone(),
                             0,
                         ) {
-                            // Swap the focused pane with its spatial neighbor in `direction`.
-                            // Focus stays on the moved pane (its id is unchanged; only its
-                            // slot in the tree changes).
-                            if layout::swap_panes(&mut tab.layout, tab.focused_pane, neighbor)
-                                && tab.layout_mode.is_automatic()
-                            {
-                                // A manual move ejects to Custom so an automatic rebuild
-                                // from `pane_order` doesn't revert the swap.
-                                tab.layout_mode = LayoutMode::Custom(CustomLayout);
-                            }
+                            tab.swap_focused_with(neighbor, area);
                         } else if let Some(new_tree) =
                             layout::relocate_pane_to_edge(&tab.layout, tab.focused_pane, direction)
                         {

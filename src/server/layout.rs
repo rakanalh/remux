@@ -1575,6 +1575,65 @@ pub fn swap_panes(node: &mut LayoutNode, a: PaneId, b: PaneId) -> bool {
     true
 }
 
+/// The result of [`swap_in_build_order`]: swap `order[i]` and `order[j]`, then
+/// install `mode` and `tree`.
+#[derive(Debug)]
+pub struct OrderSwap {
+    pub i: usize,
+    pub j: usize,
+    pub mode: LayoutMode,
+    pub tree: LayoutNode,
+}
+
+/// Swap panes `a` and `b` in the order an automatic layout is built from,
+/// so that the layout stays automatic.
+///
+/// Returns `None` when `mode` is not automatic, when either pane is not in
+/// `order`, or when the rebuilt tree does not put each pane where
+/// [`swap_panes`] on `shown` would. The last case happens when `shown` is no
+/// longer what `mode` builds from `order`. The caller then swaps in the tree
+/// and ejects to Custom, because a rebuild would also undo the other changes.
+///
+/// Master tracks its master slot by pane id, so the slot is swapped together
+/// with the order. Otherwise a move into or out of the master slot does not
+/// move the pane.
+pub fn swap_in_build_order(
+    mode: &LayoutMode,
+    order: &[PaneId],
+    active: PaneId,
+    shown: &LayoutNode,
+    area: Rect,
+    a: PaneId,
+    b: PaneId,
+) -> Option<OrderSwap> {
+    if !mode.is_automatic() || a == b {
+        return None;
+    }
+    let i = order.iter().position(|&p| p == a)?;
+    let j = order.iter().position(|&p| p == b)?;
+    let mut swapped_order = order.to_vec();
+    swapped_order.swap(i, j);
+    let mut mode = mode.clone();
+    if let LayoutMode::Master(master) = &mut mode {
+        master.master_pane = master.master_pane.map(|p| match p {
+            p if p == a => b,
+            p if p == b => a,
+            p => p,
+        });
+    }
+    let tree = mode.build_tree(&swapped_order, active);
+    let mut expected = shown.clone();
+    if !swap_panes(&mut expected, a, b) {
+        return None;
+    }
+    let geometry = |node: &LayoutNode| {
+        let mut rects = compute_layout(node, area, 0);
+        rects.sort_by_key(|&(pane, _)| pane);
+        rects
+    };
+    (geometry(&tree) == geometry(&expected)).then_some(OrderSwap { i, j, mode, tree })
+}
+
 fn swap_panes_inner(node: &mut LayoutNode, a: PaneId, b: PaneId) {
     match node {
         LayoutNode::Stack { panes, .. } => {
@@ -4343,5 +4402,113 @@ mod popup_geometry_tests {
             prev = r.width;
         }
         assert_eq!(popup_rect(area(200, 60), (50, 50)).width, 100);
+    }
+}
+
+#[cfg(test)]
+mod order_swap_tests {
+    use super::*;
+
+    const AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 120,
+        height: 40,
+    };
+
+    const DIRECTIONS: [FocusDirection; 4] = [
+        FocusDirection::Left,
+        FocusDirection::Right,
+        FocusDirection::Up,
+        FocusDirection::Down,
+    ];
+
+    fn sorted_rects(node: &LayoutNode) -> Vec<(PaneId, Rect)> {
+        let mut rects = compute_layout(node, AREA, 0);
+        rects.sort_by_key(|&(pane, _)| pane);
+        rects
+    }
+
+    #[test]
+    fn every_automatic_layout_expresses_every_neighbor_swap_as_a_reorder() {
+        let masters = [
+            MasterLayout::default(),
+            MasterLayout {
+                master_pane: Some(3),
+                ..MasterLayout::default()
+            },
+        ];
+        let mut modes: Vec<LayoutMode> = LayoutMode::automatic_modes().to_vec();
+        modes.extend(masters.into_iter().map(LayoutMode::Master));
+        let mut swaps = 0;
+        for mode in &modes {
+            for count in 2..=6u64 {
+                let order: Vec<PaneId> = (1..=count).collect();
+                for &moved in &order {
+                    let shown = mode.build_tree(&order, moved);
+                    for dir in DIRECTIONS {
+                        let Some(neighbor) = find_neighbor(&shown, AREA, moved, dir, 0) else {
+                            continue;
+                        };
+                        let swap =
+                            swap_in_build_order(mode, &order, moved, &shown, AREA, moved, neighbor)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "{} with {count} panes: {moved} <-> {neighbor}",
+                                        mode.name()
+                                    )
+                                });
+                        let mut expected = shown.clone();
+                        assert!(swap_panes(&mut expected, moved, neighbor));
+                        assert_eq!(sorted_rects(&swap.tree), sorted_rects(&expected));
+                        assert_eq!(swap.mode.name(), mode.name());
+                        let mut reordered = order.clone();
+                        reordered.swap(swap.i, swap.j);
+                        assert_eq!(
+                            sorted_rects(&swap.mode.build_tree(&reordered, moved)),
+                            sorted_rects(&expected),
+                            "the returned mode and order rebuild the swapped tree"
+                        );
+                        swaps += 1;
+                    }
+                }
+            }
+        }
+        assert!(swaps > 100, "the sweep found neighbors ({swaps})");
+    }
+
+    #[test]
+    fn a_swap_out_of_the_master_slot_moves_the_master_slot() {
+        let mode = LayoutMode::Master(MasterLayout {
+            master_pane: Some(2),
+            ..MasterLayout::default()
+        });
+        let order = [1, 2, 3];
+        let shown = mode.build_tree(&order, 2);
+        let neighbor = find_neighbor(&shown, AREA, 2, FocusDirection::Left, 0).expect("left");
+        let swap = swap_in_build_order(&mode, &order, 2, &shown, AREA, 2, neighbor).expect("swap");
+        match swap.mode {
+            LayoutMode::Master(m) => assert_eq!(m.master_pane, Some(neighbor)),
+            other => panic!("expected master, got {}", other.name()),
+        }
+    }
+
+    #[test]
+    fn a_tree_that_drifted_from_its_order_is_not_reordered() {
+        let mode = LayoutMode::Bsp(BspLayout);
+        let order = [1, 2];
+        let mut shown = mode.build_tree(&order, 1);
+        if let LayoutNode::Split { ratio, .. } = &mut shown {
+            *ratio = 0.3;
+        }
+        assert!(swap_in_build_order(&mode, &order, 1, &shown, AREA, 1, 2).is_none());
+    }
+
+    #[test]
+    fn custom_is_never_reordered() {
+        let mode = LayoutMode::Custom(CustomLayout);
+        let order = [1, 2];
+        let shown = mode.build_tree(&order, 1);
+        assert!(swap_in_build_order(&mode, &order, 1, &shown, AREA, 1, 2).is_none());
     }
 }
