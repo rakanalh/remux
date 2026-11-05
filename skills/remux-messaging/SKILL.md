@@ -70,7 +70,7 @@ Any machine whose remux can reach this one over ssh as you (it has a `[remotes]`
 ```sh
 remux msg send <target> --stdin                    # the body from stdin: a quoted heredoc
 remux msg send <target> -f <file>                  # the body from a regular file
-remux msg send <target> --stdin --deliver mailbox  # store it only; the target's hook or its next read finds it
+remux msg send <target> --stdin --deliver mailbox  # store it only, never typed: an FYI the target reads when it next looks
 remux msg send <target> --stdin --deliver submit   # store it AND type it into the agent's input, Enter included
 remux msg send <target> --stdin --deliver auto     # the default: store it, and type it when the agent can take it
 remux msg send --reply-to <id> --stdin            # answer message <id>, the number `msg read` shows: no target, it goes to the sender
@@ -81,11 +81,11 @@ remux msg send <target> --stdin --deliver submit --defer --timeout 300  # if the
 
 Every `--stdin` line here takes its body as `<<'EOF'` … `EOF`, as in the quick start.
 
-- `auto` is right for almost everything. The message is always stored. It is typed into the target only when the target is an agent that can take typed input now: an idle one, or a working Claude Code, which queues typed input as its next prompt. Otherwise it stays in the mailbox and the answer says why.
+- `auto` (or no `--deliver` at all) is right for almost everything, and always for a message the receiver is waiting on or should act on: a reply, a report back to a lead, an answer, a hand-off, a result. The message is always stored. It is typed into the target when the target is an agent that can take typed input now: an idle one, or a working Claude Code, which queues typed input as its next prompt. When it cannot take it yet (it is working, waiting on its user, a person is typing there, or no agent is running), the answer says `stored in its mailbox (<code>)` at once, and the server types the message later, as soon as the agent can take it, unless the target has read it by then. The server keeps trying for up to an hour.
 - `--deliver submit --wait` is for when you need the answer now and will do nothing until it comes. `--wait` returns when the agent's turn ends (`idle`), when it stops to ask its user something (`asking for input`), or at the timeout. `--timeout` covers `--defer` and `--wait` together: `30`, `30s`, `2m`, at most `1h`, `10m` by default. `--defer` and `--wait` are refused with `--deliver mailbox`.
-- `--deliver mailbox` is for anything that is not a prompt: a status note, a log, a long document. It never types into a terminal.
+- `--deliver mailbox` never types into a terminal, so an idle agent does not see the message until its user prompts it or its turn ends. Use it only when you deliberately do not want to interrupt the receiver (an FYI it will look at when it next reads its mail), or for a target that cannot take typed input safely (see "Single-line [y/N] prompts"). A report a lead is waiting for is not an FYI: send it with `auto`.
 - One trailing newline is stripped from the body; inner newlines are kept. Control characters other than newline and tab, and invisible Unicode, are refused `bad_body`.
-- A body is at most 64 KiB. A body is typed only up to 1500 lines (a line over 1 KiB counts once per KiB); a longer one stays in the mailbox. Put long reports in a file and send the path.
+- A body is at most 64 KiB. A body is typed only up to 1500 lines (a line over 1 KiB counts once per KiB); a longer one stays in the mailbox. Put a long report in a file and send its path, with `auto`.
 - You may send at most 20 messages in 10 seconds. Batch; a loop that sends per line of output is refused `rate_limited`.
 - Mail expires 24 hours after it was sent.
 
@@ -148,7 +148,7 @@ A state is `idle`, `working`, or waiting on its user. The table calls the last o
 
 ## The rules
 
-**A blocked agent (NeedsInput) is a person's turn, not yours.** It is waiting on its user: a permission prompt or a question. A `submit` into it is refused `agent_blocked`, and an `auto` leaves the message in the mailbox. Do not use `--defer` to get around a person who is being asked something. Leave the message in the mailbox, or wait for `idle`.
+**A blocked agent (NeedsInput) is a person's turn, not yours.** It is waiting on its user: a permission prompt or a question. A `submit` into it is refused `agent_blocked`, and an `auto` leaves the message in the mailbox, to be typed once the person has answered and the agent can take it. Do not use `--defer` to get around a person who is being asked something. Send with `auto` and leave it, or wait for `idle`.
 
 **Mail you did not ack is shown to you again.** With the hooks installed, your Stop hook hands you every unread message when your turn would end. A `--peek` read marks nothing, so the same mail comes back. Read without `--peek`, or `msg ack` what you have handled.
 
@@ -168,7 +168,7 @@ A state is `idle`, `working`, or waiting on its user. The table calls the last o
 
 A send prints one line and exits 0 when the message was stored, saying what happened to it, for example `sent #7 to alpha: typed into the pane; idle, answered after 3.2s`. A refusal prints `<code>: <message>` on stderr and exits 1. With `--json` it is `{"error":{"code":…,"message":…}}`. Exit 2 is a malformed invocation, and nothing was sent. When the line ends with advice (`do not send it again`, `clear it with Ctrl-U`), follow it.
 
-Under `auto`, a code from the agent's side (`agent_working`, `agent_blocked`, `human_typing` and the other "stored" codes below) is not an error: the send exits 0 and the line says `stored in its mailbox (<code>)`. Under `submit` the same code is an error, and the message is still stored. The exception is `agent_working` when the target's server is set to leave a working agent's mail in its mailbox, which is the default for every agent except Claude Code: the mailbox is where that server sends it, so `submit` also exits 0 with `stored in its mailbox (agent_working)`. Only a server set to refuse a working agent answers `agent_working` as an error.
+Under `auto`, a code from the agent's side (`agent_working`, `agent_blocked`, `human_typing` and the other "stored" codes below) is not an error: the send exits 0 and the line says `stored in its mailbox (<code>)`. For `agent_working`, `agent_blocked`, `agent_not_ready`, `human_typing` and `submit_timeout` the server types the message later, once the agent can take it, unless it has been read by then; it is typed at most once, so never send it again. Under `submit` the same code is an error, and the message is still stored. The exception is `agent_working` when the target's server is set to leave a working agent's mail in its mailbox, which is the default for every agent except Claude Code: the mailbox is where that server sends it, so `submit` also exits 0 with `stored in its mailbox (agent_working)`. Only a server set to refuse a working agent answers `agent_working` as an error.
 
 | Code | What happened | What you do |
 |---|---|---|
@@ -183,18 +183,18 @@ Under `auto`, a code from the agent's side (`agent_working`, `agent_blocked`, `h
 | `bad_body` | Control or invisible characters in the body. | Strip them. Newline and tab are fine. |
 | `mailbox_full` | The target's mailbox is full; nothing was dropped. | Wait, or ask the target to read. Do not retry in a loop. |
 | `rate_limited` | Over 20 sends in 10 s from your pane. | Batch. |
-| `agent_not_ready` | The target is not an agent: a shell, an editor, or the agent exited. Stored. | Nothing was typed. Someone at that pane can read it. |
-| `agent_blocked` | The target is waiting on its user. Stored. | Leave it: a person is being asked something. |
-| `agent_working` | The target is mid-turn and its server does not type into it while it works. Stored. An error under `submit` only where that server refuses a working agent. | Its hook hands it over when the turn ends. |
-| `human_typing` | A person typed into the target pane. Stored. | Leave it: the person's draft matters more. |
-| `pane_attended` | This server is configured not to type into a pane a person is looking at. Stored. | Use `--deliver mailbox`. |
+| `agent_not_ready` | The target is not an agent: a shell, an editor, or the agent exited. Stored. | Nothing was typed. Under `auto` it is typed if an agent starts there; someone at that pane can also read it. |
+| `agent_blocked` | The target is waiting on its user. Stored. | Leave it: a person is being asked something. Under `auto` it is typed once the agent can take it. |
+| `agent_working` | The target is mid-turn and its server does not type into it while it works. Stored. An error under `submit` only where that server refuses a working agent. | Nothing: under `auto` it is typed when the turn ends, and the hook hands it over if it gets there first. |
+| `human_typing` | A person typed into the target pane. Stored. | Leave it: the person's draft matters more. Under `auto` it is typed once the person stops. |
+| `pane_attended` | This server is configured not to type into a pane a person is looking at. Stored, and not typed later. | Nothing: its hook or a read hands it over. |
 | `agent_did_not_read` | The agent did not read the probe, or stopped part-way through the body. Not submitted. Stored. | If it stopped part-way, what it read is in its input, unsent: do not send it again with `submit`, and its user should clear that input. |
 | `agent_not_reading` | A shell or a line prompt is reading that terminal, not the agent. Stored. | It is in the mailbox. |
 | `queue_full` | Too many messages are already waiting to be typed into that pane. | Wait for them to drain. |
-| `submit_timeout` | The message was not typed: it waited past the server's hold on a typing person or a blocked agent, or past `--timeout` with `--defer`. Stored. | It is in the mailbox. |
+| `submit_timeout` | The message was not typed: it waited past the server's hold on a typing person or a blocked agent, or past `--timeout` with `--defer`. Stored. | It is in the mailbox. Under `auto` it is typed once the agent can take it. |
 | `sender_closed` | YOUR pane closed while the message was queued to be typed. Stored. | Nothing to do. |
 | `paste_unavailable` | The target's terminal cannot take a pasted block (bracketed paste off, or forced on over a program that never asked for it), so nothing was typed. Stored. | It is in the mailbox; its hook or a read hands it over. |
-| `too_many_lines` | Over 1500 lines to type. Nothing typed. Stored. | Send it with `--deliver mailbox`, or put it in a file. |
+| `too_many_lines` | Over 1500 lines to type. Nothing typed, now or later. Stored. | Put it in a file and send the path. |
 | `agent_too_slow` | The agent was still reading the body after 30 s. The rest was withdrawn; nothing was submitted. Stored. | Do not retry with `submit`: part of your text sits in the agent's input, and its user should clear it before pressing Enter. |
 | `read_by_another_program` | The agent stopped reading after the body was typed. Another program, the shell if the agent exited, may have your text. Stored. | **Do not retry.** Tell the person at that pane to clear the prompt with Ctrl-U before pressing Enter. |
 | `busy` | `agent wait` is refused: too many callers already wait on agents. | Try again later. |
