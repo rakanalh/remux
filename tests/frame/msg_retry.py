@@ -21,18 +21,22 @@ R3. Read first: an `auto` message refused `agent_blocked`, then acked by the
 R4. Working: an `auto` send to an agent that is working, under a row that
     leaves a working agent's mail in the mailbox, is answered `agent_working`
     and typed once the work ends.
-R5. Human typing: an `auto` send while a person keeps typing past the guard's
-    cap is answered `human_typing` and typed once the person stops.
+R5. Human typing is never retried: an `auto` send while a person keeps
+    typing past the guard's cap is answered `human_typing`, and it is NOT
+    typed once the person stops, since it would be submitted with their
+    draft. It stays unread in the mailbox.
 R6. `--deliver submit` is never retried: refused `agent_blocked`, it is not
     typed once the prompt goes.
 R7. A send behind a held retry is answered at once, as it would be at the
     head: with a retry held on `agent_working`, a second `auto` send is
     answered `agent_working` without waiting for the server's hold, and the
     two are typed in order once the work ends.
-R8. The same behind a retry held on a person typing: a second `auto` send
-    is answered `human_typing` when its own wait runs out, not at the
-    server's longer hold, and the two are typed in order once the person
-    stops.
+R8. A retry held on a working agent that then meets a person typing ends:
+    it is not typed once the person stops, and the log says why.
+R8b. A retry held on a prompt waits for a person's keys, which answer it.
+    A fresh `auto` send behind it is answered `human_typing` when its own
+    wait runs out, not at the server's longer hold, and is not retried; the
+    retry is typed once the person stops.
 R9. No panic, and no message body in the log.
 
 Run: python3 tests/frame/msg_retry.py   (RMX_RUNDIR overrides the run dir)
@@ -365,6 +369,7 @@ try:
 
     # --- R4 -----------------------------------------------------------------
     check(wait_state(F, "Idle"), "R4 the agent is Idle again")
+    work_end_ns = time.time_ns() + 3_000_000_000
     tell("work:3000")
     check(wait_state(F, "Working"), "R4 the agent reads Working")
     start = len(rx_chunks(F_LOG))
@@ -372,7 +377,8 @@ try:
     check(outcome(r) == ("Mailbox", "agent_working"), f"R4 stored agent_working ({r})")
     check(count_typed(F_LOG, "WORK:four", start) == 0, "R4 ...nothing typed while it works")
     at = wait_typed(F_LOG, "WORK:four", start, timeout=10.0)
-    check(at is not None, f"R4 once the work ends the message is typed ({rx_chunks(F_LOG)[start:]})")
+    check(at is not None and rx_chunks(F_LOG)[at][0] > work_end_ns,
+          f"R4 once the work ends the message is typed, after it ends ({rx_chunks(F_LOG)[start:]})")
     time.sleep(2.0)
     check(count_typed(F_LOG, "WORK:four", start) == 1, "R4 ...exactly once")
 
@@ -393,10 +399,11 @@ try:
     check(outcome(r) == ("Mailbox", "human_typing") and still_typing,
           f"R5 auto while a person keeps typing is answered human_typing ({took:.1f}s, {r})")
     check(typed_while == 0, "R5 ...nothing typed while the person types")
-    at = wait_typed(F_LOG, "HUMAN:five", start, timeout=10.0)
-    check(at is not None, f"R5 once the person stops the message is typed ({rx_chunks(F_LOG)[start:]})")
-    time.sleep(2.0)
-    check(count_typed(F_LOG, "HUMAN:five", start) == 1, "R5 ...exactly once")
+    time.sleep(4.0)
+    check(count_typed(F_LOG, "HUMAN:five", start) == 0,
+          f"R5 ...and nothing typed once the person stops ({rx_chunks(F_LOG)[start:]})")
+    check(box_states(F).get(rid) == "Queued" and f"msg: id={rid} retry" not in srv.log(),
+          f"R5 ...it stays unread in the mailbox, with no retry ({box_states(F)})")
 
     # --- R6 -----------------------------------------------------------------
     check(wait_state(F, "Idle"), "R6 the agent is Idle again")
@@ -430,25 +437,50 @@ try:
 
     # --- R8 -----------------------------------------------------------------
     check(wait_state(F, "Idle"), "R8 the agent is Idle again")
+    tell("work:4000")
+    check(wait_state(F, "Working"), "R8 the agent reads Working")
+    start = len(rx_chunks(F_LOG))
+    r, _ = type_send(A, send(F, "DRAFT:eight", "Auto"))
+    rid = sent_id(r)
+    check(outcome(r) == ("Mailbox", "agent_working"), f"R8 stored agent_working ({r})")
+    stop = threading.Event()
+    t = threading.Thread(target=typer, args=(stop,))
+    t.start()
+    time.sleep(6.0)
+    stop.set()
+    t.join()
+    time.sleep(3.0)
+    check(count_typed(F_LOG, "DRAFT:eight", start) == 0,
+          f"R8 a working retry that meets a person typing is never typed ({rx_chunks(F_LOG)[start:]})")
+    check(f"msg: id={rid} retry ended (human_typing)" in srv.log() and box_states(F).get(rid) == "Queued",
+          f"R8 ...its retry ends human_typing and it stays unread ({box_states(F)})")
+
+    # --- R8b ----------------------------------------------------------------
+    check(wait_state(F, "Idle"), "R8b the agent is Idle again")
+    tell("block")
+    check(wait_state(F, "NeedsInput"), "R8b the prompt reads NeedsInput")
+    start = len(rx_chunks(F_LOG))
+    r1, _ = type_send(A, send(F, "ANSWER:first", "Auto"))
+    check(outcome(r1) == ("Mailbox", "agent_blocked"), f"R8b the first is stored agent_blocked ({r1})")
+    time.sleep(1.5)
     stop = threading.Event()
     t = threading.Thread(target=typer, args=(stop,))
     t.start()
     time.sleep(0.6)
-    start = len(rx_chunks(F_LOG))
-    r1, _ = type_send(A, send(F, "GUARD:first", "Auto"))
-    time.sleep(1.5)
-    r2, took = type_send(A, send(F, "GUARD:second", "Auto"))
+    tell("clear")
+    r2, took = type_send(A, send(F, "ANSWER:second", "Auto"))
     still_typing = t.is_alive()
     time.sleep(1.0)
     stop.set()
     t.join()
-    check(outcome(r1) == ("Mailbox", "human_typing"), f"R8 the first is stored human_typing ({r1})")
     check(outcome(r2) == ("Mailbox", "human_typing") and took < 5.0 and still_typing,
-          f"R8 a send behind its retry is answered human_typing at its own cap ({took:.1f}s, {r2})")
-    a_at = wait_typed(F_LOG, "GUARD:first", start, timeout=12.0)
-    b_at = wait_typed(F_LOG, "GUARD:second", start, timeout=12.0)
-    check(a_at is not None and b_at is not None and a_at < b_at,
-          f"R8 ...and both are typed in order once the person stops ({a_at}, {b_at})")
+          f"R8b a send behind the held retry is answered human_typing at its own cap ({took:.1f}s, {r2})")
+    a_at = wait_typed(F_LOG, "ANSWER:first", start, timeout=12.0)
+    time.sleep(3.0)
+    check(a_at is not None and count_typed(F_LOG, "ANSWER:first", start) == 1,
+          f"R8b ...the retry held on the prompt is typed once the person stops ({a_at})")
+    check(count_typed(F_LOG, "ANSWER:second", start) == 0,
+          "R8b ...and the human_typing send behind it is not retried")
 
     # --- R9 -----------------------------------------------------------------
     log = srv.log()

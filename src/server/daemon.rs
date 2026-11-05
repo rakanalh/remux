@@ -2874,14 +2874,25 @@ async fn step_submit(
         }
         // A deferred submit outlasts the guard's cap: its own deadline ends
         // it, in the sweep.
-        // A retry head waits for the person however long they type, so an
-        // entry behind it whose own wait ran out is answered here, as it
-        // would be at the head.
+        // A person typing into an agent that is not waiting on them is
+        // writing a draft, and a retry typed once they pause would be
+        // submitted with it, so the retry ends. Keys that follow a prompt
+        // the retry was held on are taken as the person answering it, and
+        // the retry waits for them to finish.
+        GuardVerdict::Wait(_) | GuardVerdict::Expired
+            if !crate::server::submit::retry_waits_for_keys(head.retry, head.waiting_on) =>
+        {
+            let answer = Answer::Mailbox("human_typing");
+            return answer_head(pane, id, answer, None, store).await;
+        }
+        // A retry head waits however long the person types, so an entry
+        // behind it whose own wait ran out is answered here, as it would be
+        // at the head.
         GuardVerdict::Wait(_) | GuardVerdict::Expired => {
             let (new, behind) = {
                 let mut st = store.lock().await;
-                let behind = if head.retry {
-                    st.take_live_behind(pane, id, |e| {
+                if head.retry {
+                    let behind = st.take_live_behind(pane, id, |e| {
                         !e.defer
                             && guard_wait(
                                 sample.last_human_input,
@@ -2890,11 +2901,11 @@ async fn step_submit(
                                 now,
                                 &guard,
                             ) == GuardVerdict::Expired
-                    })
+                    });
+                    (false, behind)
                 } else {
-                    Vec::new()
-                };
-                (st.set_waiting(pane, id, "human_typing"), behind)
+                    (st.set_waiting(pane, id, "human_typing"), Vec::new())
+                }
             };
             if new {
                 log::info!("msg: id={id} submit waiting: human_typing");
@@ -3048,6 +3059,8 @@ async fn step_submit(
                 };
                 match answer {
                     None => log::info!("msg: id={id} waiting for %{pane}'s turn to end"),
+                    // A retry has no sender to answer, and `send_reply` would
+                    // log it as an answer whose sender went away.
                     Some(_) if entry.retry => {}
                     Some((reply, name)) => {
                         let message = ServerMessage::MsgSent {
@@ -3165,18 +3178,43 @@ async fn answer_untyped(
 ) {
     let reply = {
         let mut st = store.lock().await;
-        unsubmit_and_dirty(&mut st, entry.pane, entry.id);
-        st.end_typing(entry.pane)
+        untyped_section(
+            &mut st,
+            entry,
+            &answer,
+            retry,
+            std::time::Instant::now(),
+            now_ms(),
+        )
     };
-    answer_or_retry(
+    if let Some(reply) = reply {
+        reply.send(answer, policy);
+    }
+    mark_submit_dirty();
+}
+
+/// The store's half of [`answer_untyped`], in one section: the claim undone,
+/// the typing ended and the retry queued together. A retry queued in a
+/// section of its own would leave a gap after the typing ends in which the
+/// submitter can type a later send into the pane ahead of it.
+fn untyped_section(
+    st: &mut Messaging,
+    entry: crate::server::messaging::SubmitEntry,
+    answer: &crate::server::submit::Answer,
+    retry: Retry,
+    now: std::time::Instant,
+    now_ms: u64,
+) -> Option<PendingReply> {
+    unsubmit_and_dirty(st, entry.pane, entry.id);
+    let reply = st.end_typing(entry.pane);
+    settle_entry(
+        st,
         crate::server::messaging::SubmitEntry { reply, ..entry },
         answer,
-        policy,
         retry,
-        store,
+        now,
+        now_ms,
     )
-    .await;
-    mark_submit_dirty();
 }
 
 /// Put back an entry that was claimed but not written, at the front of its
@@ -3329,23 +3367,65 @@ enum Retry {
 }
 
 /// [`reply_submit`], with `retry` saying whether the message may be typed
-/// later. The sender is answered first and exactly as before: a retry never
-/// holds a send's answer. A retry entry itself has nobody to answer, so its
-/// answer is only logged, and only when its outcome changes.
+/// later. The retry is decided and queued under the lock and the answer is
+/// sent after it, worded exactly as before: a retry never holds a send's
+/// answer.
 async fn answer_or_retry(
-    mut entry: crate::server::messaging::SubmitEntry,
+    entry: crate::server::messaging::SubmitEntry,
     answer: crate::server::submit::Answer,
     policy: Option<String>,
     retry: Retry,
     store: &'static Mutex<Messaging>,
 ) {
-    use crate::server::submit::{retry_code, retry_deadline};
-    let code = retry_code(entry.deliver, &answer).filter(|_| retry == Retry::Allowed);
-    let now = std::time::Instant::now();
+    let reply = {
+        let mut st = store.lock().await;
+        settle_entry(
+            &mut st,
+            entry,
+            &answer,
+            retry,
+            std::time::Instant::now(),
+            now_ms(),
+        )
+    };
+    if let Some(reply) = reply {
+        reply.send(answer, policy);
+    }
+}
+
+/// A send's answer, decided under the lock and sent after it.
+struct PendingReply {
+    id: MsgId,
+    resolved: Resolved,
+    reply: Option<crate::server::messaging::Reply>,
+}
+
+impl PendingReply {
+    fn send(self, answer: crate::server::submit::Answer, policy: Option<String>) {
+        let message = answer_submit(self.id, self.resolved, answer, policy);
+        send_reply(self.id, self.reply, message);
+    }
+}
+
+/// Decide what becomes of `entry`, which was answered `answer` without being
+/// typed. A retry entry has nobody to answer: it is queued again, or ended
+/// and logged, and `None` is returned. Any other entry's answer is returned
+/// to be sent, and an `auto` message that may be typed later is queued as a
+/// retry first, unless its sender's pane has closed: a message typed later
+/// in its name would come from a pane that is gone.
+fn settle_entry(
+    st: &mut Messaging,
+    mut entry: crate::server::messaging::SubmitEntry,
+    answer: &crate::server::submit::Answer,
+    retry: Retry,
+    now: std::time::Instant,
+    now_ms: u64,
+) -> Option<PendingReply> {
+    use crate::server::submit::{retry_code, retry_deadline, Answer};
+    let code = retry_code(entry.deliver, answer).filter(|_| retry == Retry::Allowed);
     let id = entry.id;
     if entry.retry {
-        let mut st = store.lock().await;
-        let unread = st.unread_expiry(entry.pane, id, now_ms()).is_some();
+        let unread = st.unread_expiry(entry.pane, id, now_ms).is_some();
         match code {
             Some(code) if unread && now < entry.deadline => {
                 if entry.waiting_on != Some(code) {
@@ -3358,43 +3438,48 @@ async fn answer_or_retry(
                 let why = match answer {
                     _ if !unread => "no longer unread",
                     _ if now >= entry.deadline => "out of time",
-                    crate::server::submit::Answer::Refuse(ref refusal) => refusal.code,
-                    crate::server::submit::Answer::Mailbox(code)
-                    | crate::server::submit::Answer::TimedOut(code) => code,
+                    Answer::Refuse(refusal) => refusal.code,
+                    Answer::Mailbox(code) | Answer::TimedOut(code) => code,
                 };
                 log::info!("msg: id={id} retry ended ({why}); it stays in the mailbox");
             }
         }
-        return;
+        return None;
     }
-    let name = store.lock().await.name_of(entry.pane).map(str::to_string);
-    let resolved = Resolved {
-        host: None,
-        pane_id: entry.pane,
-        name,
+    let pending = PendingReply {
+        id,
+        resolved: Resolved {
+            host: None,
+            pane_id: entry.pane,
+            name: st.name_of(entry.pane).map(str::to_string),
+        },
+        reply: entry.reply.take(),
     };
-    let message = answer_submit(id, resolved, answer, policy);
-    send_reply(id, entry.reply.take(), message);
-    let Some(code) = code else {
-        return;
-    };
-    let mut st = store.lock().await;
-    let Some(expires_ms) = st.unread_expiry(entry.pane, id, now_ms()) else {
-        return;
-    };
-    log::info!("msg: id={id} retry pending ({code})");
-    st.requeue_retry(crate::server::messaging::SubmitEntry {
-        enqueued_at: now,
-        defer: true,
-        deadline: retry_deadline(now, now_ms(), expires_ms),
-        reply: None,
-        had_reply: false,
-        put_back: 0,
-        waiting_on: Some(code),
-        wait_until: None,
-        retry: true,
-        ..entry
-    });
+    let sender_closed = entry
+        .from
+        .local_pane()
+        .is_some_and(|from| st.is_closed(from));
+    let expires_ms = st.unread_expiry(entry.pane, id, now_ms);
+    if let (Some(code), Some(expires_ms), false) = (code, expires_ms, sender_closed) {
+        let sender_bound = entry.defer.then_some(entry.deadline).or(entry.wait_until);
+        let deadline = retry_deadline(now, now_ms, expires_ms, sender_bound);
+        if deadline > now {
+            log::info!("msg: id={id} retry pending ({code})");
+            st.requeue_retry(crate::server::messaging::SubmitEntry {
+                enqueued_at: now,
+                defer: true,
+                deadline,
+                reply: None,
+                had_reply: false,
+                put_back: 0,
+                waiting_on: Some(code),
+                wait_until: None,
+                retry: true,
+                ..entry
+            });
+        }
+    }
+    Some(pending)
 }
 
 /// End retry head `id` of `pane` when its message is no longer unread: read,
@@ -16958,7 +17043,10 @@ async fn reap_panes(
                     "the pane closed while waiting",
                 ));
             }
-            let orphans = store.take_submits_from(pane_id);
+            let (retries, orphans): (Vec<_>, Vec<_>) = store
+                .take_submits_from(pane_id)
+                .into_iter()
+                .partition(|e| e.retry);
             if !orphans.is_empty() {
                 log::info!(
                     "msg: pane %{pane_id} closed with {} of its message(s) waiting to be typed \
@@ -16966,7 +17054,14 @@ async fn reap_panes(
                     orphans.len()
                 );
             }
-            for entry in orphans.into_iter().filter(|e| !e.retry) {
+            if !retries.is_empty() {
+                log::info!(
+                    "msg: pane %{pane_id} closed with {} of its message(s) waiting to be retried \
+                     elsewhere; the retries end and they stay in the mailbox",
+                    retries.len()
+                );
+            }
+            for entry in orphans {
                 let resolved = Resolved {
                     host: None,
                     pane_id: entry.pane,
@@ -18120,6 +18215,136 @@ mod tests {
     /// from one. An id in that range loses a test's entries whenever such a
     /// test finishes alongside it, so these tests take their ids from here.
     const TEST_ONLY_PANE_IDS_FROM: crate::protocol::PaneId = 9_000_000;
+
+    use super::{settle_entry, untyped_section, Retry};
+    use crate::protocol::{Deliver, MsgId, PaneId, Sender};
+    use crate::server::messaging::Messaging;
+
+    fn retry_store() -> (Messaging, PaneId, PaneId) {
+        let st = Messaging::new(crate::config::messaging::MessagingConfig::default().limits());
+        (
+            st,
+            TEST_ONLY_PANE_IDS_FROM + 11,
+            TEST_ONLY_PANE_IDS_FROM + 12,
+        )
+    }
+
+    fn stored(st: &mut Messaging, to: PaneId, from: PaneId, body: &str) -> MsgId {
+        let sender = Sender::Pane {
+            pane_id: from,
+            name: None,
+            session: "s".to_string(),
+        };
+        st.send(
+            sender,
+            to,
+            body.to_string(),
+            None,
+            0,
+            std::time::Instant::now(),
+        )
+        .unwrap()
+    }
+
+    fn auto_entry(id: MsgId, pane: PaneId, from: PaneId) -> crate::server::messaging::SubmitEntry {
+        let now = std::time::Instant::now();
+        crate::server::messaging::SubmitEntry {
+            id,
+            pane,
+            deliver: Deliver::Auto,
+            body: String::new(),
+            from: crate::server::messaging::SubmitFrom::pane(from),
+            enqueued_at: now,
+            defer: false,
+            deadline: now + std::time::Duration::from_secs(60),
+            reply: None,
+            had_reply: false,
+            put_back: 0,
+            waiting_on: None,
+            wait_until: None,
+            retry: false,
+        }
+    }
+
+    #[test]
+    fn an_untyped_auto_is_queued_again_in_the_section_that_frees_its_pane() {
+        let (mut st, pane, from) = retry_store();
+        let r = stored(&mut st, pane, from, "R");
+        let f = stored(&mut st, pane, from + 1, "F");
+        assert!(st.mark_submitted(pane, r));
+        st.begin_typing(pane, None);
+        st.enqueue_submit(auto_entry(f, pane, from + 1), 8).unwrap();
+        assert!(st.submit_heads().is_empty(), "the pane is in flight");
+        let answer = crate::server::submit::Answer::Mailbox("agent_working");
+        let now = std::time::Instant::now();
+        let reply = untyped_section(
+            &mut st,
+            auto_entry(r, pane, from),
+            &answer,
+            Retry::Allowed,
+            now,
+            0,
+        );
+        assert!(reply.is_some(), "the sender is still answered");
+        let heads = st.submit_heads();
+        assert_eq!(heads.len(), 1);
+        assert!(
+            heads[0].id == r && heads[0].retry,
+            "the first pass after the pane is free sees the retry ahead of the later send"
+        );
+    }
+
+    #[test]
+    fn a_retry_is_not_kept_for_a_closed_sender_or_past_the_senders_timeout() {
+        let now = std::time::Instant::now();
+        let answer = crate::server::submit::Answer::Mailbox("agent_blocked");
+        let (mut st, pane, from) = retry_store();
+        let id = stored(&mut st, pane, from, "closed");
+        st.drop_pane(from);
+        settle_entry(
+            &mut st,
+            auto_entry(id, pane, from),
+            &answer,
+            Retry::Allowed,
+            now,
+            0,
+        );
+        assert!(st.submit_heads().is_empty(), "the sender's pane closed");
+
+        let (mut st, pane, from) = retry_store();
+        let id = stored(&mut st, pane, from, "deferred");
+        let deferred = crate::server::messaging::SubmitEntry {
+            defer: true,
+            deadline: now,
+            ..auto_entry(id, pane, from)
+        };
+        let timed_out = crate::server::submit::Answer::TimedOut("agent_blocked");
+        settle_entry(&mut st, deferred, &timed_out, Retry::Allowed, now, 0);
+        assert!(st.submit_heads().is_empty(), "its --timeout ran out");
+
+        let (mut st, pane, from) = retry_store();
+        let id = stored(&mut st, pane, from, "kept");
+        settle_entry(
+            &mut st,
+            auto_entry(id, pane, from),
+            &answer,
+            Retry::Allowed,
+            now,
+            0,
+        );
+        assert_eq!(st.submit_heads().first().map(|h| h.id), Some(id));
+        let (mut st2, pane2, from2) = retry_store();
+        let id2 = stored(&mut st2, pane2, from2, "never");
+        settle_entry(
+            &mut st2,
+            auto_entry(id2, pane2, from2),
+            &answer,
+            Retry::Never,
+            now,
+            0,
+        );
+        assert!(st2.submit_heads().is_empty(), "Retry::Never");
+    }
 
     #[tokio::test]
     async fn a_typing_task_that_panics_still_ends_its_panes_typing() {

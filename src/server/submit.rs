@@ -264,22 +264,21 @@ pub fn overdue(
     }
 }
 
-/// The answers an `auto` message is typed later after: each is a state of
-/// the pane that passes (the agent works, waits on its user, is not started
-/// yet, a person types, or the hold on one of those ran out) and in each
-/// nothing of the message was written. Every other answer stays final:
-/// `pane_attended` is the server's policy for a pane a person looks at, and
-/// typing the moment they look away is what that policy exists to prevent;
-/// `paste_unavailable`, `too_many_lines` and `agent_not_reading` do not pass
-/// on their own; the rest come after the agent read some of the text, which
-/// a second typing would duplicate.
-pub const RETRY_CODES: [&str; 5] = [
-    "agent_blocked",
-    "agent_working",
-    "agent_not_ready",
-    "human_typing",
-    "submit_timeout",
-];
+/// The answers an `auto` message is typed later after: the agent is working
+/// or waiting on its user, or the hold on one of those ran out. Each passes
+/// on its own, and in each nothing of the message was written. Every other
+/// answer stays final:
+/// - `human_typing`: the person is writing a draft, and a message typed once
+///   they pause is submitted with it as one prompt.
+/// - `agent_not_ready`: a shell pane. The agent that may start there later
+///   gets its mail from its hooks, not as its first prompt.
+/// - `pane_attended`: the server's policy for a pane a person looks at, and
+///   typing the moment they look away is what that policy exists to prevent.
+/// - `paste_unavailable`, `too_many_lines` and `agent_not_reading` do not pass
+///   on their own.
+/// - The rest come after the agent read some of the text, which a second
+///   typing would duplicate.
+pub const RETRY_CODES: [&str; 3] = ["agent_blocked", "agent_working", "submit_timeout"];
 
 /// The code an `auto` message waits on to be typed later, or `None` when
 /// `answer` is final.
@@ -296,16 +295,35 @@ pub fn retry_code(deliver: Deliver, answer: &Answer) -> Option<&'static str> {
 pub const RETRY_FOR: Duration = Duration::from_secs(3600);
 
 /// When a retry made at `now` (`now_ms` on the mailbox's clock) of a message
-/// expiring at `expires_ms` is given up.
-pub fn retry_deadline(now: Instant, now_ms: u64, expires_ms: u64) -> Instant {
-    now + RETRY_FOR.min(Duration::from_millis(expires_ms.saturating_sub(now_ms)))
+/// expiring at `expires_ms` is given up. `sender_bound` is the time a sender
+/// that gave `--defer` or `--wait` allowed, which `--timeout` sets: nothing is
+/// typed after it, so that `--timeout` still bounds the typing. A deadline
+/// that is not after `now` means no retry.
+pub fn retry_deadline(
+    now: Instant,
+    now_ms: u64,
+    expires_ms: u64,
+    sender_bound: Option<Instant>,
+) -> Instant {
+    let own = now + RETRY_FOR.min(Duration::from_millis(expires_ms.saturating_sub(now_ms)));
+    sender_bound.map_or(own, |bound| own.min(bound))
 }
 
-/// Why a retry head waits on its pane's state, for the two states that
-/// answer even a deferred head at once: no agent in the foreground, and an
-/// agent working under a row that does not type into a working agent.
-/// `working_first` is [`working_first`]'s verdict, so that a person's
-/// keystroke echo is not taken for work. `None` means go on as any head.
+/// Whether a head that meets a person's keys waits for them to stop rather
+/// than ending. Every live head waits, as the typing guard always has. A
+/// retry waits only when it was last held on its agent's prompt
+/// (`agent_blocked`), where the keys are the person answering it; anywhere
+/// else they are a draft.
+pub fn retry_waits_for_keys(retry: bool, waiting_on: Option<&'static str>) -> bool {
+    !retry || waiting_on == Some("agent_blocked")
+}
+
+/// Why a retry head waits on its pane's state, for the one state that answers
+/// even a deferred head at once and passes: an agent working under a row that
+/// does not type into a working agent. `working_first` is [`working_first`]'s
+/// verdict, so that a person's keystroke echo is not taken for work. `None`
+/// means go on as any head: a pane with no agent is answered `agent_not_ready`
+/// there, which ends the retry.
 pub fn retry_hold(
     live: bool,
     agent: bool,
@@ -313,11 +331,8 @@ pub fn retry_hold(
     rule: &SubmitRule,
     working_first: bool,
 ) -> Option<&'static str> {
-    if !live {
+    if !live || !agent {
         return None;
-    }
-    if !agent {
-        return Some("agent_not_ready");
     }
     let types_while_working = rule.while_working == WhileWorking::Queue;
     (state == Some(AgentState::Working) && !types_while_working && working_first)
@@ -1422,6 +1437,8 @@ mod tests {
             assert_eq!(retry_code(Mailbox, &Answer::Mailbox(code)), None);
         }
         for code in [
+            "human_typing",
+            "agent_not_ready",
             "pane_attended",
             "paste_unavailable",
             "too_many_lines",
@@ -1444,15 +1461,43 @@ mod tests {
     }
 
     #[test]
+    fn only_a_retry_held_on_a_prompt_waits_for_a_persons_keys() {
+        assert!(retry_waits_for_keys(false, None));
+        assert!(retry_waits_for_keys(false, Some("agent_working")));
+        assert!(retry_waits_for_keys(true, Some("agent_blocked")));
+        assert!(!retry_waits_for_keys(true, Some("agent_working")));
+        assert!(!retry_waits_for_keys(true, Some("submit_timeout")));
+        assert!(!retry_waits_for_keys(true, None));
+    }
+
+    #[test]
     fn a_retry_lasts_an_hour_at_most_and_never_past_its_message() {
         let now = Instant::now();
         let hour = Duration::from_secs(3600);
-        assert_eq!(retry_deadline(now, 1_000, 1_000 + 86_400_000), now + hour);
         assert_eq!(
-            retry_deadline(now, 1_000, 61_000),
+            retry_deadline(now, 1_000, 1_000 + 86_400_000, None),
+            now + hour
+        );
+        assert_eq!(
+            retry_deadline(now, 1_000, 61_000, None),
             now + Duration::from_secs(60)
         );
-        assert_eq!(retry_deadline(now, 5_000, 1_000), now, "already expired");
+        assert_eq!(
+            retry_deadline(now, 5_000, 1_000, None),
+            now,
+            "already expired"
+        );
+        let asked = now + Duration::from_secs(30);
+        assert_eq!(
+            retry_deadline(now, 1_000, 1_000 + 86_400_000, Some(asked)),
+            asked,
+            "a sender's --timeout bounds the retry"
+        );
+        assert_eq!(
+            retry_deadline(now, 1_000, 1_000 + 86_400_000, Some(now)),
+            now,
+            "a --timeout that ran out leaves nothing to retry"
+        );
     }
 
     #[test]
@@ -1466,7 +1511,8 @@ mod tests {
         assert_eq!(retry_hold(false, false, None, &mailbox, true), None);
         assert_eq!(
             retry_hold(true, false, None, &mailbox, true),
-            Some("agent_not_ready")
+            None,
+            "a shell pane ends the retry at its precheck"
         );
         assert_eq!(
             retry_hold(true, true, working, &mailbox, true),

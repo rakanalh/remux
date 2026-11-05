@@ -193,8 +193,8 @@ Task 4, --defer and the queue:
     in the mailbox.
 4d. Deferred sends whose timeout is shorter than the hold wait the hold:
     a Submit at the head is submit_timeout, an Auto at the head is
-    Mailbox/agent_blocked timed_out; once the prompt is answered the Submit
-    is never typed, and each Auto is typed exactly once (a retry).
+    Mailbox/agent_blocked timed_out, and nothing is typed once the prompt
+    is answered: a sender's --timeout bounds a retry too.
 4j. An Auto send that times out BEHIND a waiting head is Mailbox,
     timed_out, reason submit_timeout: it never waited on anything itself.
 4e. The target pane closes under two deferred sends: both no_such_target.
@@ -1745,13 +1745,9 @@ try:
           f"(got {replies['behind']})")
     tell(H_CTL, H_LOG, "clear")
     tell(I_CTL, I_LOG, "clear")
-    time.sleep(1.5)
-    time.sleep(3.0)
+    time.sleep(4.5)
     late = [c for _, c in rx_chunks(H_LOG)[d_start[0]:] + rx_chunks(I_LOG)[d_start[1]:] if b"DL:" in c]
-    counts = {b: sum(1 for c in late if f"\n{b}{CLOSE.decode()}".encode() in c)
-              for b in ("DL:sub", "DL:behind", "DL:auto")}
-    check(counts == {"DL:sub": 0, "DL:behind": 1, "DL:auto": 1} and len(late) == 2,
-          f"4d ...once the prompts are answered the Submit is never typed and each Auto once ({counts}, {late})")
+    check(not late, f"4d ...and nothing is typed once the prompts are answered (late chunks {len(late)})")
     check("panicked at" not in srv.log(), "4z no panic")
 finally:
     srv.kill()

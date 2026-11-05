@@ -357,6 +357,7 @@ pub struct SubmitHead {
     pub enqueued_at: Instant,
     pub defer: bool,
     pub retry: bool,
+    pub waiting_on: Option<&'static str>,
 }
 
 /// Why a submit could not be queued.
@@ -1251,6 +1252,7 @@ impl Messaging {
                 enqueued_at: e.enqueued_at,
                 defer: e.defer,
                 retry: e.retry,
+                waiting_on: e.waiting_on,
             })
             .collect()
     }
