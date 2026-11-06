@@ -86,7 +86,17 @@ Prints a table of sessions: `NAME`, `FOLDER`, `TABS` and `CLIENTS` (how many cli
 remux kill <NAME>
 ```
 
-Kills a session and every pane in it. If no server is running it says so and does not start one.
+Kills a session and every pane in it, then prints `Killed session '<NAME>'.` and exits `0`. A client attached to that session moves to another session, or exits if no session is left.
+
+It never starts a server. Errors go to stderr.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | The session is gone. |
+| `1` | The session does not exist, no server is running, the connection failed, or the server did not answer within 10 seconds. |
+| `2` | The command line is wrong, for example `<NAME>` is missing. |
+
+After a timeout or a lost connection the kill may still have happened. Run `remux ls` to check.
 
 ## `remux stop`
 
