@@ -325,6 +325,8 @@ pub struct SubmitEntry {
     /// A key later than this is a person's own draft, and ends a retry. `None`
     /// while the agent's prompt is up, where keys may be the answer to it, so
     /// a retry on a prompt is anchored by the first pass that sees it gone.
+    /// Every retry in a pane's queue is anchored and cleared together: a key
+    /// is the pane's, so one that a head sees is a draft to those behind it.
     pub draft_after: Option<Instant>,
 }
 
@@ -1198,9 +1200,14 @@ impl Messaging {
 
     /// Put `entry` back in its pane's queue as a retry, in id order, which is
     /// the order its pane's messages were sent in: it may have been taken
-    /// from behind a head, or be the head itself.
-    pub fn requeue_retry(&mut self, entry: SubmitEntry) {
+    /// from behind a head, or be the head itself. One with no anchor takes the
+    /// pane's: the prompt it was made on has gone, and the pass that saw that
+    /// will not come again to anchor it.
+    pub fn requeue_retry(&mut self, mut entry: SubmitEntry) {
         let queue = self.submit_queues.entry(entry.pane).or_default();
+        entry.draft_after = entry
+            .draft_after
+            .or_else(|| queue.iter().find_map(|e| e.draft_after));
         let at = queue.partition_point(|e| e.id < entry.id);
         queue.insert(at, entry);
     }
@@ -1326,16 +1333,26 @@ impl Messaging {
         }
     }
 
-    /// Set the anchor of `pane`'s head `id`, if it is still the head.
-    pub fn set_draft_after(&mut self, pane: PaneId, id: MsgId, at: Option<Instant>) {
-        if let Some(entry) = self
-            .submit_queues
-            .get_mut(&pane)
-            .and_then(|q| q.front_mut())
-            .filter(|e| e.id == id)
-        {
-            entry.draft_after = at;
+    /// Anchor at `at` every retry of `pane` that has no anchor.
+    pub fn anchor_retries(&mut self, pane: PaneId, at: Instant) {
+        for entry in self.queued_retries(pane) {
+            entry.draft_after.get_or_insert(at);
         }
+    }
+
+    /// Clear the anchor of every retry of `pane`.
+    pub fn clear_retry_anchors(&mut self, pane: PaneId) {
+        for entry in self.queued_retries(pane) {
+            entry.draft_after = None;
+        }
+    }
+
+    fn queued_retries(&mut self, pane: PaneId) -> impl Iterator<Item = &mut SubmitEntry> {
+        self.submit_queues
+            .get_mut(&pane)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.retry)
     }
 
     /// Whether `pane` closed: its mailbox was dropped with it.
@@ -3848,6 +3865,52 @@ mod tests {
             Ok(()),
             "a pending retry does not use up its sender's one deferral"
         );
+    }
+
+    #[test]
+    fn a_panes_retries_are_anchored_and_cleared_together() {
+        let (t0, t1) = (Instant::now(), Instant::now() + Duration::from_secs(1));
+        let anchors = |m: &Messaging| -> Vec<Option<Instant>> {
+            m.submit_queues[&5].iter().map(|e| e.draft_after).collect()
+        };
+        let mut m = Messaging::new(limits());
+        m.requeue_retry(retry_of(1, 5));
+        m.enqueue_submit(entry(2, 5, None), 8).unwrap();
+        m.requeue_retry(SubmitEntry {
+            draft_after: Some(t0),
+            ..retry_of(3, 5)
+        });
+        m.requeue_retry(retry_of(4, 6));
+        m.clear_retry_anchors(5);
+        assert_eq!(anchors(&m), [None, None, None]);
+
+        m.anchor_retries(5, t0);
+        assert_eq!(
+            anchors(&m),
+            [Some(t0), None, Some(t0)],
+            "a live send behind a retry has no anchor"
+        );
+        m.anchor_retries(5, t1);
+        assert_eq!(anchors(&m), [Some(t0), None, Some(t0)], "an anchor stays");
+        assert_eq!(m.submit_queues[&6][0].draft_after, None, "another pane");
+    }
+
+    #[test]
+    fn a_retry_queued_after_the_anchor_was_set_takes_the_panes() {
+        let (t0, t1) = (Instant::now(), Instant::now() + Duration::from_secs(1));
+        let mut m = Messaging::new(limits());
+        m.requeue_retry(SubmitEntry {
+            draft_after: Some(t0),
+            ..retry_of(2, 5)
+        });
+        m.requeue_retry(retry_of(1, 5));
+        m.requeue_retry(retry_of(3, 5));
+        m.requeue_retry(SubmitEntry {
+            draft_after: Some(t1),
+            ..retry_of(4, 5)
+        });
+        let anchors: Vec<_> = m.submit_queues[&5].iter().map(|e| e.draft_after).collect();
+        assert_eq!(anchors, [Some(t0), Some(t0), Some(t0), Some(t1)]);
     }
 
     #[test]

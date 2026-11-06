@@ -2813,6 +2813,17 @@ async fn step_submit(
     let working = std::time::Duration::from_millis(config.agents.working_ms);
     let now = std::time::Instant::now();
     let human_quiet = working_first(sample.last_human_input, now, working);
+    // For any head, because retries can wait behind a live send. The head's own
+    // copy of its anchor stays as it was, so that the pass that sets the anchor
+    // does not compare against it.
+    {
+        let mut st = store.lock().await;
+        if waits_while_blocked(sample.live, sample.command.is_some(), agent_state, true) {
+            st.clear_retry_anchors(pane);
+        } else {
+            st.anchor_retries(pane, now);
+        }
+    }
     if waits_while_blocked(
         sample.live,
         sample.command.is_some(),
@@ -2825,9 +2836,6 @@ async fn step_submit(
         if crate::server::submit::retry_met_a_draft(sample.last_human_input, head.draft_after) {
             let answer = Answer::Mailbox("human_typing");
             return answer_head(pane, id, answer, None, store).await;
-        }
-        if head.draft_after.is_none() {
-            store.lock().await.set_draft_after(pane, id, Some(now));
         }
         let held = crate::server::submit::retry_hold(
             sample.live,
@@ -3095,8 +3103,7 @@ async fn step_submit(
 /// Hold `pane`'s deferred head `id` while its agent waits on its user. The
 /// entries behind it that were not deferred are answered `agent_blocked` now,
 /// as each would be at the head: nothing is typed, so the order of what is
-/// typed is kept. A retry loses its anchor here, because keys on this prompt
-/// may be its answer, and the anchor is set again once the prompt has gone.
+/// typed is kept.
 async fn hold_while_blocked(
     pane: PaneId,
     id: MsgId,
@@ -3106,7 +3113,6 @@ async fn hold_while_blocked(
     use crate::server::submit::{settle, SubmitRefusal};
     let (new, behind) = {
         let mut st = store.lock().await;
-        st.set_draft_after(pane, id, None);
         (
             st.set_waiting(pane, id, "agent_blocked"),
             st.take_undeferred_behind(pane, id),

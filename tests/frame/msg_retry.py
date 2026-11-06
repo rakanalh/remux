@@ -46,6 +46,14 @@ R10. A retry held on a prompt takes the keys before the prompt went as its
     after the last of them has run out. Its own server, with a window several
     retry ticks long, so that a retry that ignores the guard cannot pass by
     landing late in a short one.
+R10b. A key is the pane's: with two retries on one prompt, one key after the
+    prompt has gone ends both, though only the head saw it. Neither is typed.
+R10c. Keys on a prompt are its answer for every retry in the pane: a retry
+    behind the head, anchored when it was made on a working agent, is not
+    ended by them when it reaches the head. Both are typed, in order.
+R10d. A retry waiting behind a live send is anchored by the live head's pass:
+    one key after the prompt has gone ends it, though it never was the head
+    while the key was new. The live send is typed, as any fresh send is.
 R11. A retry that meets a working agent while a person's last key is inside
     `working_ms` but past the guard's window is put back as it was, and the
     submitter waits for its tick: the server stays near idle. Its own server,
@@ -314,8 +322,8 @@ def focused_pane():
 
 
 def boot(rundir, config):
-    """A server with a shell pane and a focused fakeagent pane, attached."""
-    global srv, cli, A, F, F_LOG, F_CTL
+    """A server with two shell panes and a focused fakeagent pane, attached."""
+    global srv, cli, A, B, F, F_LOG, F_CTL
     srv = Server(rundir)
     srv.start(config=config)
     cli = Client(srv.sock)
@@ -325,6 +333,7 @@ def boot(rundir, config):
     cli.send({"Resize": {"cols": 160, "rows": 50}})
     cli.drain(0.8)
     A = cli_spawn("SplitRight")
+    B = cli_spawn("SplitBelow")
     F_LOG, F_CTL = f"{rundir}/agent.log", f"{rundir}/agent.ctl"
     F = cli_spawn("SplitBelow", argv=[FAKEAGENT, F_LOG, F_CTL])
     end = time.time() + 8
@@ -609,6 +618,82 @@ try:
     time.sleep(1.0)
     check(count_typed(F_LOG, "GUARD:ten", start) == 1, "R10 ...exactly once")
     check(f"msg: id={rid} retry ended" not in srv.log(), "R10 ...and its retry did not end")
+
+    # --- R10b ---------------------------------------------------------------
+    ask({"MsgAck": {"pane": F, "all": True}})
+    check(wait_state(F, "Idle"), "R10b the agent is Idle again")
+    tell("block")
+    check(wait_state(F, "NeedsInput"), "R10b the prompt reads NeedsInput")
+    start = len(rx_chunks(F_LOG))
+    r1, _ = type_send(A, send(F, "TWO:first", "Auto"))
+    r2, _ = type_send(A, send(F, "TWO:second", "Auto"))
+    ids = sent_id(r1), sent_id(r2)
+    check(outcome(r1) == ("Mailbox", "agent_blocked") and outcome(r2) == ("Mailbox", "agent_blocked"),
+          f"R10b both are stored agent_blocked ({r1}, {r2})")
+    cli.send({"Input": {"data": [0x6b]}})
+    time.sleep(0.2)
+    tell("clear")
+    time.sleep(1.5)
+    cli.send({"Input": {"data": [0x6b]}})
+    time.sleep(7.0)
+    check(count_typed(F_LOG, "TWO:first", start) == 0 and count_typed(F_LOG, "TWO:second", start) == 0,
+          f"R10b one key after the prompt has gone: neither is typed ({rx_chunks(F_LOG)[start:]})")
+    log = srv.log()
+    check(all(f"msg: id={i} retry ended (human_typing)" in log for i in ids),
+          "R10b ...both retries end human_typing")
+    check(all(box_states(F).get(i) == "Queued" for i in ids),
+          f"R10b ...and both stay unread ({box_states(F)})")
+
+    # --- R10c ---------------------------------------------------------------
+    ask({"MsgAck": {"pane": F, "all": True}})
+    check(wait_state(F, "Idle"), "R10c the agent is Idle again")
+    tell("work:900")
+    check(wait_state(F, "Working"), "R10c the agent reads Working")
+    start = len(rx_chunks(F_LOG))
+    r1, _ = type_send(A, send(F, "THROUGH:first", "Auto"))
+    r2, _ = type_send(A, send(F, "THROUGH:second", "Auto"))
+    ids = sent_id(r1), sent_id(r2)
+    check(outcome(r1) == ("Mailbox", "agent_working") and outcome(r2) == ("Mailbox", "agent_working"),
+          f"R10c both are stored agent_working, so both are anchored ({r1}, {r2})")
+    tell("block")
+    check(wait_state(F, "NeedsInput"), "R10c the prompt reads NeedsInput")
+    time.sleep(1.2)
+    check(wait_state(F, "NeedsInput", timeout=0.5), "R10c ...and still does once the work has ended")
+    keys_on_prompt(0.4)
+    time.sleep(1.5)
+    tell("clear")
+    a_at = wait_typed(F_LOG, "THROUGH:first", start, timeout=12.0)
+    b_at = wait_typed(F_LOG, "THROUGH:second", start, timeout=12.0)
+    check(a_at is not None and b_at is not None and a_at < b_at,
+          f"R10c keys on the prompt end neither: both are typed in order ({a_at}, {b_at})")
+    check(not any(f"msg: id={i} retry ended" in srv.log() for i in ids), "R10c ...and neither retry ended")
+
+    # --- R10d ---------------------------------------------------------------
+    check(wait_state(F, "Idle"), "R10d the agent is Idle again")
+    tell("block")
+    check(wait_state(F, "NeedsInput"), "R10d the prompt reads NeedsInput")
+    start = len(rx_chunks(F_LOG))
+    live = send(F, "LIVE:head", "Auto")
+    live["MsgSend"].update(defer=True, timeout_ms=30000)
+    head_send = threading.Thread(target=type_send, args=(A, live))
+    head_send.start()
+    time.sleep(1.0)
+    r, _ = type_send(B, send(F, "BEHIND:live", "Auto"))
+    rid = sent_id(r)
+    check(outcome(r) == ("Mailbox", "agent_blocked"), f"R10d the send behind it is stored agent_blocked ({r})")
+    cli.send({"Input": {"data": [0x6b]}})
+    time.sleep(0.2)
+    tell("clear")
+    time.sleep(1.5)
+    cli.send({"Input": {"data": [0x6b]}})
+    at = wait_typed(F_LOG, "LIVE:head", start, timeout=8.0)
+    check(at is not None, f"R10d the live head is typed once the guard's window ran out ({rx_chunks(F_LOG)[start:]})")
+    head_send.join()
+    time.sleep(5.0)
+    check(count_typed(F_LOG, "BEHIND:live", start) == 0,
+          f"R10d ...the retry behind it is not typed ({rx_chunks(F_LOG)[start:]})")
+    check(f"msg: id={rid} retry ended (human_typing)" in srv.log() and box_states(F).get(rid) == "Queued",
+          f"R10d ...its retry ends human_typing and it stays unread ({box_states(F)})")
     check("panicked at" not in srv.log(), "R10 no panic in the log")
     srv.kill()
 
