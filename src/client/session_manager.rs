@@ -2037,6 +2037,10 @@ mod tests {
             "dev".to_string(),
             vec![(1, ConnId::Local, 10), (2, ConnId::Local, 99)],
         )]);
+        state.model.selected = row_where(&state, |n| matches!(n, NodeType::ViewsGroup));
+        state.model.expand_selected();
+        state.model.selected = row_where(&state, |n| matches!(n, NodeType::View { id: 7 }));
+        state.model.expand_selected();
         state
     }
 

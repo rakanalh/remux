@@ -29,7 +29,7 @@ A new view created from the picker is named `View 1`, `View 2` and so on, and op
 | Open a view | `Alt-s` or `Ctrl-a x s` (views are listed first in the switcher) |
 | Leave the view; it stays available | `Ctrl-a w q` |
 
-Views also appear under their own **Views** group in the session manager. `Enter` on a view opens it; `Enter` on one of its cells opens it with that cell focused.
+Views also appear under their own **Views** group in the session manager, at the top of the `local` server, above its folders and sessions. The group and each view start collapsed in a new client: `l` on the group shows your views, and `l` on a view shows its cells. The client remembers what you open or close until it exits. `Enter` on a view opens it; `Enter` on one of its cells opens it with that cell focused. Searching reaches views and cells inside collapsed rows.
 
 ## Work inside a view
 

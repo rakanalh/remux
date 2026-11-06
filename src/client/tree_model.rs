@@ -221,6 +221,8 @@ fn dormant_key(server: &ConnId, name: &str) -> String {
     format!("dormant:{}:{}", server.key(), name)
 }
 
+const VIEW_KEY_PREFIX: &str = "view:";
+
 /// Expansion key for the Views group. Views are Local-only, so there is one.
 fn views_key() -> String {
     "views:local".to_string()
@@ -228,7 +230,13 @@ fn views_key() -> String {
 
 /// Expansion key for a view row -- by ID, so a rename keeps its expansion.
 fn view_key(id: ViewId) -> String {
-    format!("view:{id}")
+    format!("{VIEW_KEY_PREFIX}{id}")
+}
+
+/// Whether `key` is the expansion key of the Views group or of a view. The
+/// colon keeps this off `viewcell:` keys.
+fn is_views_expansion_key(key: &str) -> bool {
+    key == views_key() || key.starts_with(VIEW_KEY_PREFIX)
 }
 
 /// Filter/selection key for a view cell row. Cells never expand, so this key
@@ -296,8 +304,8 @@ pub struct TreeModel {
     /// rendered as a "Saved (resurrect)" group. Dormant sessions are a
     /// Local-server concept for now.
     dormant: Vec<String>,
-    /// The local server's views, rendered as a Views group under the Local
-    /// server node. Only the session-manager overlay feeds this; the sidebar's
+    /// The local server's views, rendered as a Views group, first under the
+    /// Local server node. Only the session-manager overlay feeds this; the sidebar's
     /// sessions panel never does, so it never shows the group.
     views: Vec<ViewEntry>,
     /// Direct hits from the most recent [`TreeModel::rebuild_rows`] (see
@@ -322,9 +330,6 @@ impl TreeModel {
         expanded.insert(server_key(&ConnId::Local));
         // Expand the Saved group by default so dormant sessions are discoverable.
         expanded.insert(saved_key(&ConnId::Local));
-        // Likewise the Views group. Inserted ONCE, here: a later `set_views`
-        // must never re-open a group the user collapsed.
-        expanded.insert(views_key());
         Self {
             rows: Vec::new(),
             selected: 0,
@@ -523,20 +528,32 @@ impl TreeModel {
 
     /// Replace the local server's views and rebuild rows.
     ///
-    /// A view this model has never seen auto-expands, through the same
-    /// cumulative `seen_keys` rule `update_tree` applies to folders and
-    /// sessions -- so a refresh (every `ViewList`) cannot re-open a view the
-    /// user collapsed. Keys are view IDS: a rename is not a new view.
+    /// For a new client the group and every view start collapsed, unlike
+    /// folders and sessions, because the group renders above them: expanded
+    /// rows here push the current session down and scroll the group off a short
+    /// popup. This function does not touch `expanded`, so a refresh (every
+    /// `ViewList`) leaves open what the user opened, and
+    /// [`TreeModel::view_expansion`] carries that state to the next open. Keys
+    /// are view IDS, so a rename keeps a view open.
     pub fn set_views(&mut self, views: Vec<ViewEntry>) {
-        let known_keys = self.seen_keys.entry(ConnId::Local).or_default();
-        for (id, _, _) in &views {
-            let key = view_key(*id);
-            if known_keys.insert(key.clone()) {
-                self.expanded.insert(key);
-            }
-        }
         self.views = views;
         self.rebuild_rows();
+    }
+
+    /// The Views group and views the user has open. This reads `expanded` only,
+    /// so rows that an active query holds open are not included.
+    pub fn view_expansion(&self) -> HashSet<String> {
+        self.expanded
+            .iter()
+            .filter(|key| is_views_expansion_key(key))
+            .cloned()
+            .collect()
+    }
+
+    /// Open the rows of an earlier [`TreeModel::view_expansion`]. Call this on a
+    /// new model, before it holds rows, because it does not rebuild them.
+    pub fn restore_view_expansion(&mut self, keys: &HashSet<String>) {
+        self.expanded.extend(keys.iter().cloned());
     }
 
     /// The label of a view cell: the aliased pane's name from this model's own
@@ -613,6 +630,13 @@ impl TreeModel {
     /// therefore lands on the first *direct hit* (a row whose own name matched,
     /// per [`Filter::hits`]).
     ///
+    /// `View` and `ViewCell` hits rank below every other hit, although they
+    /// render first. The cell of a local pane carries that pane's own name, so
+    /// one query hits both rows. Enter on the cell opens the view, and Space
+    /// and `va` do nothing there, so the pane's own row must win. A session
+    /// also wins over a view of a similar name. A query that hits only a view
+    /// or a cell still selects it.
+    ///
     /// Two fallbacks, for rows that are visible without being hits: the first
     /// non-server row, then the top. An empty query means no filtering at all,
     /// so it keeps the plain "back to the top" behaviour.
@@ -621,9 +645,17 @@ impl TreeModel {
         let next = if self.query.is_empty() {
             0
         } else {
+            let is_hit = |r: &TreeRow| self.filter_hits.contains(&self.row_key(r));
             self.rows
                 .iter()
-                .position(|r| self.filter_hits.contains(&self.row_key(r)))
+                .position(|r| {
+                    is_hit(r)
+                        && !matches!(
+                            r.node_type,
+                            NodeType::View { .. } | NodeType::ViewCell { .. }
+                        )
+                })
+                .or_else(|| self.rows.iter().position(is_hit))
                 .or_else(|| {
                     self.rows
                         .iter()
@@ -934,6 +966,12 @@ impl TreeModel {
             });
 
             if server_expanded && connected {
+                // The Views group: first, above the folders and live sessions.
+                // Views are the LOCAL server's registry, so Local only.
+                if *id == ConnId::Local {
+                    self.add_view_rows(&mut rows, filter);
+                }
+
                 if let Some((folders, unfiled)) = self.trees.get(id) {
                     for folder in folders {
                         let fkey = folder_key(id, &folder.name);
@@ -962,12 +1000,6 @@ impl TreeModel {
                     for session in unfiled {
                         self.add_session_rows(&mut rows, id, session, 1, filter);
                     }
-                }
-
-                // The Views group: after the live sessions, before Saved.
-                // Views are the LOCAL server's registry, so Local only.
-                if *id == ConnId::Local {
-                    self.add_view_rows(&mut rows, filter);
                 }
 
                 // Render the "Saved (resurrect)" group at the bottom of the
@@ -1777,8 +1809,8 @@ mod tests {
 
     // -- Views group ----------------------------------------------------------
 
-    /// `two_conn_fixture` plus a dormant local session, so the Views group has
-    /// a live session above it AND a Saved group below it to be placed between.
+    /// `two_conn_fixture` plus a dormant local session, so the rows around the
+    /// Views group cover a folder, a live session and the Saved group.
     fn views_fixture() -> TreeModel {
         let (mut model, per_conn) = two_conn_fixture();
         let local = per_conn[0].1.clone();
@@ -1800,31 +1832,104 @@ mod tests {
         )]
     }
 
+    fn expand_views(model: &mut TreeModel) {
+        expand(model, "Views");
+        expand(model, "dev");
+    }
+
     #[test]
-    fn the_views_group_renders_between_live_sessions_and_the_saved_group() {
+    fn the_views_group_starts_as_one_collapsed_row() {
         let mut model = views_fixture();
         model.set_views(one_view());
         assert_eq!(
             labels(&model),
             vec![
                 (0, "local".to_string()),
+                (1, "Views".to_string()),
                 (1, "work".to_string()),
                 (2, "alpha".to_string()),
                 (3, "editor".to_string()),
+                (1, "Saved (resurrect)".to_string()),
+                (2, "\u{1F4A4} archived".to_string()),
+                (0, "pi".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn view_expansion_holds_only_the_group_and_view_keys() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        expand_views(&mut model);
+        expand(&mut model, "editor");
+        model.expanded.insert(view_cell_key(7, 1));
+        model.expanded.insert(session_key(&ConnId::Local, "view:1"));
+
+        let want: HashSet<String> = [views_key(), view_key(7)].into_iter().collect();
+        assert_eq!(model.view_expansion(), want);
+    }
+
+    #[test]
+    fn view_expansion_leaves_out_rows_a_query_holds_open() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        for c in "top".chars() {
+            model.push_query_char(c);
+        }
+        assert!(model.rows.iter().any(|r| r.display_name == "dev"));
+        assert!(model.view_expansion().is_empty());
+    }
+
+    #[test]
+    fn a_view_starts_collapsed_inside_an_expanded_group() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        expand(&mut model, "Views");
+        assert!(model.rows.iter().any(|r| r.display_name == "dev"));
+        assert!(!model.rows.iter().any(|r| r.display_name == "top"));
+    }
+
+    #[test]
+    fn refresh_keeps_an_expanded_views_group_and_view_open() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        expand_views(&mut model);
+        let rows_before = labels(&model);
+
+        model.set_views(one_view());
+        assert_eq!(labels(&model), rows_before);
+
+        let (_, per_conn) = two_conn_fixture();
+        model.rebuild(&per_conn);
+        assert!(model.rows.iter().any(|r| r.display_name == "top"));
+    }
+
+    #[test]
+    fn the_views_group_renders_first_under_the_local_server() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        expand_views(&mut model);
+        assert_eq!(
+            labels(&model),
+            vec![
+                (0, "local".to_string()),
                 (1, "Views".to_string()),
                 (2, "dev".to_string()),
                 (3, "top".to_string()),
                 (3, "pi: sh".to_string()),
+                (1, "work".to_string()),
+                (2, "alpha".to_string()),
+                (3, "editor".to_string()),
                 (1, "Saved (resurrect)".to_string()),
                 (2, "\u{1F4A4} archived".to_string()),
                 (0, "pi".to_string()),
             ]
         );
         let kinds: Vec<&NodeType> = model.rows.iter().map(|r| &r.node_type).collect();
-        assert_eq!(kinds[4], &NodeType::ViewsGroup);
-        assert_eq!(kinds[5], &NodeType::View { id: 7 });
+        assert_eq!(kinds[1], &NodeType::ViewsGroup);
+        assert_eq!(kinds[2], &NodeType::View { id: 7 });
         assert_eq!(
-            kinds[7],
+            kinds[4],
             &NodeType::ViewCell {
                 view_id: 7,
                 cell_id: 2,
@@ -1833,10 +1938,152 @@ mod tests {
             }
         );
         // None of them is a session jump.
-        for idx in 4..8 {
+        for idx in 1..5 {
             model.selected = idx;
             assert_eq!(model.jump_target(), None, "row {idx}");
         }
+    }
+
+    #[test]
+    fn the_views_group_renders_above_an_unfiled_session() {
+        let (mut model, per_conn) = two_conn_fixture();
+        let local = per_conn[0].1.clone();
+        model.update_tree(
+            ConnId::Local,
+            local.folders,
+            vec![session("aardvark", Vec::new())],
+            Vec::new(),
+        );
+        model.set_views(one_view());
+        assert!(row_of(&model, "Views") < row_of(&model, "aardvark"));
+        assert!(row_of(&model, "Views") < row_of(&model, "work"));
+    }
+
+    #[test]
+    fn the_views_group_stays_under_local_when_the_remote_is_expanded() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        expand(&mut model, "pi");
+        assert_eq!(row_of(&model, "Views"), 1);
+        assert!(row_of(&model, "Saved (resurrect)") < row_of(&model, "pi"));
+        assert_eq!(
+            model
+                .rows
+                .iter()
+                .filter(|r| matches!(r.node_type, NodeType::ViewsGroup))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn select_current_session_lands_on_the_session_below_the_views_group() {
+        let (mut model, mut per_conn) = two_conn_fixture();
+        mark_current(&mut per_conn, "alpha");
+        model.rebuild(&per_conn);
+        model.set_views(one_view());
+
+        assert!(model.select_current_session());
+        assert_eq!(
+            model.selected_row().map(|r| &r.node_type),
+            Some(&NodeType::Session {
+                server: ConnId::Local,
+                name: "alpha".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_selection_stays_on_its_session_when_the_views_group_appears_above_it() {
+        let mut model = views_fixture();
+        model.selected = row_of(&model, "alpha");
+        model.set_views(one_view());
+        assert_eq!(
+            model.selected_row().map(|r| &r.node_type),
+            Some(&NodeType::Session {
+                server: ConnId::Local,
+                name: "alpha".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_query_matching_a_view_and_a_session_selects_the_session() {
+        let mut model = views_fixture();
+        model.set_views(vec![(7, "alpha-grid".to_string(), Vec::new())]);
+        for c in "alpha".chars() {
+            model.push_query_char(c);
+        }
+        assert!(row_of(&model, "Views") < row_of(&model, "alpha"));
+        assert_eq!(
+            model.selected_row().map(|r| &r.node_type),
+            Some(&NodeType::Session {
+                server: ConnId::Local,
+                name: "alpha".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_query_matching_only_a_view_selects_it_inside_the_collapsed_group() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        for c in "dev".chars() {
+            model.push_query_char(c);
+        }
+        assert_eq!(
+            model.selected_row().map(|r| &r.node_type),
+            Some(&NodeType::View { id: 7 })
+        );
+    }
+
+    #[test]
+    fn a_query_reaches_a_cell_inside_a_collapsed_view_and_clearing_it_collapses_again() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        let collapsed = labels(&model);
+        for c in "pi:".chars() {
+            model.push_query_char(c);
+        }
+        assert!(model.rows.iter().any(|r| r.display_name == "pi: sh"));
+        model.clear_query();
+        assert_eq!(labels(&model), collapsed);
+    }
+
+    #[test]
+    fn a_query_matching_a_pane_in_a_view_selects_the_pane_not_its_cell() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        for c in "top".chars() {
+            model.push_query_char(c);
+        }
+        assert_eq!(
+            model.selected_row().map(|r| &r.node_type),
+            Some(&NodeType::Pane {
+                server: ConnId::Local,
+                session: "alpha".to_string(),
+                tab_index: 0,
+                pane_id: 11
+            })
+        );
+    }
+
+    #[test]
+    fn a_query_matching_only_a_view_cell_selects_the_cell() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        for c in "pi:".chars() {
+            model.push_query_char(c);
+        }
+        assert_eq!(
+            model.selected_row().map(|r| &r.node_type),
+            Some(&NodeType::ViewCell {
+                view_id: 7,
+                cell_id: 2,
+                conn: remote("pi"),
+                pane_id: 20
+            })
+        );
     }
 
     #[test]
@@ -1866,15 +2113,12 @@ mod tests {
     }
 
     #[test]
-    fn a_renamed_view_keeps_its_collapsed_state() {
-        // Keyed by NAME, the renamed view would be a never-seen key and
-        // auto-expand under the user.
+    fn a_renamed_view_keeps_its_expanded_state() {
+        // Keyed by NAME, the renamed view would be an unknown key and would
+        // collapse under the user.
         let mut model = views_fixture();
         model.set_views(one_view());
-        expand(&mut model, "dev");
-        model.selected = row_of(&model, "dev");
-        model.collapse_selected();
-        assert!(!model.rows.iter().any(|r| r.display_name == "top"));
+        expand_views(&mut model);
 
         let mut renamed = one_view();
         renamed[0].1 = "renamed".to_string();
@@ -1886,8 +2130,8 @@ mod tests {
             labels(&model)
         );
         assert!(
-            !model.rows.iter().any(|r| r.display_name == "top"),
-            "the rename re-expanded the view: {:?}",
+            model.rows.iter().any(|r| r.display_name == "top"),
+            "the rename collapsed the view: {:?}",
             labels(&model)
         );
     }
@@ -1896,6 +2140,7 @@ mod tests {
     fn a_renamed_view_keeps_the_selection_on_its_cell() {
         let mut model = views_fixture();
         model.set_views(one_view());
+        expand_views(&mut model);
         model.selected = row_of(&model, "pi: sh");
         let mut renamed = one_view();
         renamed[0].1 = "renamed".to_string();
@@ -1914,6 +2159,7 @@ mod tests {
     fn refresh_does_not_re_expand_a_collapsed_views_group_or_view() {
         let mut model = views_fixture();
         model.set_views(one_view());
+        expand_views(&mut model);
 
         // Collapse the view, then the group that holds it.
         model.selected = row_of(&model, "dev");
@@ -1940,19 +2186,17 @@ mod tests {
     }
 
     #[test]
-    fn a_new_view_auto_expands() {
+    fn a_new_view_starts_collapsed_and_leaves_an_expanded_sibling_open() {
         let mut model = views_fixture();
         model.set_views(one_view());
+        expand_views(&mut model);
         let mut two = one_view();
         two.push((8, "ops".to_string(), vec![(1, ConnId::Local, 10)]));
         model.set_views(two);
+
         let ops = row_of(&model, "ops");
-        assert_eq!(
-            model.rows.get(ops + 1).map(|r| r.display_name.as_str()),
-            Some("sh"),
-            "{:?}",
-            labels(&model)
-        );
+        assert_eq!(ops + 1, row_of(&model, "work"), "{:?}", labels(&model));
+        assert!(model.rows.iter().any(|r| r.display_name == "top"));
     }
 
     #[test]
@@ -1969,6 +2213,7 @@ mod tests {
                 (5, remote("gone"), 20),
             ],
         )]);
+        expand_views(&mut model);
         let dev = row_of(&model, "dev");
         let cells: Vec<String> = model.rows[dev + 1..dev + 6]
             .iter()
