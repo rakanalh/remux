@@ -7225,7 +7225,9 @@ async fn handle_client_message(
         }
         ClientMessage::ListSessions => handle_list_sessions(client_id, state, clients).await,
         ClientMessage::KillSession { name } => {
-            let result = handle_kill_session(&name, state, panes, clients).await;
+            let result =
+                handle_kill_session(&name, state, panes, clients, config, prev_frames, dormant)
+                    .await;
             save_if_enabled(state, panes, config, dormant).await;
             mark_session_tree_dirty();
             result
@@ -9031,8 +9033,16 @@ async fn handle_command(
                 // Last tab closed -> the session was removed. Re-point attached
                 // clients onto another session (or notify them if none remain);
                 // don't broadcast the now-dead session.
-                handle_session_removed(&session_name, state, panes, clients, config, prev_frames)
-                    .await;
+                handle_session_removed(
+                    &session_name,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                    dormant,
+                )
+                .await;
             } else {
                 invalidate_session_baselines(&session_name, clients, prev_frames).await;
                 broadcast_full_render(&session_name, state, panes, clients, config, prev_frames)
@@ -9146,7 +9156,16 @@ async fn handle_command(
                 }
             };
             log::debug!("server: PaneClose pane_id={closed_pane}");
-            close_pane(closed_pane, state, panes, clients, config, prev_frames).await;
+            close_pane(
+                closed_pane,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
         }
         RemuxCommand::PaneFocusLeft
         | RemuxCommand::PaneFocusRight
@@ -9426,6 +9445,7 @@ async fn handle_command(
                         clients,
                         config,
                         prev_frames,
+                        dormant,
                     )
                     .await;
                 } else {
@@ -9888,6 +9908,7 @@ async fn handle_command(
                             clients,
                             config,
                             prev_frames,
+                            dormant,
                         )
                         .await;
                     } else {
@@ -9949,21 +9970,17 @@ async fn handle_command(
                     .collect();
                 reap_panes(&doomed, panes, clients).await;
             }
-            {
-                let mut cls = clients.lock().await;
-                for (session_name, _) in &deleted_sessions {
-                    for client in cls.values_mut() {
-                        if client.session_name.as_deref() == Some(session_name) {
-                            client.session_name = None;
-                            let _ =
-                                client
-                                    .tx
-                                    .send(ServerMessage::Event(SessionEvent::SessionDeleted(
-                                        session_name.clone(),
-                                    )));
-                        }
-                    }
-                }
+            for (session_name, _) in &deleted_sessions {
+                handle_session_removed(
+                    session_name,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                    dormant,
+                )
+                .await;
             }
         }
         RemuxCommand::FolderMoveSession { session, folder } => {
@@ -10200,7 +10217,7 @@ async fn handle_command(
                     .unwrap_or(false)
             };
             if in_active_tab {
-                close_pane(pane_id, state, panes, clients, config, prev_frames).await;
+                close_pane(pane_id, state, panes, clients, config, prev_frames, dormant).await;
             } else {
                 // Background-tab path: mirror close_pane's non-active-tab-safe
                 // subset (layout collapse + pane_order retain + focus/rebuild,
@@ -10369,8 +10386,7 @@ async fn handle_create_session(
     // Announce to EVERY client, not just the creator. A session manager open in
     // another terminal has no timer -- every tree refresh is event-driven -- so
     // a creator-only notification left every other terminal's tree stale until
-    // some unrelated action happened to refresh it. Symmetric with
-    // `SessionDeleted`, which already reaches every client it concerns.
+    // some unrelated action happened to refresh it.
     let cls = clients.lock().await;
     for client in cls.values() {
         let _ = client
@@ -11387,6 +11403,9 @@ async fn handle_kill_session(
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
 ) -> Result<()> {
     let pane_ids = {
         let mut st = state.lock().await;
@@ -11397,17 +11416,7 @@ async fn handle_kill_session(
         pane_ids.len()
     );
     reap_panes(&pane_ids, panes, clients).await;
-    let mut cls = clients.lock().await;
-    for client in cls.values_mut() {
-        if client.session_name.as_deref() == Some(name) {
-            client.session_name = None;
-            let _ = client
-                .tx
-                .send(ServerMessage::Event(SessionEvent::SessionDeleted(
-                    name.to_string(),
-                )));
-        }
-    }
+    handle_session_removed(name, state, panes, clients, config, prev_frames, dormant).await;
     Ok(())
 }
 
@@ -16915,8 +16924,10 @@ fn compute_diff(prev: &[Vec<RenderCell>], curr: &[Vec<RenderCell>]) -> Vec<CellC
 /// If no sessions remain, those clients are detached and notified with a
 /// `SessionDeleted` event so they can fall back or exit.
 ///
-/// This is the shared post-removal logic used by pane close, tab close, and
-/// close-tab-by-index.
+/// This is the shared post-removal logic used by pane close, tab close,
+/// close-tab-by-index, session kill and folder delete. The client exits on a
+/// `SessionDeleted` for its session unless its manager is open, so a removal
+/// path that sends the event while a session remains closes that client.
 async fn handle_session_removed(
     removed: &str,
     state: &Arc<Mutex<ServerState>>,
@@ -16924,6 +16935,7 @@ async fn handle_session_removed(
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
 ) {
     let next_session = {
         let st = state.lock().await;
@@ -16932,9 +16944,10 @@ async fn handle_session_removed(
     match next_session {
         Some(next) => {
             // Switch all clients that were on the removed session to the next one.
+            let mut moved = Vec::new();
             {
                 let mut cls = clients.lock().await;
-                for c in cls.values_mut() {
+                for (id, c) in cls.iter_mut() {
                     if c.session_name.as_deref() == Some(removed) {
                         c.session_name = Some(next.clone());
                         // As in `handle_attach`: these offsets index panes of
@@ -16942,14 +16955,37 @@ async fn handle_session_removed(
                         c.session_scroll.clear();
                         c.prev_scroll_offset = 0;
                         c.prev_scroll_pane = None;
+                        moved.push(*id);
                     }
                 }
             }
-            // Clients now display a different session; invalidate their
-            // baselines (from the old session) so they get a clean full render.
-            invalidate_session_baselines(&next, clients, prev_frames).await;
-            let _ = resize_session_panes(&next, state, panes, clients, config).await;
-            broadcast_full_render(&next, state, panes, clients, config, prev_frames).await;
+            // `next` is an arbitrary session that the removal does not concern
+            // unless a client landed on it. With no client attached, a resize
+            // gives its panes the fallback size and sends their programs SIGWINCH.
+            if !moved.is_empty() {
+                // Clients now display a different session; invalidate their
+                // baselines (from the old session) so they get a clean full render.
+                invalidate_session_baselines(&next, clients, prev_frames).await;
+                let _ = resize_session_panes(&next, state, panes, clients, config).await;
+                broadcast_full_render(&next, state, panes, clients, config, prev_frames).await;
+                // A session that no client has attached to has no forwarding task.
+                // Without one its pane stays blank and its output reaches nobody,
+                // so the moved client looks attached and cannot use the pane.
+                start_pty_forwarding_boxed(
+                    &next,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                    dormant,
+                )
+                .await;
+                // These clients get no `SessionDeleted`, which is the event that
+                // refreshes an open manager, and a manager has no tree subscription
+                // of its own. Without this tree it keeps the removed session's rows.
+                send_session_tree_to(&moved, state, panes, clients, dormant).await;
+            }
         }
         None => {
             // No sessions left -- notify affected clients so they disconnect
@@ -17218,6 +17254,7 @@ async fn close_pane(
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
 ) {
     /// What to do after closing a pane.
     enum CloseAction {
@@ -17314,7 +17351,16 @@ async fn close_pane(
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         CloseAction::SessionRemoved => {
-            handle_session_removed(&session_name, state, panes, clients, config, prev_frames).await;
+            handle_session_removed(
+                &session_name,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
         }
         CloseAction::NoBroadcast => {}
     }
@@ -17367,6 +17413,31 @@ async fn start_pty_forwarding(
         )
         .await;
     }
+}
+
+/// [`start_pty_forwarding`] for callers on a pane's death path.
+///
+/// The forwarding task calls `close_pane`, which reaches `handle_session_removed`,
+/// which starts forwarding. The compiler cannot prove `Send` for `tokio::spawn`
+/// through that cycle of `async fn` types, so this declared return type ends it.
+fn start_pty_forwarding_boxed<'a>(
+    session_name: &'a str,
+    state: &'a Arc<Mutex<ServerState>>,
+    panes: &'a Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &'a Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &'a Arc<Config>,
+    prev_frames: &'a PrevFrameCache,
+    dormant: &'a DormantStore,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(start_pty_forwarding(
+        session_name,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        dormant,
+    ))
 }
 
 /// Start the one forwarding task for `pane_id`: pump its PTY into its `Screen`,
@@ -17558,7 +17629,16 @@ async fn start_forwarding_for_pane(
                         if let Some(pd) = panes.lock().await.get_mut(&pane_id) {
                             pd.exited = true;
                         }
-                        close_pane(pane_id, &state, &panes, &clients, &config, &prev_frames).await;
+                        close_pane(
+                            pane_id,
+                            &state,
+                            &panes,
+                            &clients,
+                            &config,
+                            &prev_frames,
+                            &dormant,
+                        )
+                        .await;
                         notify_if_close_declined(pane_id, &panes, &clients).await;
                         save_if_enabled(&state, &panes, &config, &dormant).await;
                         // A pane dying on its own removes a row from every
@@ -21074,6 +21154,7 @@ mod popup_tests {
                 &rig.clients,
                 &rig.config,
                 &rig.prev_frames,
+                &rig.dormant,
             )
             .await;
             let st = rig.state.lock().await;
@@ -21538,6 +21619,7 @@ mod popup_tests {
             &rig.clients,
             &rig.config,
             &rig.prev_frames,
+            &rig.dormant,
         )
         .await;
 
@@ -23188,6 +23270,7 @@ mod popup_tests {
             &rig.clients,
             &rig.config,
             &rig.prev_frames,
+            &rig.dormant,
         )
         .await;
 
@@ -23221,6 +23304,7 @@ mod popup_tests {
             &rig.clients,
             &rig.config,
             &rig.prev_frames,
+            &rig.dormant,
         )
         .await;
 
