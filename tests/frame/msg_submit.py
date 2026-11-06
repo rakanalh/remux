@@ -69,7 +69,9 @@ Task 2, the per-agent rows ([messaging.submit.<command>]). The policy is read
 by the server at startup, so each variant is a fresh server with its config:
 
 2a. Default row: a blocked agent is refused (Submit) or left in the mailbox
-    (Auto), nothing typed; once it is cleared, a Submit is typed.
+    (Auto), nothing typed; once it is cleared, the Auto is typed (a retry,
+    tests/frame/msg_retry.py) and the Submit never is, and a new Submit is
+    typed.
 2b. Default row (while_working = mailbox): a working agent's message stays
     in the mailbox under Submit AND Auto (a delivery choice, not a refusal),
     nothing typed, and the log names the setting.
@@ -185,13 +187,14 @@ Task 4, --defer and the queue:
 4a. A deferred Submit waits while the agent is blocked, is typed once the
     prompt is answered, and its wait is logged once.
 4b. Three deferred sends from three senders are typed in id order, each
-    its own paste with its own Enter.
+    its own paste with its own Enter; the Auto answered agent_blocked behind
+    the first (4h) is typed later, in its id order, after the first.
 4c. A fourth deferred send to a queue of three is queue_full at once, and
     in the mailbox.
 4d. Deferred sends whose timeout is shorter than the hold wait the hold:
     a Submit at the head is submit_timeout, an Auto at the head is
     Mailbox/agent_blocked timed_out, and nothing is typed once the prompt
-    is answered.
+    is answered: a sender's --timeout bounds a retry too.
 4j. An Auto send that times out BEHIND a waiting head is Mailbox,
     timed_out, reason submit_timeout: it never waited on anything itself.
 4e. The target pane closes under two deferred sends: both no_such_target.
@@ -875,6 +878,10 @@ try:
           and no_new_chunks(F_LOG, start),
           f"2a a blocked agent: Submit refused, Auto in the mailbox, nothing typed (submit {r_sub}, auto {r_auto})")
     tell(F_CTL, F_LOG, "clear")
+    retried = wait_rx(F_LOG, framed("BLK:two", attr(r_auto)), start)
+    check(retried is not None and not any(b"BLK:one" in c for _, c in rx_chunks(F_LOG)[start:]),
+          f"2a ...once it is cleared the Auto is typed and the Submit is not ({rx_chunks(F_LOG)[start:]})")
+    time.sleep(1.0)
     check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
     r = type_send(A, send(F, "BLK:three", "Submit"))
     check(submitted(r) and wait_rx(F_LOG, framed("BLK:three", attr(r)), start) is not None,
@@ -1582,9 +1589,12 @@ try:
     ids = [sent_id(x) for x in replies]
     seq = [c for _, c in rx_chunks(F_LOG)[start:]]
     texts = [i for i, c in enumerate(seq) if c.startswith(OPEN)]
-    order = [next((n for n in (1, 2, 3) if f"ORDER:{n}".encode() in seq[i]), None) for i in texts]
+    order = [next((n for n in (1, "auto", 2, 3)
+                   if (f"ORDER:{n}" if n != "auto" else "BEHIND:auto").encode() in seq[i]), None)
+             for i in texts]
     entered = all(i + 1 < len(seq) and seq[i + 1] == b"\r" for i in texts)
-    check(held and all(submitted(x) for x in replies) and ids == sorted(ids) and order == [1, 2, 3] and entered,
+    check(held and all(submitted(x) for x in replies) and ids == sorted(ids)
+          and order == [1, "auto", 2, 3] and entered,
           f"4b three deferred sends are typed in id order, each its own paste with its own Enter "
           f"(held {held}, ids {ids}, order {order}, entered {entered}, replies {[outcome(x) for x in replies]})")
 
@@ -1735,7 +1745,7 @@ try:
           f"(got {replies['behind']})")
     tell(H_CTL, H_LOG, "clear")
     tell(I_CTL, I_LOG, "clear")
-    time.sleep(1.5)
+    time.sleep(4.5)
     late = [c for _, c in rx_chunks(H_LOG)[d_start[0]:] + rx_chunks(I_LOG)[d_start[1]:] if b"DL:" in c]
     check(not late, f"4d ...and nothing is typed once the prompts are answered (late chunks {len(late)})")
     check("panicked at" not in srv.log(), "4z no panic")

@@ -264,6 +264,84 @@ pub fn overdue(
     }
 }
 
+/// The answers an `auto` message is typed later after: the agent is working
+/// or waiting on its user, or the hold on one of those ran out. Each passes
+/// on its own, and in each nothing of the message was written. Every other
+/// answer stays final:
+/// - `human_typing`: the person is writing a draft, and a message typed once
+///   they pause is submitted with it as one prompt.
+/// - `agent_not_ready`: a shell pane. The agent that may start there later
+///   gets its mail from its hooks, not as its first prompt.
+/// - `pane_attended`: the server's policy for a pane a person looks at, and
+///   typing the moment they look away is what that policy exists to prevent.
+/// - `paste_unavailable`, `too_many_lines` and `agent_not_reading` do not pass
+///   on their own.
+/// - The rest come after the agent read some of the text, which a second
+///   typing would duplicate.
+pub const RETRY_CODES: [&str; 3] = ["agent_blocked", "agent_working", "submit_timeout"];
+
+/// The code an `auto` message waits on to be typed later, or `None` when
+/// `answer` is final.
+pub fn retry_code(deliver: Deliver, answer: &Answer) -> Option<&'static str> {
+    let code = match answer {
+        Answer::Mailbox(code) | Answer::TimedOut(code) => *code,
+        Answer::Refuse(_) => return None,
+    };
+    (deliver == Deliver::Auto && RETRY_CODES.contains(&code)).then_some(code)
+}
+
+/// The longest a retry is kept: an hour, as for any wait a sender can ask
+/// for, and never past its message's expiry.
+pub const RETRY_FOR: Duration = Duration::from_secs(3600);
+
+/// When a retry made at `now` (`now_ms` on the mailbox's clock) of a message
+/// expiring at `expires_ms` is given up. `sender_bound` is the time a sender
+/// that gave `--defer` or `--wait` allowed, which `--timeout` sets: nothing is
+/// typed after it, so that `--timeout` still bounds the typing. A deadline
+/// that is not after `now` means no retry.
+pub fn retry_deadline(
+    now: Instant,
+    now_ms: u64,
+    expires_ms: u64,
+    sender_bound: Option<Instant>,
+) -> Instant {
+    let own = now + RETRY_FOR.min(Duration::from_millis(expires_ms.saturating_sub(now_ms)));
+    sender_bound.map_or(own, |bound| own.min(bound))
+}
+
+/// Whether a person typed after `draft_after`, which ends a retry: a message
+/// typed once they pause is submitted with their draft as one prompt. Compared
+/// on every pass and not left to the typing guard, because a short burst can
+/// fall between two passes and its window can run out before the next one.
+/// Keys from before the anchor may be the answer to a prompt, so they only run
+/// out the guard's window.
+pub fn retry_met_a_draft(last_human_input: Option<Instant>, draft_after: Option<Instant>) -> bool {
+    last_human_input
+        .zip(draft_after)
+        .is_some_and(|(key, after)| key > after)
+}
+
+/// Why a retry head waits on its pane's state, for the one state that answers
+/// even a deferred head at once and passes: an agent working under a row that
+/// does not type into a working agent. `working_first` is [`working_first`]'s
+/// verdict, so that a person's keystroke echo is not taken for work. `None`
+/// means go on as any head: a pane with no agent is answered `agent_not_ready`
+/// there, which ends the retry.
+pub fn retry_hold(
+    live: bool,
+    agent: bool,
+    state: Option<AgentState>,
+    rule: &SubmitRule,
+    working_first: bool,
+) -> Option<&'static str> {
+    if !live || !agent {
+        return None;
+    }
+    let types_while_working = rule.while_working == WhileWorking::Queue;
+    (state == Some(AgentState::Working) && !types_while_working && working_first)
+        .then_some("agent_working")
+}
+
 /// Whether a submit waits instead of being answered `agent_blocked`: it was
 /// deferred, and the agent is there and waiting on its user. Only that wait
 /// is deferred; a pane that is not running an agent is answered at once.
@@ -1352,6 +1430,113 @@ mod tests {
     /// A turn that ends before the quiet point leaves no output after it, so
     /// it reads as a stall: the machine cannot tell such a turn from the
     /// prompt's own echo and redraw.
+    #[test]
+    fn only_a_passing_state_of_an_auto_message_is_retried() {
+        use Deliver::*;
+        for code in RETRY_CODES {
+            assert_eq!(retry_code(Auto, &Answer::Mailbox(code)), Some(code));
+            assert_eq!(retry_code(Auto, &Answer::TimedOut(code)), Some(code));
+            assert_eq!(retry_code(Submit, &Answer::Mailbox(code)), None);
+            assert_eq!(retry_code(Mailbox, &Answer::Mailbox(code)), None);
+        }
+        for code in [
+            "human_typing",
+            "agent_not_ready",
+            "pane_attended",
+            "paste_unavailable",
+            "too_many_lines",
+            "inbound_mailbox_only",
+            "no_such_target",
+            "agent_not_reading",
+            "agent_did_not_read",
+            "agent_too_slow",
+            "read_by_another_program",
+            "typed_over_read",
+            "agent_blocked_read",
+            "already_read",
+            "sender_closed",
+            "queue_full",
+        ] {
+            assert_eq!(retry_code(Auto, &Answer::Mailbox(code)), None, "{code}");
+        }
+        let refused = Answer::Refuse(SubmitRefusal::blocked("a"));
+        assert_eq!(retry_code(Auto, &refused), None);
+    }
+
+    #[test]
+    fn only_a_key_after_the_anchor_is_a_draft() {
+        let anchor = Instant::now();
+        let later = anchor + Duration::from_millis(1);
+        assert!(retry_met_a_draft(Some(later), Some(anchor)));
+        assert!(!retry_met_a_draft(Some(anchor), Some(anchor)));
+        assert!(!retry_met_a_draft(Some(anchor), Some(later)));
+        assert!(!retry_met_a_draft(None, Some(anchor)));
+        assert!(
+            !retry_met_a_draft(Some(later), None),
+            "keys on a prompt are not a draft"
+        );
+    }
+
+    #[test]
+    fn a_retry_lasts_an_hour_at_most_and_never_past_its_message() {
+        let now = Instant::now();
+        let hour = Duration::from_secs(3600);
+        assert_eq!(
+            retry_deadline(now, 1_000, 1_000 + 86_400_000, None),
+            now + hour
+        );
+        assert_eq!(
+            retry_deadline(now, 1_000, 61_000, None),
+            now + Duration::from_secs(60)
+        );
+        assert_eq!(
+            retry_deadline(now, 5_000, 1_000, None),
+            now,
+            "already expired"
+        );
+        let asked = now + Duration::from_secs(30);
+        assert_eq!(
+            retry_deadline(now, 1_000, 1_000 + 86_400_000, Some(asked)),
+            asked,
+            "a sender's --timeout bounds the retry"
+        );
+        assert_eq!(
+            retry_deadline(now, 1_000, 1_000 + 86_400_000, Some(now)),
+            now,
+            "a --timeout that ran out leaves nothing to retry"
+        );
+    }
+
+    #[test]
+    fn a_retry_holds_on_no_agent_and_on_work_its_row_does_not_type_into() {
+        let mailbox = SubmitRule::default();
+        let queue = SubmitRule {
+            while_working: WhileWorking::Queue,
+            ..SubmitRule::default()
+        };
+        let working = Some(AgentState::Working);
+        assert_eq!(retry_hold(false, false, None, &mailbox, true), None);
+        assert_eq!(
+            retry_hold(true, false, None, &mailbox, true),
+            None,
+            "a shell pane ends the retry at its precheck"
+        );
+        assert_eq!(
+            retry_hold(true, true, working, &mailbox, true),
+            Some("agent_working")
+        );
+        assert_eq!(retry_hold(true, true, working, &queue, true), None);
+        assert_eq!(
+            retry_hold(true, true, working, &mailbox, false),
+            None,
+            "a keystroke's echo is not work"
+        );
+        let idle = Some(AgentState::Idle);
+        assert_eq!(retry_hold(true, true, idle, &mailbox, true), None);
+        let blocked = Some(AgentState::NeedsInput);
+        assert_eq!(retry_hold(true, true, blocked, &mailbox, true), None);
+    }
+
     #[test]
     fn a_turn_inside_the_echo_window_is_a_known_gap() {
         let outputs: Vec<u64> = (50..=1050).step_by(100).collect();
