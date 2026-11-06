@@ -219,8 +219,7 @@
 # layout or close the pane. It and the popup terminal are never open together:
 # opening one closes the other.
 # In Monocle a float zoom is allowed, a fullscreen one has nothing to do. A View
-# has one zoom, the focused cell filling the view, so a float request there is
-# a fullscreen zoom.
+# zooms its focused cell the same way, with the local server's [zoom].
 #
 # Read by the server at startup: `remux restart` after a change.
 #

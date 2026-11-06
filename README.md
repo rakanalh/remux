@@ -262,7 +262,9 @@ height = 90
 
 `PaneToggleZoomFloat` always zooms as a float and `PaneToggleZoomFullscreen` always fills the tab (refused in Monocle), whatever the mode is. Neither has a default key (bind one, for example `"Alt-u" = "PaneToggleZoomFloat"`). Either action releases a zoom of either kind, so a tab is always in one zoom state. The status bar shows the `Z` for both.
 
-A float ends when you click outside the box (the click then acts as if the float had not been there), press `Alt-h/j/k/l` (the float snaps back and focus steps from that pane), split, cycle the layout, promote a master or close the pane. The float and the popup terminal are mutually exclusive: opening one closes the other. The box covers the area the tab's layout fills, so it does not cover a sidebar. A click anywhere outside the box ends the float, a sidebar included. In Monocle a float zoom is allowed, where a fullscreen one has nothing to do. A View has one zoom, the focused cell filling the view, so a float request there is a fullscreen zoom. `[zoom]` is read by the server at startup: `remux restart` after a change.
+A float ends when you click outside the box (the click then acts as if the float had not been there), press `Alt-h/j/k/l` (the float snaps back and focus steps from that pane), split, cycle the layout, promote a master or close the pane. The float and the popup terminal are mutually exclusive: opening one closes the other. The box covers the area the tab's layout fills, so it does not cover a sidebar. A click anywhere outside the box ends the float, a sidebar included. In Monocle a float zoom is allowed, where a fullscreen one has nothing to do. `[zoom]` is read by the server at startup: `remux restart` after a change.
+
+A View zooms its focused cell the same way, by the same commands and the same `[zoom]`: the local server's, since that server holds the View. A float there is the same box over the other cells, the aliased pane is sized to it, and it ends as a tab's does: a click outside the box, `Alt-h/j/k/l`, a layout change, adding a cell, removing the floated one, or its pane exiting. A fullscreen zoom follows focus, and it survives a layout change or a change of cells.
 
 ## Install / build / run
 
@@ -706,7 +708,7 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `PaneMoveDown` | — | Swap the focused pane with the pane below. In a stack of several panes, take it out of the stack into a new slot below. |
 | `PaneRename` | — | Rename the focused pane (prompts for the name). |
 | `PaneMoveToTab` | — | Pick a tab of any session on this server (or a session's `+ new tab`) and move the focused pane there. |
-| `PaneToggleZoom` | — | Toggle zoom for the focused pane, as `[zoom] mode` says: fullscreen (the default) or a float over the layout. Releases a zoom of either kind. |
+| `PaneToggleZoom` | — | Toggle zoom for the focused pane, or a View's focused cell, as `[zoom] mode` says: fullscreen (the default) or a float over the layout. Releases a zoom of either kind. |
 | `PaneToggleZoomFullscreen` | — | Toggle a fullscreen zoom for the focused pane whatever `[zoom] mode` says. It has no default key. Refused in Monocle; releases a zoom of either kind. |
 | `PaneToggleZoomFloat` | — | Toggle a float zoom for the focused pane whatever `[zoom] mode` says. It has no default key. Releases a zoom of either kind. |
 | `ResizeLeft` | `<amount>` | Resize the focused pane's left edge (default 1). |

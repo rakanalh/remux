@@ -24,16 +24,18 @@
 //! layout SHOWS demands its interior from its source pane, which reflows to fit
 //! (via the server's min-across-viewers sizing), so a pane added to a view fits
 //! the cell it is given. Cells the layout hides (Monocle's unfocused ones, the
-//! non-zoomed ones under zoom) watch read-only and impose no size demand, so a
-//! cell nobody sees never reflows the shared pane.
+//! others under a fullscreen zoom) watch read-only and impose no size demand, so
+//! a cell nobody sees never reflows the shared pane. A float zoom hides nothing:
+//! the floated cell demands its box and the others keep demanding their tiles.
 
 use crate::client::registry::ConnId;
 use crate::config::theme::CompositorTheme;
-use crate::config::BorderStyle;
+use crate::config::{BorderStyle, ZoomMode};
 use crate::protocol::{CellColor, ConnDescriptor, PaneId, RenderCell, ViewId, ViewInfo};
 use crate::server::compositor::{
     build_top_border_content, draw_right_segments, draw_tmux_dividers, draw_tmux_tab_bar,
-    draw_zellij_border, fits_zellij_border, status_right_segments, tab_strip_layout, HitRegions,
+    draw_zellij_border, fits_zellij_border, float_zoom_box, status_right_segments,
+    tab_strip_layout, HitRegions,
 };
 use crate::server::layout::{
     compute_layout, focus_in_direction, FocusDirection, LayoutMode, LayoutNode, Rect,
@@ -155,7 +157,7 @@ impl ViewCell {
 /// Phase 2: this is no longer the authoritative model. It is a per-terminal
 /// **render/view-model** rebuilt from the server's [`ViewInfo`] snapshot on every
 /// `ViewList` broadcast (see [`ClientView::from_info`]). Membership, `layout`,
-/// `custom_tree`, `focused` and `zoomed` all come FROM the server so every
+/// `custom_tree`, `focused` and `zoom` all come FROM the server so every
 /// terminal mirrors one shared arrangement; only per-terminal render state (each
 /// cell's last [`PaneSnapshot`], title, disconnected flag) and pixel geometry are
 /// local. The geometry helpers ([`cell_rects`], the Monocle strip, hit-testing,
@@ -183,11 +185,13 @@ pub struct ClientView {
     /// cell; while `Some` the layout name reads `custom` and rects come from this
     /// tree instead of a fresh automatic build. `LayoutNext` resets it to `None`.
     pub custom_tree: Option<LayoutNode>,
-    /// When `true`, only the focused cell is shown (filling the whole cell area);
-    /// every other cell is hidden. Mirrors a normal tab's zoom. Independent of
-    /// `layout`/`custom_tree`, exactly as the server's `zoomed_pane` is
-    /// independent of `layout_mode`.
-    pub zoomed: bool,
+    /// How the focused cell is zoomed, `None` when it is not. `Fullscreen` shows
+    /// only that cell, filling the whole cell area. `Float` shows it in a box
+    /// over the arrangement. Independent of `layout`/`custom_tree`, exactly as
+    /// the server's `zoomed_pane` is independent of `layout_mode`.
+    pub zoom: Option<ZoomMode>,
+    /// The server's `(width_pct, height_pct)` for a float's box.
+    pub float_pct: (u8, u8),
 }
 
 /// Map a wire [`ConnDescriptor`] (as carried in a `ViewInfo` cell) to the
@@ -214,13 +218,14 @@ impl ClientView {
             layout: LayoutMode::Grid(crate::server::layout::GridLayout),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         }
     }
 
     /// Rebuild this per-terminal view-model from a server [`ViewInfo`] snapshot.
     ///
-    /// Membership / `layout` / `custom_tree` / `focused` / `zoomed` are taken
+    /// Membership / `layout` / `custom_tree` / `focused` / `zoom` are taken
     /// verbatim from the server (the shared arrangement). Per-terminal render
     /// state — each cell's last [`PaneSnapshot`], learned title, and
     /// exited / disconnected / unavailable flags — is carried over from `prev` (this view's previous cache entry, if
@@ -267,8 +272,15 @@ impl ClientView {
             layout: info.layout.clone(),
             focused,
             custom_tree: info.custom_tree.clone(),
-            zoomed: info.zoomed,
+            zoom: info.zoomed.then_some(info.zoom_mode),
+            float_pct: info.float_pct,
         }
+    }
+
+    /// The index of the cell shown as a float zoom, if there is one.
+    pub fn floated(&self) -> Option<usize> {
+        (self.zoom == Some(ZoomMode::Float) && self.focused < self.cells.len())
+            .then_some(self.focused)
     }
 
     /// Build the automatic layout tree over the current cells (keyed by stable
@@ -428,11 +440,12 @@ pub fn cells_area(area: Rect) -> Rect {
 /// (`cells_area().height < 2`). The focused cell renders BELOW this strip; see
 /// [`cell_rects`], which subtracts it so the focused cell never overwrites it.
 pub fn monocle_strip_rect(view: &ClientView, area: Rect) -> Option<Rect> {
-    // No strip when zoomed (the focused cell fills everything) or when a manual
-    // `custom_tree` is active (cells are tiled, not stacked). Keeping the guard
-    // here means `cell_rects`, `composite` and `cell_at` can never disagree
+    // No strip under a fullscreen zoom (the focused cell fills everything) or
+    // when a manual `custom_tree` is active (cells are tiled, not stacked). A
+    // float leaves the arrangement as it is, so the strip stays. Keeping the
+    // guard here means `cell_rects`, `composite` and `cell_at` can never disagree
     // about whether the strip row exists.
-    if view.zoomed || view.custom_tree.is_some() {
+    if view.zoom == Some(ZoomMode::Fullscreen) || view.custom_tree.is_some() {
         return None;
     }
     if !matches!(view.layout, LayoutMode::Monocle(_)) {
@@ -458,24 +471,74 @@ pub fn monocle_strip_rect(view: &ClientView, area: Rect) -> Option<Rect> {
 ///
 /// The cells are keyed by their stable [`ViewCell::id`], so an active
 /// `custom_tree` (built once and mutated by resize/move) survives cell add/remove
-/// without index shifts corrupting it. When `zoomed`, only the focused cell is
-/// placed (filling the whole cell area); when a `custom_tree` is present it drives
-/// the rects; otherwise a fresh automatic tree is built from the current ids.
+/// without index shifts corrupting it. Under a fullscreen zoom only the focused
+/// cell is placed (filling the whole cell area), and under a float it is placed
+/// at the box with every other cell where the layout puts it. Otherwise a
+/// `custom_tree` drives the rects, or a fresh automatic tree built from the
+/// current ids.
 pub fn cell_rects(view: &ClientView, area: Rect) -> Vec<Option<Rect>> {
     let n = view.cells.len();
     if n == 0 {
         return Vec::new();
     }
     // Zoom: the focused cell fills the entire cell area, everything else hidden.
-    // The strip is suppressed while zoomed (see `monocle_strip_rect`), so the
+    // The strip is suppressed under this zoom (see `monocle_strip_rect`), so the
     // focused cell gets the full `cells_area`.
-    if view.zoomed {
+    if view.zoom == Some(ZoomMode::Fullscreen) {
         let mut out = vec![None; n];
         if view.focused < n {
             out[view.focused] = Some(cells_area(area));
         }
         return out;
     }
+    let mut out = layout_rects(view, area);
+    if let (Some(floated), Some(rect)) = (view.floated(), float_box(view, area)) {
+        out[floated] = Some(rect);
+    }
+    out
+}
+
+/// The box a float zoom is drawn in, frame included, or `None` with no float. A
+/// tab's box comes from the same function over the same area, the rows above the
+/// status bar of the rect the content is drawn in.
+pub fn float_box(view: &ClientView, area: Rect) -> Option<Rect> {
+    view.floated()?;
+    Some(float_zoom_box(cells_area(area), view.float_pct).0)
+}
+
+/// The border style of cell `idx`. A float is always framed, as a tab's is,
+/// because its box and the size of its pane do not depend on the session's style.
+pub fn cell_style<'a>(view: &ClientView, idx: usize, style: &'a BorderStyle) -> &'a BorderStyle {
+    if view.floated() == Some(idx) {
+        &BorderStyle::ZellijStyle
+    } else {
+        style
+    }
+}
+
+/// Whether a press ends the float: there is one, and the press is outside its
+/// box. `at` is the press in the view's coordinates, and `None` is a press
+/// outside the view, on a sidebar, which is outside the box too.
+pub fn press_ends_float(view: &ClientView, area: Rect, at: Option<(u16, u16)>) -> bool {
+    float_box(view, area).is_some_and(|rect| !at.is_some_and(|(x, y)| rect_holds(rect, x, y)))
+}
+
+fn rect_holds(rect: Rect, x: u16, y: u16) -> bool {
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+}
+
+/// The index of the cell on top at `(x, y)`, given [`cell_rects`]. A float's box
+/// overlaps the tiles of other cells, so it is tested first.
+fn cell_on_top(view: &ClientView, rects: &[Option<Rect>], x: u16, y: u16) -> Option<usize> {
+    let holds = |r: &Option<Rect>| r.is_some_and(|rect| rect_holds(rect, x, y));
+    view.floated()
+        .filter(|&i| rects.get(i).is_some_and(holds))
+        .or_else(|| rects.iter().position(holds))
+}
+
+/// Where the layout puts each cell, ignoring any zoom. See [`cell_rects`].
+fn layout_rects(view: &ClientView, area: Rect) -> Vec<Option<Rect>> {
+    let n = view.cells.len();
     let mut inner = cells_area(area);
     // Monocle reserves the top row of the cell area for the title strip, so the
     // focused cell tiles the region BELOW it (never overwriting the strip).
@@ -599,9 +662,20 @@ pub fn composite(
         return buf;
     }
 
-    let rects = cell_rects(view, area);
+    // The floated cell's tile keeps its place as an empty, unfocused frame, as a
+    // tab's slot does: its pane has the size of the box, so it cannot fill the
+    // tile.
+    let floated = view.floated();
+    let rects = match floated {
+        Some(_) => layout_rects(view, area),
+        None => cell_rects(view, area),
+    };
     for (i, cell) in view.cells.iter().enumerate() {
         if let Some(Some(rect)) = rects.get(i) {
+            if floated == Some(i) {
+                draw_cell_frame(&mut buf, area, *rect, cell, false, theme, mode, style);
+                continue;
+            }
             draw_cell(
                 &mut buf,
                 area,
@@ -646,6 +720,30 @@ pub fn composite(
     if let Some(strip) = monocle_strip_rect(view, area) {
         draw_monocle_strip(&mut buf, area, strip, view, theme, mode, style);
     }
+    if let (Some(i), Some(rect)) = (floated, float_box(view, area)) {
+        // Cleared first, so a snapshot smaller than the box shows nothing of what
+        // is under it.
+        for row in rect.y..rect.y.saturating_add(rect.height) {
+            for col in rect.x..rect.x.saturating_add(rect.width) {
+                put(
+                    &mut buf,
+                    row.saturating_sub(area.y) as usize,
+                    col.saturating_sub(area.x) as usize,
+                    RenderCell::default(),
+                );
+            }
+        }
+        draw_cell(
+            &mut buf,
+            area,
+            rect,
+            &view.cells[i],
+            true,
+            theme,
+            mode,
+            &BorderStyle::ZellijStyle,
+        );
+    }
     buf
 }
 
@@ -666,6 +764,13 @@ pub fn cell_at(
     if view.cells.is_empty() {
         return None;
     }
+    let rects = cell_rects(view, area);
+    // A float is on top of everything, the strip included.
+    if let Some(floated) = view.floated() {
+        if rects[floated].is_some_and(|rect| rect_holds(rect, x, y)) {
+            return Some(floated);
+        }
+    }
     // Monocle title strip: a click on a strip entry focuses that cell. The strip
     // (row `strip.y`) and the focused cell rect (below it) never overlap, so
     // checking it first is unambiguous.
@@ -681,13 +786,7 @@ pub fn cell_at(
             }
         }
     }
-    let rects = cell_rects(view, area);
-    rects.iter().position(|r| match r {
-        Some(rect) => {
-            x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
-        }
-        None => false,
-    })
+    cell_on_top(view, &rects, x, y)
 }
 
 /// The region of the screen a cell's content actually occupies, and where the
@@ -745,7 +844,7 @@ pub fn cell_content_geometry(
         rect.y as usize,
         rect.width as usize,
         rect.height as usize,
-        style,
+        cell_style(view, idx, style),
     );
     if iw == 0 || ih == 0 {
         return None;
@@ -799,12 +898,7 @@ pub fn cell_content_at(
     y: u16,
     style: &BorderStyle,
 ) -> Option<(usize, u16, u16)> {
-    let idx = cell_rects(view, area).iter().position(|r| match r {
-        Some(rect) => {
-            x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
-        }
-        None => false,
-    })?;
+    let idx = cell_on_top(view, &cell_rects(view, area), x, y)?;
     let g = cell_content_geometry(view, area, idx, style)?;
     if x < g.origin.0 || x >= g.origin.0 + g.cols || y < g.origin.1 || y >= g.origin.1 + g.rows {
         return None;
@@ -849,7 +943,7 @@ pub fn focused_cursor(view: &ClientView, area: Rect, style: &BorderStyle) -> Opt
     if rw == 0 || rh == 0 {
         return None;
     }
-    let (ix, iy, iw, ih) = cell_interior(rx, ry, rw, rh, style);
+    let (ix, iy, iw, ih) = cell_interior(rx, ry, rw, rh, cell_style(view, view.focused, style));
     if iw == 0 || ih == 0 {
         return None;
     }
@@ -900,7 +994,7 @@ pub fn focused_cell_visual_scope(
         rect.y as usize,
         rect.width as usize,
         rect.height as usize,
-        style,
+        cell_style(view, idx, style),
     );
     if iw == 0 || ih == 0 {
         return None;
@@ -992,6 +1086,30 @@ fn draw_cell(
     mode: &str,
     style: &BorderStyle,
 ) {
+    let Some((ix, iy, iw, ih)) =
+        draw_cell_frame(buf, area, rect, cell, focused, theme, mode, style)
+    else {
+        return;
+    };
+    if iw == 0 || ih == 0 {
+        return;
+    }
+    draw_cell_content(buf, cell, ix, iy, iw, ih);
+}
+
+/// Draw the frame of a cell, if `style` gives it one, and return its interior in
+/// buffer coordinates. `None` for a rect with no area.
+#[allow(clippy::too_many_arguments)]
+fn draw_cell_frame(
+    buf: &mut [Vec<RenderCell>],
+    area: Rect,
+    rect: Rect,
+    cell: &ViewCell,
+    focused: bool,
+    theme: &CompositorTheme,
+    mode: &str,
+    style: &BorderStyle,
+) -> Option<(usize, usize, usize, usize)> {
     let ox = area.x as usize;
     let oy = area.y as usize;
     let rx = (rect.x as usize).saturating_sub(ox);
@@ -999,7 +1117,7 @@ fn draw_cell(
     let rw = rect.width as usize;
     let rh = rect.height as usize;
     if rw == 0 || rh == 0 {
-        return;
+        return None;
     }
 
     let (ix, iy, iw, ih) = cell_interior(rx, ry, rw, rh, style);
@@ -1026,11 +1144,19 @@ fn draw_cell(
             theme,
         );
     }
+    Some((ix, iy, iw, ih))
+}
 
-    if iw == 0 || ih == 0 {
-        return;
-    }
-
+/// Paint what a cell holds into its interior: the snapshot, or the label that
+/// says why there is none.
+fn draw_cell_content(
+    buf: &mut [Vec<RenderCell>],
+    cell: &ViewCell,
+    ix: usize,
+    iy: usize,
+    iw: usize,
+    ih: usize,
+) {
     // The source PANE is gone: the server said so, which outranks every other
     // state -- `disconnected`/`unavailable` are guesses about reachability, this
     // is a reported fact. Any snapshot still held is stale by definition, so it
@@ -1583,7 +1709,8 @@ mod tests {
             layout,
             focused,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         }
     }
 
@@ -1596,6 +1723,116 @@ mod tests {
     }
 
     // -- Mouse/visual mapping into a cell's content --------------------------
+
+    fn floated(n: usize, layout: LayoutMode, focused: usize) -> ClientView {
+        let mut v = view_n(n, layout, focused);
+        v.zoom = Some(ZoomMode::Float);
+        v.float_pct = (60, 50);
+        v
+    }
+
+    #[test]
+    fn a_float_moves_only_the_focused_cell_to_the_box() {
+        let a = area(120, 40);
+        let tiled = cell_rects(&view_n(2, gridv(), 1), a);
+        let v = floated(2, gridv(), 1);
+        let (rect, _) = float_zoom_box(cells_area(a), (60, 50));
+        let rects = cell_rects(&v, a);
+        assert_eq!(rects[0], tiled[0], "the other cell keeps its tile");
+        assert_eq!(rects[1], Some(rect));
+        assert_ne!(rects[1], tiled[1]);
+    }
+
+    #[test]
+    fn a_float_demands_the_interior_of_a_tabs_box_under_either_style() {
+        let a = area(120, 40);
+        let v = floated(2, gridv(), 0);
+        let (rect, interior) = float_zoom_box(cells_area(a), (60, 50));
+        for style in [BorderStyle::ZellijStyle, BorderStyle::TmuxStyle] {
+            assert_eq!(
+                cell_content_size(rect, cell_style(&v, 0, &style)),
+                (interior.width, interior.height),
+                "{style:?}"
+            );
+            assert_eq!(cell_style(&v, 1, &style), &style, "the other cell's style");
+        }
+    }
+
+    #[test]
+    fn a_click_in_the_box_lands_on_the_float_over_a_lower_cell() {
+        let a = area(120, 40);
+        let v = floated(2, gridv(), 1);
+        let rect = float_box(&v, a).unwrap();
+        let theme = CompositorTheme::default();
+        let style = BorderStyle::ZellijStyle;
+        let over_the_left_tile = (rect.x + 3, rect.y + 3);
+        assert!(over_the_left_tile.0 < 60);
+        let (x, y) = over_the_left_tile;
+        assert_eq!(cell_at(&v, a, x, y, &style, &theme), Some(1));
+        assert_eq!(cell_at(&v, a, 3, 3, &style, &theme), Some(0));
+        assert_eq!(
+            cell_at(&v, a, 115, 3, &style, &theme),
+            None,
+            "the empty slot"
+        );
+    }
+
+    #[test]
+    fn a_press_ends_a_float_only_outside_its_box() {
+        let a = area(120, 40);
+        let v = floated(2, gridv(), 0);
+        let rect = float_box(&v, a).unwrap();
+        assert!(!press_ends_float(&v, a, Some((rect.x, rect.y))));
+        assert!(press_ends_float(&v, a, Some((rect.x - 1, rect.y))));
+        assert!(press_ends_float(
+            &v,
+            a,
+            Some((rect.x, rect.y + rect.height))
+        ));
+        assert!(press_ends_float(&v, a, None), "a press on a sidebar");
+
+        let mut full = v.clone();
+        full.zoom = Some(ZoomMode::Fullscreen);
+        assert!(!press_ends_float(&full, a, Some((0, 0))));
+        assert!(!press_ends_float(&full, a, None));
+    }
+
+    #[test]
+    fn a_float_keeps_the_monocle_strip() {
+        let a = area(80, 24);
+        assert!(monocle_strip_rect(&floated(2, monoclev(), 0), a).is_some());
+    }
+
+    #[test]
+    fn a_float_paints_the_other_cell_a_frame_in_the_slot_and_nothing_under_the_box() {
+        let a = area(120, 40);
+        let cells = vec![
+            cell_with(1, Some(snap_filled(58, 37, 'A'))),
+            cell_with(2, Some(snap_filled(5, 2, 'B'))),
+        ];
+        let mut v = view_of(cells, gridv(), 1);
+        v.zoom = Some(ZoomMode::Float);
+        v.float_pct = (60, 50);
+        let buf = composite(
+            &v,
+            a,
+            &CompositorTheme::default(),
+            "NORMAL",
+            &BorderStyle::TmuxStyle,
+        );
+        let rect = float_box(&v, a).unwrap();
+        assert_eq!(buf[0][0].c, 'A', "the other cell is still drawn");
+        assert_eq!(
+            buf[rect.y as usize][rect.x as usize].c, '╭',
+            "tmux style too"
+        );
+        assert_eq!(buf[rect.y as usize + 1][rect.x as usize + 1].c, 'B');
+        assert_eq!(
+            buf[rect.y as usize + 3][rect.x as usize + 1].c,
+            ' ',
+            "the other cell's tile does not show through the box"
+        );
+    }
 
     /// A snapshot whose row `r` is the digit `r % 10`, so a mapped row is
     /// identifiable from the character it addresses.
@@ -1883,7 +2120,7 @@ mod tests {
     #[test]
     fn zoom_shows_only_focused_full_cell_area() {
         let mut v = view_n(3, gridv(), 1);
-        v.zoomed = true;
+        v.zoom = Some(ZoomMode::Fullscreen);
         let a = area(80, 24);
         let rects = cell_rects(&v, a);
         assert_eq!(rects[1], Some(cells_area(a)), "focused fills the cell area");
@@ -1892,7 +2129,7 @@ mod tests {
         let mut v2 = view_n(2, gridv(), 0);
         v2.cells[0].snapshot = Some(snap_filled(40, 10, 'A'));
         v2.cells[1].snapshot = Some(snap_filled(40, 10, 'B'));
-        v2.zoomed = true;
+        v2.zoom = Some(ZoomMode::Fullscreen);
         let buf = composite(&v2, a, &tt(), "NORMAL", &zj());
         let joined: String = buf.iter().flat_map(|r| r.iter().map(|c| c.c)).collect();
         assert!(joined.contains('A') && !joined.contains('B'));
@@ -1901,7 +2138,7 @@ mod tests {
     #[test]
     fn zoom_suppresses_monocle_strip() {
         let mut v = view_n(3, monoclev(), 1);
-        v.zoomed = true;
+        v.zoom = Some(ZoomMode::Fullscreen);
         assert!(monocle_strip_rect(&v, area(80, 24)).is_none());
     }
 
@@ -2123,7 +2360,7 @@ mod tests {
         assert_eq!(monocle_strip_rect(&mv, area(80, 0)), None);
         // Zoom and custom_tree both suppress the strip even in Monocle.
         let mut zoomed = view_n(2, monoclev(), 0);
-        zoomed.zoomed = true;
+        zoomed.zoom = Some(ZoomMode::Fullscreen);
         assert_eq!(monocle_strip_rect(&zoomed, area(80, 24)), None);
         let mut custom = view_n(2, monoclev(), 0);
         custom.custom_tree = Some(custom.auto_tree());
@@ -2143,7 +2380,8 @@ mod tests {
             layout: monoclev(),
             focused: 1,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let theme = tt();
         let a = area(80, 24);
@@ -2195,7 +2433,8 @@ mod tests {
             layout: monoclev(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let a = area(80, 24);
         let buf = composite(&view, a, &tt(), "NORMAL", &zj());
@@ -2226,7 +2465,8 @@ mod tests {
             layout: monoclev(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let a = area(80, 24);
         let buf = composite(&view, a, &tt(), "NORMAL", &zj());
@@ -2252,7 +2492,8 @@ mod tests {
             layout: monoclev(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let a = area(80, 24);
         // Locate beta's entry on the strip via the same segment layout used to
@@ -2378,7 +2619,8 @@ mod tests {
             layout: monoclev(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         for (w, h) in [(1u16, 1u16), (5, 1), (10, 2), (10, 3), (0, 0)] {
             let buf = composite(&view, area(w, h), &tt(), "NORMAL", &zj());
@@ -2415,7 +2657,8 @@ mod tests {
             layout: gridv(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let a = area(80, 24);
         let buf = composite(&view, a, &tt(), "NORMAL", &zj());
@@ -2441,7 +2684,8 @@ mod tests {
             layout: gridv(),
             focused: 1,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let a = area(80, 24);
         let theme = tt();
@@ -2510,7 +2754,8 @@ mod tests {
             layout: gridv(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let a = area(80, 24);
         let buf = composite(&view, a, &tt(), "NORMAL", &zj());
@@ -2539,7 +2784,8 @@ mod tests {
             layout: gridv(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let a = area(80, 24);
         let buf = composite(&view, a, &tt(), "NORMAL", &zj());
@@ -2556,7 +2802,8 @@ mod tests {
             layout: gridv(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let buf = composite(&view, area(80, 24), &tt(), "NORMAL", &zj());
         // A cell with no snapshot yet shows a `waiting…` placeholder.
@@ -2629,6 +2876,8 @@ mod tests {
             custom_tree: None,
             focused: 0,
             zoomed: false,
+            zoom_mode: ZoomMode::Fullscreen,
+            float_pct: (90, 90),
         };
         let rebuilt = ClientView::from_info(&info, Some(&prev));
         assert_eq!(
@@ -2700,6 +2949,8 @@ mod tests {
             custom_tree: None,
             focused: 0,
             zoomed: false,
+            zoom_mode: ZoomMode::Fullscreen,
+            float_pct: (90, 90),
         };
         let rebuilt = ClientView::from_info(&info, Some(&prev));
         assert!(rebuilt.cells[0].exited);
@@ -2716,7 +2967,8 @@ mod tests {
             layout: gridv(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let buf = composite(&view, area(80, 24), &tt(), "NORMAL", &zj());
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
@@ -2737,7 +2989,8 @@ mod tests {
             layout: monoclev(),
             focused: 1,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let buf = composite(&view, area(80, 24), &tt(), "NORMAL", &zj());
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
@@ -2758,7 +3011,8 @@ mod tests {
             layout: gridv(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let a = area(80, 24);
         let rects = cell_rects(&view, a);
@@ -2785,7 +3039,8 @@ mod tests {
             layout: monoclev(),
             focused: 1,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         assert_eq!(cell_at(&view, area(80, 24), 5, 5, &zj(), &tt()), Some(1));
     }
@@ -2803,7 +3058,8 @@ mod tests {
             layout: gridv(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         let a = area(80, 24);
         // Focused cell 0: interior origin (ix=1, iy=1); snapshot (10 rows) fits in
@@ -2823,7 +3079,8 @@ mod tests {
             layout: gridv(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         assert_eq!(focused_cursor(&view2, a, &zj()), None);
 
@@ -2840,7 +3097,8 @@ mod tests {
             layout: gridv(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         assert_eq!(focused_cursor(&view3, a, &zj()), None);
     }
@@ -2878,7 +3136,8 @@ mod tests {
             layout: gridv(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         // Sanity: confirm the grid lays 4 cells as a 2x2 (two rows of two), so
         // the neighbor expectations below are the geometric truth.
@@ -2935,7 +3194,8 @@ mod tests {
             layout: gridv(),
             focused: 1, // B (bottom) focused
             custom_tree: Some(tree),
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         // Focus UP from the bottom cell must reach the TOP cell (index 0 = A).
         assert!(
@@ -2961,7 +3221,8 @@ mod tests {
             layout: monoclev(),
             focused: 0,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         assert!(view.move_focus(FocusDirection::Right, cells));
         assert_eq!(view.focused, 1);
@@ -2989,7 +3250,8 @@ mod tests {
             layout: gridv(),
             focused: 2,
             custom_tree: None,
-            zoomed: false,
+            zoom: None,
+            float_pct: (90, 90),
         };
         view.cells.pop();
         view.clamp_focus();
@@ -3015,7 +3277,8 @@ mod tests {
                 layout,
                 focused: 0,
                 custom_tree: None,
-                zoomed: false,
+                zoom: None,
+                float_pct: (90, 90),
             };
             let a = area(80, 24);
             let buf = composite(&view, a, &tt(), "NORMAL", &zj());
