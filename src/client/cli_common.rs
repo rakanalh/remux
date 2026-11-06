@@ -1,6 +1,7 @@
-//! Plumbing shared by the one-shot CLI verbs (`remux msg`, `remux agent`):
-//! one request, one answer, a deadline on each, a fixed exit code, and
-//! nothing printed that the server or a message chose without escaping it.
+//! Plumbing shared by the one-shot CLI verbs (`remux msg`, `remux agent`,
+//! `remux kill`): send, wait for one answer, a deadline on each, a fixed exit
+//! code, and nothing printed that the server or a message chose without
+//! escaping it.
 //!
 //! These verbs are run by agents and their hooks as much as by people, so
 //! they never start a server (a message to a server that was not running has
@@ -131,6 +132,15 @@ pub(crate) fn finish(result: Result<(), CliError>, json: bool) -> u8 {
 
 /// Connect, send `msg`, and wait up to `deadline` for its answer.
 pub(crate) async fn ask(msg: ClientMessage, deadline: Duration) -> Result<ServerMessage, CliError> {
+    ask_in_order(vec![msg], deadline).await
+}
+
+/// Connect, send `msgs` in order, and wait up to `deadline` for the first
+/// answer to any of them.
+async fn ask_in_order(
+    msgs: Vec<ClientMessage>,
+    deadline: Duration,
+) -> Result<ServerMessage, CliError> {
     if !socket_path().exists() {
         return Err(CliError::NoServer);
     }
@@ -144,10 +154,12 @@ pub(crate) async fn ask(msg: ClientMessage, deadline: Duration) -> Result<Server
                 CliError::Transport(format!("{e:#}"))
             }
         })?;
-    client
-        .send(msg)
-        .await
-        .map_err(|e| CliError::Transport(format!("{e:#}")))?;
+    for msg in msgs {
+        client
+            .send(msg)
+            .await
+            .map_err(|e| CliError::Transport(format!("{e:#}")))?;
+    }
     // One deadline for the whole wait, so a stream of pushes cannot extend it.
     let answer = tokio::time::timeout(deadline, async {
         loop {
@@ -171,6 +183,35 @@ pub(crate) async fn ask(msg: ClientMessage, deadline: Duration) -> Result<Server
             message,
         }),
         Some(answer) => Ok(answer),
+    }
+}
+
+/// `remux kill`: the exit code of killing session `name`.
+pub(crate) async fn run_kill(name: &str) -> u8 {
+    run_verb(kill(name), false).await
+}
+
+/// A successful `KillSession` has no answer, because the server tells only the
+/// clients attached to the session, and this connection is never attached. The
+/// server handles a connection's messages one at a time and in order, so the
+/// `ListSessions` behind the kill is answered once the kill is done, and a
+/// refused kill answers first with its `Error`.
+async fn kill(name: &str) -> Result<(), CliError> {
+    let kill = ClientMessage::KillSession {
+        name: name.to_string(),
+    };
+    match ask_in_order(vec![kill, ClientMessage::ListSessions], REPLY_DEADLINE).await? {
+        ServerMessage::SessionList { sessions } if sessions.iter().any(|s| s.name == name) => {
+            Err(CliError::Refused {
+                code: "not_killed".to_string(),
+                message: format!("the server still lists session '{name}'"),
+            })
+        }
+        ServerMessage::SessionList { .. } => {
+            println!("Killed session '{}'.", escape(name));
+            Ok(())
+        }
+        other => Err(unexpected(&other)),
     }
 }
 
