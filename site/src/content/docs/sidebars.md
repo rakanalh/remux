@@ -135,6 +135,8 @@ A built-in file browser with nothing to install or configure.
 
 `Enter` on a file opens a new split running an editor, and the keyboard moves to that split with it. `l` never opens a file; only `Enter` does.
 
+Inside a [View](/remux/views/), opening a file leaves the view and opens the split in the session you entered the view from. If that session is gone, the split opens in the most recent other live session you held on that server. If there is none, the view stays and nothing opens.
+
 The editor is resolved **on the server that holds the file**: the panel's `editor` if you set one, else that server's `$EDITOR`, else `vi`. That matters for remotes, where your local `$EDITOR` may not exist.
 
 ```toml
