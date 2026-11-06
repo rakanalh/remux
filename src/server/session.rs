@@ -90,8 +90,10 @@ pub struct ServerView {
     pub custom_tree: Option<LayoutNode>,
     /// Index into `cells` of the focused cell.
     pub focused: usize,
-    /// Whether only the focused cell is shown (zoom).
-    pub zoomed: bool,
+    /// How the focused cell is zoomed, `None` when it is not. A zoom always
+    /// names the focused cell, so this one field is what a tab's `zoomed_pane`
+    /// and `zoom_mode` are together.
+    pub zoom: Option<ZoomMode>,
     /// Monotonic source for this view's [`CellId`]s.
     next_cell_id: CellId,
 }
@@ -106,7 +108,7 @@ impl ServerView {
             layout,
             custom_tree: None,
             focused: 0,
-            zoomed: false,
+            zoom: None,
             next_cell_id: 1,
         }
     }
@@ -122,10 +124,28 @@ impl ServerView {
     }
 
     /// Switch to the automatic layout `mode`. A view keeps no saved manual
-    /// arrangement, so the custom tree is dropped rather than remembered.
+    /// arrangement, so the custom tree is dropped rather than remembered. A
+    /// float ends, as it does in a tab, and a fullscreen zoom stays.
     fn set_layout(&mut self, mode: LayoutMode) {
         self.layout = mode;
         self.custom_tree = None;
+        self.release_float_zoom();
+    }
+
+    /// Whether the cells are stacked one at a time. A hand-arranged view keeps
+    /// its `layout` as Monocle under a `custom_tree`, which tiles the cells.
+    fn is_monocle(&self) -> bool {
+        matches!(self.layout, LayoutMode::Monocle(_)) && self.custom_tree.is_none()
+    }
+
+    /// End a float zoom, leaving a fullscreen zoom alone. Returns whether one
+    /// was released.
+    fn release_float_zoom(&mut self) -> bool {
+        let floated = self.zoom == Some(ZoomMode::Float);
+        if floated {
+            self.zoom = None;
+        }
+        floated
     }
 
     /// The stable id of the focused cell, or `0` when the view is empty.
@@ -867,6 +887,7 @@ impl ServerState {
     /// survives the add. Fail-silent if the view is absent.
     pub fn view_add_cells(&mut self, id: ViewId, cells: Vec<(ConnDescriptor, PaneId)>) {
         if let Some(v) = self.find_view_mut(id) {
+            v.release_float_zoom();
             for (conn, pane_id) in cells {
                 let cell_id = v.next_cell_id;
                 v.next_cell_id += 1;
@@ -889,26 +910,39 @@ impl ServerState {
         }
     }
 
-    /// Remove cell `cell_id` from view `id`, pruning it from any custom tree and
-    /// re-clamping focus. Fail-silent on unknown view/cell.
+    /// Remove cell `cell_id` from view `id`, pruning it from any custom tree.
+    /// Focus stays on the cell it was on, or is clamped if that cell went. A zoom
+    /// names the focused cell, so removing a lower cell without this would move
+    /// the zoom to another pane. Fail-silent on unknown view/cell.
     pub fn view_remove_cell(&mut self, id: ViewId, cell_id: CellId) {
         if let Some(v) = self.find_view_mut(id) {
             if let Some(idx) = v.index_of_id(cell_id) {
+                if idx == v.focused {
+                    v.release_float_zoom();
+                }
                 v.cells.remove(idx);
                 if let Some(tree) = v.custom_tree.as_mut() {
                     if tree.close_pane(cell_id).is_none() {
                         v.custom_tree = None;
                     }
                 }
+                if idx < v.focused {
+                    v.focused -= 1;
+                }
                 v.clamp_focus();
             }
         }
     }
 
-    /// Focus cell `cell_id` within view `id`. Fail-silent on unknown view/cell.
+    /// Focus cell `cell_id` within view `id`. Moving to another cell ends a
+    /// float, which would otherwise move to the cell focused, and a fullscreen
+    /// zoom follows focus. Fail-silent on unknown view/cell.
     pub fn view_set_focus(&mut self, id: ViewId, cell_id: CellId) {
         if let Some(v) = self.find_view_mut(id) {
             if let Some(idx) = v.index_of_id(cell_id) {
+                if idx != v.focused {
+                    v.release_float_zoom();
+                }
                 v.focused = idx;
             }
         }
@@ -960,11 +994,25 @@ impl ServerState {
         Ok(true)
     }
 
-    /// Toggle focus-cell zoom for view `id`.
-    pub fn view_toggle_zoom(&mut self, id: ViewId) {
-        if let Some(v) = self.find_view_mut(id) {
-            v.zoomed = !v.zoomed;
+    /// Toggle focus-cell zoom for view `id`, as [`Tab::toggle_zoom`] does for a
+    /// tab: a zoom of either kind is released whatever `mode` says, and only
+    /// taking one can be refused. `Err` names why.
+    pub fn view_toggle_zoom(&mut self, id: ViewId, mode: ZoomMode) -> Result<(), &'static str> {
+        let v = self.find_view_mut(id).ok_or("no such view")?;
+        if v.zoom.is_some() {
+            v.zoom = None;
+        } else if mode == ZoomMode::Fullscreen && v.is_monocle() {
+            return Err("Monocle is already full-area");
+        } else {
+            v.zoom = Some(mode);
         }
+        Ok(())
+    }
+
+    /// End view `id`'s float zoom. Returns whether one was released.
+    pub fn view_release_float(&mut self, id: ViewId) -> bool {
+        self.find_view_mut(id)
+            .is_some_and(ServerView::release_float_zoom)
     }
 
     /// Switch view `id` to the Master layout and promote its focused cell into
@@ -984,7 +1032,7 @@ impl ServerState {
         }
         let focused = v.focused_id();
         v.custom_tree = None;
-        v.zoomed = false;
+        v.zoom = None;
         if !matches!(v.layout, LayoutMode::Master(_)) {
             v.layout = LayoutMode::Master(MasterLayout::default());
         }
@@ -2327,13 +2375,14 @@ mod tests {
             id,
             vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
         );
-        st.view_toggle_zoom(id);
+        st.view_toggle_zoom(id, ZoomMode::Fullscreen).unwrap();
         assert_eq!(st.view_set_layout(id, "grid", &enabled), Ok(false));
         assert_eq!(st.view_set_layout(id, "rows", &enabled), Ok(true));
         assert_eq!(st.views[0].layout_name(), "rows");
-        assert!(
-            st.views[0].zoomed,
-            "a switch keeps the zoom, as a cycle does"
+        assert_eq!(
+            st.views[0].zoom,
+            Some(ZoomMode::Fullscreen),
+            "a switch keeps a fullscreen zoom, as a cycle does"
         );
         {
             let v = st.find_view_mut(id).unwrap();
@@ -2386,11 +2435,58 @@ mod tests {
             "cycling layout drops the custom tree"
         );
         assert_ne!(st.views[0].layout_name(), "custom");
-        assert!(!st.views[0].zoomed);
-        st.view_toggle_zoom(id);
-        assert!(st.views[0].zoomed);
-        st.view_toggle_zoom(id);
-        assert!(!st.views[0].zoomed);
+        assert_eq!(st.views[0].zoom, None);
+        st.view_toggle_zoom(id, ZoomMode::Float).unwrap();
+        assert_eq!(st.views[0].zoom, Some(ZoomMode::Float));
+        st.view_toggle_zoom(id, ZoomMode::Fullscreen).unwrap();
+        assert_eq!(st.views[0].zoom, None, "either kind releases either");
+    }
+
+    #[test]
+    fn a_view_refuses_a_fullscreen_zoom_in_monocle_only_while_it_stacks() {
+        let mut st = ServerState::new();
+        let enabled = EnabledLayouts::default();
+        let id = st.view_create("V".into(), &enabled);
+        st.view_add_cells(
+            id,
+            vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
+        );
+        st.view_set_layout(id, "monocle", &enabled).unwrap();
+        assert!(st.view_toggle_zoom(id, ZoomMode::Fullscreen).is_err());
+        assert_eq!(st.views[0].zoom, None);
+        st.view_toggle_zoom(id, ZoomMode::Float).unwrap();
+        st.view_toggle_zoom(id, ZoomMode::Fullscreen).unwrap();
+        assert_eq!(st.views[0].zoom, None, "releasing is never refused");
+
+        let v = st.find_view_mut(id).unwrap();
+        v.custom_tree = Some(v.auto_tree());
+        st.view_toggle_zoom(id, ZoomMode::Fullscreen).unwrap();
+        assert_eq!(st.views[0].zoom, Some(ZoomMode::Fullscreen));
+    }
+
+    #[test]
+    fn a_focus_move_ends_a_view_float_and_carries_a_fullscreen_zoom() {
+        let mut st = ServerState::new();
+        let id = st.view_create("V".into(), &EnabledLayouts::default());
+        st.view_add_cells(
+            id,
+            vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
+        );
+        let (first, second) = (st.views[0].cells[0].id, st.views[0].cells[1].id);
+        st.view_toggle_zoom(id, ZoomMode::Float).unwrap();
+        st.view_set_focus(id, first);
+        assert_eq!(
+            st.views[0].zoom,
+            Some(ZoomMode::Float),
+            "focus did not move"
+        );
+        st.view_set_focus(id, second);
+        assert_eq!(st.views[0].zoom, None);
+
+        st.view_toggle_zoom(id, ZoomMode::Fullscreen).unwrap();
+        st.view_set_focus(id, first);
+        assert_eq!(st.views[0].zoom, Some(ZoomMode::Fullscreen));
+        assert!(!st.view_release_float(id), "not a float");
     }
 
     #[test]
@@ -2430,7 +2526,7 @@ mod tests {
         {
             let v = st.find_view_mut(id).unwrap();
             v.custom_tree = Some(v.auto_tree());
-            v.zoomed = true;
+            v.zoom = Some(ZoomMode::Fullscreen);
         }
         assert_eq!(st.views[0].layout_name(), "custom");
 
@@ -2441,7 +2537,10 @@ mod tests {
             st.views[0].custom_tree.is_none(),
             "promoting a master rebuilds the arrangement"
         );
-        assert!(!st.views[0].zoomed, "promoting a master releases the zoom");
+        assert_eq!(
+            st.views[0].zoom, None,
+            "promoting a master releases the zoom"
+        );
         match st.views[0].layout {
             LayoutMode::Master(ref m) => assert_eq!(m.master_pane, Some(c1)),
             ref other => panic!("expected Master, got {other:?}"),

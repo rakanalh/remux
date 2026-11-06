@@ -2918,7 +2918,7 @@ fn paint_view(
         .and_then(|c| c.title.as_deref());
     // Mirror a normal tab's zoom marker (`format!("{} Z", name)` in the server
     // status bar): append ` Z` to the view name while a cell is zoomed.
-    let view_name = if view.zoomed {
+    let view_name = if view.zoom.is_some() {
         format!("{} Z", view.name)
     } else {
         view.name.clone()
@@ -2993,7 +2993,7 @@ fn paint_view(
 ///
 /// Two cells impose NO demand:
 /// - a cell HIDDEN by the current layout (Monocle's unfocused cells, and the
-///   non-zoomed cells while the view is zoomed): it is still subscribed -- at
+///   other cells under a fullscreen zoom): it is still subscribed -- at
 ///   the full cell area, so a cell that has just been focused releases its old
 ///   size clamp instead of staying pinned to it forever -- but a cell nobody
 ///   sees must not clamp the pane to a size nothing is drawing;
@@ -3036,6 +3036,9 @@ async fn subscribe_view_cells(
     };
     let inner = crate::client::view::cells_area(area);
     let rects = crate::client::view::cell_rects(view, area);
+    let styles: Vec<_> = (0..view.cells.len())
+        .map(|i| crate::client::view::cell_style(view, i, border_style))
+        .collect();
     for (i, cell) in view.cells.iter_mut().enumerate() {
         // The source pane is gone (the server reported `PaneExited`). Nothing can
         // ever stream again, so skip it: re-subscribing would only make the
@@ -3059,7 +3062,7 @@ async fn subscribe_view_cells(
             // tmux is edge-to-edge). Sharing `cell_content_size` with the
             // compositor keeps the reflowed pane exactly the size that is drawn,
             // instead of leaving two blank columns in tmux style.
-            let (cols, rows) = crate::client::view::cell_content_size(rect, border_style);
+            let (cols, rows) = crate::client::view::cell_content_size(rect, styles[i]);
             if cols > 0 && rows > 0 {
                 // No transport for this cell's server: start/observe a lazy dial
                 // and label the cell honestly instead of subscribing into the
@@ -3645,8 +3648,8 @@ async fn send_to_focused_cell(
 ///   (`handle_chrome_resize` cannot: it repaints with `chrome.paint`).
 /// - `PaneMove{Left,Right,Up,Down}` -> `ViewMoveCell { dir }`.
 /// - `PaneToggleZoom`, `PaneToggleZoomFullscreen` and `PaneToggleZoomFloat` ->
-///   `ViewToggleZoom`. A view has one zoom, the focused cell filling the view,
-///   so a float request falls back to it.
+///   `ViewToggleZoom`. `PaneToggleZoom` carries no mode: the server resolves it
+///   from `[zoom]`, which a client never reads.
 /// - `SetMaster` -> `ViewSetMaster` (Master layout + promote the focused cell).
 /// - `PaneClose` -> eject the focused cell: `ViewRemoveCell { cell_id }` (the
 ///   real pane is untouched; the resync unsubscribes it).
@@ -3760,6 +3763,15 @@ async fn handle_view_command(
                         id: view_id,
                         cell_id,
                     },
+                )
+                .await?;
+                handled = true;
+            } else if views[av].floated().is_some() {
+                // A tab ends a float on this key whether or not a neighbour
+                // exists, so the key does not go on to a sidebar.
+                mgr.send(
+                    &ConnId::Local,
+                    ClientMessage::ViewReleaseFloat { id: view_id },
                 )
                 .await?;
                 handled = true;
@@ -3918,9 +3930,16 @@ async fn handle_view_command(
         | RemuxCommand::PaneToggleZoomFloat => {
             hide_whichkey!();
             if !views[av].cells.is_empty() {
+                let mode = match cmd {
+                    RemuxCommand::PaneToggleZoomFloat => Some(crate::config::ZoomMode::Float),
+                    RemuxCommand::PaneToggleZoomFullscreen => {
+                        Some(crate::config::ZoomMode::Fullscreen)
+                    }
+                    _ => None,
+                };
                 mgr.send(
                     &ConnId::Local,
-                    ClientMessage::ViewToggleZoom { id: view_id },
+                    ClientMessage::ViewToggleZoom { id: view_id, mode },
                 )
                 .await?;
             }
@@ -4059,7 +4078,7 @@ fn broadcast_views(
             name: v.name.clone(),
             cells: v.cells.len(),
             layout: v.layout_name().to_string(),
-            zoomed: v.zoomed,
+            zoomed: v.zoom.is_some(),
         })
         .collect();
     chrome.broadcast(&crate::client::sidebar::PluginEvent::Views {
@@ -7233,6 +7252,16 @@ async fn run_client_loop(
                             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                         {
                             view_drag = None;
+                            // A panel is always outside a float's box, and this
+                            // press never reaches the view branch that ends one.
+                            if let Some(view) = active_view
+                                .and_then(|av| views.get(av))
+                                .filter(|v| v.floated().is_some())
+                            {
+                                let id = view.id;
+                                mgr.send(&ConnId::Local, ClientMessage::ViewReleaseFloat { id })
+                                    .await?;
+                            }
                         }
                         if let Some(av) = active_view.filter(|_| !panel_gesture) {
                             // The view is composited into the CONTENT rect, so
@@ -7268,6 +7297,23 @@ async fn run_client_loop(
                                 .row
                                 .saturating_sub(content.y)
                                 .min(content.height.saturating_sub(1));
+                            // A left press outside a float ends it, a sidebar
+                            // included, and then acts as it would have. The zoom
+                            // is cleared here too, so that the hit tests below
+                            // see the tiles and not the box. The `ViewList`
+                            // answering the release says the same.
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                                && crate::client::view::press_ends_float(
+                                    &views[av],
+                                    area,
+                                    inside.then_some((mx, my)),
+                                )
+                            {
+                                let id = views[av].id;
+                                mgr.send(&ConnId::Local, ClientMessage::ViewReleaseFloat { id })
+                                    .await?;
+                                views[av].zoom = None;
+                            }
                             if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
                                 // Cleared BEFORE the out-of-content bail below:
                                 // a press on a sidebar's frame must not leave the
@@ -8954,10 +9000,15 @@ async fn run_client_loop(
                         // every keystroke.
                         if let crate::protocol::SessionEvent::PaneExited { pane_id, .. } = &event {
                             let mut active_touched = false;
+                            let mut floats_ended = Vec::new();
                             for (vi, view) in views.iter_mut().enumerate() {
-                                for cell in view.cells.iter_mut() {
+                                let floated = view.floated();
+                                for (ci, cell) in view.cells.iter_mut().enumerate() {
                                     if cell.conn == src && cell.pane_id == *pane_id && !cell.exited {
                                         cell.exited = true;
+                                        if floated == Some(ci) {
+                                            floats_ended.push(view.id);
+                                        }
                                         // Drop the last snapshot with it: keeping it
                                         // would keep painting stale content that
                                         // looks live.
@@ -8967,6 +9018,13 @@ async fn run_client_loop(
                                         }
                                     }
                                 }
+                            }
+                            // The client does this, not the server, because a
+                            // cell can alias a pane of another server and only
+                            // the client hears of that pane's death.
+                            for id in floats_ended {
+                                mgr.send(&ConnId::Local, ClientMessage::ViewReleaseFloat { id })
+                                    .await?;
                             }
                             if active_touched {
                                 if let Some(av) = active_view {

@@ -6373,7 +6373,7 @@ impl RemuxServer {
         // "nothing here" information a client can rely on).
         {
             let st = self.state.lock().await;
-            let msg = build_view_list_message(&st);
+            let msg = build_view_list_message(&st, &self.config.zoom);
             drop(st);
             let cls = self.clients.lock().await;
             if let Some(conn) = cls.get(&client_id) {
@@ -7908,7 +7908,7 @@ entries={} error={:?} truncated={}",
                     let _ = conn.tx.send(ServerMessage::ViewCreated { id });
                 }
             }
-            broadcast_view_list(state, clients).await;
+            broadcast_view_list(state, clients, config).await;
             Ok(())
         }
         ClientMessage::ViewDelete { id } => {
@@ -7916,7 +7916,7 @@ entries={} error={:?} truncated={}",
                 let mut st = state.lock().await;
                 st.view_delete(id);
             }
-            broadcast_view_list(state, clients).await;
+            broadcast_view_list(state, clients, config).await;
             Ok(())
         }
         ClientMessage::ViewRename { id, name } => {
@@ -7924,7 +7924,7 @@ entries={} error={:?} truncated={}",
                 let mut st = state.lock().await;
                 st.view_rename(id, name);
             }
-            broadcast_view_list(state, clients).await;
+            broadcast_view_list(state, clients, config).await;
             Ok(())
         }
         ClientMessage::ViewAddCells { id, cells } => {
@@ -7932,7 +7932,7 @@ entries={} error={:?} truncated={}",
                 let mut st = state.lock().await;
                 st.view_add_cells(id, cells);
             }
-            broadcast_view_list(state, clients).await;
+            broadcast_view_list(state, clients, config).await;
             Ok(())
         }
         ClientMessage::ViewRemoveCell { id, cell_id } => {
@@ -7940,7 +7940,7 @@ entries={} error={:?} truncated={}",
                 let mut st = state.lock().await;
                 st.view_remove_cell(id, cell_id);
             }
-            broadcast_view_list(state, clients).await;
+            broadcast_view_list(state, clients, config).await;
             Ok(())
         }
         ClientMessage::ViewSetFocus { id, cell_id } => {
@@ -7948,7 +7948,7 @@ entries={} error={:?} truncated={}",
                 let mut st = state.lock().await;
                 st.view_set_focus(id, cell_id);
             }
-            broadcast_view_list(state, clients).await;
+            broadcast_view_list(state, clients, config).await;
             Ok(())
         }
         ClientMessage::ViewCycleLayout { id } => {
@@ -7956,7 +7956,7 @@ entries={} error={:?} truncated={}",
                 let mut st = state.lock().await;
                 st.view_cycle_layout(id, &config.layouts);
             }
-            broadcast_view_list(state, clients).await;
+            broadcast_view_list(state, clients, config).await;
             Ok(())
         }
         ClientMessage::ListViewLayouts { request, id } => {
@@ -7982,7 +7982,7 @@ entries={} error={:?} truncated={}",
                 st.view_set_layout(id, name, &config.layouts)
             };
             match outcome {
-                Ok(true) => broadcast_view_list(state, clients).await,
+                Ok(true) => broadcast_view_list(state, clients, config).await,
                 Ok(false) => {}
                 Err(why) => {
                     log::info!("server: ViewSetLayout id={id} name={name:?} refused: {why}");
@@ -7990,12 +7990,28 @@ entries={} error={:?} truncated={}",
             }
             Ok(())
         }
-        ClientMessage::ViewToggleZoom { id } => {
-            {
+        ClientMessage::ViewToggleZoom { id, mode } => {
+            let mode = mode.unwrap_or(config.zoom.mode);
+            let outcome = {
                 let mut st = state.lock().await;
-                st.view_toggle_zoom(id);
+                st.view_toggle_zoom(id, mode)
+            };
+            match outcome {
+                Ok(()) => broadcast_view_list(state, clients, config).await,
+                Err(why) => {
+                    log::info!("server: ViewToggleZoom id={id} mode={mode:?} refused: {why}");
+                }
             }
-            broadcast_view_list(state, clients).await;
+            Ok(())
+        }
+        ClientMessage::ViewReleaseFloat { id } => {
+            let released = {
+                let mut st = state.lock().await;
+                st.view_release_float(id)
+            };
+            if released {
+                broadcast_view_list(state, clients, config).await;
+            }
             Ok(())
         }
         ClientMessage::ViewSetMaster { id } => {
@@ -8003,7 +8019,7 @@ entries={} error={:?} truncated={}",
                 let mut st = state.lock().await;
                 st.view_set_master(id);
             }
-            broadcast_view_list(state, clients).await;
+            broadcast_view_list(state, clients, config).await;
             Ok(())
         }
         ClientMessage::ViewResizeCell {
@@ -8016,7 +8032,7 @@ entries={} error={:?} truncated={}",
                 let mut st = state.lock().await;
                 st.view_resize_cell(id, cell_id, dir, amount);
             }
-            broadcast_view_list(state, clients).await;
+            broadcast_view_list(state, clients, config).await;
             Ok(())
         }
         ClientMessage::ViewMoveCell { id, cell_id, dir } => {
@@ -8025,7 +8041,7 @@ entries={} error={:?} truncated={}",
                 let mut st = state.lock().await;
                 st.view_move_cell(id, cell_id, dir, area);
             }
-            broadcast_view_list(state, clients).await;
+            broadcast_view_list(state, clients, config).await;
             Ok(())
         }
     }
@@ -15365,7 +15381,7 @@ async fn stream_pane_content(
 /// Build the `ViewList` message that mirrors the current shared-view registry.
 /// Pure over a locked `ServerState`; the full [`LayoutMode`]/`custom_tree`
 /// travel so a client can composite without an extra round trip.
-fn build_view_list_message(st: &ServerState) -> ServerMessage {
+fn build_view_list_message(st: &ServerState, zoom: &crate::config::ZoomConfig) -> ServerMessage {
     let views = st
         .views
         .iter()
@@ -15384,7 +15400,9 @@ fn build_view_list_message(st: &ServerState) -> ServerMessage {
             layout: v.layout.clone(),
             custom_tree: v.custom_tree.clone(),
             focused: v.focused,
-            zoomed: v.zoomed,
+            zoomed: v.zoom.is_some(),
+            zoom_mode: v.zoom.unwrap_or_default(),
+            float_pct: zoom.float_pct(),
         })
         .collect();
     ServerMessage::ViewList { views }
@@ -15397,10 +15415,11 @@ fn build_view_list_message(st: &ServerState) -> ServerMessage {
 async fn broadcast_view_list(
     state: &Arc<Mutex<ServerState>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Config,
 ) {
     let msg = {
         let st = state.lock().await;
-        build_view_list_message(&st)
+        build_view_list_message(&st, &config.zoom)
     };
     let cls = clients.lock().await;
     for conn in cls.values() {
