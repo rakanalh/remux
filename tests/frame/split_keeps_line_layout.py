@@ -16,8 +16,9 @@ import re
 import sys
 import time
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxsplk"
+RUNDIR = run_dir("rmxsplk")
 COLS, ROWS = 100, 31
 LAYOUTS = ("monocle", "master", "custom", "columns", "rows", "grid", "bsp")
 

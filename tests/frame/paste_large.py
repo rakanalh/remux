@@ -49,13 +49,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Server, Client  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-# PID-unique, unlike every other harness here, and the exception is earned. A
-# fixed `/tmp/rmx-*` path is this repo's convention and it is fine for a harness
-# whose only shared state is the SERVER -- two of those merely race. This one
-# has a pane WRITING FILES to a path derived from that directory, so two runs do
-# not race, they CORRUPT each other's evidence, and the corruption reads as a
-# truncation in the very thing under test.
+# A private run dir matters more here than in most harnesses. A pane WRITES
+# FILES to a path derived from this directory, so two runs on one path would not
+# merely race. They would CORRUPT each other's evidence, and the corruption reads
+# as a truncation in the very thing under test.
 # `Server.start` opens with `shutil.rmtree(RUNDIR)`, so a second instance
 # starting mid-run deletes the first's `workdir` under its feet: its `cat` keeps
 # writing to an unlinked inode and the file it later reads is gone, which is
@@ -64,10 +63,7 @@ from harness import Server, Client  # noqa: E402
 # 2.6s apart. Worse, a shared path can put two clients on one pane, and the
 # stream then contains one payload, the other instance's `cat > ...` command
 # line, and the payload again.
-#
-# `/tmp/rmx-paste-<pid>/run/remux.sock` is ~36 chars, well inside the 108-char
-# limit on a Unix socket path.
-RUNDIR = f"/tmp/rmx-paste-{os.getpid()}"
+RUNDIR = run_dir("rmx-paste")
 WORKDIR = f"{RUNDIR}/workdir"
 
 # Linux's pty input queue is a few KB; the truncation threshold measured on it
@@ -237,7 +233,7 @@ def main():
     print()
     if failures:
         # Kept on failure: the server log and the half-written files are the
-        # evidence. A pid-unique dir would otherwise accumulate in /tmp for ever.
+        # evidence.
         print(f"FAILED ({len(failures)}): " + "; ".join(failures))
         print(f"      evidence kept in {RUNDIR}")
         return 1

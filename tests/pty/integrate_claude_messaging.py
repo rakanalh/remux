@@ -48,7 +48,7 @@
       hooks and the skill THERE, and ~/.claude is never created; a relative
       value is ignored and ~/.claude is used
 
-Copies of the binary go under ~/.cache/rmx-integmsg, never under /tmp: /tmp
+Copies of the binary go under ~/.cache/rmx-integmsg-<pid>, never under /tmp: /tmp
 is world-writable, so a binary there is refused (i21). That tree is removed
 on any exit, a SIGTERM included.
 
@@ -83,11 +83,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import BIN  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-integmsg"
+RUNDIR = run_dir("rmx-integmsg")
 # Where copies of the binary live: a tree only this user can write, since the
 # installer refuses a binary under any directory others can write.
-SAFE = os.path.join(os.path.expanduser("~"), ".cache", "rmx-integmsg")
+SAFE = os.path.join(os.path.expanduser("~"), ".cache", f"rmx-integmsg-{os.getpid()}")
 assert "/.claude" not in SAFE, SAFE
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fixtures", "settings")
 HARNESS = "claude-messaging"

@@ -43,8 +43,9 @@ for _var in ("REMUX_SESSION", "REMUX_PANE", "REMUX"):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_server import FakeServer  # noqa: E402
 from pty_harness import BIN, PROTOCOL_VERSION, guard_rundir, reap_rundir  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUN = "/tmp/rmx-skew"
+RUN = run_dir("rmx-skew")
 guard_rundir(RUN)
 # The protocol the stand-in speaks: hard-coded on purpose, since this is the
 # skew test and it must not be the current one. The check below keeps it

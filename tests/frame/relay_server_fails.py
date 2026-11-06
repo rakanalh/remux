@@ -28,8 +28,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, PROTOCOL_VERSION, Client, Server  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-relayfail")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-relayfail")
 CAUSE = "exited before its socket appeared"
 
 failures = []
@@ -123,7 +124,6 @@ if __name__ == "__main__":
     finally:
         for d in read_only:
             os.chmod(d, 0o700)
-        shutil.rmtree(RUNDIR, ignore_errors=True)
     print()
     print(f"{len(failures)} FAILED" if failures else "ALL PASS")
     sys.exit(1 if failures else 0)

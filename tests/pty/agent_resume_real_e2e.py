@@ -83,6 +83,7 @@ import pyte
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import BIN, Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 REAL_HOME = os.path.expanduser("~")
 PROMPT = "reply with the word OK"
@@ -261,7 +262,7 @@ class Run:
     def __init__(self, agent):
         self.agent = agent
         self.spec = AGENTS[agent]
-        self.rundir = f"/tmp/rmx-e2e-{agent}"
+        self.rundir = run_dir(f"rmx-e2e-{agent}")
         self.home = f"{self.rundir}/home"
         self.work = f"{self.home}/work"
         self.bin = f"{self.rundir}-bin"

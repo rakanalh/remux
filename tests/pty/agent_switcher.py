@@ -39,9 +39,12 @@ import pyte
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import install_agent_standin  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
+from harness import kill_relays  # noqa: E402
+from rundirs import run_dir, run_root  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUN = "/tmp/rmx-asw"
+RUN = run_dir("rmx-asw")
 SOCK = f"{RUN}/run/remux.sock"
 SOCK2 = f"{RUN}/run2/remux.sock"
 VERBOSE = "-v" in sys.argv
@@ -211,8 +214,7 @@ def stop_servers():
                            stderr=subprocess.DEVNULL, timeout=10)
         except Exception:
             pass
-    subprocess.run(["pkill", "-x", "-f", f"{BIN} relay"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    kill_relays(run_root())
 
 
 def protocol_version():

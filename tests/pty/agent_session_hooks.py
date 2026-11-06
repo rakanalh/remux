@@ -125,9 +125,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "frame"))
 sys.path.insert(0, HERE)
 from harness import BIN, Client, Server, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 import fakeclaude  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-agsess-hooks")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-agsess-hooks")
 BINDIR = RUNDIR + "-bin"
 FIXTURES = os.path.join(HERE, "..", "fixtures", "agent_session")
 HERMETIC_PATH = "/usr/local/bin:/usr/bin:/bin"

@@ -50,11 +50,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "frame"))
 from pty_harness import BIN, Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 from harness import Client, name_of  # noqa: E402
 
-RUNDIR = "/tmp/rmxpmxp"
-REMOTE = "/tmp/rmxpmxq"
-OVERFLOW_RUNDIR = "/tmp/rmxpmxw"
+RUNDIR = run_dir("rmxpmxp")
+REMOTE = run_dir("rmxpmxq")
+OVERFLOW_RUNDIR = run_dir("rmxpmxw")
 COLS, ROWS = 110, 34
 ESC = b"\x1b"
 TITLE = "Move pane to tab"

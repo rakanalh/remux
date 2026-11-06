@@ -1,8 +1,9 @@
 """Exploratory step 2: expand tab, mark panes, create view."""
 import sys, time
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
-t = Tui("/tmp/rmxfix/exp2", cols=120, rows=40).start()
+t = Tui(run_dir("rmxfix/exp2"), cols=120, rows=40).start()
 t.send("clear\r", 0.4)
 t.send("printf 'AAAA_marker_one\\n'\r", 0.5)
 t.prefix(b"pv", 0.6)

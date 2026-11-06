@@ -6,8 +6,9 @@ selection, press k many times. Assert earlier line numbers scroll into view.
 """
 import re, sys
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxfix/i5"
+RUNDIR = run_dir("rmxfix/i5")
 
 
 def visible_line_nums(t):

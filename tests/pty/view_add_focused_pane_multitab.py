@@ -28,8 +28,9 @@ import sys
 import time
 
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-vaddmt"
+RUNDIR = run_dir("rmx-vaddmt")
 
 
 def wait_for(t, needle, timeout=8.0):

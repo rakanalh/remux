@@ -100,10 +100,11 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pty_harness import BIN, Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 import standin  # noqa: E402
 from portable import SETSID_F  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-agres")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-agres")
 FIXTURES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "fixtures", "agent_session")
 ZDOTDIR = f"{RUNDIR}-zdot"

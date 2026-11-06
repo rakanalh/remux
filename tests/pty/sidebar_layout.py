@@ -18,9 +18,10 @@ import pyte
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from standin import require_private_dir  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 BIN = os.path.abspath("target/debug/remux")
-RUNDIR = "/tmp/rmx-sb"
+RUNDIR = run_dir("rmx-sb")
 COLS, ROWS = 100, 30
 SIDEBAR_W = 30
 
@@ -58,7 +59,7 @@ size = 5
 
 def write_private(directory: str, name: str, text: str) -> None:
     """Write `directory/name`, refusing a directory another user could have
-    planted under the fixed /tmp run dir, and never following a link at `name`."""
+    planted under the run dir, and never following a link at `name`."""
     require_private_dir(directory)
     fd = os.open(os.path.join(directory, name),
                  os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)

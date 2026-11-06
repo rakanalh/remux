@@ -26,13 +26,14 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
 from pty_harness import Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 from harness import Client  # noqa: E402
 
 NEW_SESSION = "zulu_from_b"
 
 
 def main():
-    t = Tui("/tmp/rmxscr", cols=120, rows=40).start()
+    t = Tui(run_dir("rmxscr"), cols=120, rows=40).start()
     fails = []
     b = None
     try:

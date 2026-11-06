@@ -42,9 +42,13 @@ import time
 
 import pexpect
 import pyte
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
+from harness import kill_relays  # noqa: E402
+from rundirs import run_dir, run_root  # noqa: E402
 
 BIN = os.path.abspath("target/debug/remux")
-RUN = "/tmp/rmx-sbs"
+RUN = run_dir("rmx-sbs")
 SOCK1 = f"{RUN}/run/remux.sock"
 SOCK2 = f"{RUN}/run2/remux.sock"
 VERBOSE = "-v" in sys.argv
@@ -523,10 +527,9 @@ def scenario_remote():
     # Kill the RELAY, not the far server: that is what a dropped SSH looks like
     # from here, and it is the only thing that closes the client's end. (The
     # relay outlives the server it was talking to -- a separate quirk, and not
-    # this task's to fix.) Matched on the absolute path of the binary under
-    # test so a real `remux relay` elsewhere on the machine is never touched.
-    subprocess.run(["pkill", "-x", "-f", f"{BIN} relay"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # this task's to fix.) Only this run's relays are killed, so a `remux relay`
+    # of another run or of the real server is never touched.
+    kill_relays(run_root())
     pump(3.0)
     rows = panel_rows(screen)
     log("panel after the remote died:", rows)

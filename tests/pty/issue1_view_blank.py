@@ -4,6 +4,7 @@ their content (no blank), and the client must stay alive.
 """
 import sys
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
 A = "AAAA_marker_one"
 B = "BBBB_marker_two"
@@ -27,7 +28,7 @@ def both_visible(t):
 
 
 def main():
-    t = Tui("/tmp/rmxfix/i1v", cols=120, rows=40).start()
+    t = Tui(run_dir("rmxfix/i1v"), cols=120, rows=40).start()
     make_view(t)
 
     fails = []

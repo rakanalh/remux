@@ -24,6 +24,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 COLS, ROWS = 160, 48
 ALT_U = b"\x1bu"
@@ -73,7 +74,7 @@ def box_corners(t):
 
 
 def main():
-    t = Tui(f"/tmp/rmxfloat/pty-{os.getpid()}", cols=COLS, rows=ROWS, config=CONFIG)
+    t = Tui(run_dir("rmxfloat/pty"), cols=COLS, rows=ROWS, config=CONFIG)
     try:
         t.start()
         t.pump(1.6)

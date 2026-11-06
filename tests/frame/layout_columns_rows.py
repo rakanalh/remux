@@ -29,8 +29,9 @@ import os
 import re
 import sys
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxlcr"
+RUNDIR = run_dir("rmxlcr")
 SOCK = f"{RUNDIR}/run/remux.sock"
 COLS, ROWS = 100, 31
 LAYOUTS = ("monocle", "master", "custom", "columns", "rows", "grid", "bsp")

@@ -34,9 +34,10 @@ import pexpect, pyte
 # and proceeds rather than rejecting it.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import PROTOCOL_VERSION  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 BIN = os.path.abspath("target/debug/remux")
-RUN = "/tmp/rmxrv"
+RUN = run_dir("rmxrv")
 SOCK1 = f"{RUN}/run/remux.sock"      # the LOCAL server both clients attach to
 SOCK2 = f"{RUN}/run2/remux.sock"     # the "remote" server reached via the shim
 VERBOSE = "-v" in sys.argv

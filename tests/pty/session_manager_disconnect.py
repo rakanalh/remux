@@ -72,10 +72,11 @@ from pty_harness import (  # noqa: E402
     PROTOCOL_VERSION, BOX_TL, BOX_TR, BOX_V,
     sm_open, sm_tree, sm_selected, sm_goto, sm_goto_text, sm_expand, sm_children,
 )
+from rundirs import run_dir  # noqa: E402
 import pyte  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUN = "/tmp/rmxdisc"
+RUN = run_dir("rmxdisc")
 SOCK1 = f"{RUN}/run/remux.sock"      # the LOCAL server the client attaches to
 SOCK2 = f"{RUN}/run2/remux.sock"     # the "remote" server reached via the shim
 DIALS = f"{RUN}/dials"               # one line per `ssh` shim invocation

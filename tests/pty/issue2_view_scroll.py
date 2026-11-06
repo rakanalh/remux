@@ -6,8 +6,9 @@ Build a 1-cell view over a pane holding >1 screen of numbered history. Wheel up
 """
 import re, sys
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxfix/i2"
+RUNDIR = run_dir("rmxfix/i2")
 
 
 def wheel(t, up, col, row, n=1):

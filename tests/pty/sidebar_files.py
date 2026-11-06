@@ -62,9 +62,11 @@ import time
 
 import pexpect
 import pyte
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from rundirs import run_dir  # noqa: E402
 
 BIN = os.path.abspath("target/debug/remux")
-RUN = "/tmp/rmx-sbb"
+RUN = run_dir("rmx-sbb")
 # The SERVER's `$HOME` for this run, and the fixture sits inside it -- which is
 # what lets the header be `~/fixture` and not the absolute path. Not the real
 # home: the substitution must be the server's answer, and a fixture under the
@@ -87,7 +89,9 @@ COLS, ROWS = 100, 30
 # Long enough for the panel's 2s poll plus a round trip, short enough that a
 # panel which never re-lists fails rather than hangs.
 REFRESH_WINDOW = 8.0
-SIDEBAR_W = 30
+# Wide enough that case 13's `<run dir>/homework` fits the header uncut, which
+# its exact-path check needs.
+SIDEBAR_W = 40
 FRAME = 1  # the sidebar's border is drawn INSIDE the bar
 
 CFG = f"""
@@ -583,7 +587,7 @@ def scenario():
 
     # -- 13: `~` ------------------------------------------------------------
     #
-    # EQUALITY, not `endswith`: `~/fixture` and `/tmp/rmx-sbb/home/fixture` both
+    # EQUALITY, not `endswith`: `~/fixture` and `<run dir>/home/fixture` both
     # end in "fixture", so the assertion every other case uses would pass here
     # whether or not a single character was substituted.
     check("13 the header shortens the server's home to `~`",

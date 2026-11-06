@@ -105,11 +105,12 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from harness import Client, Server, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 import standin  # noqa: E402
 
 DARWIN = sys.platform == "darwin"
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-agents")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-agents")
 # The second server, run with the SHIPPED patterns (see cases 13-14).
 RUNDIR2 = RUNDIR + "-shipped"
 # OUTSIDE the rundir on purpose: `Server.start` wipes the rundir, so a stand-in

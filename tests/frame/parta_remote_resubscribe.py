@@ -15,8 +15,9 @@ carrying the pane's real content -- arrives through the relay every time.
 """
 import json, os, struct, subprocess, sys, time
 from harness import PROTOCOL_VERSION, Server, BIN, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxais/parta"
+RUNDIR = run_dir("rmxais/parta")
 MARKER = "REMOTE_MARKER_4417"
 
 

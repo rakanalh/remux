@@ -32,11 +32,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-# Keyed on the pid: two concurrent runs would otherwise share a socket and a
+# Private to this run: two concurrent runs would otherwise share a socket and a
 # state dir, and the corruption that follows looks exactly like the bug under
 # test. Kept short, because a Unix socket path must stay under 108 characters.
-RUNDIR = f"/tmp/rmx-pp{os.getpid()}"
+RUNDIR = run_dir("rmx-pp")
 COLS, ROWS = 120, 40
 HIST = 300
 VERBOSE = "-v" in sys.argv

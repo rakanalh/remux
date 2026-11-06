@@ -31,8 +31,9 @@ import sys
 import time
 import subprocess
 from harness import BIN, Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = f"/tmp/rmxprn-{os.getpid()}"
+RUNDIR = run_dir("rmxprn")
 COLS, ROWS = 160, 40
 NAME = "RN-MINE"
 
@@ -259,7 +260,6 @@ def main():
         if c is not None:
             c.close()
         srv.kill()
-        shutil.rmtree(RUNDIR, ignore_errors=True)
     print()
     if fails:
         print(f"FAILED ({len(fails)}):")

@@ -33,9 +33,11 @@ import time
 
 import pexpect
 import pyte
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from rundirs import run_dir  # noqa: E402
 
 BIN = os.path.abspath("target/debug/remux")
-RUNDIR = "/tmp/rmx-sbn"
+RUNDIR = run_dir("rmx-sbn")
 COLS, ROWS = 100, 30
 SIDEBAR_W = 30
 BOTTOM_H = 6

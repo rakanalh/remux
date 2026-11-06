@@ -194,12 +194,13 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from harness import BIN, PROTOCOL_VERSION, Client, Server, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 from portable import SETSID_F  # noqa: E402
 import ssh_shim  # noqa: E402
 import fakeagent  # noqa: E402
 import relay_fds  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msgrem")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-msgrem")
 SHIMDIR = RUNDIR + "-bin"
 PEER = f"{SHIMDIR}/peer.py"
 FAKEAGENT = f"{SHIMDIR}/fakeagent"

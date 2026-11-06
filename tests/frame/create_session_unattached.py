@@ -72,6 +72,8 @@ import struct
 import subprocess
 import sys
 import time
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from rundirs import run_dir  # noqa: E402
 
 COLS, ROWS = 100, 30
 SPAWN_COLS, SPAWN_ROWS = 80, 24  # what the server gives a client that never resized
@@ -662,12 +664,7 @@ def main():
 
     rundir = args.rundir
     if rundir is None:
-        # PID in the name: two concurrent runs of one harness under a shared
-        # path corrupt each other, and the false red mimics the bug under test.
-        base = os.environ.get("TMPDIR", "/tmp").rstrip("/")
-        rundir = f"{base}/rmxcsu{os.getpid()}"
-        if len(f"{rundir}/x/run/remux.sock") >= 100:
-            rundir = f"/tmp/rmxcsu{os.getpid()}"
+        rundir = run_dir("rmxcsu")
     rundir = os.path.abspath(rundir)
     if len(f"{rundir}/x/run/remux.sock") >= 100:
         raise SystemExit(f"--rundir too long for a unix socket: {rundir}")

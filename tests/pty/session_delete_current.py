@@ -28,11 +28,12 @@ import pyte
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import BIN, Tui, sm_open, sm_goto_text, sm_tree  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
 from harness import Client, Server  # noqa: E402
 
-RUNDIR = "/tmp/rmx-sdc"
-WINCH_RUNDIR = "/tmp/rmx-sdcw"
+RUNDIR = run_dir("rmx-sdc")
+WINCH_RUNDIR = run_dir("rmx-sdcw")
 
 # A foreground loop and not a trap at the prompt, so that the trap runs within a
 # `sleep` of the signal whatever the shell does with traps while it reads a line.

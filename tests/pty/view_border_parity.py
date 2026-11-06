@@ -24,6 +24,7 @@ Run from the repo root:  python3 tests/pty/view_border_parity.py
 """
 import sys
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
 ROUNDED = ["╭", "╮", "╰", "╯"]  # ╭ ╮ ╰ ╯
 SQUARE = ["┌", "┐", "└", "┘"]   # ┌ ┐ └ ┘
@@ -113,7 +114,7 @@ def require_in_view(t):
 
 
 def main():
-    t = Tui("/tmp/rmxvbp", cols=120, rows=40).start()
+    t = Tui(run_dir("rmxvbp"), cols=120, rows=40).start()
     fails = []
     try:
         # --- 1. normal tab: 2 panes ------------------------------------------

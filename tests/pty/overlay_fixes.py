@@ -33,9 +33,12 @@ import pyte
 # notifications for this test's agents.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import install_agent_standin, install_notify_shims  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
+from harness import kill_relays  # noqa: E402
+from rundirs import run_dir, run_root  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUN = "/tmp/rmxov-a1afb"
+RUN = run_dir("rmxov-a1afb")
 SOCK = f"{RUN}/run/remux.sock"
 SOCK2 = f"{RUN}/run2/remux.sock"
 VERBOSE = "-v" in sys.argv
@@ -166,8 +169,7 @@ def stop_servers():
             pass
     subprocess.run(["pkill", "-f", f"{RUN}/"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["pkill", "-x", "-f", f"{BIN} relay"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    kill_relays(run_root())
 
 
 class Wire:

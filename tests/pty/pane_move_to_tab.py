@@ -28,8 +28,9 @@ import re
 import sys
 
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxpmtp"
+RUNDIR = run_dir("rmxpmtp")
 COLS, ROWS = 100, 30
 ESC = b"\x1b"
 TITLE = "Move pane to tab"

@@ -19,8 +19,9 @@ import os, socket, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Server, Client, name_of
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-pdd"
+RUNDIR = run_dir("rmx-pdd")
 # A pane id no client subscribes to. Any unsubscribed pane reaches the same
 # arm -- the `subscribed_panes` guard is checked before the pane map is.
 BOGUS_PANE = 999999

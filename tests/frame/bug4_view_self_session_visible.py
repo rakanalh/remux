@@ -24,8 +24,9 @@ import json, os, shutil, socket, struct, subprocess, sys, time
 # to speak a protocol that no longer existed.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import PROTOCOL_VERSION  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-BIN, RUNDIR = "target/debug/remux", "/tmp/rmxbug4"
+BIN, RUNDIR = "target/debug/remux", run_dir("rmxbug4")
 SOCK = f"{RUNDIR}/run/remux.sock"
 
 

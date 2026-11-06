@@ -40,6 +40,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import Tui, sm_compose_view  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 COLS, ROWS = 120, 40
 SIDEBAR_W = 30
@@ -240,7 +241,7 @@ def finish(t, name, fails):
 def test_view_paints_inside_the_content_rect():
     """The view's own chrome starts at the seam; the panel keeps its columns."""
     name = "test_view_paints_inside_the_content_rect"
-    t = Tui("/tmp/rmx-sbv1", cols=COLS, rows=ROWS, config=CFG).start()
+    t = Tui(run_dir("rmx-sbv1"), cols=COLS, rows=ROWS, config=CFG).start()
     fails = []
     make_two_panes(t)
     compose_view(t)
@@ -311,7 +312,7 @@ def test_view_cells_are_sized_to_the_content_rect():
     thinks it is 58 columns wide inside a 43-column cell.
     """
     name = "test_view_cells_are_sized_to_the_content_rect"
-    t = Tui("/tmp/rmx-sbv2", cols=COLS, rows=ROWS, config=CFG).start()
+    t = Tui(run_dir("rmx-sbv2"), cols=COLS, rows=ROWS, config=CFG).start()
     fails = []
     make_two_panes(t)
     compose_view(t)
@@ -376,7 +377,7 @@ def test_clicking_a_view_cell_uses_content_coordinates():
     wrong.
     """
     name = "test_clicking_a_view_cell_uses_content_coordinates"
-    t = Tui("/tmp/rmx-sbv3", cols=COLS, rows=ROWS, config=CFG).start()
+    t = Tui(run_dir("rmx-sbv3"), cols=COLS, rows=ROWS, config=CFG).start()
     fails = []
     make_two_panes(t)
     compose_view(t)
@@ -435,7 +436,7 @@ def test_entering_a_view_releases_sidebar_focus():
     composes a view with focus still parked in the panel.
     """
     name = "test_entering_a_view_releases_sidebar_focus"
-    t = Tui("/tmp/rmx-sbv4", cols=COLS, rows=ROWS, config=CFG).start()
+    t = Tui(run_dir("rmx-sbv4"), cols=COLS, rows=ROWS, config=CFG).start()
     fails = []
     make_two_panes(t)
 
@@ -563,7 +564,7 @@ def test_toggling_a_sidebar_inside_a_view_reflows_the_cells():
     """
     return toggle_in_a_view(
         "test_toggling_a_sidebar_inside_a_view_reflows_the_cells",
-        "/tmp/rmx-sbv5", CFG, left_edge=1,
+        run_dir("rmx-sbv5"), CFG, left_edge=1,
         hidden_stty=STRIP_STTY)
 
 
@@ -571,7 +572,7 @@ def test_toggling_a_sidebar_without_a_strip_gives_the_view_the_whole_width():
     """`collapse_to_strip = false`: hiding hands the view column 0."""
     return toggle_in_a_view(
         "test_toggling_a_sidebar_without_a_strip_gives_the_view_the_whole_width",
-        "/tmp/rmx-sbv5b", CFG_NO_STRIP, left_edge=0,
+        run_dir("rmx-sbv5b"), CFG_NO_STRIP, left_edge=0,
         hidden_stty=NO_SIDEBAR_STTY)
 
 
@@ -584,7 +585,7 @@ def test_a_focus_refused_by_a_live_view_does_not_strand_the_which_key_popup():
     geometry at all, so that repaint never comes.
     """
     name = "test_a_focus_refused_by_a_live_view_does_not_strand_the_which_key_popup"
-    t = Tui("/tmp/rmx-sbv6", cols=COLS, rows=ROWS, config=CFG_FOCUS_LEAF).start()
+    t = Tui(run_dir("rmx-sbv6"), cols=COLS, rows=ROWS, config=CFG_FOCUS_LEAF).start()
     fails = []
     make_two_panes(t)
     compose_view(t)
@@ -787,7 +788,7 @@ def test_alt_l_at_a_views_right_edge_focuses_the_right_sidebar():
     `intercept_focus` and the sidebar could not be entered from a view at all.
     """
     name = "test_alt_l_at_a_views_right_edge_focuses_the_right_sidebar"
-    t = Tui("/tmp/rmx-sbv7", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    t = Tui(run_dir("rmx-sbv7"), cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
     fails = []
 
     # Harness self-test FIRST, on the path that already worked: with no view up,
@@ -874,7 +875,7 @@ def test_alt_h_from_a_panel_returns_to_the_cell_the_view_left_from():
     from, not cell 0.
     """
     name = "test_alt_h_from_a_panel_returns_to_the_cell_the_view_left_from"
-    t = Tui("/tmp/rmx-sbv8", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    t = Tui(run_dir("rmx-sbv8"), cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
     fails = []
     make_two_panes(t)
     compose_view(t)
@@ -941,7 +942,7 @@ def test_alt_l_from_a_non_edge_cell_still_moves_within_the_view():
     focused CELL's interior, so a non-edge cell can never satisfy it.
     """
     name = "test_alt_l_from_a_non_edge_cell_still_moves_within_the_view"
-    t = Tui("/tmp/rmx-sbv9", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    t = Tui(run_dir("rmx-sbv9"), cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
     fails = []
     make_two_panes(t)
     compose_view(t)
@@ -977,7 +978,7 @@ def test_alt_l_at_a_views_edge_with_no_sidebar_reaches_no_server():
     arriving there moves focus in a session the user is not looking at.
     """
     name = "test_alt_l_at_a_views_edge_with_no_sidebar_reaches_no_server"
-    t = Tui("/tmp/rmx-sbv10", cols=COLS, rows=ROWS, config=CFG_RIGHT_NO_SIDEBAR).start()
+    t = Tui(run_dir("rmx-sbv10"), cols=COLS, rows=ROWS, config=CFG_RIGHT_NO_SIDEBAR).start()
     fails = []
     make_two_panes(t)
     compose_view(t)
@@ -1007,7 +1008,7 @@ def test_alt_l_with_only_the_focused_cell_placed_does_not_panic():
     that the client survives the layout at all.
     """
     name = "test_alt_l_with_only_the_focused_cell_placed_does_not_panic"
-    t = Tui("/tmp/rmx-sbv11", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    t = Tui(run_dir("rmx-sbv11"), cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
     fails = []
     make_two_panes(t)
     compose_view(t)
@@ -1048,7 +1049,7 @@ def test_hiding_the_sidebar_from_inside_it_does_not_strand_the_keyboard():
     painted cannot show the user where their keys went.
     """
     name = "test_hiding_the_sidebar_from_inside_it_does_not_strand_the_keyboard"
-    t = Tui("/tmp/rmx-sbv12", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    t = Tui(run_dir("rmx-sbv12"), cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
     fails = []
     make_two_panes(t)
     compose_view(t)
@@ -1095,7 +1096,7 @@ def test_leaving_the_view_from_a_panel_hands_the_keyboard_to_the_session():
     user really can be in a panel when the view closes.
     """
     name = "test_leaving_the_view_from_a_panel_hands_the_keyboard_to_the_session"
-    t = Tui("/tmp/rmx-sbv13", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    t = Tui(run_dir("rmx-sbv13"), cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
     fails = []
     make_two_panes(t)
     compose_view(t)
@@ -1136,7 +1137,7 @@ def test_a_resize_from_a_panel_inside_a_view_moves_the_sidebar_and_the_cells():
     inside the cell is what sees that, and a border check would not.
     """
     name = "test_a_resize_from_a_panel_inside_a_view_moves_the_sidebar_and_the_cells"
-    t = Tui("/tmp/rmx-sbv14", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    t = Tui(run_dir("rmx-sbv14"), cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
     fails = []
     make_two_panes(t)
     compose_view(t)

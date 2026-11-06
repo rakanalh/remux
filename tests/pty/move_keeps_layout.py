@@ -41,11 +41,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import PROTOCOL_VERSION, Tui, sm_compose_view  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUN_TAB = "/tmp/rmx-mvkl-tab"
-RUN_VIEW = "/tmp/rmx-mvkl-view"
-RUN_BSP = "/tmp/rmx-mvkl-bsp"
-RUN_MASTER = "/tmp/rmx-mvkl-master"
+RUN_TAB = run_dir("rmx-mvkl-tab")
+RUN_VIEW = run_dir("rmx-mvkl-view")
+RUN_BSP = run_dir("rmx-mvkl-bsp")
+RUN_MASTER = run_dir("rmx-mvkl-master")
 VERBOSE = "-v" in sys.argv
 
 MOVE_UP = b"\x1bK"

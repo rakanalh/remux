@@ -121,8 +121,17 @@ def reap_rundir(rundir, kinds=(b"server", b"relay")):
 def kill_relays(rundir):
     """SIGKILL the `remux relay` processes under `rundir` -- a dropped SSH, as
     the client sees it. Only this harness's: a `pkill -f 'remux relay'` also
-    takes down every other harness's remote running at the same time."""
+    takes down every other harness's remote running at the same time.
+
+    Without /proc (macOS) the environment cannot be read, so the fallback is
+    that `pkill`, which matches every relay of this binary. A run on macOS can
+    therefore drop a concurrent run's relay.
+    """
     root = _checked_root(rundir)
+    if not os.path.isdir("/proc"):
+        subprocess.run(["pkill", "-x", "-f", f"{BIN} relay"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
     for pid in remux_daemons(root, kinds=(b"relay",)):
         _kill(pid, root, (b"relay",))
 
@@ -173,7 +182,9 @@ def guard_rundir(rundir):
     SIGTERM/SIGINT/SIGHUP (the suite's `timeout` sends SIGTERM).
 
     Called from `start()`, it also reaps a concurrent run that shares this
-    rundir, deliberately: two runs on one rundir corrupt each other anyway.
+    rundir, deliberately: two runs on one rundir corrupt each other anyway. Only
+    a fixed path or `RMX_RUNDIR` can share one, because `rundirs.run_dir` is
+    private to its run.
 
     Its signal handler replaces Python's default SIGINT handler, so a Ctrl-C
     skips `finally` blocks and the other atexit handlers, `Tui.kill`'s graceful

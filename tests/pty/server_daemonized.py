@@ -44,8 +44,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pty_harness import PROTOCOL_VERSION, Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx_daemonized"
+RUNDIR = run_dir("rmx_daemonized")
 SOCK = f"{RUNDIR}/run/remux.sock"
 PIDFILE = f"{RUNDIR}/run/remux.pid"
 

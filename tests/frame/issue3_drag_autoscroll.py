@@ -7,8 +7,9 @@ text on the anchored screen row stays stable as we scroll.
 """
 import re, sys, time
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxfix/i3"
+RUNDIR = run_dir("rmxfix/i3")
 COLS, ROWS = 100, 30
 
 

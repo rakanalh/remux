@@ -12,9 +12,10 @@ import pexpect, pyte
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import sm_compose_view  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 BIN = os.path.abspath("target/debug/remux")
-RUN = "/tmp/rmx2c"
+RUN = run_dir("rmx2c")
 SOCK = f"{RUN}/run/remux.sock"
 VERBOSE = "-v" in sys.argv
 
