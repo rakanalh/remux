@@ -36,18 +36,24 @@ use crate::config::sidebar::IconStyle;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
 
-/// One icon per row type, as `[folder, session, tab, pane]`.
+/// One icon per row type, as `[server, folder, session, tab, pane]`.
 ///
 /// These are emoji-presentation glyphs because `unicode-width` and terminals
 /// agree that those take two columns. A text-presentation pictograph such as
 /// U+1F5A5 measures one column where many terminals draw two, which shifts the
 /// rest of the row.
-const EMOJI_ICONS: [char; 4] = ['\u{1F4C1}', '\u{1F4BB}', '\u{1F4D1}', '\u{1F532}'];
+const EMOJI_ICONS: [char; 5] = [
+    '\u{1F4BB}',
+    '\u{1F4C1}',
+    '\u{1F4FA}',
+    '\u{1F4D1}',
+    '\u{1F532}',
+];
 
-/// Font Awesome glyphs from the Nerd Font Private Use Area: folder, terminal,
-/// clone and square-o. Each measures one column, and a font can draw one wider
+/// Font Awesome glyphs from the Nerd Font Private Use Area: desktop, folder,
+/// terminal, clone and square-o. Each measures one column, and a font can draw one wider
 /// than its cell, so the space after the icon keeps it off the name.
-const NERD_ICONS: [char; 4] = ['\u{F07B}', '\u{F120}', '\u{F24D}', '\u{F096}'];
+const NERD_ICONS: [char; 5] = ['\u{F108}', '\u{F07B}', '\u{F120}', '\u{F24D}', '\u{F096}'];
 
 /// The columns the `▼`/`▶` marker and the space after it take.
 const MARKER_WIDTH: u16 = 2;
@@ -138,12 +144,13 @@ fn closes_under(name: &str, count: usize, noun: &str) -> String {
 }
 
 fn icon_of(node: &NodeType, style: IconStyle) -> Option<char> {
-    let [folder, session, tab, pane] = match style {
+    let [server, folder, session, tab, pane] = match style {
         IconStyle::Emoji => EMOJI_ICONS,
         IconStyle::Nerd => NERD_ICONS,
         IconStyle::None => return None,
     };
     match node {
+        NodeType::Server { .. } => Some(server),
         NodeType::Folder { .. } => Some(folder),
         NodeType::Session { .. } => Some(session),
         NodeType::Tab { .. } => Some(tab),
@@ -1028,14 +1035,16 @@ mod tests {
         p.on_event(&local_tree());
         let open = painted(&p, 24, 12);
         assert!(
-            open.iter().any(|r| r.starts_with(" \u{25BC} local")),
+            open.iter()
+                .any(|r| r.starts_with(&format!(" \u{25BC} {}  local", EMOJI_ICONS[0]))),
             "an expanded server is not marked open: {open:?}"
         );
         select(&mut p, "local");
         p.on_key(key(KeyCode::Char('h')));
         let shut = painted(&p, 24, 12);
         assert!(
-            shut.iter().any(|r| r.starts_with(" \u{25B6} local")),
+            shut.iter()
+                .any(|r| r.starts_with(&format!(" \u{25B6} {}  local", EMOJI_ICONS[0]))),
             "a collapsed server is not marked shut: {shut:?}"
         );
     }
@@ -1686,6 +1695,35 @@ mod tests {
     }
 
     #[test]
+    fn every_emoji_icon_defaults_to_emoji_presentation() {
+        let emoji = regex::Regex::new(r"^\p{Emoji_Presentation}$").unwrap();
+        for icon in EMOJI_ICONS {
+            assert!(emoji.is_match(&icon.to_string()), "{icon:?}");
+        }
+    }
+
+    #[test]
+    fn a_server_row_wears_a_computer_under_each_style_but_none() {
+        for (style, icon) in [
+            (IconStyle::Emoji, format!("{}  ", EMOJI_ICONS[0])),
+            (IconStyle::Nerd, format!("{} ", NERD_ICONS[0])),
+            (IconStyle::None, String::new()),
+        ] {
+            let mut p = SessionsPlugin::new(style);
+            p.on_event(&local_tree());
+            p.on_event(&remote_tree());
+            let rows = painted(&p, 40, 20);
+            for server in ["local", "gpu"] {
+                let want = format!(" \u{25BC} {icon}{server}");
+                assert!(
+                    rows.iter().any(|r| r.starts_with(&want)),
+                    "{style:?} {server}: {rows:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_marker_click_toggles_under_every_icon_style() {
         for style in [IconStyle::Emoji, IconStyle::Nerd, IconStyle::None] {
             let mut p = SessionsPlugin::new(style);
@@ -1704,8 +1742,8 @@ mod tests {
     #[test]
     fn each_style_draws_its_own_icon_between_marker_and_name() {
         for (style, want) in [
-            (IconStyle::Emoji, format!("{}  alpha", EMOJI_ICONS[1])),
-            (IconStyle::Nerd, format!("{} alpha", NERD_ICONS[1])),
+            (IconStyle::Emoji, format!("{}  alpha", EMOJI_ICONS[2])),
+            (IconStyle::Nerd, format!("{} alpha", NERD_ICONS[2])),
             (IconStyle::None, "alpha".to_string()),
         ] {
             let mut p = SessionsPlugin::new(style);
@@ -1742,18 +1780,18 @@ mod tests {
         p.on_key(key(KeyCode::Char('l')));
         let rows = painted(&p, 40, 20);
         for (name, icon) in [
-            ("work", EMOJI_ICONS[0]),
-            ("alpha", EMOJI_ICONS[1]),
-            ("editor", EMOJI_ICONS[2]),
+            ("work", EMOJI_ICONS[1]),
+            ("alpha", EMOJI_ICONS[2]),
+            ("editor", EMOJI_ICONS[3]),
         ] {
             let (x, y) = marker_cell(&p, name);
             let row: Vec<char> = rows[y as usize].chars().collect();
             assert_eq!(row[x as usize + 2], icon, "{name}: {row:?}");
         }
         let pane_row = rows.iter().find(|r| r.ends_with(" sh")).unwrap();
-        assert!(pane_row.contains(EMOJI_ICONS[3]), "{pane_row:?}");
+        assert!(pane_row.contains(EMOJI_ICONS[4]), "{pane_row:?}");
         let server = rows.iter().find(|r| r.contains("local")).unwrap();
-        assert_eq!(server, " \u{25BC} local");
+        assert_eq!(server, &format!(" \u{25BC} {}  local", EMOJI_ICONS[0]));
     }
 
     #[test]
@@ -1763,7 +1801,7 @@ mod tests {
         current.is_current = true;
         p.on_event(&tree(ConnId::Local, vec![current]));
         let rows = painted(&p, 40, 20);
-        let want = format!("   \u{25BC} {}  * alpha", EMOJI_ICONS[1]);
+        let want = format!("   \u{25BC} {}  * alpha", EMOJI_ICONS[2]);
         assert!(rows.contains(&want), "{rows:?}");
     }
 
@@ -1862,7 +1900,8 @@ mod tests {
         let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&remote_tree());
         let rows = painted(&p, 40, 12);
-        assert!(rows.iter().any(|r| r.trim() == "\u{25BC} gpu"), "{rows:?}");
+        let want = format!("\u{25BC} {}  gpu", EMOJI_ICONS[0]);
+        assert!(rows.iter().any(|r| r.trim() == want), "{rows:?}");
     }
 
     #[test]
