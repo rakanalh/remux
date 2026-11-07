@@ -2359,6 +2359,170 @@ fn apply_session_rename(
     }
 }
 
+/// Bring the session names held for `conn` into line with `live`, the sessions
+/// that server has now.
+///
+/// The server moves a client off a deleted session without naming either one,
+/// so a tree or a session list is the only way to learn of it. Attaching to a
+/// name the server no longer has is refused, and a client that has already
+/// detached then has a blank screen and loses its input.
+///
+/// Only a name that `live` proves dead is changed. A tree can be in flight while
+/// the user switches, and it then marks the session being left as current. The
+/// session being switched to exists, so that tree changes nothing here. The one
+/// session that can be absent from such a tree is the one `creating` names, whose
+/// `CreateSession` the server has not answered yet.
+///
+/// `landed` is the session the server says this client is on. The caller passes
+/// it only for the foreground connection, and it is `None` for a client that is
+/// detached, which leaves the current name for the caller to resolve. The current
+/// name does not go through [`record_switch`], because the user did not switch
+/// and Alt+o must not offer the deleted session. A previous name that is dead, or
+/// that the client has just landed on, is cleared, so Alt+o does nothing.
+fn reconcile_session_names(
+    conn: &ConnId,
+    live: &[String],
+    landed: Option<&str>,
+    creating: Option<&(ConnId, String)>,
+    current: &mut Option<(ConnId, String)>,
+    previous: &mut Option<(ConnId, String)>,
+    last_local: &mut Option<String>,
+) {
+    let gone = |entry: &(ConnId, String)| {
+        entry.0 == *conn && !live.contains(&entry.1) && creating != Some(entry)
+    };
+    if let Some(landed) = landed.filter(|_| current.as_ref().is_some_and(gone)) {
+        log::debug!("session names: on {conn:?} the current session is gone; now on {landed:?}");
+        if matches!(conn, ConnId::Local) {
+            *last_local = Some(landed.to_string());
+        }
+        *current = Some((conn.clone(), landed.to_string()));
+    }
+    if previous
+        .as_ref()
+        .is_some_and(|p| gone(p) || current.as_ref() == Some(p))
+    {
+        log::debug!("session names: the last session {previous:?} is no longer one to return to");
+        *previous = None;
+    }
+}
+
+/// What the client does with the `SessionList` it asked for around an attach
+/// from a remembered name.
+///
+/// A client that is detached hears nothing when a session is deleted: the server
+/// moves only clients attached to it. That is a client inside a View, and a
+/// connection in the background. So the list is asked for at the moment the name
+/// is needed, instead of relying on a push that does not come. A connection
+/// delivers in order, so the reply also reflects everything sent before it.
+///
+/// Where the client can survive a refusal, the `Attach` goes first and the reply
+/// only repairs a dead name, because the server drops input from an unattached
+/// client and keys typed during the round trip must reach the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttachCheck {
+    /// The foreground left a remote, so land on a local session.
+    LocalFallback,
+    /// A View closed and the session behind it was re-attached. A refusal leaves
+    /// the client detached, so a dead name needs another attach.
+    ViewExit { conn: ConnId },
+    /// Alt+o to another server or out of a View, where the switch detaches the
+    /// client. It waits for the reply, so that a dead target leaves the client
+    /// where it is.
+    SwitchLast { conn: ConnId, session: String },
+    /// Alt+o on the foreground server, already attached and recorded. A refusal
+    /// leaves the client on the session it was on, so only the names need repair.
+    SwitchedLast { conn: ConnId, session: String },
+}
+
+impl AttachCheck {
+    /// The connection whose `SessionList` settles this check.
+    fn conn(&self) -> &ConnId {
+        match self {
+            AttachCheck::LocalFallback => &ConnId::Local,
+            AttachCheck::ViewExit { conn }
+            | AttachCheck::SwitchLast { conn, .. }
+            | AttachCheck::SwitchedLast { conn, .. } => conn,
+        }
+    }
+
+    /// Whether the client can be left detached unless this check is settled, so
+    /// that Alt+o must not replace it. An Alt+o check owes nothing, so one aimed
+    /// at a server that never answers cannot disable the key.
+    fn owes_attach(&self) -> bool {
+        match self {
+            AttachCheck::LocalFallback | AttachCheck::ViewExit { .. } => true,
+            AttachCheck::SwitchLast { .. } | AttachCheck::SwitchedLast { .. } => false,
+        }
+    }
+}
+
+/// Re-attach the session behind a closed View, and ask for the session list that
+/// shows whether the name was still good. Without a known session there is
+/// nothing to re-attach, and a pending local fallback will attach by itself.
+async fn reattach_after_view(
+    mgr: &mut ConnectionManager,
+    current_attached: &Option<(ConnId, String)>,
+    attach_check: &mut Option<AttachCheck>,
+) -> Result<()> {
+    if matches!(attach_check, Some(AttachCheck::LocalFallback)) {
+        return Ok(());
+    }
+    if let Some((_, session)) = current_attached {
+        let conn = mgr.foreground().clone();
+        mgr.send(
+            &conn,
+            ClientMessage::Attach {
+                session_name: session.clone(),
+            },
+        )
+        .await?;
+        mgr.send(&conn, ClientMessage::ListSessions).await?;
+        *attach_check = Some(AttachCheck::ViewExit { conn });
+    }
+    Ok(())
+}
+
+/// The session a refused Alt+o left the client on: the one the switch recorded as
+/// previous, while the switch's target is still the current name and is dead.
+fn stayed_after_refused_switch(
+    conn: &ConnId,
+    session: &str,
+    live: &[String],
+    current: &Option<(ConnId, String)>,
+    previous: &Option<(ConnId, String)>,
+) -> Option<String> {
+    let refused = !live.iter().any(|s| s == session)
+        && current
+            .as_ref()
+            .is_some_and(|(c, name)| c == conn && name == session);
+    previous
+        .as_ref()
+        .filter(|(c, _)| refused && c == conn)
+        .map(|(_, name)| name.clone())
+}
+
+/// Whether `message` from `src` refuses the session the client is creating. Any
+/// other error leaves the create in flight, and a tree that does not list the
+/// session yet must still not move the client's names off it.
+fn refuses_creation(creating: &(ConnId, String), src: &ConnId, message: &str) -> bool {
+    creating.0 == *src && message.contains(&format!("'{}'", creating.1))
+}
+
+/// Forget what was waiting on `conn`, which has gone away and will never answer.
+fn forget_pending_on(
+    conn: &ConnId,
+    attach_check: &mut Option<AttachCheck>,
+    creating: &mut Option<(ConnId, String)>,
+) {
+    if attach_check.as_ref().is_some_and(|c| c.conn() == conn) {
+        *attach_check = None;
+    }
+    if creating.as_ref().is_some_and(|(c, _)| c == conn) {
+        *creating = None;
+    }
+}
+
 /// The session a server frame belongs to, as `(server, session)`.
 ///
 /// Usually the attached one, but not always: the attachment changes when the
@@ -3242,8 +3406,8 @@ struct DropCtx<'a> {
     viewport_top: usize,
     focused_pane_rect: Option<&'a crate::protocol::PaneRect>,
     last_local_session: &'a Option<String>,
-    current_attached: &'a mut Option<(ConnId, String)>,
-    previous_attached: &'a mut Option<(ConnId, String)>,
+    attach_check: &'a mut Option<AttachCheck>,
+    creating_session: &'a mut Option<(ConnId, String)>,
     live_sessions: &'a mut HashMap<ConnId, Vec<String>>,
     move_follow: &'a mut MoveFollow,
     wants_session_tree: bool,
@@ -3329,8 +3493,8 @@ async fn handle_connection_drop(
         viewport_top,
         focused_pane_rect,
         last_local_session,
-        current_attached,
-        previous_attached,
+        attach_check,
+        creating_session,
         live_sessions,
         move_follow,
         wants_session_tree,
@@ -3338,6 +3502,7 @@ async fn handle_connection_drop(
     } = cx;
     log::debug!("srv: connection closed src={:?}", src);
     live_sessions.remove(src);
+    forget_pending_on(src, attach_check, creating_session);
     // An open agent switcher must not offer a jump to a machine that is gone.
     if let Some(sw) = input.agent_switch.as_mut() {
         sw.drop_conn(src);
@@ -3440,16 +3605,10 @@ async fn handle_connection_drop(
                     },
                 )
                 .await?;
-                if let Some(session) = last_local_session.clone() {
-                    // Reattach; the server responds with a fresh FullRender.
-                    mgr.send(
-                        &ConnId::Local,
-                        ClientMessage::Attach {
-                            session_name: session.clone(),
-                        },
-                    )
-                    .await?;
-                    record_switch(current_attached, previous_attached, ConnId::Local, session);
+                if last_local_session.is_some() {
+                    *attach_check = Some(AttachCheck::LocalFallback);
+                    mgr.send(&ConnId::Local, ClientMessage::ListSessions)
+                        .await?;
                 } else {
                     // Nothing to fall back to: open the session manager.
                     input.mode = Mode::SessionManager;
@@ -4272,11 +4431,13 @@ async fn run_client_loop(
     // foreground-remote connection drops. Seeded from the pre-loop attach.
     let mut last_local_session: Option<String> = initial_local_session;
 
-    // Set when a foreground-remote session was deleted (e.g. its last tab was
-    // closed) and we've asked the local server for its session list to decide
-    // whether to fall back to a local session or exit. Consumed by the
-    // `SessionList` handler (gated on `src == Local`) to complete the fallback.
-    let mut pending_local_fallback = false;
+    // Set while a `SessionList` is awaited to settle an attach. Consumed by the
+    // `SessionList` handler, gated on the connection the check names.
+    let mut attach_check: Option<AttachCheck> = None;
+
+    // The session the client has just asked to create and attach to, until the
+    // server answers. See `reconcile_session_names`.
+    let mut creating_session: Option<(ConnId, String)> = None;
 
     // Set when a foreground *local* session was deleted while the session
     // manager is open. It arms a one-shot check: when the LOCAL server's tree
@@ -5932,8 +6093,8 @@ async fn run_client_loop(
                                         viewport_top,
                                         focused_pane_rect: focused_pane_rect.as_ref(),
                                         last_local_session: &last_local_session,
-                                        current_attached: &mut current_attached,
-                                        previous_attached: &mut previous_attached,
+                                        attach_check: &mut attach_check,
+                                        creating_session: &mut creating_session,
                                         live_sessions: &mut live_sessions,
                                         move_follow: &mut move_follow,
                                         wants_session_tree,
@@ -6027,8 +6188,8 @@ async fn run_client_loop(
                                                 viewport_top,
                                                 focused_pane_rect: focused_pane_rect.as_ref(),
                                                 last_local_session: &last_local_session,
-                                                current_attached: &mut current_attached,
-                                                previous_attached: &mut previous_attached,
+                                                attach_check: &mut attach_check,
+                                                creating_session: &mut creating_session,
                                                 live_sessions: &mut live_sessions,
                                                 move_follow: &mut move_follow,
                                                 wants_session_tree,
@@ -6512,35 +6673,29 @@ async fn run_client_loop(
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 renderer.flush()?;
-                                if let Some((server, session)) = previous_attached.clone() {
-                                    // Mirror the SessionSwitchConfirm path.
-                                    // A live view masks the switched-to session: tear
-                                    // it down before handing off the screen.
-                                    leave_active_view(
-                                    mgr,
-                                    &views,
-                                    &mut active_view,
-                                    &mut active_view_id,
-                                    &mut chrome,
-                                    &mut mouse_grab,
-                                ).await?;
-                                    // Leaving the view hands the screen back to the content rect:
-                                    // re-point the renderer at it before the target server is told
-                                    // what size to composite.
-                                    let content = content_rect_now(&chrome)?;
-                                    sync_content_rect(&mut renderer, &chrome, &content);
-                                    switch_to_server(mgr, &mut renderer, &server, content).await?;
-                                    mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
-                                    mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
-                                    if server == ConnId::Local {
-                                        last_local_session = Some(session.clone());
+                                if attach_check.as_ref().is_some_and(AttachCheck::owes_attach) {
+                                    log::debug!("Alt+o: dropped, an attach is still being settled");
+                                } else if let Some((server, session)) = previous_attached.clone() {
+                                    if mgr.is_foreground(&server) && active_view.is_none() {
+                                        mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
+                                        mgr.send(&server, ClientMessage::ListSessions).await?;
+                                        if server == ConnId::Local {
+                                            last_local_session = Some(session.clone());
+                                        }
+                                        attach_check = Some(AttachCheck::SwitchedLast { conn: server.clone(), session: session.clone() });
+                                        record_switch(&mut current_attached, &mut previous_attached, server, session);
+                                    } else {
+                                        // A remote that dropped must be up to answer.
+                                        if let ConnId::Remote(name) = &server {
+                                            if mgr.remote_state(name) != RemoteState::Connected {
+                                                mgr.connect_remote(name).await?;
+                                            }
+                                        }
+                                        mgr.send(&server, ClientMessage::ListSessions).await?;
+                                        attach_check = Some(AttachCheck::SwitchLast { conn: server, session });
                                     }
-                                    // Record so repeated Alt-o toggles back and forth.
-                                    record_switch(&mut current_attached, &mut previous_attached, server, session);
-                                } else {
-                                    // No previous session: keep the server's mode in sync.
-                                    mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                 }
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::AgentSwitchOpen => {
                                 if whichkey.visible {
@@ -6800,6 +6955,7 @@ async fn run_client_loop(
                                 // record it so the Alt-o toggle baseline stays in
                                 // sync with the actual foreground session.
                                 let fg = mgr.foreground().clone();
+                                creating_session = Some((fg.clone(), name.clone()));
                                 record_switch(&mut current_attached, &mut previous_attached, fg, name.clone());
                             }
                             // -- Views --------------------------------------------------
@@ -7108,15 +7264,11 @@ async fn run_client_loop(
                                     let content = chrome.content_rect(c, r);
                                     sync_content_rect(&mut renderer, &chrome, &content);
                                     // Entering the view detached the foreground session
-                                    // (bug4 fix); re-attach it now so the server resumes
+                                    // (bug4 fix); re-attach it so the server resumes
                                     // rendering it. `handle_resize` is a no-op for an
                                     // unattached client, so without this re-attach the
                                     // screen would stay blank on view exit.
-                                    if let Some((_, session)) = current_attached.clone() {
-                                        mgr.send_foreground(ClientMessage::Attach {
-                                            session_name: session,
-                                        }).await?;
-                                    }
+                                    reattach_after_view(mgr, &current_attached, &mut attach_check).await?;
                                     mgr.send_foreground(ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
                                     chrome.paint(&mut renderer, c, r, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                     renderer.flush()?;
@@ -8250,8 +8402,8 @@ async fn run_client_loop(
                                 viewport_top,
                                 focused_pane_rect: focused_pane_rect.as_ref(),
                                 last_local_session: &last_local_session,
-                                current_attached: &mut current_attached,
-                                previous_attached: &mut previous_attached,
+                                attach_check: &mut attach_check,
+                                creating_session: &mut creating_session,
                                 live_sessions: &mut live_sessions,
                                 move_follow: &mut move_follow,
                                 wants_session_tree,
@@ -8434,43 +8586,140 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::SessionList { sessions }) => {
                         log::debug!("received session list with {} sessions", sessions.len());
-                        // Complete a pending local fallback: a foreground remote
-                        // session was deleted and we asked the local server for its
-                        // sessions to decide where to land.
-                        if pending_local_fallback && src == ConnId::Local {
-                            pending_local_fallback = false;
-                            if sessions.is_empty() {
-                                // No local sessions to fall back to -- exit.
-                                break;
+                        let live: Vec<String> = sessions.into_iter().map(|s| s.name).collect();
+                        reconcile_session_names(
+                            &src,
+                            &live,
+                            None,
+                            creating_session.as_ref(),
+                            &mut current_attached,
+                            &mut previous_attached,
+                            &mut last_local_session,
+                        );
+                        match attach_check.take_if(|check| *check.conn() == src) {
+                            Some(AttachCheck::LocalFallback) => {
+                                // A dropped remote can leave the manager open, and
+                                // it is the one place a user can reconnect from, so
+                                // it stays, over a local session if there is one.
+                                let manager_open = input.session_manager.is_some();
+                                if live.is_empty() && !manager_open {
+                                    // No local sessions to fall back to -- exit.
+                                    break;
+                                }
+                                // Prefer the last local session we were on if it still
+                                // exists; otherwise take the first available one.
+                                let target = last_local_session
+                                    .as_ref()
+                                    .filter(|name| live.contains(name))
+                                    .or(live.first())
+                                    .cloned();
+                                if let Some(target) = target {
+                                    if !manager_open {
+                                        input.mode = Mode::Normal;
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        renderer.clear_overlay(c, r)?;
+                                        renderer.flush()?;
+                                    }
+                                    // Standard switch dance (mirrors the session-manager
+                                    // SwitchSession path) targeting the local server.
+                                    let content = content_rect_now(&chrome)?;
+                                    switch_to_server(mgr, &mut renderer, &ConnId::Local, content).await?;
+                                    mgr.send(&ConnId::Local, ClientMessage::Attach {
+                                        session_name: target.clone(),
+                                    }).await?;
+                                    if !manager_open {
+                                        mgr.send(&ConnId::Local, ClientMessage::ModeChanged {
+                                            mode: "NORMAL".to_string(),
+                                        }).await?;
+                                    }
+                                    last_local_session = Some(target.clone());
+                                    record_switch(&mut current_attached, &mut previous_attached, ConnId::Local, target);
+                                }
                             }
-                            // Prefer the last local session we were on if it still
-                            // exists; otherwise take the first available one.
-                            let target = last_local_session
-                                .as_ref()
-                                .filter(|name| sessions.iter().any(|s| &s.name == *name))
-                                .cloned()
-                                .unwrap_or_else(|| sessions[0].name.clone());
-                            // Standard switch dance (mirrors the session-manager
-                            // SwitchSession path) targeting the local server.
-                            input.session_manager = None;
-                            input.mode = Mode::Normal;
-                            let (c, r) = crossterm::terminal::size()?;
-                            renderer.clear_overlay(c, r)?;
-                            renderer.flush()?;
-                            let content = content_rect_now(&chrome)?;
-                            switch_to_server(mgr, &mut renderer, &ConnId::Local, content).await?;
-                            mgr.send(&ConnId::Local, ClientMessage::Attach {
-                                session_name: target.clone(),
-                            }).await?;
-                            mgr.send(&ConnId::Local, ClientMessage::ModeChanged {
-                                mode: "NORMAL".to_string(),
-                            }).await?;
-                            last_local_session = Some(target.clone());
-                            record_switch(&mut current_attached, &mut previous_attached, ConnId::Local, target);
+                            // A view entered, or a switch made, since the exit has
+                            // settled what is on screen.
+                            Some(AttachCheck::ViewExit { .. })
+                                if active_view.is_none()
+                                    && mgr.is_foreground(&src)
+                                    && current_attached
+                                        .as_ref()
+                                        .is_some_and(|(conn, session)| *conn == src && !live.contains(session)) =>
+                            {
+                                if let Some(target) = live.first().cloned() {
+                                    reconcile_session_names(
+                                        &src,
+                                        &live,
+                                        Some(&target),
+                                        creating_session.as_ref(),
+                                        &mut current_attached,
+                                        &mut previous_attached,
+                                        &mut last_local_session,
+                                    );
+                                    mgr.send(&src, ClientMessage::Attach { session_name: target }).await?;
+                                    let content = content_rect_now(&chrome)?;
+                                    mgr.send(&src, ClientMessage::Resize {
+                                        cols: content.width,
+                                        rows: content.height,
+                                    }).await?;
+                                } else if src != ConnId::Local && mgr.connected_ids().contains(&ConnId::Local) {
+                                    attach_check = Some(AttachCheck::LocalFallback);
+                                    mgr.send(&ConnId::Local, ClientMessage::ListSessions).await?;
+                                } else {
+                                    // Nothing is left to show, as when the last
+                                    // session of the foreground server goes.
+                                    break;
+                                }
+                            }
+                            // Reconciling above cleared a target that is gone, and
+                            // a switch made since replaced it.
+                            Some(AttachCheck::SwitchLast { conn, session })
+                                if previous_attached
+                                    .as_ref()
+                                    .is_some_and(|(c, s)| *c == conn && *s == session) =>
+                            {
+                                switch_to_target(
+                                    mgr,
+                                    &mut renderer,
+                                    &mut chrome,
+                                    &views,
+                                    &mut active_view,
+                                    &mut active_view_id,
+                                    &mut mouse_grab,
+                                    &mut last_local_session,
+                                    &mut current_attached,
+                                    &mut previous_attached,
+                                    JumpTarget::Session { conn, session },
+                                )
+                                .await?;
+                            }
+                            Some(AttachCheck::SwitchedLast { conn, session }) => {
+                                let stayed = stayed_after_refused_switch(
+                                    &conn,
+                                    &session,
+                                    &live,
+                                    &current_attached,
+                                    &previous_attached,
+                                );
+                                if let Some(stayed) = stayed {
+                                    reconcile_session_names(
+                                        &conn,
+                                        &live,
+                                        Some(&stayed),
+                                        creating_session.as_ref(),
+                                        &mut current_attached,
+                                        &mut previous_attached,
+                                        &mut last_local_session,
+                                    );
+                                }
+                            }
+                            Some(AttachCheck::ViewExit { .. } | AttachCheck::SwitchLast { .. }) | None => {}
                         }
                     }
                     Some(ServerMessage::Error { message, .. }) => {
                         log::error!("Server error: {}", message);
+                        if creating_session.as_ref().is_some_and(|c| refuses_creation(c, &src, &message)) {
+                            creating_session = None;
+                        }
                     }
                     Some(ServerMessage::ContextMenu { x, y, target }) => {
                         // A modal prompt, a view or an open session manager owns
@@ -8802,6 +9051,17 @@ async fn run_client_loop(
                             }
                             record_switch(&mut current_attached, &mut previous_attached, conn, session);
                         }
+                        // After the follow above, which can record a session that
+                        // a pane move has just emptied as the previous one.
+                        reconcile_session_names(
+                            &src,
+                            live_sessions.get(&src).map_or(&[], Vec::as_slice),
+                            current.filter(|_| mgr.is_foreground(&src)),
+                            creating_session.as_ref(),
+                            &mut current_attached,
+                            &mut previous_attached,
+                            &mut last_local_session,
+                        );
                         // Hand every panel the tree BEFORE the overlay branches
                         // below move it. Unconditional: a tree arrives whether
                         // it was asked for (`ListSessionTree`) or pushed
@@ -9070,6 +9330,11 @@ async fn run_client_loop(
                         if let crate::protocol::SessionEvent::SessionRenamed { old, new } = &event {
                             apply_session_rename(&src, old, new, &mut current_attached, &mut previous_attached, &mut last_local_session, &mut popup);
                         }
+                        if let crate::protocol::SessionEvent::SessionCreated(name) = &event {
+                            if creating_session.as_ref().is_some_and(|(conn, n)| *conn == src && n == name) {
+                                creating_session = None;
+                            }
+                        }
                         // A pane the SERVER reports dead is deliberately NOT
                         // foreground-scoped: a view cell can alias a pane on any
                         // connected server, and the whole point of the event is
@@ -9167,7 +9432,7 @@ async fn run_client_loop(
                                 // connection to fall back to -- exit gracefully
                                 // rather than send to a connection that isn't there.
                                 if mgr.connected_ids().contains(&ConnId::Local) {
-                                    pending_local_fallback = true;
+                                    attach_check = Some(AttachCheck::LocalFallback);
                                     mgr.send(&ConnId::Local, ClientMessage::ListSessions).await?;
                                 } else {
                                     break;
@@ -9491,12 +9756,7 @@ async fn run_client_loop(
                                     // the edges back to the sidebars.
                                     let content = chrome.content_rect(c, r);
                                     sync_content_rect(&mut renderer, &chrome, &content);
-                                    if let Some((_, session)) = current_attached.clone() {
-                                        mgr.send_foreground(ClientMessage::Attach {
-                                            session_name: session,
-                                        })
-                                        .await?;
-                                    }
+                                    reattach_after_view(mgr, &current_attached, &mut attach_check).await?;
                                     mgr.send_foreground(ClientMessage::Resize {
                                         cols: content.width,
                                         rows: content.height,
@@ -9993,6 +10253,215 @@ mod tests {
     }
 
     use super::*;
+
+    mod session_names {
+        use super::*;
+
+        fn entry(conn: &ConnId, name: &str) -> Option<(ConnId, String)> {
+            Some((conn.clone(), name.to_string()))
+        }
+
+        fn live(names: &[&str]) -> Vec<String> {
+            names.iter().map(|s| s.to_string()).collect()
+        }
+
+        struct Names {
+            current: Option<(ConnId, String)>,
+            previous: Option<(ConnId, String)>,
+            last_local: Option<String>,
+        }
+
+        impl Names {
+            fn reconcile(
+                &mut self,
+                conn: &ConnId,
+                sessions: &[&str],
+                landed: Option<&str>,
+                creating: Option<&(ConnId, String)>,
+            ) {
+                reconcile_session_names(
+                    conn,
+                    &live(sessions),
+                    landed,
+                    creating,
+                    &mut self.current,
+                    &mut self.previous,
+                    &mut self.last_local,
+                );
+            }
+        }
+
+        fn on_main() -> Names {
+            Names {
+                current: entry(&ConnId::Local, "main"),
+                previous: None,
+                last_local: Some("main".to_string()),
+            }
+        }
+
+        #[test]
+        fn a_moved_client_follows_the_server_off_a_deleted_session() {
+            let mut names = on_main();
+            names.reconcile(&ConnId::Local, &["haven"], Some("haven"), None);
+            assert_eq!(names.current, entry(&ConnId::Local, "haven"));
+            assert_eq!(names.last_local.as_deref(), Some("haven"));
+            assert_eq!(names.previous, None, "the user did not switch");
+        }
+
+        #[test]
+        fn a_moved_client_on_a_remote_keeps_its_local_fallback() {
+            let far = ConnId::Remote("far".to_string());
+            let mut names = on_main();
+            names.current = entry(&far, "r1");
+            names.reconcile(&far, &["r2"], Some("r2"), None);
+            assert_eq!(names.current, entry(&far, "r2"));
+            assert_eq!(names.last_local.as_deref(), Some("main"));
+        }
+
+        #[test]
+        fn a_tree_in_flight_does_not_undo_a_switch_to_a_live_session() {
+            let mut names = on_main();
+            names.current = entry(&ConnId::Local, "haven");
+            names.previous = entry(&ConnId::Local, "main");
+            names.reconcile(&ConnId::Local, &["main", "haven"], Some("main"), None);
+            assert_eq!(names.current, entry(&ConnId::Local, "haven"));
+            assert_eq!(names.previous, entry(&ConnId::Local, "main"));
+        }
+
+        #[test]
+        fn a_tree_in_flight_does_not_undo_a_switch_to_a_session_being_created() {
+            let mut names = on_main();
+            names.current = entry(&ConnId::Local, "fresh");
+            names.previous = entry(&ConnId::Local, "main");
+            let creating = entry(&ConnId::Local, "fresh");
+            names.reconcile(&ConnId::Local, &["main"], Some("main"), creating.as_ref());
+            assert_eq!(names.current, entry(&ConnId::Local, "fresh"));
+            assert_eq!(names.previous, entry(&ConnId::Local, "main"));
+        }
+
+        #[test]
+        fn a_tree_from_another_server_proves_nothing_about_these_names() {
+            let far = ConnId::Remote("far".to_string());
+            let mut names = on_main();
+            names.previous = entry(&far, "r1");
+            names.reconcile(&ConnId::Local, &["main"], Some("main"), None);
+            assert_eq!(names.previous, entry(&far, "r1"));
+
+            names.current = entry(&far, "r1");
+            names.previous = entry(&ConnId::Local, "main");
+            names.reconcile(&ConnId::Local, &["haven"], None, None);
+            assert_eq!(names.current, entry(&far, "r1"));
+        }
+
+        #[test]
+        fn a_dead_previous_session_is_cleared_and_a_live_one_kept() {
+            let mut names = on_main();
+            names.previous = entry(&ConnId::Local, "side");
+            names.reconcile(&ConnId::Local, &["main", "side"], Some("main"), None);
+            assert_eq!(names.previous, entry(&ConnId::Local, "side"));
+            names.reconcile(&ConnId::Local, &["main"], Some("main"), None);
+            assert_eq!(names.previous, None);
+        }
+
+        #[test]
+        fn landing_on_the_previous_session_leaves_nothing_to_toggle_to() {
+            let mut names = on_main();
+            names.current = entry(&ConnId::Local, "side");
+            names.previous = entry(&ConnId::Local, "main");
+            names.reconcile(&ConnId::Local, &["main"], Some("main"), None);
+            assert_eq!(names.current, entry(&ConnId::Local, "main"));
+            assert_eq!(names.previous, None);
+        }
+
+        #[test]
+        fn a_detached_client_keeps_its_name_for_the_view_exit_to_resolve() {
+            let mut names = on_main();
+            names.reconcile(&ConnId::Local, &["haven"], None, None);
+            assert_eq!(names.current, entry(&ConnId::Local, "main"));
+        }
+
+        #[test]
+        fn only_a_check_that_can_leave_the_client_detached_blocks_alt_o() {
+            let conn = ConnId::Remote("far".to_string());
+            let session = "r1".to_string();
+            assert!(AttachCheck::LocalFallback.owes_attach());
+            assert!(AttachCheck::ViewExit { conn: conn.clone() }.owes_attach());
+            assert!(!AttachCheck::SwitchLast {
+                conn: conn.clone(),
+                session: session.clone()
+            }
+            .owes_attach());
+            assert!(!AttachCheck::SwitchedLast { conn, session }.owes_attach());
+        }
+
+        #[test]
+        fn a_dropped_connection_takes_what_was_waiting_on_it() {
+            let far = ConnId::Remote("far".to_string());
+            let mut check = Some(AttachCheck::ViewExit { conn: far.clone() });
+            let mut creating = entry(&far, "fresh");
+            forget_pending_on(&ConnId::Local, &mut check, &mut creating);
+            assert!(check.is_some(), "another connection's drop proves nothing");
+            assert!(creating.is_some());
+            forget_pending_on(&far, &mut check, &mut creating);
+            assert_eq!(check, None);
+            assert_eq!(creating, None);
+        }
+
+        #[test]
+        fn only_an_error_naming_the_session_refuses_its_creation() {
+            let far = ConnId::Remote("far".to_string());
+            let creating = (far.clone(), "fresh".to_string());
+            assert!(refuses_creation(
+                &creating,
+                &far,
+                "session 'fresh' already exists"
+            ));
+            assert!(!refuses_creation(&creating, &far, "pane 7 not found"));
+            assert!(!refuses_creation(
+                &creating,
+                &far,
+                "session 'refresh' not found"
+            ));
+            assert!(!refuses_creation(
+                &creating,
+                &ConnId::Local,
+                "session 'fresh' already exists"
+            ));
+        }
+
+        #[test]
+        fn a_refused_alt_o_names_the_session_the_client_stayed_on() {
+            let current = entry(&ConnId::Local, "gone");
+            let previous = entry(&ConnId::Local, "main");
+            let stayed = |sessions: &[&str]| {
+                stayed_after_refused_switch(
+                    &ConnId::Local,
+                    "gone",
+                    &live(sessions),
+                    &current,
+                    &previous,
+                )
+            };
+            assert_eq!(stayed(&["main"]).as_deref(), Some("main"));
+            assert_eq!(stayed(&["main", "gone"]), None, "the attach was accepted");
+        }
+
+        #[test]
+        fn a_refused_alt_o_changes_nothing_once_the_names_have_moved_on() {
+            let current = entry(&ConnId::Local, "third");
+            let previous = entry(&ConnId::Local, "main");
+            assert_eq!(
+                stayed_after_refused_switch(
+                    &ConnId::Local,
+                    "gone",
+                    &live(&["main", "third"]),
+                    &current,
+                    &previous,
+                ),
+                None
+            );
+        }
+    }
 
     mod tree_focus {
         use super::super::current_tree_focus;
