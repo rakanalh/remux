@@ -337,8 +337,9 @@ def held(srv, name, requests, argv0=None, deaf=False):
     the end of the run: neither can mark the agents list dirty around the
     send. With `argv0`, python is re-executed under that `argv[0]`, which is
     how the pane is listed as an agent (case 12's rescue) while staying one
-    process. With `deaf`, its terminal is put in raw mode first and never
-    read: an agent the server's probe finds not reading.
+    process. With `deaf`, it turns bracketed paste on, then puts its terminal
+    in raw mode and never reads it: an agent the server's probe finds not
+    reading.
 
     `requests` may be a callable taking the new pane's id, for a pane that
     must address itself.
@@ -346,7 +347,12 @@ def held(srv, name, requests, argv0=None, deaf=False):
     go, in_file, out_file = (f"{RUNDIR}/{name}-{n}" for n in ("go", "in.json", "out.json"))
     argv = ["python3"]
     if argv0 is not None:
-        raw = "import tty; tty.setraw(0); " if deaf else ""
+        # The deaf agent turns bracketed paste on first, as Claude Code and
+        # Codex do. A submit types only into a live bracketed paste, so
+        # without it the server refuses `paste_unavailable` before the probe
+        # and never finds out that the agent does not read. The sequence
+        # changes a mode and draws nothing on the screen.
+        raw = "import tty; os.write(1, b'\\x1b[?2004h'); tty.setraw(0); " if deaf else ""
         exe = "sys.executable"
         if DARWIN:
             # A macOS `python3` is a stub that re-execs the framework's
