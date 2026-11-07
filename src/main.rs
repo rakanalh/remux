@@ -1165,6 +1165,17 @@ fn move_follow_for(conn: &ConnId, current: &str, target: &str) -> Option<(ConnId
 /// supersedes it), when its connection goes away, and when its connection is
 /// no longer the foreground once the answer arrives, because a background
 /// connection's session must never be recorded as the one the client is on.
+///
+/// A whole tab moved out of the client's session is armed too, because the
+/// server follows only a tab it has active and the client cannot know which
+/// that is. A move the server does not follow therefore leaves the follow
+/// armed until one of the events above. If the client is later moved into the
+/// target by other means, for example by the deletion of the source, that is
+/// recorded as a switch and Alt+o returns to the source instead of the session
+/// before it. The follow cannot be forgotten on a tree that shows the client
+/// still in the source: the server moves the tab and then, after awaits that
+/// release its state, attaches the requester, so a tree pushed in between shows
+/// exactly that for a move it does follow.
 #[derive(Debug, Default)]
 struct MoveFollow(Option<(ConnId, String)>);
 
@@ -1425,6 +1436,86 @@ async fn switch_to_target(
     }
     record_switch(current_attached, previous_attached, server, session);
     Ok(())
+}
+
+/// Go to `target`, which a menu or a tree named, once it is known to exist.
+///
+/// Everything a user picks from a list goes through here, because the list can
+/// be older than a deletion. On the foreground server and outside a View, the
+/// client stays attached through a refused `Attach`, so the jump goes first and
+/// keys typed behind it reach the target; the session list that follows puts the
+/// names back if the target was gone. Anywhere else the switch detaches the
+/// client, so it waits for the list and does not happen if the target is gone.
+///
+/// A jump is dropped while a check owes an attach, for the reason Alt+o is.
+///
+/// Returns whether the client switched now. A caller leaves the sidebar only
+/// then, so a dropped jump keeps the keyboard where it was; a waiting jump
+/// leaves it when the reply switches.
+#[allow(clippy::too_many_arguments)]
+async fn request_jump(
+    mgr: &mut ConnectionManager,
+    renderer: &mut Renderer,
+    chrome: &mut crate::client::chrome::Chrome,
+    views: &[crate::client::view::ClientView],
+    active_view: &mut Option<usize>,
+    active_view_id: &mut Option<ViewId>,
+    mouse_grab: &mut Option<MouseGrab>,
+    last_local_session: &mut Option<String>,
+    current_attached: &mut Option<(ConnId, String)>,
+    previous_attached: &mut Option<(ConnId, String)>,
+    attach_check: &mut Option<AttachCheck>,
+    target: JumpTarget,
+    then: Option<RemuxCommand>,
+) -> Result<bool> {
+    if attach_check.as_ref().is_some_and(AttachCheck::owes_attach) {
+        log::debug!("jump to {target:?}: dropped, an attach is still being settled");
+        return Ok(false);
+    }
+    let conn = target.conn().clone();
+    if mgr.is_foreground(&conn) && active_view.is_none() {
+        let before = SessionNames {
+            current: current_attached.clone(),
+            previous: previous_attached.clone(),
+            last_local: last_local_session.clone(),
+        };
+        let session = target.session().to_string();
+        switch_to_target(
+            mgr,
+            renderer,
+            chrome,
+            views,
+            active_view,
+            active_view_id,
+            mouse_grab,
+            last_local_session,
+            current_attached,
+            previous_attached,
+            target,
+        )
+        .await?;
+        if let Some(cmd) = then {
+            mgr.send(&conn, ClientMessage::Command(cmd)).await?;
+        }
+        mgr.send(&conn, ClientMessage::ListSessions).await?;
+        *attach_check = Some(AttachCheck::Jumped {
+            conn,
+            session,
+            before: Box::new(before),
+        });
+        return Ok(true);
+    }
+    if let ConnId::Remote(name) = &conn {
+        if mgr.remote_state(name) != RemoteState::Connected {
+            if let Err(e) = mgr.connect_remote(name).await {
+                log::warn!("jump to {target:?}: dropped, '{name}' did not connect: {e:#}");
+                return Ok(false);
+            }
+        }
+    }
+    mgr.send(&conn, ClientMessage::ListSessions).await?;
+    *attach_check = Some(AttachCheck::Jump { target, then });
+    Ok(false)
 }
 
 /// Act on what a sidebar plugin asked for after an input event.
@@ -1908,6 +1999,7 @@ async fn handle_plugin_action(
     last_local_session: &mut Option<String>,
     current_attached: &mut Option<(ConnId, String)>,
     previous_attached: &mut Option<(ConnId, String)>,
+    attach_check: &mut Option<AttachCheck>,
     input: &InputHandler,
     view_paint: ViewPaint<'_>,
 ) -> Result<()> {
@@ -1942,8 +2034,7 @@ async fn handle_plugin_action(
         }
         PluginAction::JumpTo(target) => {
             log::debug!("sidebar: plugin jump to {target:?}");
-            chrome.leave_sidebar();
-            switch_to_target(
+            let switched = request_jump(
                 mgr,
                 renderer,
                 chrome,
@@ -1954,9 +2045,14 @@ async fn handle_plugin_action(
                 last_local_session,
                 current_attached,
                 previous_attached,
+                attach_check,
                 target,
+                None,
             )
             .await?;
+            if switched {
+                chrome.leave_sidebar();
+            }
         }
         PluginAction::EnterView(id) => {
             let ViewPaint {
@@ -2085,6 +2181,7 @@ async fn run_menu_action(
     current_attached: &mut Option<(ConnId, String)>,
     previous_attached: &mut Option<(ConnId, String)>,
     move_follow: &mut MoveFollow,
+    attach_check: &mut Option<AttachCheck>,
     live_sessions: &HashMap<ConnId, Vec<String>>,
     view_paint: ViewPaint<'_>,
 ) -> Result<()> {
@@ -2111,19 +2208,24 @@ async fn run_menu_action(
                 last_local_session,
                 current_attached,
                 previous_attached,
+                attach_check,
                 input,
                 view_paint,
             )
             .await?;
         }
         MenuAction::JumpThen(target, then) => {
-            handle_plugin_action(
-                PluginAction::JumpTo(target),
-                chrome,
+            let then = match *then {
+                MenuAction::Command(cmd) => Some(cmd),
+                other => {
+                    log::warn!("context menu: no action follows a jump for {other:?}");
+                    None
+                }
+            };
+            let switched = request_jump(
                 mgr,
                 renderer,
-                theme,
-                focused_pane_rect,
+                chrome,
                 views,
                 active_view,
                 active_view_id,
@@ -2131,15 +2233,13 @@ async fn run_menu_action(
                 last_local_session,
                 current_attached,
                 previous_attached,
-                input,
-                view_paint,
+                attach_check,
+                target,
+                then,
             )
             .await?;
-            match *then {
-                MenuAction::Command(cmd) => {
-                    mgr.send_foreground(ClientMessage::Command(cmd)).await?;
-                }
-                other => log::warn!("context menu: no action follows a jump for {other:?}"),
+            if switched {
+                chrome.leave_sidebar();
             }
         }
         MenuAction::KillSession { conn, name } => {
@@ -2165,7 +2265,15 @@ async fn run_menu_action(
             to,
             follows,
         } => {
-            if follows {
+            // The server decides from the tab it has active, and a menu built from
+            // an older tree can disagree, so every move out of the client's own
+            // session is armed. `MoveFollow` records the follow when a tree shows
+            // the client in `to`; a move the server does not follow stays armed,
+            // as `MoveFollow` describes.
+            let from_current = current_attached
+                .as_ref()
+                .is_some_and(|(c, s)| *c == conn && *s == from);
+            if follows || from_current {
                 move_follow.arm((conn.clone(), to.clone()));
             }
             mgr.send(
@@ -2241,6 +2349,7 @@ async fn run_menu_action(
                 last_local_session,
                 current_attached,
                 previous_attached,
+                attach_check,
                 input,
                 view_paint,
             )
@@ -2419,7 +2528,7 @@ fn reconcile_session_names(
 /// Where the client can survive a refusal, the `Attach` goes first and the reply
 /// only repairs a dead name, because the server drops input from an unattached
 /// client and keys typed during the round trip must reach the session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum AttachCheck {
     /// The foreground left a remote, so land on a local session.
     LocalFallback,
@@ -2433,6 +2542,29 @@ enum AttachCheck {
     /// Alt+o on the foreground server, already attached and recorded. A refusal
     /// leaves the client on the session it was on, so only the names need repair.
     SwitchedLast { conn: ConnId, session: String },
+    /// A jump to another server or out of a View, where the switch detaches the
+    /// client. It waits for the reply, so that a jump to a session deleted since
+    /// the tree was drawn leaves the client where it is.
+    Jump {
+        target: JumpTarget,
+        then: Option<RemuxCommand>,
+    },
+    /// A jump on the foreground server, already attached and recorded. A refusal
+    /// leaves the client on the session it was on, so the names go back to what
+    /// they were before the jump.
+    Jumped {
+        conn: ConnId,
+        session: String,
+        before: Box<SessionNames>,
+    },
+}
+
+/// The client's three session names, as [`switch_to_target`] leaves them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionNames {
+    current: Option<(ConnId, String)>,
+    previous: Option<(ConnId, String)>,
+    last_local: Option<String>,
 }
 
 impl AttachCheck {
@@ -2440,19 +2572,24 @@ impl AttachCheck {
     fn conn(&self) -> &ConnId {
         match self {
             AttachCheck::LocalFallback => &ConnId::Local,
+            AttachCheck::Jump { target, .. } => target.conn(),
             AttachCheck::ViewExit { conn }
             | AttachCheck::SwitchLast { conn, .. }
-            | AttachCheck::SwitchedLast { conn, .. } => conn,
+            | AttachCheck::SwitchedLast { conn, .. }
+            | AttachCheck::Jumped { conn, .. } => conn,
         }
     }
 
     /// Whether the client can be left detached unless this check is settled, so
-    /// that Alt+o must not replace it. An Alt+o check owes nothing, so one aimed
-    /// at a server that never answers cannot disable the key.
+    /// that neither Alt+o nor a jump may replace it. A switch's check owes
+    /// nothing, so one aimed at a server that never answers cannot disable either.
     fn owes_attach(&self) -> bool {
         match self {
             AttachCheck::LocalFallback | AttachCheck::ViewExit { .. } => true,
-            AttachCheck::SwitchLast { .. } | AttachCheck::SwitchedLast { .. } => false,
+            AttachCheck::SwitchLast { .. }
+            | AttachCheck::SwitchedLast { .. }
+            | AttachCheck::Jump { .. }
+            | AttachCheck::Jumped { .. } => false,
         }
     }
 }
@@ -4627,6 +4764,7 @@ async fn run_client_loop(
                     &mut current_attached,
                     &mut previous_attached,
                     &mut move_follow,
+                    &mut attach_check,
                     &live_sessions,
                     ViewPaint {
                         whichkey: &whichkey,
@@ -4897,6 +5035,7 @@ async fn run_client_loop(
                                             &mut last_local_session,
                                             &mut current_attached,
                                             &mut previous_attached,
+                                            &mut attach_check,
                                             &input,
                                             ViewPaint {
                                                 whichkey: &whichkey,
@@ -6209,7 +6348,7 @@ async fn run_client_loop(
                                         renderer.flush()?;
                                         // Same jump path as the sidebar panel; see
                                         // `switch_to_target`.
-                                        switch_to_target(
+                                        request_jump(
                                             mgr,
                                             &mut renderer,
                                             &mut chrome,
@@ -6220,7 +6359,9 @@ async fn run_client_loop(
                                             &mut last_local_session,
                                             &mut current_attached,
                                             &mut previous_attached,
+                                            &mut attach_check,
                                             JumpTarget::Session { conn: server, session },
+                                            None,
                                         ).await?;
                                     }
                                     SessionManagerAction::SwitchTab { server, session, tab_index } => {
@@ -6231,7 +6372,7 @@ async fn run_client_loop(
                                         renderer.flush()?;
                                         // Same jump path as the sidebar panel; see
                                         // `switch_to_target`.
-                                        switch_to_target(
+                                        request_jump(
                                             mgr,
                                             &mut renderer,
                                             &mut chrome,
@@ -6242,7 +6383,9 @@ async fn run_client_loop(
                                             &mut last_local_session,
                                             &mut current_attached,
                                             &mut previous_attached,
+                                            &mut attach_check,
                                             JumpTarget::Tab { conn: server, session, tab_index },
+                                            None,
                                         ).await?;
                                     }
                                     SessionManagerAction::SwitchPane { server, session, tab_index, pane_id } => {
@@ -6253,7 +6396,7 @@ async fn run_client_loop(
                                         renderer.flush()?;
                                         // The jump itself is shared with the sidebar's
                                         // `PluginAction::JumpTo`; see `switch_to_target`.
-                                        switch_to_target(
+                                        request_jump(
                                             mgr,
                                             &mut renderer,
                                             &mut chrome,
@@ -6264,7 +6407,9 @@ async fn run_client_loop(
                                             &mut last_local_session,
                                             &mut current_attached,
                                             &mut previous_attached,
+                                            &mut attach_check,
                                             JumpTarget::Pane { conn: server, session, tab_index, pane_id },
+                                            None,
                                         ).await?;
                                     }
                                     // Structural edits target the server carried by the
@@ -7992,6 +8137,7 @@ async fn run_client_loop(
                                 &mut last_local_session,
                                 &mut current_attached,
                                 &mut previous_attached,
+                                &mut attach_check,
                                 &input,
                                 ViewPaint {
                                     whichkey: &whichkey,
@@ -8705,6 +8851,53 @@ async fn run_client_loop(
                                         &conn,
                                         &live,
                                         Some(&stayed),
+                                        creating_session.as_ref(),
+                                        &mut current_attached,
+                                        &mut previous_attached,
+                                        &mut last_local_session,
+                                    );
+                                }
+                            }
+                            Some(AttachCheck::Jump { target, then }) => {
+                                if live.iter().any(|s| s == target.session()) {
+                                    let conn = target.conn().clone();
+                                    chrome.leave_sidebar();
+                                    switch_to_target(
+                                        mgr,
+                                        &mut renderer,
+                                        &mut chrome,
+                                        &views,
+                                        &mut active_view,
+                                        &mut active_view_id,
+                                        &mut mouse_grab,
+                                        &mut last_local_session,
+                                        &mut current_attached,
+                                        &mut previous_attached,
+                                        target,
+                                    )
+                                    .await?;
+                                    if let Some(cmd) = then {
+                                        mgr.send(&conn, ClientMessage::Command(cmd)).await?;
+                                    }
+                                } else {
+                                    log::info!("jump to {target:?}: dropped, the session is gone");
+                                }
+                            }
+                            Some(AttachCheck::Jumped { conn, session, before }) => {
+                                let refused = !live.contains(&session)
+                                    && current_attached
+                                        .as_ref()
+                                        .is_some_and(|(c, s)| *c == conn && *s == session);
+                                if refused {
+                                    log::info!("jump to {session:?} on {conn:?} was refused; names restored");
+                                    let SessionNames { current, previous, last_local } = *before;
+                                    current_attached = current;
+                                    previous_attached = previous;
+                                    last_local_session = last_local;
+                                    reconcile_session_names(
+                                        &conn,
+                                        &live,
+                                        None,
                                         creating_session.as_ref(),
                                         &mut current_attached,
                                         &mut previous_attached,
@@ -10391,7 +10584,42 @@ mod tests {
                 session: session.clone()
             }
             .owes_attach());
-            assert!(!AttachCheck::SwitchedLast { conn, session }.owes_attach());
+            assert!(!AttachCheck::SwitchedLast {
+                conn: conn.clone(),
+                session: session.clone()
+            }
+            .owes_attach());
+            let target = JumpTarget::Session {
+                conn: conn.clone(),
+                session: session.clone(),
+            };
+            assert!(!AttachCheck::Jump { target, then: None }.owes_attach());
+            let before = Box::new(SessionNames {
+                current: None,
+                previous: None,
+                last_local: None,
+            });
+            assert!(!AttachCheck::Jumped {
+                conn,
+                session,
+                before
+            }
+            .owes_attach());
+        }
+
+        #[test]
+        fn a_deferred_jump_is_settled_by_its_target_server() {
+            let far = ConnId::Remote("far".to_string());
+            let target = JumpTarget::Tab {
+                conn: far.clone(),
+                session: "r1".to_string(),
+                tab_index: 1,
+            };
+            let mut check = Some(AttachCheck::Jump { target, then: None });
+            assert_eq!(check.as_ref().map(AttachCheck::conn), Some(&far));
+            let mut creating = None;
+            forget_pending_on(&far, &mut check, &mut creating);
+            assert_eq!(check, None, "a dropped target server will never answer");
         }
 
         #[test]
@@ -10811,6 +11039,22 @@ mod tests {
         let mut f = armed(mini.clone(), "build");
         assert_eq!(f.settle(&mini, &ConnId::Local, Some("build")), None);
         assert!(f.is_idle());
+    }
+
+    #[test]
+    fn a_tree_from_before_the_tab_move_keeps_it_armed() {
+        // The first tree predates the move, and the second is pushed after the
+        // tab moved but before the server attached the requester to `other`.
+        // Both still show the client in `main`.
+        let mut f = armed(ConnId::Local, "other");
+        for _ in 0..2 {
+            assert_eq!(f.settle(&ConnId::Local, &ConnId::Local, Some("main")), None);
+            assert!(!f.is_idle());
+        }
+        assert_eq!(
+            f.settle(&ConnId::Local, &ConnId::Local, Some("other")),
+            Some(local("other"))
+        );
     }
 
     #[test]
