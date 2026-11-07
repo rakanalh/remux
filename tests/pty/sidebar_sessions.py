@@ -27,7 +27,8 @@ What it covers:
      tree OR to the agent list
  10  a push that removes a row ABOVE the selection does not retarget it --
      Enter still jumps to the session the user picked
- 11  each of folder, session, tab and pane wears its own icon; a server wears none
+ 11  each of server, folder, session, tab and pane wears its own icon, a
+     remote server the same computer as the local one
  12  right-clicking a folder offers Rename and a Delete that names the sessions
      it takes with it; both land, read back from the server
  13  a click on a tab's marker shows and hides its panes across tree pushes,
@@ -539,6 +540,11 @@ def scenario_remote():
     check("2 the remote server row is listed", any("mini" in r for r in rows), rows)
     check("2 the remote's sessions are listed too (its node is expanded)",
           any("mini1" in r for r in rows), rows)
+    for server in ("local", "mini"):
+        row = next((r for r in panel_rows(screen) if r.endswith(f" {server}")), "")
+        mx = next((x for x, c in enumerate(row) if c in "\u25b6\u25bc"), None)
+        check(f"11 the {server} server row wears the computer after its marker",
+              mx is not None and row[mx + 2] == "\U0001F4BB", row)
 
     # -- 6: Enter on a REMOTE pane row ---------------------------------------
     child.send(b"\x1b2")
@@ -695,14 +701,16 @@ def seed_four():
 
 MARKERS = "\u25b6\u25bc"
 NERD_ICONS = {
+    "server": "\uF108",
     "folder": "\uF07B",
     "session": "\uF120",
     "tab": "\uF24D",
     "pane": "\uF096",
 }
 ICONS = {
+    "server": "\U0001F4BB",
     "folder": "\U0001F4C1",
-    "session": "\U0001F4BB",
+    "session": "\U0001F4FA",
     "tab": "\U0001F4D1",
     "pane": "\U0001F532",
 }
@@ -859,6 +867,7 @@ def scenario_icons():
         return cell_rows(screen)[my][mx + 2]
 
     got = {
+        "server": icon_of("local"),
         "folder": icon_of("work"),
         "session": icon_of("home"),
         "tab": icon_of("tabone"),
@@ -868,10 +877,7 @@ def scenario_icons():
     for kind, want in ICONS.items():
         check(f"11 a {kind} row wears its icon", got[kind] == want,
               f"{got} in {panel_rows(screen)}")
-    check("11 the four icons are distinct", len(set(got.values())) == 4, got)
-    server = next(r for r in panel_rows(screen) if "local" in r)
-    check("11 a server row wears no icon",
-          not any(i in server for i in ICONS.values()), server)
+    check("11 the five icons are distinct", len(set(got.values())) == 5, got)
     check("11 the panel's right frame is unbroken by the wide glyphs",
           all(r[SIDEBAR_W - 1] != " " for r in cell_rows(screen)[1:ROWS - 2]),
           [r[:SIDEBAR_W + 1] for r in cell_rows(screen)])
@@ -889,7 +895,8 @@ def glyphs_after_markers(screen):
     """{row kind: the cell after the marker and its space}, by cell."""
     rows = cell_rows(screen)
     got = {}
-    for kind, name in (("folder", "work"), ("session", "home"), ("tab", "tabone")):
+    for kind, name in (("server", "local"), ("folder", "work"), ("session", "home"),
+                       ("tab", "tabone")):
         x, y = marker_of(screen, name)
         got[kind] = rows[y][x + 2]
     tab_x, _ = marker_of(screen, "tabone")

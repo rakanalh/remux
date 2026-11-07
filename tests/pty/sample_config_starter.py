@@ -150,7 +150,9 @@ def run(mode):
         # Content, not just chrome: each panel has to have something IN it that
         # only that panel draws. `main` alone would not do -- the status bar
         # carries the session name too, so it is on screen with no sidebar at all.
-        assert t.has("\u25bc local"), (
+        # The sample leaves `icons` at its default, so the server row wears the
+        # emoji computer, read by cell because `display` drops its second cell.
+        assert any("\u25bc \U0001F4BB  local" in r for r in t.cell_rows()), (
             "the sessions panel painted no tree\n" + "\n".join(rows)
         )
         # The `files` panel's header is the DIRECTORY, not the word "Files", so
