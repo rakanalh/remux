@@ -5116,11 +5116,7 @@ async fn log_peer_identity(
 
 /// Return the runtime directory used for the socket and pid files.
 fn runtime_dir() -> PathBuf {
-    xdg_runtime_dir().unwrap_or_else(fallback_runtime_dir)
-}
-
-fn xdg_runtime_dir() -> Option<PathBuf> {
-    dirs::runtime_dir().or_else(|| std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from))
+    crate::paths::runtime_dir().unwrap_or_else(fallback_runtime_dir)
 }
 
 /// `$TMPDIR/remux-<uid>` (TMPDIR defaulting to `/tmp`), for a session with no
@@ -5128,7 +5124,7 @@ fn xdg_runtime_dir() -> Option<PathBuf> {
 /// shared: a socket straight in `/tmp` could be connected to, or created
 /// first, by any other user on the machine.
 fn fallback_runtime_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("remux-{}", own_uid()))
+    crate::paths::temp_dir().join(format!("remux-{}", own_uid()))
 }
 
 /// Make the runtime directory ready to hold the socket, or to trust a socket
@@ -5140,7 +5136,7 @@ fn fallback_runtime_dir() -> PathBuf {
 /// with no group or other permission: another user who made it first would
 /// otherwise own the socket every client of ours connects to.
 pub fn prepare_runtime_dir() -> Result<PathBuf> {
-    if let Some(dir) = xdg_runtime_dir() {
+    if let Some(dir) = crate::paths::runtime_dir() {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating runtime directory {}", dir.display()))?;
         return Ok(dir);
