@@ -628,29 +628,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Kill { name }) => {
             log::debug!("cmd: kill session={name:?}");
-            if !socket_path().exists() {
-                eprintln!("No server running.");
-                return Ok(());
-            }
-            let mut client = RemuxClient::connect().await?;
-            client
-                .send(ClientMessage::KillSession { name: name.clone() })
-                .await?;
-
-            // Wait for confirmation
-            match client.recv_skip_views().await? {
-                Some(ServerMessage::Event(crate::protocol::SessionEvent::SessionDeleted(
-                    deleted,
-                ))) => {
-                    println!("Killed session '{}'.", deleted);
-                }
-                Some(ServerMessage::Error { message, .. }) => {
-                    eprintln!("Error: {}", message);
-                }
-                _ => {
-                    println!("Killed session '{}'.", name);
-                }
-            }
+            std::process::exit(crate::client::cli_common::run_kill(&name).await.into());
         }
         Some(Commands::Split {
             right,

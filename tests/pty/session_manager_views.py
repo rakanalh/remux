@@ -88,6 +88,16 @@ def cells_of(t, name):
     return sm_children(t, rows[0]) if rows else []
 
 
+def open_view_rows(t, name):
+    """Expand the group and `name`, unless this client already has them open."""
+    row = sm_goto(t, is_group, "the Views group")
+    if "▶" in row.text:
+        t.send("l", 0.4)
+    row = sm_goto(t, is_view(name), f"the {name} view")
+    if "▶" in row.text:
+        t.send("l", 0.4)
+
+
 def mark(t, tag, prefix="RAN"):
     t.send(f"clear; printf '{prefix}:%s\\n' {tag}\r", 0.4)
     if not wait_until(t, lambda: count(t, f"{prefix}:{tag}") > 0):
@@ -141,6 +151,7 @@ def main():
 
     # --- the group is in the manager -----------------------------------------
     sm_open(t)
+    open_view_rows(t, "View 1")
     groups = [r for r in tree_rows(t) if is_group(r)]
     cells = cells_of(t, "View 1")
     print(f"[tree] groups={groups} View 1 cells={cells}")
@@ -179,6 +190,7 @@ def main():
 
     # --- vx: remove the FIRST cell (RAN:one; cells are in mark order) --------
     sm_open(t)
+    open_view_rows(t, "renamed")
     cells = cells_of(t, "renamed")
     if len(cells) == 2:
         sm_goto(t, lambda r: r.y == cells[0].y, "renamed's first cell")
@@ -217,6 +229,7 @@ def main():
 
     # --- vd + y from a manager opened OVER the displayed view ----------------
     sm_open(t)
+    open_view_rows(t, "renamed")
     rows = view_rows(t, "renamed")
     if rows:
         sm_goto(t, is_view("renamed"), "the renamed view row")

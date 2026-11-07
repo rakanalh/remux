@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -604,6 +604,11 @@ pub struct InputHandler {
     /// Chord bindings for the session-manager overlay (injected into the
     /// overlay state when it is opened).
     session_manager_bindings: SessionManagerBindings,
+    /// The Views rows the user has open in the session manager. The overlay's
+    /// model is new on every open, so this holds them for the client's lifetime.
+    /// It is copied after every overlay key and not at close, because the
+    /// overlay closes from many sites and none of them changes expansion.
+    view_expansion: HashSet<String>,
     /// Command palette state. When `Some`, the palette overlay is active.
     pub command_palette: Option<CommandPaletteState>,
     /// State for Search mode.
@@ -1910,6 +1915,7 @@ impl InputHandler {
             rename_overlay: None,
             shortcut_bindings,
             session_manager_bindings,
+            view_expansion: HashSet::new(),
             command_palette: None,
             search_state: None,
             session_manager: None,
@@ -1999,6 +2005,7 @@ impl InputHandler {
     ) -> crate::client::session_manager::SessionManagerState {
         let mut sm = crate::client::session_manager::SessionManagerState::new();
         sm.set_bindings(self.session_manager_bindings.clone());
+        sm.model.restore_view_expansion(&self.view_expansion);
         sm
     }
 
@@ -2046,7 +2053,13 @@ impl InputHandler {
             Mode::Visual => self.handle_visual_key(key),
             Mode::CommandPalette => self.handle_command_palette_key(key),
             Mode::Search => self.handle_search_key(key),
-            Mode::SessionManager => self.handle_session_manager_key(key),
+            Mode::SessionManager => {
+                let action = self.handle_session_manager_key(key);
+                if let Some(sm) = &self.session_manager {
+                    self.view_expansion = sm.model.view_expansion();
+                }
+                action
+            }
         }
     }
 
@@ -6005,6 +6018,91 @@ mod tests {
         );
         handler.session_manager = Some(sm);
         handler
+    }
+
+    /// Open the overlay on a one-view local tree through the production
+    /// constructor, as every open does.
+    fn open_views_manager(handler: &mut InputHandler) {
+        use crate::client::registry::RemoteState;
+
+        handler.mode = Mode::SessionManager;
+        let mut sm = handler.new_session_manager();
+        sm.set_roster(vec![(
+            ConnId::Local,
+            "local".to_string(),
+            RemoteState::Connected,
+            None,
+        )]);
+        sm.set_views(vec![(7, "dev".to_string(), vec![(1, ConnId::Local, 10)])]);
+        handler.session_manager = Some(sm);
+    }
+
+    fn press(handler: &mut InputHandler, keys: &str) {
+        for c in keys.chars() {
+            let _ = handler.handle_key(char_key(c));
+        }
+    }
+
+    fn close_manager(handler: &mut InputHandler) {
+        for _ in 0..3 {
+            if handler.session_manager.is_none() {
+                return;
+            }
+            let _ = handler.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        assert!(handler.session_manager.is_none(), "Esc did not close it");
+    }
+
+    fn manager_rows(handler: &InputHandler) -> Vec<String> {
+        let sm = handler.session_manager.as_ref().unwrap();
+        sm.model
+            .rows
+            .iter()
+            .map(|r| r.display_name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn views_expansion_survives_closing_and_reopening_the_manager() {
+        let mut handler = InputHandler::with_defaults();
+        open_views_manager(&mut handler);
+        assert_eq!(manager_rows(&handler), ["local", "Views"]);
+        press(&mut handler, "jljl");
+        close_manager(&mut handler);
+
+        open_views_manager(&mut handler);
+        assert_eq!(manager_rows(&handler), ["local", "Views", "dev", "pane-10"]);
+    }
+
+    #[test]
+    fn a_views_collapse_survives_closing_and_reopening_the_manager() {
+        let mut handler = InputHandler::with_defaults();
+        open_views_manager(&mut handler);
+        press(&mut handler, "jljl");
+        close_manager(&mut handler);
+
+        open_views_manager(&mut handler);
+        press(&mut handler, "jjh");
+        close_manager(&mut handler);
+        open_views_manager(&mut handler);
+        assert_eq!(manager_rows(&handler), ["local", "Views", "dev"]);
+
+        press(&mut handler, "jh");
+        close_manager(&mut handler);
+        open_views_manager(&mut handler);
+        assert_eq!(manager_rows(&handler), ["local", "Views"]);
+    }
+
+    #[test]
+    fn a_search_does_not_change_what_the_next_open_shows() {
+        let mut handler = InputHandler::with_defaults();
+        open_views_manager(&mut handler);
+        press(&mut handler, "/pane");
+        assert!(manager_rows(&handler).contains(&"pane-10".to_string()));
+        close_manager(&mut handler);
+
+        open_views_manager(&mut handler);
+        assert_eq!(manager_rows(&handler), ["local", "Views"]);
     }
 
     /// `search_handler()` with the search bar focused -- reached the way a user

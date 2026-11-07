@@ -568,6 +568,8 @@ def remote_view_section():
         check("remote: the remote session is the foreground",
               "rbox" in t.rows_text()[-1], t.rows_text()[-1])
         sm_open(t)
+        sm_goto_text(t, "Views")
+        t.send(b"l", 0.4)     # opens the group, and does nothing if it is open
         sm_goto_text(t, "View 1")
         t.send(b"\r", 1.5)
         check("remote: back in the view", t.has("View 1"), "\n".join(t.rows_text()))

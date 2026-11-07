@@ -10510,8 +10510,7 @@ async fn handle_create_session(
     // Announce to EVERY client, not just the creator. A session manager open in
     // another terminal has no timer -- every tree refresh is event-driven -- so
     // a creator-only notification left every other terminal's tree stale until
-    // some unrelated action happened to refresh it. Symmetric with
-    // `SessionDeleted`, which already reaches every client it concerns.
+    // some unrelated action happened to refresh it.
     let cls = clients.lock().await;
     for client in cls.values() {
         let _ = client
