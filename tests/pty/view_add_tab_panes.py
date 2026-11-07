@@ -25,8 +25,9 @@ import sys
 import time
 
 from pty_harness import Tui, sm_goto, sm_open, sm_title
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-vaddtab"
+RUNDIR = run_dir("rmx-vaddtab")
 TAGS = ("one", "two", "three")
 
 

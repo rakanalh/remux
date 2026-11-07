@@ -24,8 +24,9 @@ import json, os, shutil, signal, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Server, Client, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxzw"
+RUNDIR = run_dir("rmxzw")
 COLS, ROWS = 90, 24
 FAILURES = []
 

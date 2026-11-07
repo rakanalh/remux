@@ -15,8 +15,9 @@ Run: python3 tests/frame/zoom_cleared_on_pane_create.py
 """
 import sys
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxzcl"
+RUNDIR = run_dir("rmxzcl")
 COLS, ROWS = 100, 30
 
 fails = []

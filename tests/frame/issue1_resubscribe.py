@@ -8,8 +8,9 @@ thing keeping it painted -- and the task claims it goes blank.
 """
 import sys, time
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxfix/i1"
+RUNDIR = run_dir("rmxfix/i1")
 
 
 def pane_ids(c):

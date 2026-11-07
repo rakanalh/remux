@@ -58,8 +58,8 @@ int main(int argc, char **argv) {
 def require_private_dir(path):
     """Refuse a directory another user could write into, and close ours.
 
-    The harness BINDIRs sit at fixed `/tmp` paths and are made with
-    `exist_ok=True`, so one another local user created first is accepted
+    A harness BINDIR at a fixed `/tmp` path is made with `exist_ok=True`, so
+    one another local user created first is accepted
     silently, and they could swap the source, the binary or the program
     between install and the pane running it. A group-writable one of ours
     is what a umask of 002 makes, so it is tightened to 0700 rather than

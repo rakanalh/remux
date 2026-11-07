@@ -39,9 +39,11 @@ import pyte
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import install_agent_standin  # noqa: E402
+import rundirs  # noqa: E402
+from rundirs import relay_pids, run_dir  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUN = "/tmp/rmx-asw"
+RUN = run_dir("rmx-asw")
 SOCK = f"{RUN}/run/remux.sock"
 SOCK2 = f"{RUN}/run2/remux.sock"
 VERBOSE = "-v" in sys.argv
@@ -187,7 +189,7 @@ def setup_dirs():
             f"export XDG_STATE_HOME={RUN}/state2\n"
             f"export XDG_DATA_HOME={RUN}/data2\n"
             f"export XDG_CONFIG_HOME={RUN}/cfg-none\n"
-            f"exec {BIN} relay\n"
+            f"echo $$ >> {relay_pids()}\n" f"exec {BIN} relay\n"
         )
     os.chmod(shim, 0o755)
 
@@ -211,8 +213,7 @@ def stop_servers():
                            stderr=subprocess.DEVNULL, timeout=10)
         except Exception:
             pass
-    subprocess.run(["pkill", "-x", "-f", f"{BIN} relay"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    rundirs.kill_relays()
 
 
 def protocol_version():

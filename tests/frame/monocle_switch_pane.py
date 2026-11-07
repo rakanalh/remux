@@ -30,8 +30,9 @@ import re
 import sys
 import time
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxfs-mono"
+RUNDIR = run_dir("rmxfs-mono")
 COLS, ROWS = 100, 30
 
 fails = []

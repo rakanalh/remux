@@ -21,9 +21,11 @@ import sys
 import time
 
 import pexpect
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from rundirs import run_dir  # noqa: E402
 
 BIN = os.path.abspath("target/debug/remux")
-RUNDIR = "/tmp/rmx-sbr"
+RUNDIR = run_dir("rmx-sbr")
 
 RESIZE_RE = re.compile(r"resize cols=(\d+) rows=(\d+)")
 

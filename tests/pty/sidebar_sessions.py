@@ -57,7 +57,7 @@ What it covers:
 Run from the repo root:
     python3 tests/pty/sidebar_sessions.py [-v] [scenario_<name> ...]
 
-Set REMUX_SBS_RUN to a short path to run beside another copy of this harness.
+REMUX_SBS_RUN overrides the run dir.
 """
 import json
 import os
@@ -70,12 +70,14 @@ import time
 
 import pexpect
 import pyte
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from rundirs import kill_relays, relay_pids, run_dir  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import sm_open, sm_tree
 
 BIN = os.path.abspath("target/debug/remux")
-RUN = os.environ.get("REMUX_SBS_RUN", "/tmp/rmx-sbs")
+RUN = os.environ.get("REMUX_SBS_RUN") or run_dir("rmx-sbs")
 SOCK1 = f"{RUN}/run/remux.sock"
 SOCK2 = f"{RUN}/run2/remux.sock"
 VERBOSE = "-v" in sys.argv
@@ -175,7 +177,7 @@ def write_shim():
             f"export XDG_STATE_HOME={RUN}/state2\n"
             f"export XDG_DATA_HOME={RUN}/data2\n"
             f"export XDG_CONFIG_HOME={RUN}/cfg-none\n"
-            f"exec {BIN} relay\n"
+            f"echo $$ >> {relay_pids(RUN)}\n" f"exec {BIN} relay\n"
         )
     os.chmod(shim, 0o755)
 
@@ -572,10 +574,9 @@ def scenario_remote():
     # Kill the RELAY, not the far server: that is what a dropped SSH looks like
     # from here, and it is the only thing that closes the client's end. (The
     # relay outlives the server it was talking to -- a separate quirk, and not
-    # this task's to fix.) Matched on the absolute path of the binary under
-    # test so a real `remux relay` elsewhere on the machine is never touched.
-    subprocess.run(["pkill", "-x", "-f", f"{BIN} relay"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # this task's to fix.) Only this run's relays are killed, so a `remux relay`
+    # of another run or of the real server is never touched.
+    kill_relays(RUN)
     pump(3.0)
     rows = panel_rows(screen)
     log("panel after the remote died:", rows)
@@ -1776,8 +1777,7 @@ def scenario_menu_after_remote_drop():
     # By position: the drop repaints the panel over the menu, which stays open.
     mx, my = must_find(screen, "Confirm: Kill session")
 
-    subprocess.run(["pkill", "-x", "-f", f"{BIN} relay"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    kill_relays(RUN)
     pump(2.0)
     check("27 setup: the remote's rows are gone",
           not any("rone" in r for r in panel_rows(screen)), panel_rows(screen))

@@ -22,8 +22,9 @@ Run: python3 tests/pty/popup_terminal.py
 """
 import os, re, sys, time
 from pty_harness import Tui, PREFIX
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxpop/pty"
+RUNDIR = run_dir("rmxpop/pty")
 COLS, ROWS = 120, 40
 
 ALT_P = b"\x1bp"
@@ -244,7 +245,7 @@ def float_over_sidebar_case():
     print("\n== float over a left sidebar ==")
     fails = []
     check = make_check(fails)
-    tui = start("/tmp/rmxpop/sb_float", cfg())
+    tui = start(run_dir("rmxpop/sb_float"), cfg())
     try:
         before = list(tui.cell_rows())
         check(before[0][0] == "\u256d" and before[5][SIDEBAR_W - 1] == "\u2502",
@@ -291,7 +292,7 @@ def left_case():
     print("\n== popup_position = left ==")
     fails = []
     check = make_check(fails)
-    tui = start("/tmp/rmxpop/sb_left", cfg("left"))
+    tui = start(run_dir("rmxpop/sb_left"), cfg("left"))
     try:
         tui.send(ALT_P)
         tui.pump(1.8)
@@ -324,7 +325,7 @@ def top_case():
     print("\n== popup_position = top ==")
     fails = []
     check = make_check(fails)
-    tui = start("/tmp/rmxpop/sb_top", cfg("top"))
+    tui = start(run_dir("rmxpop/sb_top"), cfg("top"))
     try:
         tui.send(ALT_P)
         tui.pump(1.8)
@@ -359,7 +360,7 @@ def live_reload_case():
     print("\n== live config reload moves an open popup ==")
     fails = []
     check = make_check(fails)
-    tui = start("/tmp/rmxpop/sb_reload", cfg())
+    tui = start(run_dir("rmxpop/sb_reload"), cfg())
     try:
         tui.send(ALT_P)
         tui.pump(1.8)
@@ -383,7 +384,7 @@ def runtime_resize_case():
     print("\n== the runtime resize keys widen a left drawer ==")
     fails = []
     check = make_check(fails)
-    tui = start("/tmp/rmxpop/sb_resize", cfg("left", wpct=50))
+    tui = start(run_dir("rmxpop/sb_resize"), cfg("left", wpct=50))
     try:
         tui.send(ALT_P)
         tui.pump(1.8)
@@ -405,9 +406,9 @@ def per_tab_case():
     print("\n== one popup per tab ==")
     fails = []
     check = make_check(fails)
-    marker_dir = "/tmp/rmxpop/tab2dir"
+    marker_dir = run_dir("rmxpop/tab2dir")
     os.makedirs(marker_dir, exist_ok=True)
-    tui = start("/tmp/rmxpop/sb_tabs", cfg())
+    tui = start(run_dir("rmxpop/sb_tabs"), cfg())
     try:
         # Tab 1: open the popup and type a marker.
         tui.send(ALT_P)
@@ -430,7 +431,7 @@ def per_tab_case():
         rows = list(tui.cell_rows())
         # A path on its own line inside the popup, not the typed command or a
         # prompt (which carries the `$`).
-        check(any("/tmp/rmxpop/tab2dir" in r[17:143] and "$" not in r[17:143]
+        check(any(run_dir("rmxpop/tab2dir") in r[17:143] and "$" not in r[17:143]
                   for r in rows[6:41]),
               "the popup starts in the directory tab 2's pane is in")
 
@@ -477,7 +478,7 @@ def toggle_position_case():
     print("\n== a popup key opens where it says and any popup key closes ==")
     fails = []
     check = make_check(fails)
-    tui = start("/tmp/rmxpop/sb_keys", POPUP_KEYS + cfg())
+    tui = start(run_dir("rmxpop/sb_keys"), POPUP_KEYS + cfg())
     try:
         tui.send(ALT_MINUS)
         tui.pump(1.8)
@@ -523,7 +524,7 @@ def sized_float_case():
     fails = []
     check = make_check(fails)
     # popup_width_pct = popup_height_pct = 45 is what a plain open uses.
-    tui = start("/tmp/rmxpop/sb_sized", SIZED_KEYS + cfg(wpct=45, hpct=45))
+    tui = start(run_dir("rmxpop/sb_sized"), SIZED_KEYS + cfg(wpct=45, hpct=45))
     try:
         # 80% of 160 columns and of 47 rows (the window minus the status row),
         # centred on the whole window.
@@ -556,7 +557,7 @@ def tab_switch_no_resize_case():
     print("\n== a tab switch does not resize a popup opened at a named position ==")
     fails = []
     check = make_check(fails)
-    tui = start("/tmp/rmxpop/sb_noresize", POPUP_KEYS + cfg())
+    tui = start(run_dir("rmxpop/sb_noresize"), POPUP_KEYS + cfg())
 
     def popup_resizes():
         return tui.log("server").count("resize_session_popups: popup pane_id=")
@@ -592,7 +593,7 @@ def focus_return_case():
     print("\n== closing the popup returns input to the pane focused before it ==")
     fails = []
     check = make_check(fails)
-    tui = start("/tmp/rmxpop/sb_focus", POPUP_KEYS + cfg())
+    tui = start(run_dir("rmxpop/sb_focus"), POPUP_KEYS + cfg())
     try:
         # Three panes; the newest is focused. Alt-h moves to another one.
         tui.prefix(b"pv", 1.8)
@@ -643,7 +644,7 @@ def dismiss_case():
     print("\n== a click outside the box, or Alt-hjkl, closes the popup and acts ==")
     fails = []
     check = make_check(fails)
-    tui = start("/tmp/rmxpop/sb_dismiss", cfg())
+    tui = start(run_dir("rmxpop/sb_dismiss"), cfg())
     try:
         # Three panes, newest on the right; Alt-h makes the middle one current.
         tui.prefix(b"pv", 1.8)
@@ -730,7 +731,7 @@ def tab_click_case():
     print("\n== a click on a tab switches tabs and leaves the popup of the tab left ==")
     fails = []
     check = make_check(fails)
-    tui = start("/tmp/rmxpop/sb_tabclick", cfg())
+    tui = start(run_dir("rmxpop/sb_tabclick"), cfg())
     try:
         tui.send(ALT_P)
         tui.pump(1.8)
@@ -760,7 +761,7 @@ def focus_key_sidebar_case():
     print("\n== a focus key with the popup up never enters a sidebar ==")
     fails = []
     check = make_check(fails)
-    tui = start("/tmp/rmxpop/sb_focuskey", cfg())
+    tui = start(run_dir("rmxpop/sb_focuskey"), cfg())
     try:
         tui.send(b"echo EDGE$((40+1))\r")
         tui.pump(1.0)
@@ -794,10 +795,10 @@ def in_tab_cwd_case():
     print("\n== the first popup in a tab opens in the focused pane's directory ==")
     fails = []
     check = make_check(fails)
-    dir_a, dir_b = "/tmp/rmxpop/cwdA", "/tmp/rmxpop/cwdB"
+    dir_a, dir_b = run_dir("rmxpop/cwdA"), run_dir("rmxpop/cwdB")
     for d in (dir_a, dir_b):
         os.makedirs(d, exist_ok=True)
-    tui = start("/tmp/rmxpop/sb_cwd", cfg())
+    tui = start(run_dir("rmxpop/sb_cwd"), cfg())
     try:
         tui.send(f"cd {dir_a}\r".encode())
         tui.pump(0.8)

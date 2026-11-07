@@ -24,6 +24,7 @@ Run from the repo root:  python3 tests/pty/view_status_bar_parity.py
 """
 import sys
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
 MARK_A = "AAAA_status_marker"
 MARK_B = "BBBB_status_marker"
@@ -89,7 +90,7 @@ def require_in_view(t):
 
 
 def main():
-    t = Tui("/tmp/rmxsbp", cols=120, rows=40).start()
+    t = Tui(run_dir("rmxsbp"), cols=120, rows=40).start()
     fails = []
     try:
         make_two_panes(t)

@@ -102,8 +102,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import BIN  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-integres")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-integres")
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fixtures")
 REAL = os.path.realpath(BIN)
 

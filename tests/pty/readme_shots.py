@@ -36,6 +36,7 @@ import pyte
 # notifications for this test's agents.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import install_agent_standin, install_notify_shims  # noqa: E402
+from rundirs import kill_relays, stop_servers  # noqa: E402
 import pyte.graphics
 from PIL import Image
 
@@ -187,10 +188,9 @@ class Env:
                 self.server.wait(timeout=5)
             except Exception:
                 self.server.kill()
-        # Stand-in agents loop for ever; anything still carrying our run dir in
-        # its command line or environment is ours to reap.
-        subprocess.run(["pkill", "-f", self.run], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL)
+        kill_relays(self.run)
+        # Stand-in agents loop for ever, and a pane's end stops them.
+        stop_servers(self.run)
         if not self.keep:
             shutil.rmtree(self.run, ignore_errors=True)
 
@@ -1201,7 +1201,10 @@ def fake_remote(env, client_env, cols=COLS, rows=ROWS):
     re = remote.env()
     exports = " ".join(f"{k}={re[k]}" for k in (
         "HOME", "PATH", "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"))
-    client_env.install("ssh", f"#!/bin/sh\nexport {exports}\nexec {BIN} relay\n")
+    # Recorded with the remote, whose teardown drops it: the relay's socket dir
+    # is the remote's, and `kill_relays` signals only a relay under its dir.
+    client_env.install("ssh", f"#!/bin/sh\necho $$ >> {remote.run}/relay.pids\n"
+                              f"export {exports}\nexec {BIN} relay\n")
     return remote
 
 

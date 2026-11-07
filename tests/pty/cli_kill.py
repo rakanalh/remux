@@ -33,9 +33,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_server import FakeServer, _frame, _read_frame  # noqa: E402
 from pty_harness import BIN, PROTOCOL_VERSION, Tui  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
-from harness import Client, Server, remux_daemons  # noqa: E402
+from harness import Client, Server  # noqa: E402
+from rundirs import run_dir, runs  # noqa: E402
 
-RUNDIR = "/tmp/rmx-clikill"
+RUNDIR = run_dir("rmx-clikill")
 CLI_TIMEOUT = 6.0
 # Past the CLI's own reply deadline, for the case that waits it out.
 SILENT_TIMEOUT = 14.0
@@ -230,10 +231,11 @@ def from_inside_the_victim():
     t, c = start_tui()
     try:
         create(c, "haven")
-        t.send(f"{BIN} kill main\r", 0.5)
+        kill_pid = f"{t.rundir}/kill.pid"
+        t.send(f"sh -c 'echo $$ > {kill_pid}; exec {BIN} kill main'\r", 0.5)
         check(wait_for(t, lambda: "main" not in sessions(c)), "`main` is gone")
         recovered(t, c, "inside", "haven", "bravo")
-        check(remux_daemons(RUNDIR, kinds=(b"kill",)) == [], "no `remux kill` process is left")
+        check(not runs(int(open(kill_pid).read()), "kill"), "no `remux kill` process is left")
     finally:
         t.kill()
     no_panic(t.log("server"), "inside")
@@ -245,7 +247,7 @@ def no_server():
     check(not os.path.exists(s.sock), "the server is gone")
     expect(cli(s.env, "kill", "haven"), "kill", 1, "", NO_SERVER)
     check(not os.path.exists(s.sock), "no socket appeared")
-    check(remux_daemons(RUNDIR) == [], "no server was started")
+    check(s.starts() == 1, f"no server was started ({s.starts()} in the log)")
 
 
 def dead_server():
@@ -253,7 +255,7 @@ def dead_server():
     s.crash()
     check(os.path.exists(s.sock), "the dead server left its socket")
     expect(cli(s.env, "kill", "haven"), "kill", 1, "", NO_SERVER)
-    check(remux_daemons(RUNDIR) == [], "no server was started")
+    check(s.starts() == 1, f"no server was started ({s.starts()} in the log)")
 
 
 class ScriptedServer(FakeServer):

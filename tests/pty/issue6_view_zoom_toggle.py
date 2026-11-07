@@ -8,10 +8,11 @@ import os
 import shutil
 import sys
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
 A = "AAAA_marker_one"
 B = "BBBB_marker_two"
-RUNDIR = f"/tmp/rmxfix-i6-{os.getpid()}"
+RUNDIR = run_dir("rmxfix-i6")
 
 
 def make_view(t):
@@ -35,7 +36,6 @@ def main():
         run(t)
     finally:
         t.kill()
-        shutil.rmtree(RUNDIR, ignore_errors=True)
 
 
 def run(t):

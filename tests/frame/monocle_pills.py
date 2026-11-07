@@ -24,8 +24,9 @@ import shutil
 import sys
 import time
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = f"/tmp/rmxmpl-{os.getpid()}"
+RUNDIR = run_dir("rmxmpl")
 ROWS = 30
 LEFT_CAP, RIGHT_CAP, ELLIPSIS = "", "", "…"
 TITLES = [
@@ -155,7 +156,6 @@ def main():
         monocle_case(style, 120, expect_cut=True)
         custom_stack_case(style, 120)
     monocle_case("zellij_style", 160, expect_cut=False)
-    shutil.rmtree(RUNDIR, ignore_errors=True)
     print()
     if fails:
         print(f"FAILED ({len(fails)}):")

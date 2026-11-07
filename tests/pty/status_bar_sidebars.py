@@ -35,6 +35,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import BIN, Tui, sm_compose_view  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 COLS, ROWS = 100, 30
 LEFT_W, RIGHT_W, BOTTOM_H = 22, 18, 6
@@ -133,7 +134,7 @@ def check_full_width_bar(t, label, needle):
 
 def test_left_and_right():
     label = "left+right"
-    t = Tui("/tmp/rmx-sbs1", cols=COLS, rows=ROWS, config=CFG_LEFT_RIGHT).start()
+    t = Tui(run_dir("rmx-sbs1"), cols=COLS, rows=ROWS, config=CFG_LEFT_RIGHT).start()
     t.pump(1.5)
     rows = t.rows_text()
     check_full_width_bar(t, label, "[NORMAL]")
@@ -174,7 +175,7 @@ def test_left_and_right():
 
 def test_bottom():
     label = "bottom"
-    t = Tui("/tmp/rmx-sbs2", cols=COLS, rows=ROWS, config=CFG_BOTTOM).start()
+    t = Tui(run_dir("rmx-sbs2"), cols=COLS, rows=ROWS, config=CFG_BOTTOM).start()
     t.pump(1.5)
     t.send("printf 'PANE%s\\n' ROW\r", 1.0)
     rows = t.rows_text()
@@ -200,7 +201,7 @@ def test_bottom():
 
 def test_view():
     label = "view"
-    t = Tui("/tmp/rmx-sbs3", cols=COLS, rows=ROWS, config=CFG_LEFT_RIGHT).start()
+    t = Tui(run_dir("rmx-sbs3"), cols=COLS, rows=ROWS, config=CFG_LEFT_RIGHT).start()
     t.pump(1.0)
     t.send("clear\r", 0.4)
     t.prefix(b"pv", 0.8)
@@ -220,7 +221,7 @@ def test_view():
 
 def test_no_sidebar():
     label = "no sidebar"
-    t = Tui("/tmp/rmx-sbs4", cols=COLS, rows=ROWS, config="").start()
+    t = Tui(run_dir("rmx-sbs4"), cols=COLS, rows=ROWS, config="").start()
     t.pump(1.5)
     check_full_width_bar(t, label, "[NORMAL]")
     check(f"{label}: the pane's box starts at column 0 on row 0",

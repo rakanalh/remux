@@ -72,10 +72,11 @@ from pty_harness import (  # noqa: E402
     PROTOCOL_VERSION, BOX_TL, BOX_TR, BOX_V,
     sm_open, sm_tree, sm_selected, sm_goto, sm_goto_text, sm_expand, sm_children,
 )
+from rundirs import relay_pids, run_dir  # noqa: E402
 import pyte  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUN = "/tmp/rmxdisc"
+RUN = run_dir("rmxdisc")
 SOCK1 = f"{RUN}/run/remux.sock"      # the LOCAL server the client attaches to
 SOCK2 = f"{RUN}/run2/remux.sock"     # the "remote" server reached via the shim
 DIALS = f"{RUN}/dials"               # one line per `ssh` shim invocation
@@ -152,7 +153,7 @@ def write_shim():
             f"export XDG_RUNTIME_DIR={RUN}/run2\n"
             f"export XDG_STATE_HOME={RUN}/state2\n"
             f"export XDG_DATA_HOME={RUN}/data2\n"
-            f"exec {BIN} relay\n"
+            f"echo $$ >> {relay_pids()}\n" f"exec {BIN} relay\n"
         )
     os.chmod(shim, 0o755)
 

@@ -30,8 +30,9 @@ import re
 import sys
 
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxfix/vsar"
+RUNDIR = run_dir("rmxfix/vsar")
 COLS, TALL, SHORT = 120, 40, 24
 NLINES = 300
 

@@ -19,8 +19,9 @@ Run: python3 tests/pty/osc52_clipboard.py
 """
 import os, sys
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxosp"
+RUNDIR = run_dir("rmxosp")
 MARKER = "REMUX_CLIP_7788"
 BIG = "".join(f"line {i:04} of copied text\n" for i in range(400))
 

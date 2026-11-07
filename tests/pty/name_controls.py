@@ -23,8 +23,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import PROTOCOL_VERSION, Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUN = f"/tmp/rmx-nc-{os.getpid()}"
+RUN = run_dir("rmx-nc")
 FAILS = []
 
 

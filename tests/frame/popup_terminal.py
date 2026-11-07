@@ -26,8 +26,9 @@ Run: python3 tests/frame/popup_terminal.py
 """
 import sys, time
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxpop/frame"
+RUNDIR = run_dir("rmxpop/frame")
 COLS, ROWS = 100, 30
 
 # Mirrors src/server/layout.rs.

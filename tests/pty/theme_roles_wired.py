@@ -25,6 +25,7 @@ Run from the repo root:
 """
 import sys
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
 FRAME_BG = "123456"
 FRAME_FG = "abcdef"
@@ -116,7 +117,7 @@ def stack_tab_styles(t):
 def run(mode):
     print(f"===== mode: {mode} =====")
     cfg = CONFIG if mode == "themed" else None
-    t = Tui(f"/tmp/rmxthm{mode[:3]}", cols=120, rows=40, config=cfg).start()
+    t = Tui(run_dir(f"rmxthm{mode[:3]}"), cols=120, rows=40, config=cfg).start()
     fails = []
     try:
         t.send("clear\r", 0.5)

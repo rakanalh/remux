@@ -20,8 +20,9 @@ Assertions, read straight off the `PaneContent` messages client2 receives:
 """
 import sys, time
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxais/partb"
+RUNDIR = run_dir("rmxais/partb")
 
 
 def first_pane_id(c):

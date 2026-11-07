@@ -105,8 +105,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Server, Client, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-agentsess")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-agentsess")
 UUID = "7f3c2a9e-51d4-4b8e-9a61-0c2f5d8e4b17"
 OTHER = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
 CLI_ID = "c11a77e1-9d0b-4c3a-8e2f-6b5a4d3c2b1a"

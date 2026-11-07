@@ -38,8 +38,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Server, Client, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msgreuse")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-msgreuse")
 ATTEMPTS = 20
 
 failures = []

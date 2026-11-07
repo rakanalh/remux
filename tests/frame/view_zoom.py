@@ -25,8 +25,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Client, Server, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx_vzoomf"
+RUNDIR = run_dir("rmx_vzoomf")
 CONFIG = """
 [zoom]
 mode = "{mode}"

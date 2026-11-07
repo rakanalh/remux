@@ -57,8 +57,9 @@ import sys
 import time
 
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-bpaste"
+RUNDIR = run_dir("rmx-bpaste")
 OUTDIR = f"{RUNDIR}/paste"
 
 OPEN_MARK = b"\x1b[200~"

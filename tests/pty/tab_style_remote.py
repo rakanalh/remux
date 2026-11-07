@@ -25,8 +25,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sidebar_sessions as h  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-h.RUN = f"/tmp/rmx-tsr-{os.getpid()}"
+h.RUN = run_dir("rmx-tsr")
 h.SOCK1 = f"{h.RUN}/run/remux.sock"
 h.SOCK2 = f"{h.RUN}/run2/remux.sock"
 
@@ -130,12 +131,10 @@ def main():
         h.teardown(child)
         for w in list(seeds) + [rseed]:
             w.close()
-        subprocess.run(["pkill", "-x", "-f", f"{h.BIN} relay"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        h.kill_relays(h.RUN)
         for env in (local_env, remote_env):
             subprocess.run([h.BIN, "stop"], env=env, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=10)
-        shutil.rmtree(h.RUN, ignore_errors=True)
     print(f"\n{'FAILED' if h.FAILURES else 'OK'}: {len(h.FAILURES)} failure(s)")
     sys.exit(1 if h.FAILURES else 0)
 

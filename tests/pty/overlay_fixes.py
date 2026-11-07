@@ -33,9 +33,11 @@ import pyte
 # notifications for this test's agents.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import install_agent_standin, install_notify_shims  # noqa: E402
+import rundirs  # noqa: E402
+from rundirs import relay_pids, run_dir  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUN = "/tmp/rmxov-a1afb"
+RUN = run_dir("rmxov-a1afb")
 SOCK = f"{RUN}/run/remux.sock"
 SOCK2 = f"{RUN}/run2/remux.sock"
 VERBOSE = "-v" in sys.argv
@@ -140,7 +142,7 @@ def setup_dirs(config):
             f"export XDG_STATE_HOME={RUN}/state2\n"
             f"export XDG_DATA_HOME={RUN}/data2\n"
             f"export XDG_CONFIG_HOME={RUN}/cfg-none\n"
-            f"exec {BIN} relay\n"
+            f"echo $$ >> {relay_pids()}\n" f"exec {BIN} relay\n"
         )
     os.chmod(shim, 0o755)
 
@@ -164,10 +166,8 @@ def stop_servers():
                            stderr=subprocess.DEVNULL, timeout=10)
         except Exception:
             pass
-    subprocess.run(["pkill", "-f", f"{RUN}/"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["pkill", "-x", "-f", f"{BIN} relay"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    rundirs.kill_relays()
+    rundirs.stop_servers(RUN)
 
 
 class Wire:

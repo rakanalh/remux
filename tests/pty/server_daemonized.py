@@ -44,8 +44,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pty_harness import PROTOCOL_VERSION, Tui  # noqa: E402
+from rundirs import run_dir, server_pid as recorded_server  # noqa: E402
 
-RUNDIR = "/tmp/rmx_daemonized"
+RUNDIR = run_dir("rmx_daemonized")
 SOCK = f"{RUNDIR}/run/remux.sock"
 PIDFILE = f"{RUNDIR}/run/remux.pid"
 
@@ -215,9 +216,8 @@ def stop_server():
     detached server outlives the harness, so teardown has to be explicit, and
     has to run on the red path too.
     """
-    try:
-        pid = int(open(PIDFILE).read().strip())
-    except (FileNotFoundError, ValueError):
+    pid = recorded_server(f"{RUNDIR}/run")
+    if pid is None:
         return
     try:
         os.kill(pid, signal.SIGTERM)

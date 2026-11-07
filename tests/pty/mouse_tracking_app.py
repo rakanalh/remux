@@ -21,8 +21,9 @@ import re
 import sys
 
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx_mta"
+RUNDIR = run_dir("rmx_mta")
 COLS, ROWS = 120, 40
 LEFT_COL, RIGHT_COL = 30, 90
 REPORT = re.compile(r"\^\[\[<(\d+);(\d+);(\d+)([Mm])")

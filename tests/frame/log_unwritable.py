@@ -32,8 +32,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Server  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-logro")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-logro")
 
 failures = []
 
@@ -135,7 +136,6 @@ if __name__ == "__main__":
         for d in (f"{RUNDIR}/state-ro", f"{RUNDIR}/state-rofile/remux/client.log"):
             if os.path.exists(d):
                 os.chmod(d, 0o700)
-        shutil.rmtree(RUNDIR, ignore_errors=True)
     print()
     print(f"{len(failures)} FAILED" if failures else "ALL PASS")
     sys.exit(1 if failures else 0)

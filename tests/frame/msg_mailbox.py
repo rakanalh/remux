@@ -119,6 +119,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Server, Client, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 from portable import SETSID_F, SETSID_W  # noqa: E402
 
 # macOS has no sid to attribute by: a pane's own process is found by the walk
@@ -136,7 +137,7 @@ def by_own(depth):
     return "by Sid", "by Sid"
 
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msg")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-msg")
 
 failures = []
 

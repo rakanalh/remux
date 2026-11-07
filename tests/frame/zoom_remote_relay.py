@@ -41,8 +41,9 @@ import json, os, select, shutil, socket, struct, subprocess, sys, threading, tim
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, PROTOCOL_VERSION, Server, Client, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxzr"
+RUNDIR = run_dir("rmxzr")
 COLS, ROWS = 200, 60
 TOGGLES = 60
 

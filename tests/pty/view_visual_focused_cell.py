@@ -25,8 +25,9 @@ import re
 import sys
 
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxvvf"
+RUNDIR = run_dir("rmxvvf")
 COLS, ROWS = 120, 40
 TOKENS = ["PANEAA", "PANEBB", "PANECC", "PANEDD"]
 

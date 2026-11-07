@@ -26,8 +26,9 @@ import re
 import sys
 
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxtmk"
+RUNDIR = run_dir("rmxtmk")
 COLS, ROWS = 100, 24
 ESC = b"\x1b"
 NAMES = ["alpha", "bravo", "charlie"]

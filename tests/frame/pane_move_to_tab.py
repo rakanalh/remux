@@ -31,8 +31,9 @@ import os
 import re
 import sys
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxpmt"
+RUNDIR = run_dir("rmxpmt")
 COLS, ROWS = 100, 30
 
 fails = []

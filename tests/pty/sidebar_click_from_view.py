@@ -25,9 +25,6 @@ A landing is proven by the shell that receives the next line: `printf` assembles
 `AT<session/pane>` from the pane's own `REMUX_SESSION`/`REMUX_PANE`, so neither
 the echoed command nor a stale frame can satisfy the check.
 
-The rundirs are fixed: two concurrent runs corrupt each other, and the false
-red looks like a real failure.
-
 Run from the repo root:  python3 tests/pty/sidebar_click_from_view.py [test ...]
 """
 import atexit
@@ -43,6 +40,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import BIN, PROTOCOL_VERSION, Tui, sm_compose_view  # noqa: E402
+from rundirs import relay_pids, run_dir  # noqa: E402
 
 COLS, ROWS = 120, 40
 SIDEBAR_W = 30
@@ -233,7 +231,7 @@ def subscribed(t, verb, pane):
 
 def test_click_another_view():
     name = "test_click_another_view"
-    rundir = "/tmp/rmx-scfv1"
+    rundir = run_dir("rmx-scfv1")
     t = setup(rundir, "views")
     fails = []
     w = Wire(rundir)
@@ -281,7 +279,7 @@ def test_click_another_view():
 
 def test_click_the_view_on_screen():
     name = "test_click_the_view_on_screen"
-    rundir = "/tmp/rmx-scfv2"
+    rundir = run_dir("rmx-scfv2")
     t = setup(rundir, "views")
     fails = []
     w = Wire(rundir)
@@ -325,7 +323,7 @@ def drags_at_server(t):
 
 def test_a_lost_panel_release_does_not_take_a_cell_drag():
     name = "test_a_lost_panel_release_does_not_take_a_cell_drag"
-    t = setup("/tmp/rmx-scfv12", "views")
+    t = setup(run_dir("rmx-scfv12"), "views")
     fails = []
     x = SIDEBAR_W + 10
     # A blank panel row claims the grab and activates nothing.
@@ -342,7 +340,7 @@ def test_a_lost_panel_release_does_not_take_a_cell_drag():
 
 def test_a_panel_press_disarms_a_cell_drag():
     name = "test_a_panel_press_disarms_a_cell_drag"
-    t = setup("/tmp/rmx-scfv13", "views")
+    t = setup(run_dir("rmx-scfv13"), "views")
     fails = []
     x = SIDEBAR_W + 10
     # The cell press's release is lost, which leaves its drag anchor armed.
@@ -384,7 +382,7 @@ def landed(t, fails, pane):
 
 def test_click_session_row():
     name = "test_click_session_row"
-    t, (_, _, p3) = sessions_setup("/tmp/rmx-scfv3")
+    t, (_, _, p3) = sessions_setup(run_dir("rmx-scfv3"))
     fails = []
     y = session_rows(t)[0]
     x = name_x(t, y, "other")
@@ -398,7 +396,7 @@ def test_click_session_row():
 
 def test_click_tab_row():
     name = "test_click_tab_row"
-    t, (_, p2, _) = sessions_setup("/tmp/rmx-scfv4")
+    t, (_, p2, _) = sessions_setup(run_dir("rmx-scfv4"))
     fails = []
     y = session_rows(t)[1]
     click(t, y)
@@ -411,7 +409,7 @@ def test_click_tab_row():
 
 def test_click_pane_row():
     name = "test_click_pane_row"
-    t, (p1, _, _) = sessions_setup("/tmp/rmx-scfv5")
+    t, (p1, _, _) = sessions_setup(run_dir("rmx-scfv5"))
     fails = []
     tab = session_rows(t)[1]
     click(t, tab)
@@ -428,7 +426,7 @@ def test_click_pane_row():
 
 def test_click_the_session_the_view_aliases():
     name = "test_click_the_session_the_view_aliases"
-    rundir = "/tmp/rmx-scfv9"
+    rundir = run_dir("rmx-scfv9")
     t, _ = sessions_setup(rundir)
     fails = []
     w = Wire(rundir)
@@ -514,7 +512,7 @@ def test_file_control_with_no_view():
     """The same clicks with no view up, so the two below cannot pass on a
     stand-in editor that never runs."""
     name = "test_file_control_with_no_view"
-    rundir = "/tmp/rmx-scfv6"
+    rundir = run_dir("rmx-scfv6")
     fix, stamp, env = files_env(rundir)
     t = Tui(rundir, cols=COLS, rows=ROWS, config=cfg("files"), extra_env=env).start()
     t.send(f"cd {fix}\r", 0.4)
@@ -594,7 +592,7 @@ def main_panes(rundir):
 
 def test_file_click_in_view():
     name = "test_file_click_in_view"
-    rundir = "/tmp/rmx-scfv7"
+    rundir = run_dir("rmx-scfv7")
     t, fix, stamp = file_view_setup(rundir)
     fails = []
     before = pane_count(rundir)
@@ -611,7 +609,7 @@ def test_file_click_in_view():
 
 def test_file_enter_in_view():
     name = "test_file_enter_in_view"
-    rundir = "/tmp/rmx-scfv8"
+    rundir = run_dir("rmx-scfv8")
     t, fix, stamp = file_view_setup(rundir)
     fails = []
     before = pane_count(rundir)
@@ -648,7 +646,7 @@ def start_fake_remote(rundir, editor):
     shim = f"{remote}/bin/ssh"
     with open(shim, "w") as f:
         f.write("#!/bin/sh\n" + "".join(f"export {k}={v}\n" for k, v in xdg.items())
-                + f"exec {BIN} relay\n")
+                + f"echo $$ >> {relay_pids()}\n" f"exec {BIN} relay\n")
     os.chmod(shim, 0o755)
     env = {**os.environ, **xdg, "HOME": f"{remote}/home", "SHELL": "/bin/sh", "ENV": "/dev/null",
            "TERM": "xterm-256color", "PS1": "$ ", "EDITOR": editor}
@@ -667,7 +665,7 @@ def start_fake_remote(rundir, editor):
 
 def test_file_in_view_opens_on_the_panels_remote():
     name = "test_file_in_view_opens_on_the_panels_remote"
-    rundir = "/tmp/rmx-scfv10"
+    rundir = run_dir("rmx-scfv10")
     fix, local_stamp, env = files_env(rundir)
     remote_stamp = f"{fix}.remote"
     if os.path.exists(remote_stamp):
@@ -741,7 +739,7 @@ def test_file_in_view_opens_on_the_panels_remote():
 
 def test_file_in_view_with_no_session_to_return_to():
     name = "test_file_in_view_with_no_session_to_return_to"
-    rundir = "/tmp/rmx-scfv11"
+    rundir = run_dir("rmx-scfv11")
     fix, stamp, env = files_env(rundir)
     t = Tui(rundir, cols=COLS, rows=ROWS, config=cfg("files", "views"), extra_env=env).start()
     t.send(f"cd {fix}\r", 0.4)

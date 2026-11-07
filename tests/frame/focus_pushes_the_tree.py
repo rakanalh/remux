@@ -32,8 +32,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Server, Client, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-ftree"
+RUNDIR = run_dir("rmx-ftree")
 PUSH_INTERVAL = 0.100
 
 failures = []

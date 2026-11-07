@@ -17,8 +17,9 @@ import sys
 import time
 
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = os.environ.get("REMUX_SDS_RUN", "/tmp/rmxsds")
+RUNDIR = os.environ.get("REMUX_SDS_RUN") or run_dir("rmxsds")
 COLS, ROWS = 100, 30
 
 fails = []

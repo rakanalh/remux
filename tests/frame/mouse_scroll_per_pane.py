@@ -28,12 +28,13 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Client, Server, name_of, only  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-# Keyed on the pid: two concurrent runs of this harness on one machine would
+# Private to this run: two concurrent runs of this harness on one machine would
 # otherwise share a socket and a state dir, and the corruption that follows
 # looks exactly like the bug under test. Kept short, because a Unix socket path
 # must stay under 108 characters.
-RUNDIR_BASE = f"/tmp/rmx-pp{os.getpid()}"
+RUNDIR_BASE = run_dir("rmx-pp")
 COLS, ROWS = 100, 30
 VERBOSE = "-v" in sys.argv
 HIST = 300

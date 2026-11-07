@@ -33,8 +33,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Client, Server, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-statecompat")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-statecompat")
 OLD = os.environ.get("REMUX_OLD_BIN")
 RECORD_ID = "abcd0000-1111-4222-8333-944445555001"
 CONFIG = """

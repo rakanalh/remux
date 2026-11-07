@@ -10,6 +10,7 @@ Run from repo root:  PYTHONPATH=tests/pty python3 tests/pty/shared_views_single_
 """
 import sys
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
 VERBOSE = "-v" in sys.argv
 A = "AAAA_alpha"
@@ -17,7 +18,7 @@ B = "BBBB_bravo"
 
 
 def main():
-    t = Tui("/tmp/rmxlife/v", cols=110, rows=36).start()
+    t = Tui(run_dir("rmxlife/v"), cols=110, rows=36).start()
     fails = []
 
     def fail(m):

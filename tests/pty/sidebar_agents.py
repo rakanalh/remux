@@ -50,9 +50,10 @@ import pyte
 # notifications for this test's agents.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import install_agent_standin, install_notify_shims  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 BIN = os.path.abspath("target/debug/remux")
-RUN = "/tmp/rmx-sba"
+RUN = run_dir("rmx-sba")
 SOCK = f"{RUN}/run/remux.sock"
 VERBOSE = "-v" in sys.argv
 

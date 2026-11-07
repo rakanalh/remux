@@ -1,8 +1,9 @@
 """Exploratory: build a 2-cell view via the TUI and dump screens per step."""
 import sys, time
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
-t = Tui("/tmp/rmxfix/exp", cols=120, rows=40).start()
+t = Tui(run_dir("rmxfix/exp"), cols=120, rows=40).start()
 t.dump("initial")
 
 # Distinct static content in pane A.

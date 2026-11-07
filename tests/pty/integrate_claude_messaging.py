@@ -50,7 +50,9 @@
 
 Copies of the binary go under ~/.cache/rmx-integmsg, never under /tmp: /tmp
 is world-writable, so a binary there is refused (i21). That tree is removed
-on any exit, a SIGTERM included.
+on any exit, a SIGTERM included. It is one fixed dir under an exclusive lock, so
+concurrent runs take turns, and a killed run leaves one tree that the next run
+replaces rather than a copy per run.
 
 The skill, at ~/.claude/skills/remux-messaging/SKILL.md:
   s1  install writes it 0644, byte for byte the repo's SKILL.md
@@ -72,6 +74,7 @@ The skill, at ~/.claude/skills/remux-messaging/SKILL.md:
 Run: python3 tests/pty/integrate_claude_messaging.py
 """
 import atexit
+import fcntl
 import grp
 import json
 import os
@@ -83,8 +86,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import BIN  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-integmsg"
+RUNDIR = run_dir("rmx-integmsg")
 # Where copies of the binary live: a tree only this user can write, since the
 # installer refuses a binary under any directory others can write.
 SAFE = os.path.join(os.path.expanduser("~"), ".cache", "rmx-integmsg")
@@ -165,6 +169,11 @@ def snapshot(path):
 
 shutil.rmtree(RUNDIR, ignore_errors=True)
 os.makedirs(RUNDIR)
+# Held until this process exits. The descriptor must stay referenced, because
+# closing it releases the lock.
+os.makedirs(os.path.dirname(SAFE), exist_ok=True)
+SAFE_LOCK = open(SAFE + ".lock", "w")
+fcntl.flock(SAFE_LOCK, fcntl.LOCK_EX)
 shutil.rmtree(SAFE, ignore_errors=True)
 # i21-i23 open directories under SAFE for a moment and run binaries from
 # them; 0700 keeps every other user out of SAFE whatever $HOME's mode is.

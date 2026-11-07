@@ -24,8 +24,9 @@ import re
 import sys
 
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxvms"
+RUNDIR = run_dir("rmxvms")
 COLS, ROWS = 120, 40
 # Grid splits a 120-col view into two ~60-col cells; these columns sit well
 # inside each cell's content area (1-based, as SGR mouse reports are).

@@ -30,8 +30,9 @@ Run: python3 tests/frame/osc52_clipboard.py
 """
 import json, os, struct, subprocess, sys, time
 from harness import Server, Client, BIN, PROTOCOL_VERSION, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxosc"
+RUNDIR = run_dir("rmxosc")
 MARKER = "REMUX_CLIP_7788"
 
 # 400 lines, ~10 KB -- a realistic "copy a block of output" payload, and well

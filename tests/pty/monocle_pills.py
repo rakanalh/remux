@@ -24,6 +24,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import Tui, sm_compose_view  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 VERBOSE = "-v" in sys.argv
 LEFT_CAP, RIGHT_CAP = "", ""
@@ -66,7 +67,7 @@ def pills(row):
 
 
 def main():
-    rundir = f"/tmp/rmx-mpl-{os.getpid()}"
+    rundir = run_dir("rmx-mpl")
     t = Tui(rundir, cols=120, rows=40, config=CONFIG)
     try:
         t.start()
@@ -108,7 +109,6 @@ def main():
             check("panicked" not in t.log(which), f"no panic in {which}.log")
     finally:
         t.kill()
-        shutil.rmtree(rundir, ignore_errors=True)
     print(f"\n{'FAILED' if failures else 'OK'}: {len(failures)} failure(s)")
     sys.exit(1 if failures else 0)
 
