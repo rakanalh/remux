@@ -4472,7 +4472,7 @@ async fn run_client_loop(
                 }
             };
             if let Some(action) = chosen {
-                run_menu_action(
+                let ran = run_menu_action(
                     action,
                     &mut input,
                     &mut chrome,
@@ -4497,7 +4497,12 @@ async fn run_client_loop(
                         viewport_top,
                     },
                 )
-                .await?;
+                .await;
+                // A menu stays open across a connection drop, so its action can
+                // name a server that is gone. That must not end the client.
+                if let Err(e) = ran {
+                    log::warn!("context menu: the action failed: {e:#}");
+                }
             }
         }};
     }

@@ -28,7 +28,14 @@ Cases, in the order they run:
      target rather than wherever `handle_session_removed` would send it.
   6. A bystander scrolled back on a moved pane is pushed live frames afterwards.
   7. An unattached requester can move a tab, as a remote's panel does.
-  8. No panic in server.log.
+  8. A tab of a never-attached session has no forwarding task. Moved to an
+     attached session without the requester following, its pane still prints
+     once the requester switches to it.
+  9. A move between sessions no client is on resizes neither, so a program in
+     them gets no SIGWINCH. A client attaching afterwards still fires the trap.
+ 10. An emptied source whose bystanders land on a never-attached target: the
+     target's own pane reaches them.
+ 11. No panic in server.log.
 
 Markers are ASSEMBLED by the shell (`printf 'RAN:%s' b` prints `RAN:b`).
 
@@ -45,6 +52,11 @@ RUNDIR = os.environ.get("REMUX_TMS_RUN", "/tmp/rmxtms")
 MONOCLE = '[appearance]\ndefault_layout = "monocle"\n'
 COLS, ROWS = 100, 30
 RENDERS = ("FullRender", "RenderDiff", "ScrollRender")
+
+WINCH_SCRIPT = """trap 'stty size >> {log}' WINCH
+stty size > {log}
+while :; do sleep 0.1; done
+"""
 
 fails = []
 
@@ -152,6 +164,22 @@ def pane_contents(msgs, pane):
             cells = only(m, "PaneContent")["cells"]
             out += ["".join(c.get("c", " ") for c in row) for row in cells]
     return "\n".join(out)
+
+
+def winch_lines(path):
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return f.read().split("\n")[:-1]
+
+
+def wait_for_winch(path, seen, timeout=4.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if len(winch_lines(path)) > seen:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def main():
@@ -306,7 +334,73 @@ def main():
         check(any(t[0] == tab for t in tree(loose)["other"]), "the tab moved")
         check(current(loose) is None, "the requester stays unattached")
 
-        print("8. no panic")
+        print("8. a never-attached tab, not followed, then switched to")
+        loose.send({"CreateSession": {"name": "cold", "folder": None}})
+        loose.drain(0.5)
+        cold_tab = tree(loose)["cold"][0][0]
+        move(req, cold_tab, "cold", "main")
+        check(current(req) == "main", "the requester did not follow")
+        for _ in tree(req)["main"]:
+            if active(tree(req)["main"])[0] == cold_tab:
+                break
+            cmd(req, "TabNext")
+        check(active(tree(req)["main"])[0] == cold_tab, "the requester switched to it")
+        req.send({"Input": {"data": list(b"printf 'RAN:%s\\n' cold\n")}})
+        time.sleep(0.5)
+        check("RAN:cold" in text_of(req.drain(1.0)), "the moved pane's output reaches it")
+
+        print("9. a move between unattached sessions resizes neither")
+        log = f"{RUNDIR}/winch.log"
+        script = f"{RUNDIR}/winch.sh"
+        with open(script, "w") as f:
+            f.write(WINCH_SCRIPT.format(log=log))
+        held = Client(srv.sock)
+        held.hello()
+        held.send({"CreateSession": {"name": "quiet", "folder": None}})
+        attach(held, "quiet")
+        cmd(held, "TabNew")
+        held.send({"Input": {"data": list(f"sh {script}\n".encode())}})
+        check(wait_for_winch(log, 0), "setup: the WINCH script started")
+        held.close()
+        loose.send({"CreateSession": {"name": "side", "folder": None}})
+        loose.drain(1.0)
+        before = winch_lines(log)
+        t8 = tree(loose)
+        move(loose, t8["quiet"][0][0], "quiet", "side")
+        check(winch_lines(log) == before, f"the source was left alone: {winch_lines(log)}")
+        move(loose, t8["side"][0][0], "side", "quiet")
+        time.sleep(0.5)
+        check(winch_lines(log) == before, f"the target was left alone: {winch_lines(log)}")
+        probe = Client(srv.sock)
+        probe.hello()
+        probe.send({"Attach": {"session_name": "quiet"}})
+        probe.send({"Resize": {"cols": 90, "rows": 28}})
+        check(wait_for_winch(log, len(before)), "the trap still fires on a real resize")
+        probe.close()
+
+        print("10. an emptied source, bystanders landing on a never-attached target")
+        loose.send({"CreateSession": {"name": "src", "folder": None}})
+        loose.drain(0.5)
+        for c in (req, by_main, by_other):
+            attach(c, "src")
+        for name in sorted(tree(loose)):
+            if name != "src":
+                loose.send({"KillSession": {"name": name}})
+                loose.drain(0.5)
+        loose.send({"CreateSession": {"name": "cold2", "folder": None}})
+        loose.drain(0.5)
+        by_other.drain(0.3)
+        move(loose, tree(loose)["src"][0][0], "src", "cold2")
+        got = by_other.drain(1.0)
+        check(any(name_of(m) == "SessionBorderStyle" for m in got),
+              "the bystander is told the border style")
+        check(current(by_other) == "cold2", "the bystander landed on the target")
+        by_other.send({"Input": {"data": list(b"printf 'RAN:%s\\n' landed\n")}})
+        time.sleep(0.5)
+        check("RAN:landed" in text_of(by_other.drain(1.0)),
+              "the target's own pane reaches the bystander")
+
+        print("11. no panic")
         check("panicked" not in srv.log(), "no panic in server.log")
     finally:
         for c in (req, by_main, by_other, sub, loose):

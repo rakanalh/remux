@@ -818,9 +818,8 @@ pub enum MoveRefused {
 pub struct TabMoveOutcome {
     /// Every pane the tab took with it, popup included.
     pub panes: Vec<PaneId>,
-    /// `Some` when the move emptied the source and removed it, with the panes
-    /// the caller must reap.
-    pub source_removed: Option<Vec<PaneId>>,
+    /// The move emptied the source and removed it.
+    pub source_removed: bool,
 }
 
 struct MovePlan {
@@ -1766,13 +1765,13 @@ impl ServerState {
         let tab = source.tabs.remove(index);
         let mut panes = tab.pane_order.clone();
         panes.extend(tab.popup_pane);
-        let source_removed = if source.tabs.is_empty() {
-            Some(self.remove_emptied_session(from))
+        let source_removed = source.tabs.is_empty();
+        if source_removed {
+            self.remove_emptied_session(from);
         } else {
             source.after_tab_removed(index);
             debug_check_invariant(source, "move_tab_to_session source");
-            None
-        };
+        }
         let target = self.sessions.get_mut(to).ok_or(MoveRefused::NoSession)?;
         target.tabs.push(tab);
         if activate {
@@ -4917,7 +4916,7 @@ mod move_pane_to_tab_tests {
         let moved = st.move_tab_to_session(id, "main", "other", false).unwrap();
 
         assert_eq!(moved.panes, ids[0][0]);
-        assert_eq!(moved.source_removed, None);
+        assert!(!moved.source_removed);
         assert_eq!(sess_named(&st, "main").tabs.len(), 2);
         let other = sess_named(&st, "other");
         assert_eq!(other.tabs.len(), 2);
@@ -4967,7 +4966,7 @@ mod move_pane_to_tab_tests {
 
         let moved = st.move_tab_to_session(id, "main", "other", true).unwrap();
 
-        assert_eq!(moved.source_removed, Some(Vec::new()));
+        assert!(moved.source_removed);
         assert!(!st.sessions.contains_key("main"));
         assert!(st.folders["work"].session_ids.is_empty());
     }

@@ -49,6 +49,7 @@ What it covers:
  25  `d` on a session's only tab asks, naming the session it ends
  26  killing the session the client is on lands it on a survivor, by right click,
      by `d` and by a folder; with nothing left the client ends
+ 27  a menu left open when its remote drops: Confirm does not end the client
 
 Run from the repo root:
     python3 tests/pty/sidebar_sessions.py [-v] [scenario_<name> ...]
@@ -1656,6 +1657,42 @@ def scenario_keys_remote():
     r.close()
 
 
+def scenario_menu_after_remote_drop():
+    """27: a menu's action names its connection, which can go while it is open."""
+    print("a confirm menu outlives its remote")
+    start_server(SOCK2, env_remote())
+    r = Wire(SOCK2)
+    r.send({"CreateSession": {"name": "rone", "folder": None}})
+    time.sleep(0.4)
+    start_server(SOCK1, env_local(f"{RUN}/cfg-remote"))
+    seed = seed_tree()
+    child, screen, pump = spawn(env_local(f"{RUN}/cfg-remote"))
+    pump(3.0)
+    focus_panel(child, pump)
+    select_row(child, screen, pump, "rone")
+    child.send(b"d")
+    pump(0.7)
+    check("27 setup: the confirm is open",
+          "Confirm: Kill session" in menu_labels(screen), menu_labels(screen))
+
+    # By position: the drop repaints the panel over the menu, which stays open.
+    mx, my = must_find(screen, "Confirm: Kill session")
+
+    subprocess.run(["pkill", "-x", "-f", f"{BIN} relay"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pump(2.0)
+    check("27 setup: the remote's rows are gone",
+          not any("rone" in r for r in panel_rows(screen)), panel_rows(screen))
+    press(child, pump, mx + 1, my, wait=2.0)
+    check("27 the client survived", child.isalive())
+    check("27 the failed send is in the log",
+          "context menu: the action failed" in open(f"{RUN}/state/remux/client.log").read())
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+    r.close()
+
+
 def scenario_nowhere():
     """24: one session, no folders."""
     print("m with nowhere to go")
@@ -1812,7 +1849,7 @@ def main():
                      scenario_d_key, scenario_shortcuts, scenario_m_session,
                      scenario_m_tab, scenario_m_tab_follow, scenario_tm_manager,
                      scenario_keys_remote, scenario_d_only_tab, scenario_kill_attached,
-                     scenario_nowhere):
+                     scenario_menu_after_remote_drop, scenario_nowhere):
         if only and scenario.__name__ not in only:
             continue
         setup_dirs()

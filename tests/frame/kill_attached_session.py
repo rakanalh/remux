@@ -15,11 +15,17 @@ last case, where it must.
   4. A client on an unrelated session is left where it is.
   5. Nothing left: a client on the last session gets `SessionDeleted` and is
      attached to nothing. The same through a folder.
+  6. The survivor was never attached, so its pane has no forwarding task until
+     a bystander lands there. The bystander is told the border style before the
+     first frame, and a marker its shell prints reaches it. The survivor is the
+     only session left each time, because `sessions` is a HashMap and any other
+     choice would be arbitrary. The kill path and the folder cascade both.
 
 Run from the repo root: PYTHONPATH=tests/frame python3 tests/frame/kill_attached_session.py
 """
 import os
 import sys
+import time
 
 from harness import Server, Client, name_of, only
 
@@ -80,6 +86,30 @@ def frame_session(msgs):
         if n in RENDERS:
             status = only(m, n).get("status") or status
     return status["session_name"] if status else None
+
+
+def text_of(msgs):
+    out = []
+    for m in msgs:
+        n = name_of(m)
+        if n == "FullRender":
+            out += ["".join(c.get("c", " ") for c in row) for row in only(m, n)["cells"]]
+        elif n == "RenderDiff":
+            out.append("".join(ch["cell"].get("c", " ") for ch in only(m, n)["changes"]))
+    return "\n".join(out)
+
+
+def check_landing(label, cli, survivor, got, tag):
+    kinds = [name_of(m) for m in got]
+    frames = [i for i, k in enumerate(kinds) if k in RENDERS]
+    check("SessionBorderStyle" in kinds and frames
+          and kinds.index("SessionBorderStyle") < frames[0],
+          f"{label}: the border style comes before the first frame: {kinds}")
+    check(current(cli) == survivor, f"{label}: the bystander is on {survivor}")
+    cli.send({"Input": {"data": list(f"printf 'RAN:%s\\n' {tag}\n".encode())}})
+    time.sleep(0.5)
+    check(f"RAN:{tag}" in text_of(cli.drain(1.0)),
+          f"{label}: the survivor's pane reaches the bystander")
 
 
 def main():
@@ -160,6 +190,23 @@ def main():
         got_req, got_by = req.drain(1.0), by.drain(1.0)
         check(len(deleted_events(got_req)) == 1, "a folder emptying the server tells the requester")
         check(len(deleted_events(got_by)) == 1, "and the client on its other session")
+
+        print("6. the survivor was never attached")
+        create(loose, "cold")
+        create(loose, "doomed")
+        attach(by, "doomed")
+        loose.send({"KillSession": {"name": "doomed"}})
+        check_landing("kill", by, "cold", by.drain(1.0), "kill")
+
+        create(loose, "cold2")
+        loose.send({"Command": {"FolderNew": "h"}})
+        loose.drain(0.3)
+        create(loose, "fdoomed", "h")
+        attach(by, "fdoomed")
+        loose.send({"KillSession": {"name": "cold"}})
+        loose.drain(0.5)
+        loose.send({"Command": {"FolderDelete": "h"}})
+        check_landing("folder", by, "cold2", by.drain(1.0), "folder")
 
         check("panicked" not in srv.log(), "no panic in server.log")
     finally:
