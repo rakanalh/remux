@@ -194,12 +194,13 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from harness import BIN, PROTOCOL_VERSION, Client, Server, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 from portable import SETSID_F  # noqa: E402
 import ssh_shim  # noqa: E402
 import fakeagent  # noqa: E402
 import relay_fds  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msgrem")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-msgrem")
 SHIMDIR = RUNDIR + "-bin"
 PEER = f"{SHIMDIR}/peer.py"
 FAKEAGENT = f"{SHIMDIR}/fakeagent"
@@ -385,12 +386,34 @@ def check_proc(cond, label):
         skip(label + " (no /proc)")
 
 
+def carries_this_runs_shim_env(pid):
+    want = f"RMX_SHIM_PIDS={os.environ['RMX_SHIM_PIDS']}"
+    if os.path.isdir("/proc"):
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                return want.encode() in f.read().split(b"\0")
+        except OSError:
+            return False
+    out = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", str(pid)],
+                         capture_output=True, text=True).stdout
+    return want in out.split()
+
+
+def signal_relay(pid, sig):
+    """Signal a shim this run recorded. The pid file keeps every shim of the run,
+    and a dead shim's pid can be reused, so it is verified first. The check is the
+    environment, because a shim can play a hostile peer and not run a relay."""
+    if not carries_this_runs_shim_env(pid):
+        raise ProcessLookupError(pid)
+    os.kill(pid, sig)
+
+
 def kill_relays():
     """Only the relays this run started, by their recorded pids: never a
     `pkill -f "remux relay"`, which would hit another harness's relay."""
     for line in shim_lines("RMX_SHIM_PIDS"):
         try:
-            os.kill(int(line), 9)
+            signal_relay(int(line), 9)
         except (ValueError, OSError):
             pass
 
@@ -669,7 +692,7 @@ def drop_link():
     """Kill the far end of A's link and wait until A has seen it go."""
     before = downs()
     try:
-        os.kill(relay_pid(), 9)
+        signal_relay(relay_pid(), 9)
     except (TypeError, OSError):
         pass
     end = time.time() + 5
@@ -1112,7 +1135,7 @@ try:
     send_from_a1(f"mini:%{B1}", "redial-g")
     before = downs()
     old_relay = relay_pid()
-    os.kill(old_relay, 9)
+    signal_relay(old_relay, 9)
     end = time.time() + 5
     while time.time() < end and downs() == before:
         time.sleep(0.05)
@@ -1482,7 +1505,10 @@ try:
     while time.time() < end and "foura" not in fake_text(BF_LOG):
         time.sleep(0.1)
     stopped, before = relay_pid(), downs()
-    os.kill(stopped, signal.SIGSTOP)
+    try:
+        signal_relay(stopped, signal.SIGSTOP)
+    except OSError as e:
+        check(False, f"4a the recorded relay {stopped} is verified and stopped ({e!r})")
     t0 = time.time()
     went = wait_downs(before, 5)
     took = time.time() - t0
@@ -1494,7 +1520,7 @@ try:
     # A kills the child of a link it gave up on, so the relay may be gone.
     for sig in (signal.SIGCONT, signal.SIGKILL):
         try:
-            os.kill(stopped, sig)
+            signal_relay(stopped, sig)
         except OSError:
             pass
 
@@ -1595,10 +1621,13 @@ try:
     a_restart(A_CONFIG)
     code, out, err = send_from_a1(f"mini:%{B7}", "four-l0")
     stopped, before, b_mark = relay_pid(), downs(), len(srv_b.log())
-    os.kill(stopped, signal.SIGSTOP)
+    try:
+        signal_relay(stopped, signal.SIGSTOP)
+    except OSError as e:
+        check(False, f"4l the recorded relay {stopped} is verified and stopped ({e!r})")
     expired = wait_b_log("peer link laptop: expired", b_mark, timeout=2.5)
     try:
-        os.kill(stopped, signal.SIGCONT)
+        signal_relay(stopped, signal.SIGCONT)
     except OSError:
         pass
     went = wait_downs(before, 3)
@@ -1634,7 +1663,7 @@ try:
     check(code == 0 and went and "2 pongs missed" in last_down(),
           f"4g pongs with the wrong nonce are not pongs: the link goes down (exit {code}, {last_down()[-60:]!r})")
     try:
-        os.kill(relay_pid(), signal.SIGKILL)
+        signal_relay(relay_pid(), signal.SIGKILL)
     except OSError:
         pass
     set_mode("relay")

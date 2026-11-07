@@ -43,8 +43,9 @@ import json, os, re, shutil, socket, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Server, Client, name_of, only  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = f"/tmp/rmx-osct-{os.getpid()}"
+RUNDIR = run_dir("rmx-osct")
 # The shell's name as this server reports it, read off the first pane at its
 # prompt: `sh` on Linux, where macOS's `/bin/sh` is a trampoline that execs
 # another shell under its own name.

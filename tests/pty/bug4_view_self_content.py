@@ -16,6 +16,7 @@ second viewer. Because the sole client detaches on view entry:
 """
 import sys
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
 MARK_A = "AAAA_bug4_marker"
 MARK_B = "BBBB_bug4_marker"
@@ -45,7 +46,7 @@ def make_self_view(t):
 
 
 def main():
-    t = Tui("/tmp/rmxbug4pty/self", cols=120, rows=40).start()
+    t = Tui(run_dir("rmxbug4pty/self"), cols=120, rows=40).start()
     make_self_view(t)
     fails = []
 

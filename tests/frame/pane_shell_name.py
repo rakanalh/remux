@@ -32,8 +32,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Server, Client, name_of, only  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = f"/tmp/rmx-psn-{os.getpid()}"
+RUNDIR = run_dir("rmx-psn")
 # macOS's `/bin/sh` is a trampoline that execs another shell, which then names
 # itself differently to `ps` and to the kernel's executable path. Compare like
 # with like by running a real shell there unless told otherwise.

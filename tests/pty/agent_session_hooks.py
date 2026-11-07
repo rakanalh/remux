@@ -125,9 +125,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "frame"))
 sys.path.insert(0, HERE)
 from harness import BIN, Client, Server, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 import fakeclaude  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-agsess-hooks")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-agsess-hooks")
 BINDIR = RUNDIR + "-bin"
 FIXTURES = os.path.join(HERE, "..", "fixtures", "agent_session")
 HERMETIC_PATH = "/usr/local/bin:/usr/bin:/bin"
@@ -683,6 +684,10 @@ def processes_with_home(home):
 
 
 def end_processes_with_home(name, home):
+    # The match is on HOME alone, so a HOME outside this run could match the
+    # developer's own processes.
+    if not home.startswith((RUNDIR + "/", RUNDIR + "-")):
+        raise SystemExit(f"refusing to end the processes of {home}: not this run's")
     left = processes_with_home(home)
     for pid in left:
         try:

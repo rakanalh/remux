@@ -16,8 +16,9 @@ Run: python3 tests/frame/pane_new_in_background_tab.py
 """
 import sys
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxpnb"
+RUNDIR = run_dir("rmxpnb")
 COLS, ROWS = 100, 30
 
 fails = []

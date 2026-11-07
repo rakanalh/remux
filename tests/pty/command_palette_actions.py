@@ -22,8 +22,9 @@ Run from the repo root:
 """
 import sys
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxcpa"
+RUNDIR = run_dir("rmxcpa")
 
 
 def open_palette(t):

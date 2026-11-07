@@ -21,12 +21,13 @@ the right pane.
 """
 import sys
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
 A = "AAAA_marker_one"
 B = "BBBB_marker_two"
 NORMAL_MARK = "PASTEDNORM"
 VIEW_MARK = "PASTEDVIEW"
-RUNDIR = "/tmp/rmxfix/paste"
+RUNDIR = run_dir("rmxfix/paste")
 
 
 def paste(t, text, wait=0.7):

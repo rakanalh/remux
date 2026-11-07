@@ -32,8 +32,9 @@ Run: python3 tests/frame/tab_chip_style.py
 import os
 import sys
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxtcs"
+RUNDIR = run_dir("rmxtcs")
 COLS, ROWS = 80, 24
 LEFT_CAP, RIGHT_CAP = "", ""
 

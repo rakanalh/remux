@@ -37,8 +37,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, PROTOCOL_VERSION  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = os.path.normpath(os.environ.get("RMX_RUNDIR", "/tmp/rmx-relrun"))
+RUNDIR = os.path.normpath(os.environ.get("RMX_RUNDIR") or run_dir("rmx-relrun"))
 UID = os.geteuid()
 if not os.path.isabs(RUNDIR) or RUNDIR.count("/") < 2:
     raise SystemExit(f"refusing RMX_RUNDIR={RUNDIR!r}: not a dedicated absolute dir")

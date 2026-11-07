@@ -46,10 +46,11 @@ from pty_harness import (  # noqa: E402
 )
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
 from harness import Client, Server  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-snt"
-REMOTE_RUNDIR = "/tmp/rmx-sntr"
-SHIM_DIR = "/tmp/rmx-sntb"
+RUNDIR = run_dir("rmx-snt")
+REMOTE_RUNDIR = run_dir("rmx-sntr")
+SHIM_DIR = run_dir("rmx-sntb")
 
 ALT_O = b"\x1bo"
 
@@ -73,19 +74,24 @@ REFUSED_NAME = {
 # `hand_switch_during_delete` is not here: a tree can tell the client first.
 REFUSAL_REQUIRED = set(REFUSED_NAME) - {"hand_switch_during_delete"}
 
-# argv: delay, control FIFO, remux binary. A line on the FIFO goes to the client
-# at once: `tree` repeats the last `SessionTree` seen, `frame <json>` sends <json>.
+# argv: delay, control FIFO, remux binary, relay pid file. A line on the FIFO
+# goes to the client at once: `tree` repeats the last `SessionTree` seen, `frame
+# <json>` sends <json>.
 # `cut` stops reading from the client, so its writes fail while what the relay
 # sends still arrives, which is a dead ssh whose end of file is not read yet.
 # The client treats its first failed write as the drop and ends the transport
 # itself, which takes the proxy with it, so the end of file never matters.
 # `drop` ends the proxy if it is still there; the cases send it with `gone_ok`,
 # because by then it normally is not.
+# The relay is the proxy's child, so the proxy records its pid: `kill_relays`
+# signals only a recorded pid that is a relay.
 PROXY = r"""
 import collections, os, struct, subprocess, sys, threading, time
 
-delay, control, remux = float(sys.argv[1]), sys.argv[2], sys.argv[3]
+delay, control, remux, pids = float(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 relay = subprocess.Popen([remux, "relay"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+with open(pids, "a") as f:
+    f.write(f"{relay.pid}\n")
 to_client = threading.Lock()
 last_tree = [None]
 cut = [False]
@@ -292,14 +298,15 @@ class Rig:
             create(self.rc, "r1")
             create(self.rc, "r2")
             os.makedirs(SHIM_DIR, exist_ok=True)
-            run = f"exec {BIN} relay\n"
+            run = f"echo $$ >> {REMOTE_RUNDIR}/relay.pids\nexec {BIN} relay\n"
             if delay:
                 with open(f"{SHIM_DIR}/proxy.py", "w") as f:
                     f.write(PROXY)
                 if os.path.exists(self.control):
                     os.unlink(self.control)
                 os.mkfifo(self.control)
-                run = f"exec {sys.executable} {SHIM_DIR}/proxy.py {delay} {self.control} {BIN}\n"
+                run = (f"exec {sys.executable} {SHIM_DIR}/proxy.py {delay} {self.control} {BIN} "
+                       f"{REMOTE_RUNDIR}/relay.pids\n")
             with open(f"{SHIM_DIR}/ssh", "w") as f:
                 f.write(
                     "#!/bin/sh\n"

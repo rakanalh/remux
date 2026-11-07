@@ -66,9 +66,10 @@ import pyte
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "frame"))
 from harness import Client, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUNDIR = "/tmp/rmx-cls"
+RUNDIR = run_dir("rmx-cls")
 COLS, ROWS = 110, 34
 SIDEBAR_W = 34
 RUNNER = f"{RUNDIR}/runner.sh"

@@ -64,8 +64,9 @@ from pty_harness import (  # noqa: E402
     sm_tree,
 )
 from harness import Client  # noqa: E402
+from rundirs import relay_pids, run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-smvt"
+RUNDIR = run_dir("rmx-smvt")
 REMOTE_DIR = f"{RUNDIR}-remote"
 VIEWPORT_DIR = f"{RUNDIR}-vp"
 COLLAPSED = "▶"
@@ -180,7 +181,7 @@ def start_remote():
             f"export XDG_RUNTIME_DIR={REMOTE_DIR}/run\n"
             f"export XDG_STATE_HOME={REMOTE_DIR}/state\n"
             f"export XDG_DATA_HOME={REMOTE_DIR}/data\n"
-            f"exec {BIN} relay\n"
+            f"echo $$ >> {relay_pids()}\n" f"exec {BIN} relay\n"
         )
     os.chmod(shim, 0o755)
 

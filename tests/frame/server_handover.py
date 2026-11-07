@@ -26,9 +26,10 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import BIN, Client, Server, name_of, remux_daemons  # noqa: E402
+from harness import BIN, Client, Server, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUN = "/tmp/rmx-handover"
+RUN = run_dir("rmx-handover")
 
 failures = []
 
@@ -129,8 +130,7 @@ try:
           and "did not exit" in restart.stderr,
           f"3 a restart whose stop timed out fails (rc {restart.returncode}, out {restart.stdout!r}, "
           f"err {restart.stderr.strip()[-160:]!r})")
-    others = [p for p in remux_daemons(stuck.rundir, kinds=(b"server",)) if p != stuck.proc.pid]
-    check(not others, f"3 ...and starts no server beside the stopped one ({others})")
+    check(stuck.starts() == 1, f"3 ...and starts no server beside the stopped one ({stuck.starts()} in the log)")
     stuck.proc.send_signal(signal.SIGCONT)
     stuck.proc.wait(timeout=15)
 

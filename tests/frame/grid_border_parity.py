@@ -20,8 +20,9 @@ Run: python3 tests/frame/grid_border_parity.py
 """
 import sys
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxgbp"
+RUNDIR = run_dir("rmxgbp")
 COLS, ROWS = 100, 30
 
 ROUNDED = {"╭", "╮", "╰", "╯"}   # ╭ ╮ ╰ ╯

@@ -28,6 +28,7 @@ Run from the repo root:  python3 tests/pty/view_cell_pane_exited.py
 """
 import sys
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
 MARK_A = "AAAA_survivor_marker"
 MARK_B = "BBBB_doomed_marker"
@@ -104,7 +105,7 @@ def focus_keys(pos_a, pos_b):
 
 
 def main():
-    t = Tui("/tmp/rmxvcpe", cols=120, rows=40).start()
+    t = Tui(run_dir("rmxvcpe"), cols=120, rows=40).start()
     fails = []
     try:
         make_two_panes(t)

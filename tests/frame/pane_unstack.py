@@ -28,8 +28,9 @@ import os
 import re
 import sys
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxust"
+RUNDIR = run_dir("rmxust")
 COLS, ROWS = 100, 30
 
 fails = []

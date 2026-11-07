@@ -28,8 +28,9 @@ import sys
 import time
 
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = os.environ.get("REMUX_KAS_RUN", "/tmp/rmxkas")
+RUNDIR = os.environ.get("REMUX_KAS_RUN") or run_dir("rmxkas")
 COLS, ROWS = 100, 30
 RENDERS = ("FullRender", "RenderDiff", "ScrollRender")
 

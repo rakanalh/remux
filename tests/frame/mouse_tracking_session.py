@@ -29,8 +29,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Client, Server, name_of, only  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx_mts"
+RUNDIR = run_dir("rmx_mts")
 COLS, ROWS = 100, 30
 # `cat -v` renders ESC as "^[", so a forwarded SGR report reads like
 # "^[[<64;10;5M" on screen.

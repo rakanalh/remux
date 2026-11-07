@@ -64,8 +64,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Client, Server, name_of, only  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx_smw"
+RUNDIR = run_dir("rmx_smw")
 COLS, ROWS = 100, 30
 VERBOSE = "-v" in sys.argv
 MARK = "WEDGEMARK_4242"

@@ -14,10 +14,11 @@ discriminate. The same sequence is run in a normal TAB as the parity reference.
 """
 import sys
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
 A = "AAAA_marker_one"
 B = "BBBB_marker_two"
-RUNDIR = "/tmp/rmxfix/setmaster"
+RUNDIR = run_dir("rmxfix/setmaster")
 
 
 def col_of(t, needle):

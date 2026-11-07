@@ -24,13 +24,16 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 
 import pexpect
 import pyte
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from rundirs import run_dir  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUNDIR = "/tmp/rmx-sbb"
+RUNDIR = run_dir("rmx-sbb")
 COLS, ROWS = 100, 30
 SIDEBAR_W = 30
 # With a sidebar shown the client draws the status bar across the last row, so

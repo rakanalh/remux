@@ -33,12 +33,13 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Client, Server, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 import fakeagent  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pty"))
 import fakeclaude  # noqa: E402
 
-RUNDIR = "/tmp/rmx-logredact"
+RUNDIR = run_dir("rmx-logredact")
 FAILURES = []
 
 # Distinctive enough that a match cannot be a coincidence, and shaped like the

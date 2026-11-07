@@ -45,9 +45,11 @@ import pyte
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
 import fakeagent  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from rundirs import run_dir  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msgsubtui")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-msgsubtui")
 # Outside the run dir, which make_env wipes.
 BINDIR = RUNDIR + "-bin"
 FAKEAGENT = f"{BINDIR}/fakeagent"

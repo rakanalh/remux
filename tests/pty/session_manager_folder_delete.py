@@ -19,10 +19,11 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import BIN, Tui, sm_open, sm_goto_text, sm_selected  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
 from harness import Client  # noqa: E402
 
-RUNDIR = os.environ.get("REMUX_SMFD_RUN", "/tmp/rmx-smfd")
+RUNDIR = os.environ.get("REMUX_SMFD_RUN") or run_dir("rmx-smfd")
 
 fails = []
 

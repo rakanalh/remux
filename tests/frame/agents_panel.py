@@ -97,6 +97,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -105,11 +106,12 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from harness import Client, Server, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 import standin  # noqa: E402
 
 DARWIN = sys.platform == "darwin"
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-agents")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-agents")
 # The second server, run with the SHIPPED patterns (see cases 13-14).
 RUNDIR2 = RUNDIR + "-shipped"
 # OUTSIDE the rundir on purpose: `Server.start` wipes the rundir, so a stand-in
@@ -423,6 +425,22 @@ def pids_matching(pattern):
     return [int(x) for x in r.stdout.split()]
 
 
+def started_by_this_run(pid):
+    """A command line can name BINDIR in a process this run did not start, such
+    as a `tail` of a log. A pane's process inherits the run's XDG_RUNTIME_DIR."""
+    want = f"XDG_RUNTIME_DIR={RUNDIR}"
+    if os.path.isdir("/proc"):
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                entries = f.read().decode(errors="replace").split("\0")
+        except OSError:
+            return False
+    else:
+        entries = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", str(pid)],
+                                 capture_output=True, text=True).stdout.split()
+    return any(e.startswith(want) for e in entries)
+
+
 def ps_field(pid, field):
     """One `ps` column for `pid`, for macOS, which has no `/proc`."""
     r = subprocess.run(["ps", "-o", f"{field}=", "-p", str(pid)], capture_output=True, text=True)
@@ -568,7 +586,12 @@ def main():
     # to take on trust.
     # `-9`: a STOPPED process leaves a SIGTERM pending until something
     # continues it, and case 19 parks one on purpose.
-    subprocess.run(["pkill", "-9", "-f", BINDIR + "/"], capture_output=True)
+    for pid in pids_matching(BINDIR + "/"):
+        if started_by_this_run(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     time.sleep(0.5)
     left = pids_matching(BINDIR + "/")
     check(not left, f"the run left no stand-in processes behind ({left})")

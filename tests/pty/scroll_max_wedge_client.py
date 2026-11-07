@@ -40,8 +40,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx_smwc"
+RUNDIR = run_dir("rmx_smwc")
 VERBOSE = "-v" in sys.argv
 MARK = "PTYWEDGE_7171"
 

@@ -28,10 +28,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SAMPLE = os.path.join(ROOT, "config.sample.toml")
-RUNDIR = "/tmp/rmxsamp"
+RUNDIR = run_dir("rmxsamp")
 
 # A commented line that is TOML rather than prose: a table header, a key = value,
 # or the blank spacer between two tables. Anything else ends the example block.

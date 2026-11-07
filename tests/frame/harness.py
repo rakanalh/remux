@@ -7,141 +7,16 @@ import atexit, json, os, shutil, signal, socket, struct, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import home_guard  # noqa: E402,F401  (installs the real-HOME refusal)
+from rundirs import kill_relays, stop_runtime, stop_servers  # noqa: E402,F401
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 
 
-# The runtime dir this harness started under, read before a harness can point
-# XDG_RUNTIME_DIR at its own: the user's real server listens there.
-_REAL_RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "")
-
-
-def _protected():
-    """Where the user's real servers listen, which no rundir may contain."""
-    uid = os.getuid()
-    dirs = (_REAL_RUNTIME, os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{uid}",
-            f"{os.environ.get('TMPDIR') or '/tmp'}/remux-{uid}")
-    return [os.path.normpath(d) for d in dirs if d]
-
-
-def _checked_root(rundir):
-    """`rundir` normalised, or AssertionError when reaping under it could reach
-    a server that is not this harness's: an empty, relative or top-level dir,
-    or one that contains a dir where the user's real server listens. Raised
-    explicitly rather than by `assert`, which `python -O` strips."""
-    root = os.path.normpath(rundir) if rundir else ""
-    if not os.path.isabs(root) or root.count("/") < 2:
-        raise AssertionError(f"refusing to reap under {rundir!r}: not a dedicated absolute run dir")
-    for live in _protected():
-        if _under(live, root):
-            raise AssertionError(f"refusing to reap under {rundir!r}: it contains {live}, "
-                                 "where a real server listens")
-    return root
-
-
-def _under(path, root):
-    return path == root or path.startswith(root + "/")
-
-
-def _matches(pid, root, kinds):
-    """Whether `pid` is a `remux` of one of `kinds` whose XDG_RUNTIME_DIR (or,
-    with none set, TMPDIR) is under `root`. Both read normalised, so a `..` in
-    the process's environment cannot escape `root` lexically."""
-    try:
-        argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
-        environ = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
-    except OSError:
-        return False
-    if len(argv) < 2 or not argv[0].endswith(b"remux") or argv[1] not in kinds:
-        return False
-    env = dict(e.split(b"=", 1) for e in environ if b"=" in e)
-    runtime = env.get(b"XDG_RUNTIME_DIR", b"").decode(errors="replace")
-    tmpdir = env.get(b"TMPDIR", b"").decode(errors="replace")
-    if runtime:
-        return _under(os.path.normpath(runtime), root)
-    return bool(tmpdir) and _under(os.path.normpath(tmpdir), root)
-
-
-def remux_daemons(rundir, kinds=(b"server", b"relay")):
-    """Pids of every `remux server` / `remux relay` whose XDG_RUNTIME_DIR (or,
-    with none set, TMPDIR) is under `rundir`.
-
-    Found by environment, not by Popen handle: a server a CLIENT auto-spawns
-    through `ensure_server_running` daemonizes (setsid) and is no child of the
-    harness, so killing the harness's own processes never reaches it.
-
-    Without /proc (macOS) nothing can be found this way, and the list is
-    empty: the harness then reaps only what it holds handles to, as before.
-    """
-    root = _checked_root(rundir)
-    if not os.path.isdir("/proc"):
-        return []
-    return [int(pid) for pid in os.listdir("/proc")
-            if pid.isdigit() and _matches(pid, root, kinds)]
-
-
-def _kill(pid, root, kinds):
-    """SIGKILL `pid` if it is still the process the scan found. Through a pidfd
-    where there is one: the match is checked again AFTER the pidfd pins the
-    process, so a pid reused between the scan and the kill is never signalled.
-    Without pidfds the check and the kill are separate, as they were."""
-    try:
-        fd = os.pidfd_open(pid)
-    except ProcessLookupError:
-        return
-    except (AttributeError, OSError):
-        if _matches(pid, root, kinds):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-        return
-    try:
-        if _matches(pid, root, kinds):
-            signal.pidfd_send_signal(fd, signal.SIGKILL)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
-
-
-def reap_rundir(rundir, kinds=(b"server", b"relay")):
-    """SIGKILL every remux server/relay living under `rundir`, and wait for them."""
-    root = _checked_root(rundir)
-    pids = remux_daemons(root, kinds)
-    for pid in pids:
-        _kill(pid, root, kinds)
-    end = time.time() + 3.0
-    while time.time() < end and any(os.path.exists(f"/proc/{p}") and
-                                    _alive(p) for p in pids):
-        time.sleep(0.05)
-    return pids
-
-
-def kill_relays(rundir):
-    """SIGKILL the `remux relay` processes under `rundir` -- a dropped SSH, as
-    the client sees it. Only this harness's: a `pkill -f 'remux relay'` also
-    takes down every other harness's remote running at the same time."""
-    root = _checked_root(rundir)
-    for pid in remux_daemons(root, kinds=(b"relay",)):
-        _kill(pid, root, (b"relay",))
-
-
-def _alive(pid):
-    try:
-        state = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0]
-    except OSError:
-        return False
-    return state != "Z"
-
-
 _GUARDED = []
 
-# Every server process a `Server` started, by handle. The /proc scan above
-# finds nothing on macOS, so these are what teardown can always stop there:
-# a crash-and-restart leaves the earlier handle behind, and a run that dies
-# mid-case leaves the current one. A handle is our own unreaped child, so its
-# pid cannot have been reused.
+# Every server process a `Server` started, by handle: a crash-and-restart leaves
+# the earlier handle behind, and a run that dies mid-case leaves the current one.
+# A handle is our own unreaped child, so its pid cannot have been reused.
 _STARTED = []
 
 
@@ -158,7 +33,10 @@ def _reap_started():
 def _reap_all(*_):
     _reap_started()
     for root in _GUARDED:
-        reap_rundir(root)
+        try:
+            stop_servers(root)
+        except Exception as e:
+            print(f"could not stop the servers under {root}: {e!r}", file=sys.stderr)
 
 
 def _on_signal(signum, frame):
@@ -168,19 +46,21 @@ def _on_signal(signum, frame):
 
 
 def guard_rundir(rundir):
-    """Reap every remux server/relay under `rundir` now (a crashed earlier run's)
-    and again when this harness exits -- normally, on an exception, or on
+    """Stop every remux server under `rundir` now (a crashed earlier run's) and
+    again when this harness exits -- normally, on an exception, or on
     SIGTERM/SIGINT/SIGHUP (the suite's `timeout` sends SIGTERM).
 
-    Called from `start()`, it also reaps a concurrent run that shares this
-    rundir, deliberately: two runs on one rundir corrupt each other anyway.
+    Called from `start()`, it also stops a concurrent run that shares this
+    rundir, deliberately: two runs on one rundir corrupt each other anyway. Only
+    a fixed path or `RMX_RUNDIR` can share one, because `rundirs.run_dir` is
+    private to its run.
 
     Its signal handler replaces Python's default SIGINT handler, so a Ctrl-C
-    skips `finally` blocks and the other atexit handlers, `Tui.kill`'s graceful
-    `remux stop` among them: the reaper SIGKILLs what that would have stopped.
+    skips `finally` blocks and the other atexit handlers, `Tui.kill` among them:
+    this stops what that would have stopped.
     """
-    root = _checked_root(rundir)
-    reap_rundir(root)
+    stop_servers(rundir)
+    root = os.path.normpath(rundir)
     if root in _GUARDED:
         return
     if not _GUARDED:
@@ -268,8 +148,7 @@ class Server:
     def stop(self):
         """Stop the server the way `remux restart` does (`remux stop`, a
         SIGTERM and a clean save), and wait for it to exit."""
-        subprocess.run([BIN, "stop"], env=self.env, timeout=20,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stop_runtime(self.env["XDG_RUNTIME_DIR"])
         self.proc.wait(timeout=10)
         for _ in range(100):
             if not os.path.exists(self.sock):
@@ -306,6 +185,10 @@ class Server:
     def log(self):
         p = f"{self.rundir}/state/remux/server.log"
         return open(p).read() if os.path.exists(p) else ""
+
+    def starts(self):
+        """How many servers have started on this run dir, from the run's own log."""
+        return self.log().count("remux starting as server")
 
 
 class Client:

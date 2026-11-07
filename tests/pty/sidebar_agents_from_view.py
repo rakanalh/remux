@@ -22,9 +22,6 @@ next reaches the stand-in agent, which answers with a marker it ASSEMBLES
 (`SAW-AGENT1<whereami>`), so the terminal's echo of the typed word cannot
 satisfy the check. A view cell's shell would only echo the word back.
 
-The rundirs are fixed: two concurrent runs corrupt each other, and the false
-red looks like a real failure.
-
 Run from the repo root:  python3 tests/pty/sidebar_agents_from_view.py
 """
 import json
@@ -41,6 +38,7 @@ from pty_harness import (  # noqa: E402
     install_agent_standin,
     sm_compose_view,
 )
+from rundirs import run_dir  # noqa: E402
 
 COLS, ROWS = 120, 40
 SIDEBAR_W = 30
@@ -191,7 +189,7 @@ def finish(t, name, fails):
 
 def test_click_agent_from_view():
     name = "test_click_agent_from_view"
-    t = setup("/tmp/rmx-safv1")
+    t = setup(run_dir("rmx-safv1"))
     fails = []
     # The only row is already the selection, so one click activates it.
     click(t, agent_rows_y(t)[0])
@@ -214,7 +212,7 @@ def test_click_agent_from_view():
 
 def test_enter_agent_from_view():
     name = "test_enter_agent_from_view"
-    t = setup("/tmp/rmx-safv2")
+    t = setup(run_dir("rmx-safv2"))
     fails = []
     t.send(b"\x1bh", 0.6)
     t.send(b"\r", 0.3)
@@ -224,7 +222,7 @@ def test_enter_agent_from_view():
 
 def test_click_unselected_agent_from_view():
     name = "test_click_unselected_agent_from_view"
-    t = setup("/tmp/rmx-safv3", agents=(("agents", "AGENT1"), ("other", "AGENT2")))
+    t = setup(run_dir("rmx-safv3"), agents=(("agents", "AGENT1"), ("other", "AGENT2")))
     fails = []
     y = agent_rows_y(t)[1]
     text = t.rows_text()[y][:SIDEBAR_W]
@@ -240,7 +238,7 @@ def test_click_unselected_agent_from_view():
 
 def test_click_back_on_a_cell_returns_the_keyboard():
     name = "test_click_back_on_a_cell_returns_the_keyboard"
-    t = setup("/tmp/rmx-safv4")
+    t = setup(run_dir("rmx-safv4"))
     fails = []
     # A blank row of the panel: it takes focus and activates nothing.
     blank = agent_rows_y(t)[0] + 4

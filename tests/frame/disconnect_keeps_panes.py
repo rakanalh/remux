@@ -36,8 +36,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Server, Client  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-disc"
+RUNDIR = run_dir("rmx-disc")
 PIDFILE = f"{RUNDIR}/pane.pid"
 
 failures = []

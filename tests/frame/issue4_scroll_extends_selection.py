@@ -11,8 +11,9 @@ lines.
 """
 import re, sys, time
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxfix/i4"
+RUNDIR = run_dir("rmxfix/i4")
 COLS, ROWS = 100, 30
 
 

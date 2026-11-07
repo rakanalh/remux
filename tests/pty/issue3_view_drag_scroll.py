@@ -8,8 +8,9 @@ the top edge repeatedly, and assert earlier line numbers scroll in.
 """
 import re, sys
 from pty_harness import Tui, sm_compose_view
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxfix/i3v"
+RUNDIR = run_dir("rmxfix/i3v")
 
 
 def press(t, col, row):

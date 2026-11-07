@@ -10,7 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import home_guard  # noqa: E402,F401  (installs the real-HOME refusal)
 import standin  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
-from harness import guard_rundir, kill_relays, reap_rundir  # noqa: E402,F401
+from harness import guard_rundir, kill_relays  # noqa: E402,F401
+from rundirs import stop_runtime  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 PREFIX = b"\x01"  # Ctrl-a
@@ -98,13 +99,12 @@ class Tui:
         self.config = config
 
     def start(self):
-        # `kill()` runs `remux stop` against this rundir, and the reaper kills
-        # under it; a relative one would resolve against whatever directory
-        # the harness runs from.
+        # `kill()` runs `remux stop` against this rundir, and so does the exit
+        # hook; a relative one would resolve against whatever directory the
+        # harness runs from.
         assert os.path.isabs(self.rundir), f"rundir must be absolute: {self.rundir}"
         # Before `atexit.register(self.kill)`: atexit runs last-registered
-        # first, so `kill()`'s graceful `remux stop` runs before the reaper
-        # SIGKILLs whatever survived it.
+        # first, so `kill()` runs before the exit hook stops whatever survived.
         guard_rundir(self.rundir)
         # The client auto-spawns a server that outlives it, so a harness that
         # exits without reaching `kill()` (an uncaught exception, an early
@@ -232,33 +232,9 @@ class Tui:
         if env is None:
             return
         try:
-            subprocess.run([BIN, "stop"], env=env, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=15)
-            self._kill_wedged_server(env["XDG_RUNTIME_DIR"])
+            stop_runtime(env["XDG_RUNTIME_DIR"])
         except Exception:
             pass
-
-    @staticmethod
-    def _kill_wedged_server(run_dir):
-        """SIGKILL a server that outlived `remux stop`'s SIGTERM.
-
-        The pid comes from the server's own pid file, and is killed only when
-        that process's XDG_RUNTIME_DIR is `run_dir`, so a pid reused by an
-        unrelated process since the server wrote the file is left alone.
-        """
-        sock, pid_file = f"{run_dir}/remux.sock", f"{run_dir}/remux.pid"
-        # The server removes the socket and then the pid file, so allow the
-        # gap between the two before treating a leftover file as a wedge.
-        for _ in range(10):
-            if not os.path.exists(sock) and not os.path.exists(pid_file):
-                return
-            time.sleep(0.1)
-        with open(pid_file) as f:
-            pid = int(f.read().strip())
-        with open(f"/proc/{pid}/environ", "rb") as f:
-            environ = f.read().split(b"\0")
-        if f"XDG_RUNTIME_DIR={run_dir}".encode() in environ:
-            os.kill(pid, signal.SIGKILL)
 
     def log(self, which="client"):
         p = f"{self.rundir}/state/remux/{which}.log"

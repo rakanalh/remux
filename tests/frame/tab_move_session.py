@@ -47,8 +47,9 @@ import sys
 import time
 
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = os.environ.get("REMUX_TMS_RUN", "/tmp/rmxtms")
+RUNDIR = os.environ.get("REMUX_TMS_RUN") or run_dir("rmxtms")
 MONOCLE = '[appearance]\ndefault_layout = "monocle"\n'
 COLS, ROWS = 100, 30
 RENDERS = ("FullRender", "RenderDiff", "ScrollRender")

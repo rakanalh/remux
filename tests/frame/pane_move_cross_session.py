@@ -68,10 +68,11 @@ import re
 import subprocess
 import time
 from harness import BIN, Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxpmx"
-RESTORE_RUNDIR = "/tmp/rmxpmxr"
-SCROLL_RUNDIR = "/tmp/rmxpmxs"
+RUNDIR = run_dir("rmxpmx")
+RESTORE_RUNDIR = run_dir("rmxpmxr")
+SCROLL_RUNDIR = run_dir("rmxpmxs")
 MONOCLE = '[appearance]\ndefault_layout = "monocle"\n'
 COLS, ROWS = 100, 30
 RENDERS = ("FullRender", "RenderDiff", "ScrollRender")

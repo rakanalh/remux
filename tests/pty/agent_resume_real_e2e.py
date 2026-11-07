@@ -83,6 +83,7 @@ import pyte
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import BIN, Tui  # noqa: E402
+from rundirs import run_dir, run_root  # noqa: E402
 
 REAL_HOME = os.path.expanduser("~")
 PROMPT = "reply with the word OK"
@@ -228,6 +229,10 @@ def processes_with_home(home):
 
 
 def end_processes(home):
+    # The match is on HOME alone, so a HOME outside this run could match the
+    # developer's own processes.
+    if not home.startswith(run_root() + "/"):
+        raise SystemExit(f"refusing to end the processes of {home}: not this run's")
     left = processes_with_home(home)
     for sig in (signal.SIGTERM, signal.SIGKILL):
         for pid in processes_with_home(home):
@@ -261,7 +266,7 @@ class Run:
     def __init__(self, agent):
         self.agent = agent
         self.spec = AGENTS[agent]
-        self.rundir = f"/tmp/rmx-e2e-{agent}"
+        self.rundir = run_dir(f"rmx-e2e-{agent}")
         self.home = f"{self.rundir}/home"
         self.work = f"{self.home}/work"
         self.bin = f"{self.rundir}-bin"

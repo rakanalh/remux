@@ -24,8 +24,9 @@ Run: python3 tests/frame/tmux_zoom_stack_rows.py
 import re
 import sys
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxtzs"
+RUNDIR = run_dir("rmxtzs")
 COLS, ROWS = 100, 30
 CONTENT_ROWS = ROWS - 1  # the status bar owns the bottom row
 

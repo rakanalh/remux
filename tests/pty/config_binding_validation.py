@@ -20,6 +20,7 @@ Run from the repo root:
 """
 import sys
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
 TYPO_CONFIG = """
 [keybindings.command]
@@ -40,7 +41,7 @@ n = "ViewNew"
 
 def run(mode):
     config = TYPO_CONFIG if mode == "typo" else VALID_CONFIG
-    t = Tui(f"/tmp/rmxcbv{mode}", config=config).start()
+    t = Tui(run_dir(f"rmxcbv{mode}"), config=config).start()
     fails = []
     try:
         log = t.log("client")

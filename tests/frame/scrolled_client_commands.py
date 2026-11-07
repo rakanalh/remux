@@ -27,8 +27,9 @@ import os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR_BASE = "/tmp/rmx-scrollcmd"
+RUNDIR_BASE = run_dir("rmx-scrollcmd")
 COLS, ROWS = 100, 30
 RENDERS = ("FullRender", "RenderDiff", "ScrollRender")
 SCROLL_BY = 10

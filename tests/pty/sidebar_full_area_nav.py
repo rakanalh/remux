@@ -28,6 +28,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 VERBOSE = "-v" in sys.argv
 ALT_H, ALT_L, ALT_SPACE = b"\x1bh", b"\x1bl", b"\x1b "
@@ -106,7 +107,7 @@ def expect_sidebar(t, step, label):
 
 def run(name, edge, body):
     print(f"--- {name}")
-    rundir = f"/tmp/rmx-sfa-{os.getpid()}"
+    rundir = run_dir("rmx-sfa")
     t = Tui(rundir, cols=120, rows=36, config=config(edge))
     try:
         t.start()
@@ -120,7 +121,6 @@ def run(name, edge, body):
             check("panicked" not in t.log(which), f"{name}: no panic in {which}.log")
     finally:
         t.kill()
-        shutil.rmtree(rundir, ignore_errors=True)
 
 
 def monocle_left(t):

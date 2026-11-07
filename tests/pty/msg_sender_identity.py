@@ -67,9 +67,10 @@ import pyte
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from portable import SETSID_F, SETSID_W  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msgid")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-msgid")
 COLS, ROWS = 110, 34
 SOCK = f"{RUNDIR}/run/remux.sock"
 SERVER_LOG = f"{RUNDIR}/state/remux/server.log"

@@ -34,9 +34,11 @@ import time
 
 import pexpect
 import pyte
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from rundirs import run_dir  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUN = os.environ.get("RMX_RUNDIR", "/tmp/rmx-sbmsg")
+RUN = os.environ.get("RMX_RUNDIR") or run_dir("rmx-sbmsg")
 WIRE_SEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame", "wire_send.py")
 SOCK = f"{RUN}/run/remux.sock"
 

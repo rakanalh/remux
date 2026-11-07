@@ -22,8 +22,9 @@ import subprocess
 import sys
 
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
-BASE = "/tmp/rmx-cm"
+BASE = run_dir("rmx-cm")
 RUNDIR = f"{BASE}/run1"
 RUNDIR2 = f"{BASE}/run2"
 RUNDIR3 = f"{BASE}/run3"

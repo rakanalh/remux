@@ -49,8 +49,7 @@ demand. The "gone" outcome is unit-tested on `resolve_view_entry` in
  11  no panic in either log (proven able to fail by a deliberate panic in the
      plugin's render once), and the client is alive
 
-The rundir is fixed (RMX_RUNDIR overrides): two concurrent runs corrupt each
-other, and the false red looks like a real failure.
+RMX_RUNDIR overrides the run dir.
 
 Run from the repo root:  python3 tests/pty/sidebar_views.py
 """
@@ -63,6 +62,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import (  # noqa: E402
     PROTOCOL_VERSION, Tui, sm_compose_view, sm_goto_text, sm_open,
 )
+from rundirs import run_dir  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
 from harness import Client  # noqa: E402
 
@@ -70,7 +70,7 @@ import pexpect  # noqa: E402
 import pyte  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUN = os.environ.get("RMX_RUNDIR", "/tmp/rmx-sbviews")
+RUN = os.environ.get("RMX_RUNDIR") or run_dir("rmx-sbviews")
 SOCK = f"{RUN}/run/remux.sock"
 
 COLS, ROWS = 120, 40

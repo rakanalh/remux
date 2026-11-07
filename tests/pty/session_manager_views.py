@@ -33,8 +33,9 @@ from pty_harness import (
     sm_open,
     sm_tree,
 )
+from rundirs import run_dir
 
-RUNDIR = "/tmp/rmx-smviews"
+RUNDIR = run_dir("rmx-smviews")
 FAILS = []
 
 

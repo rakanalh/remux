@@ -28,8 +28,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, PROTOCOL_VERSION, Client, Server  # noqa: E402
+from rundirs import relay_pids, run_dir  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-relayfail")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-relayfail")
 CAUSE = "exited before its socket appeared"
 
 failures = []
@@ -74,7 +75,7 @@ def through_a_dial(kind, env):
         f.write("#!/bin/sh\n")
         for k in ("XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "HOME"):
             f.write(f"export {k}='{env[k]}'\n")
-        f.write(f"exec '{BIN}' relay\n")
+        f.write(f"echo $$ >> {relay_pids()}\nexec '{BIN}' relay\n")
     os.chmod(f"{shimdir}/ssh", 0o755)
     path = os.environ["PATH"]
     os.environ["PATH"] = f"{shimdir}:{path}"
@@ -123,7 +124,6 @@ if __name__ == "__main__":
     finally:
         for d in read_only:
             os.chmod(d, 0o700)
-        shutil.rmtree(RUNDIR, ignore_errors=True)
     print()
     print(f"{len(failures)} FAILED" if failures else "ALL PASS")
     sys.exit(1 if failures else 0)

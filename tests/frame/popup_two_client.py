@@ -21,8 +21,9 @@ Run: python3 tests/frame/popup_two_client.py
 """
 import sys, time
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxpop/two"
+RUNDIR = run_dir("rmxpop/two")
 A_COLS, A_ROWS = 100, 30
 B_COLS, B_ROWS = 80, 24
 

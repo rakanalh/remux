@@ -25,8 +25,9 @@ Run: python3 tests/frame/stack_survives_rebuild.py
 """
 import sys
 from harness import Server, Client, name_of, only
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmxstk"
+RUNDIR = run_dir("rmxstk")
 COLS, ROWS = 100, 30
 
 fails = []

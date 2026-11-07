@@ -43,6 +43,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
 from pty_harness import Tui, sm_compose_view   # noqa: E402
+from rundirs import run_dir  # noqa: E402
 from harness import Client, name_of  # noqa: E402
 
 COLS, ROWS = 120, 40
@@ -153,11 +154,11 @@ def cycle_to(t, name, obs, fails):
 def main_scenario(fails):
     """Phases 1-5: the user's exact scenario, plus monocle/zoom/terminal
     resize/reclaim."""
-    t = Tui("/tmp/rmxvcr", cols=COLS, rows=ROWS).start()
+    t = Tui(run_dir("rmxvcr"), cols=COLS, rows=ROWS).start()
     obs = None
     try:
         two_stacked_panes(t)
-        obs = Observer("/tmp/rmxvcr")
+        obs = Observer(run_dir("rmxvcr"))
         panes = obs.panes()
         if len(panes) != 2:
             print(f"ABORT: expected 2 panes, got {panes}")
@@ -284,11 +285,11 @@ def main_scenario(fails):
 def alt_screen_scenario(fails):
     """Phase 6: the small pane on the ALT screen (a full-screen app like the
     reported neovim) must still be sized to its cell."""
-    t = Tui("/tmp/rmxvcra", cols=COLS, rows=ROWS).start()
+    t = Tui(run_dir("rmxvcra"), cols=COLS, rows=ROWS).start()
     obs = None
     try:
         two_stacked_panes(t)
-        obs = Observer("/tmp/rmxvcra")
+        obs = Observer(run_dir("rmxvcra"))
         panes = obs.panes()
         if len(panes) != 2:
             print(f"ABORT(alt): expected 2 panes, got {panes}")

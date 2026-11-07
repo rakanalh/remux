@@ -32,6 +32,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
 COLS, ROWS = 100, 30
 SIDEBAR_W = 24
@@ -212,7 +213,7 @@ def finish(t, name, fails):
 
 def test_a_sidebar_added_to_the_config_appears_without_a_restart():
     name = "test_a_sidebar_added_to_the_config_appears_without_a_restart"
-    t = Tui("/tmp/rmx-sbrl1", cols=COLS, rows=ROWS, config=CFG_NONE).start()
+    t = Tui(run_dir("rmx-sbrl1"), cols=COLS, rows=ROWS, config=CFG_NONE).start()
     fails = []
     t.pump(1.0)
 
@@ -245,7 +246,7 @@ def test_a_sidebar_added_to_the_config_appears_without_a_restart():
 
 def test_a_sidebar_removed_from_the_config_goes_away_without_a_restart():
     name = "test_a_sidebar_removed_from_the_config_goes_away_without_a_restart"
-    t = Tui("/tmp/rmx-sbrl2", cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
+    t = Tui(run_dir("rmx-sbrl2"), cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
     fails = []
     t.pump(1.0)
 
@@ -285,7 +286,7 @@ def test_a_reload_keeps_the_width_the_user_set_by_hand():
     """`sidebar_state` is re-applied after the rebuild, so an unrelated config
     edit does not throw away a width the user dragged out at runtime."""
     name = "test_a_reload_keeps_the_width_the_user_set_by_hand"
-    t = Tui("/tmp/rmx-sbrl3", cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
+    t = Tui(run_dir("rmx-sbrl3"), cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
     fails = []
     t.pump(1.0)
 
@@ -335,7 +336,7 @@ def test_a_size_typed_into_the_config_beats_the_persisted_one():
     `size = ...` in the config is dead -- and hot-reload made that WORSE, since
     the reload now fires and silently reverts the width."""
     name = "test_a_size_typed_into_the_config_beats_the_persisted_one"
-    t = Tui("/tmp/rmx-sbrl4", cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
+    t = Tui(run_dir("rmx-sbrl4"), cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
     fails = []
     t.pump(1.0)
 
@@ -393,7 +394,7 @@ def test_a_visible_flip_typed_into_the_config_beats_the_persisted_one():
     nothing at all.
     """
     name = "test_a_visible_flip_typed_into_the_config_beats_the_persisted_one"
-    t = Tui("/tmp/rmx-sbrl5", cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
+    t = Tui(run_dir("rmx-sbrl5"), cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
     fails = []
     t.pump(1.0)
 
@@ -432,7 +433,7 @@ def test_one_save_is_one_reload():
     subscription give-back and re-subscribe of every connection, plugin state
     wiped, repaint -- ran once per event, with a visible flash each time."""
     name = "test_one_save_is_one_reload"
-    t = Tui("/tmp/rmx-sbrl6", cols=COLS, rows=ROWS, config=CFG_NONE).start()
+    t = Tui(run_dir("rmx-sbrl6"), cols=COLS, rows=ROWS, config=CFG_NONE).start()
     fails = []
     t.pump(1.0)
 
@@ -476,7 +477,7 @@ def test_a_reload_does_not_yank_the_keyboard_out_of_a_focused_panel():
     keypress with no cause on screen. The rebuild renumbers the sidebars, so
     the focus has to be carried across by EDGE, not by index."""
     name = "test_a_reload_does_not_yank_the_keyboard_out_of_a_focused_panel"
-    t = Tui("/tmp/rmx-sbrl7", cols=COLS, rows=ROWS, config=CFG_PLACEHOLDER).start()
+    t = Tui(run_dir("rmx-sbrl7"), cols=COLS, rows=ROWS, config=CFG_PLACEHOLDER).start()
     fails = []
     t.pump(1.0)
 
@@ -526,7 +527,7 @@ def test_focus_falls_back_when_the_reload_drops_the_focused_panel():
     swallows the keyboard into a panel nobody can see.
     """
     name = "test_focus_falls_back_when_the_reload_drops_the_focused_panel"
-    t = Tui("/tmp/rmx-sbrl8", cols=COLS, rows=ROWS, config=CFG_STACKED).start()
+    t = Tui(run_dir("rmx-sbrl8"), cols=COLS, rows=ROWS, config=CFG_STACKED).start()
     fails = []
     t.pump(1.0)
 
@@ -577,7 +578,7 @@ def test_commenting_a_block_out_and_back_in_returns_the_dragged_width():
     now, so writing it verbatim destroys the rest. Commenting a block out to
     try something without it reads as reversible; it has to be."""
     name = "test_commenting_a_block_out_and_back_in_returns_the_dragged_width"
-    t = Tui("/tmp/rmx-sbrl9", cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
+    t = Tui(run_dir("rmx-sbrl9"), cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
     fails = []
     t.pump(1.0)
 

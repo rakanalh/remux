@@ -34,9 +34,10 @@ import pexpect, pyte
 # and proceeds rather than rejecting it.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import PROTOCOL_VERSION  # noqa: E402
+from rundirs import relay_pids, run_dir  # noqa: E402
 
 BIN = os.path.abspath("target/debug/remux")
-RUN = "/tmp/rmxrv"
+RUN = run_dir("rmxrv")
 SOCK1 = f"{RUN}/run/remux.sock"      # the LOCAL server both clients attach to
 SOCK2 = f"{RUN}/run2/remux.sock"     # the "remote" server reached via the shim
 VERBOSE = "-v" in sys.argv
@@ -107,7 +108,7 @@ def write_shim(delay=0):
             f"export XDG_STATE_HOME={RUN}/state2\n"
             f"export XDG_DATA_HOME={RUN}/data2\n"
             + (f"sleep {delay}\n" if delay else "")
-            + f"exec {BIN} relay\n"
+            + f"echo $$ >> {relay_pids()}\n" f"exec {BIN} relay\n"
         )
     os.chmod(shim, 0o755)
 

@@ -45,6 +45,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
 from pty_harness import Tui  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 from harness import Client  # noqa: E402
 
 # The session the client auto-creates and attaches to on startup (`main.rs`).
@@ -89,7 +90,7 @@ def sel_row(t, search_y):
 
 
 def main():
-    t = Tui("/tmp/rmxsms", cols=120, rows=40).start()
+    t = Tui(run_dir("rmxsms"), cols=120, rows=40).start()
     fails = []
     b = None
 

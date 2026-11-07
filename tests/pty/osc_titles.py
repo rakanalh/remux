@@ -24,9 +24,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import Tui, install_agent_standin, sm_compose_view  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUN = "/tmp/rmx-osctp"
-BINDIR = "/tmp/rmx-osctp-bin"
+RUN = run_dir("rmx-osctp")
+BINDIR = run_dir("rmx-osctp-bin")
 SIDEBAR_W = 34
 ALT_A = b"\x1ba"
 TITLE = "Fix the bug"

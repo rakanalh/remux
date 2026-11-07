@@ -93,10 +93,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "frame"))
 sys.path.insert(0, HERE)
 from harness import BIN, Client, Server, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 from portable import SETSID_F  # noqa: E402
 import fakeclaude  # noqa: E402
 
-RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msghook")
+RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-msghook")
 # Outside the run dir, which `Server.start` wipes.
 BINDIR = RUNDIR + "-bin"
 FAKE = f"{BINDIR}/claude"

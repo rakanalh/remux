@@ -6,8 +6,9 @@ Shift-Tab, and checks what the app actually received.
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import Tui
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-stab"
+RUNDIR = run_dir("rmx-stab")
 
 # BSD `cat` has no `-T`. Its `-t` shows tabs and implies `-v`, which is what
 # GNU's `-vT` does.

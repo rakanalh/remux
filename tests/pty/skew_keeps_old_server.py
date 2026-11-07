@@ -42,9 +42,10 @@ for _var in ("REMUX_SESSION", "REMUX_PANE", "REMUX"):
     os.environ.pop(_var, None)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_server import FakeServer  # noqa: E402
-from pty_harness import BIN, PROTOCOL_VERSION, guard_rundir, reap_rundir  # noqa: E402
+from pty_harness import BIN, PROTOCOL_VERSION, guard_rundir  # noqa: E402
+from rundirs import run_dir, stop_servers  # noqa: E402
 
-RUN = "/tmp/rmx-skew"
+RUN = run_dir("rmx-skew")
 guard_rundir(RUN)
 # The protocol the stand-in speaks: hard-coded on purpose, since this is the
 # skew test and it must not be the current one. The check below keeps it
@@ -144,7 +145,7 @@ def darwin_remux_pids(runtime_dir):
 
 
 def stop_all(runtime_dir):
-    reap_rundir(runtime_dir)
+    stop_servers(runtime_dir)
 
 
 shutil.rmtree(RUN, ignore_errors=True)
