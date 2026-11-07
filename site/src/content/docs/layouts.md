@@ -143,7 +143,7 @@ A float ends when you:
 - split, cycle the layout, promote a master or close the pane, as for a fullscreen zoom.
 - toggle either zoom action again.
 
-The float and the [popup terminal](/remux/keybindings/) are never open together: opening one closes the other. The box covers the area the tab's layout fills, so it does not cover a sidebar. A click anywhere outside the box ends the float, a sidebar included. A float zoom works in Monocle, where a fullscreen zoom has nothing to do. A [view](/remux/views/) has one zoom, the focused cell filling the view, so a float request there is a fullscreen zoom. `[zoom]` is read by the **server** when it starts. Run `remux restart` after changing it.
+The float and the [popup terminal](/remux/keybindings/) are never open together: opening one closes the other. The box covers the area the tab's layout fills, so it does not cover a sidebar. A click anywhere outside the box ends the float, a sidebar included. A float zoom works in Monocle, where a fullscreen zoom has nothing to do. A [view](/remux/views/) zooms its focused cell the same way, by the same commands and the local server's `[zoom]`. `[zoom]` is read by the **server** when it starts. Run `remux restart` after changing it.
 
 ## Pane stacks
 

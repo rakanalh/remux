@@ -14,6 +14,7 @@ mod screen;
 mod server;
 mod shell_word;
 
+use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
@@ -1458,11 +1459,22 @@ async fn switch_to_target(
 /// This is where a panel's "list me this directory" becomes a message to a
 /// specific server. The mapping lives here, not in the plugin, for the reason
 /// [`PluginRequest`] gives.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_plugin_request(
     si: usize,
     pi: usize,
     req: crate::client::sidebar::PluginRequest,
     mgr: &mut ConnectionManager,
+    renderer: &mut Renderer,
+    chrome: &mut crate::client::chrome::Chrome,
+    views: &[crate::client::view::ClientView],
+    active_view: &mut Option<usize>,
+    active_view_id: &mut Option<ViewId>,
+    mouse_grab: &mut Option<MouseGrab>,
+    last_local_session: &mut Option<String>,
+    current_attached: &mut Option<(ConnId, String)>,
+    previous_attached: &mut Option<(ConnId, String)>,
+    live_sessions: &HashMap<ConnId, Vec<String>>,
 ) {
     use crate::client::sidebar::PluginRequest;
     let key = (si, pi);
@@ -1491,6 +1503,55 @@ async fn dispatch_plugin_request(
             command,
             vertical,
         } => {
+            // A client showing a view is detached, and the server opens the
+            // split in the attached session, so it would drop this request.
+            // The Attach inside `switch_to_target` must be sent first, on the
+            // same connection, because the server handles one client's
+            // messages in order.
+            if active_view.is_some() {
+                let session = mgr
+                    .connected_ids()
+                    .contains(&conn)
+                    .then(|| {
+                        session_to_open_file_in(
+                            &conn,
+                            live_sessions.get(&conn).map_or(&[], Vec::as_slice),
+                            current_attached.as_ref(),
+                            previous_attached.as_ref(),
+                            last_local_session.as_deref(),
+                        )
+                    })
+                    .flatten();
+                let Some(session) = session else {
+                    log::warn!(
+                        "sidebar: OpenInSplit for panel {key:?} dropped: this client has no \
+live session to return to on {conn:?}, so the view stays"
+                    );
+                    return;
+                };
+                let target = JumpTarget::Session {
+                    conn: conn.clone(),
+                    session,
+                };
+                if let Err(e) = switch_to_target(
+                    mgr,
+                    renderer,
+                    chrome,
+                    views,
+                    active_view,
+                    active_view_id,
+                    mouse_grab,
+                    last_local_session,
+                    current_attached,
+                    previous_attached,
+                    target,
+                )
+                .await
+                {
+                    log::warn!("sidebar: leaving the view to open a file failed: {e:#}");
+                    return;
+                }
+            }
             if let Err(e) = mgr
                 .send(
                     &conn,
@@ -1506,6 +1567,31 @@ async fn dispatch_plugin_request(
             }
         }
     }
+}
+
+/// The session to re-attach on `conn` so that a file opened from inside a view
+/// has a session to open in: the most recent one this client was attached to
+/// on that connection, if it is still `live`.
+///
+/// `conn` is the machine the file is on, so a session on any other connection
+/// is never an answer. `None` means the caller must stay in the view. A dead
+/// session is not an answer either, because the server refuses the Attach only
+/// after the view has been torn down.
+fn session_to_open_file_in(
+    conn: &ConnId,
+    live: &[String],
+    current: Option<&(ConnId, String)>,
+    previous: Option<&(ConnId, String)>,
+    last_local: Option<&str>,
+) -> Option<String> {
+    [current, previous]
+        .into_iter()
+        .flatten()
+        .filter(|(c, _)| c == conn)
+        .map(|(_, session)| session.as_str())
+        .chain(last_local.filter(|_| *conn == ConnId::Local))
+        .find(|session| live.iter().any(|l| l == session))
+        .map(str::to_owned)
 }
 
 /// The pane the user is focused on, read out of a session tree: the current
@@ -2021,6 +2107,7 @@ async fn run_menu_action(
     current_attached: &mut Option<(ConnId, String)>,
     previous_attached: &mut Option<(ConnId, String)>,
     move_follow: &mut MoveFollow,
+    live_sessions: &HashMap<ConnId, Vec<String>>,
     view_paint: ViewPaint<'_>,
 ) -> Result<()> {
     use crate::client::context_menu::MenuAction;
@@ -2143,7 +2230,23 @@ async fn run_menu_action(
             mgr.send(&conn, ClientMessage::ListSessionTree).await?;
         }
         MenuAction::Request(request) => {
-            dispatch_plugin_request(0, 0, request, mgr).await;
+            dispatch_plugin_request(
+                0,
+                0,
+                request,
+                mgr,
+                renderer,
+                chrome,
+                views,
+                active_view,
+                active_view_id,
+                mouse_grab,
+                last_local_session,
+                current_attached,
+                previous_attached,
+                live_sessions,
+            )
+            .await;
             // As the panel's own Enter does: the user asked for the file to be
             // open, and the keys must reach the editor, not the panel.
             handle_plugin_action(
@@ -2860,7 +2963,7 @@ fn paint_view(
         .and_then(|c| c.title.as_deref());
     // Mirror a normal tab's zoom marker (`format!("{} Z", name)` in the server
     // status bar): append ` Z` to the view name while a cell is zoomed.
-    let view_name = if view.zoomed {
+    let view_name = if view.zoom.is_some() {
         format!("{} Z", view.name)
     } else {
         view.name.clone()
@@ -2935,7 +3038,7 @@ fn paint_view(
 ///
 /// Two cells impose NO demand:
 /// - a cell HIDDEN by the current layout (Monocle's unfocused cells, and the
-///   non-zoomed cells while the view is zoomed): it is still subscribed -- at
+///   other cells under a fullscreen zoom): it is still subscribed -- at
 ///   the full cell area, so a cell that has just been focused releases its old
 ///   size clamp instead of staying pinned to it forever -- but a cell nobody
 ///   sees must not clamp the pane to a size nothing is drawing;
@@ -2978,6 +3081,9 @@ async fn subscribe_view_cells(
     };
     let inner = crate::client::view::cells_area(area);
     let rects = crate::client::view::cell_rects(view, area);
+    let styles: Vec<_> = (0..view.cells.len())
+        .map(|i| crate::client::view::cell_style(view, i, border_style))
+        .collect();
     for (i, cell) in view.cells.iter_mut().enumerate() {
         // The source pane is gone (the server reported `PaneExited`). Nothing can
         // ever stream again, so skip it: re-subscribing would only make the
@@ -3001,7 +3107,7 @@ async fn subscribe_view_cells(
             // tmux is edge-to-edge). Sharing `cell_content_size` with the
             // compositor keeps the reflowed pane exactly the size that is drawn,
             // instead of leaving two blank columns in tmux style.
-            let (cols, rows) = crate::client::view::cell_content_size(rect, border_style);
+            let (cols, rows) = crate::client::view::cell_content_size(rect, styles[i]);
             if cols > 0 && rows > 0 {
                 // No transport for this cell's server: start/observe a lazy dial
                 // and label the cell honestly instead of subscribing into the
@@ -3160,6 +3266,7 @@ struct DropCtx<'a> {
     last_local_session: &'a Option<String>,
     current_attached: &'a mut Option<(ConnId, String)>,
     previous_attached: &'a mut Option<(ConnId, String)>,
+    live_sessions: &'a mut HashMap<ConnId, Vec<String>>,
     move_follow: &'a mut MoveFollow,
     wants_session_tree: bool,
     wants_agents: bool,
@@ -3246,11 +3353,13 @@ async fn handle_connection_drop(
         last_local_session,
         current_attached,
         previous_attached,
+        live_sessions,
         move_follow,
         wants_session_tree,
         wants_agents,
     } = cx;
     log::debug!("srv: connection closed src={:?}", src);
+    live_sessions.remove(src);
     // An open agent switcher must not offer a jump to a machine that is gone.
     if let Some(sw) = input.agent_switch.as_mut() {
         sw.drop_conn(src);
@@ -3473,9 +3582,9 @@ async fn enter_view(
     // can step back into the sidebar with a directional key. `leave_sidebar`
     // mirrors `focused_panel` first, so that step returns to the same panel.
     chrome.leave_sidebar();
-    // The view branch of the mouse loop `continue`s above the grab bookkeeping,
-    // so a grab set before entering would never see its release. Drop it here
-    // rather than leaving a stale claim on a panel across the whole view.
+    // A grab set before entering belongs to a gesture this view ended. The
+    // mouse loop trusts a `Panel` grab for every drag and release, so a grab
+    // that survived would send the view's next drag or release to that panel.
     *mouse_grab = None;
     // bug4: detach the foreground session so a cell aliasing one of its
     // active-tab panes streams content instead of showing the "Active in
@@ -3584,8 +3693,8 @@ async fn send_to_focused_cell(
 ///   (`handle_chrome_resize` cannot: it repaints with `chrome.paint`).
 /// - `PaneMove{Left,Right,Up,Down}` -> `ViewMoveCell { dir }`.
 /// - `PaneToggleZoom`, `PaneToggleZoomFullscreen` and `PaneToggleZoomFloat` ->
-///   `ViewToggleZoom`. A view has one zoom, the focused cell filling the view,
-///   so a float request falls back to it.
+///   `ViewToggleZoom`. `PaneToggleZoom` carries no mode: the server resolves it
+///   from `[zoom]`, which a client never reads.
 /// - `SetMaster` -> `ViewSetMaster` (Master layout + promote the focused cell).
 /// - `PaneClose` -> eject the focused cell: `ViewRemoveCell { cell_id }` (the
 ///   real pane is untouched; the resync unsubscribes it).
@@ -3699,6 +3808,15 @@ async fn handle_view_command(
                         id: view_id,
                         cell_id,
                     },
+                )
+                .await?;
+                handled = true;
+            } else if views[av].floated().is_some() {
+                // A tab ends a float on this key whether or not a neighbour
+                // exists, so the key does not go on to a sidebar.
+                mgr.send(
+                    &ConnId::Local,
+                    ClientMessage::ViewReleaseFloat { id: view_id },
                 )
                 .await?;
                 handled = true;
@@ -3857,9 +3975,16 @@ async fn handle_view_command(
         | RemuxCommand::PaneToggleZoomFloat => {
             hide_whichkey!();
             if !views[av].cells.is_empty() {
+                let mode = match cmd {
+                    RemuxCommand::PaneToggleZoomFloat => Some(crate::config::ZoomMode::Float),
+                    RemuxCommand::PaneToggleZoomFullscreen => {
+                        Some(crate::config::ZoomMode::Fullscreen)
+                    }
+                    _ => None,
+                };
                 mgr.send(
                     &ConnId::Local,
-                    ClientMessage::ViewToggleZoom { id: view_id },
+                    ClientMessage::ViewToggleZoom { id: view_id, mode },
                 )
                 .await?;
             }
@@ -3973,8 +4098,8 @@ async fn leave_active_view(
         // focus does too. This is a real transition now, not a tidy-up of an
         // unreachable state -- a panel CAN hold the keyboard inside a view --
         // and leaving on the panel would drop the user somewhere they did not
-        // ask to be. A grab claimed while the view swallowed the mouse must not
-        // survive into the next gesture either.
+        // ask to be. A grab claimed by a gesture in the view must not survive
+        // into the next gesture on the session either.
         chrome.leave_sidebar();
         *mouse_grab = None;
     }
@@ -3998,7 +4123,7 @@ fn broadcast_views(
             name: v.name.clone(),
             cells: v.cells.len(),
             layout: v.layout_name().to_string(),
-            zoomed: v.zoomed,
+            zoomed: v.zoom.is_some(),
         })
         .collect();
     chrome.broadcast(&crate::client::sidebar::PluginEvent::Views {
@@ -4191,6 +4316,8 @@ async fn run_client_loop(
         .as_ref()
         .map(|name| (ConnId::Local, name.clone()));
     let mut previous_attached: Option<(ConnId, String)> = None;
+    // The attachable sessions of each connection, from its latest tree.
+    let mut live_sessions: HashMap<ConnId, Vec<String>> = HashMap::new();
     let mut move_follow = MoveFollow::default();
 
     // Views: virtual tabs whose cells alias real panes and are composited from
@@ -4361,6 +4488,7 @@ async fn run_client_loop(
                     &mut current_attached,
                     &mut previous_attached,
                     &mut move_follow,
+                    &live_sessions,
                     ViewPaint {
                         whichkey: &whichkey,
                         theme: &theme,
@@ -4382,7 +4510,23 @@ async fn run_client_loop(
             let (tc, tr) = renderer.size();
             let requests = chrome.pump(tc, tr);
             for (si, pi, req) in requests {
-                dispatch_plugin_request(si, pi, req, mgr).await;
+                dispatch_plugin_request(
+                    si,
+                    pi,
+                    req,
+                    mgr,
+                    &mut renderer,
+                    &mut chrome,
+                    &views,
+                    &mut active_view,
+                    &mut active_view_id,
+                    &mut mouse_grab,
+                    &mut last_local_session,
+                    &mut current_attached,
+                    &mut previous_attached,
+                    &live_sessions,
+                )
+                .await;
             }
         }
         // Announce the popup interior the foreground server should size its
@@ -5807,6 +5951,7 @@ async fn run_client_loop(
                                         last_local_session: &last_local_session,
                                         current_attached: &mut current_attached,
                                         previous_attached: &mut previous_attached,
+                                        live_sessions: &mut live_sessions,
                                         move_follow: &mut move_follow,
                                         wants_session_tree,
                                         wants_agents,
@@ -5901,6 +6046,7 @@ async fn run_client_loop(
                                                 last_local_session: &last_local_session,
                                                 current_attached: &mut current_attached,
                                                 previous_attached: &mut previous_attached,
+                                                live_sessions: &mut live_sessions,
                                                 move_follow: &mut move_follow,
                                                 wants_session_tree,
                                                 wants_agents,
@@ -7173,17 +7319,48 @@ async fn run_client_loop(
                         // session. Entering a view detaches, so those would find
                         // no session and silently do nothing.
                         //
-                        // KNOWN GAP: this branch swallows EVERY mouse event, so
-                        // while a view is up a click can neither enter a panel
-                        // nor leave one -- the panel routing and the
-                        // "a press in the content returns focus there" rule
-                        // below are both past the `continue`s here. A panel CAN
-                        // hold the keyboard in a view (see the sidebar key gate
-                        // and `handle_view_command`'s directional branch), so
-                        // that focus is keyboard-only: `Alt+<dir>` and `Esc` are
-                        // the ways out. Deliberate -- the ask was directional
-                        // keys -- and not a trap, since both ways out work.
-                        if let Some(av) = active_view {
+                        // A left-button gesture on a panel is the exception: it
+                        // goes to the sidebar routing below, as it does with no
+                        // view up. Swallowing it here made a click on an agents
+                        // or sessions row do nothing inside a view, while the
+                        // same row's Enter jumped. Every other event over a
+                        // sidebar stays here: the wheel keeps its focused-cell
+                        // fallback, and a right press opens no context menu,
+                        // because `repaint_overlays` restores the session's
+                        // cursor and only `paint_view` places a view's.
+                        let panel_gesture = active_view.is_some()
+                            && match mouse.kind {
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    let (tc, tr) = renderer.size();
+                                    matches!(
+                                        chrome.pointer_target(tc, tr, mouse.column, mouse.row),
+                                        crate::client::chrome::PointerTarget::Panel { .. }
+                                    )
+                                }
+                                MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
+                                    matches!(mouse_grab, Some(MouseGrab::Panel { .. }))
+                                }
+                                _ => false,
+                            };
+                        // A panel press skips the view branch, which is what
+                        // clears the anchor for every other press. A cell press
+                        // whose release was lost would otherwise stay armed.
+                        if panel_gesture
+                            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                        {
+                            view_drag = None;
+                            // A panel is always outside a float's box, and this
+                            // press never reaches the view branch that ends one.
+                            if let Some(view) = active_view
+                                .and_then(|av| views.get(av))
+                                .filter(|v| v.floated().is_some())
+                            {
+                                let id = view.id;
+                                mgr.send(&ConnId::Local, ClientMessage::ViewReleaseFloat { id })
+                                    .await?;
+                            }
+                        }
+                        if let Some(av) = active_view.filter(|_| !panel_gesture) {
                             // The view is composited into the CONTENT rect, so
                             // every hit test below runs in content coordinates
                             // and against a content-sized area -- the same rect
@@ -7217,19 +7394,60 @@ async fn run_client_loop(
                                 .row
                                 .saturating_sub(content.y)
                                 .min(content.height.saturating_sub(1));
+                            // A left press outside a float ends it, a sidebar
+                            // included, and then acts as it would have. The zoom
+                            // is cleared here too, so that the hit tests below
+                            // see the tiles and not the box. The `ViewList`
+                            // answering the release says the same.
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                                && crate::client::view::press_ends_float(
+                                    &views[av],
+                                    area,
+                                    inside.then_some((mx, my)),
+                                )
+                            {
+                                let id = views[av].id;
+                                mgr.send(&ConnId::Local, ClientMessage::ViewReleaseFloat { id })
+                                    .await?;
+                                views[av].zoom = None;
+                            }
                             if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
                                 // Cleared BEFORE the out-of-content bail below:
-                                // a press on a panel must not leave the previous
-                                // anchor armed for the next drag to extend.
+                                // a press on a sidebar's frame must not leave the
+                                // previous anchor armed for the next drag to
+                                // extend. A `Panel` grab survives a lost release,
+                                // and `panel_gesture` would then send this
+                                // press's drag and release to that panel.
                                 view_drag = None;
+                                mouse_grab = None;
                                 if !inside {
-                                    // A press on a sidebar is not a view gesture.
-                                    // It is not routed to the panel either: the
-                                    // view owns the keyboard, and focusing a panel
-                                    // here would strand keys nothing can deliver
-                                    // (the sidebar key gate is `active_view
-                                    // .is_none()`).
+                                    // A press on a sidebar's frame, chip or
+                                    // strip is not a view gesture. A press on
+                                    // a panel never gets here: `panel_gesture`
+                                    // sent it to the sidebar routing.
                                     continue;
+                                }
+                                // A press here takes the keyboard back from
+                                // a panel, because a click can put it there.
+                                if matches!(
+                                    chrome.focus,
+                                    crate::client::chrome::ChromeFocus::Sidebar { .. }
+                                ) {
+                                    chrome.leave_sidebar();
+                                    paint_view(
+                                        &mut renderer,
+                                        &chrome,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &view_border_style,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                    renderer.flush()?;
                                 }
                                 if let Some(idx) = crate::client::view::cell_at(
                                     &views[av],
@@ -8051,6 +8269,7 @@ async fn run_client_loop(
                                 last_local_session: &last_local_session,
                                 current_attached: &mut current_attached,
                                 previous_attached: &mut previous_attached,
+                                live_sessions: &mut live_sessions,
                                 move_follow: &mut move_follow,
                                 wants_session_tree,
                                 wants_agents,
@@ -8576,6 +8795,15 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled, dormant }) => {
                         log::debug!("srv: SessionTree src={:?} folders={} unfiled={} dormant={}", src, folders.len(), unfiled.len(), dormant.len());
+                        live_sessions.insert(
+                            src.clone(),
+                            folders
+                                .iter()
+                                .flat_map(|f| f.sessions.iter())
+                                .chain(unfiled.iter())
+                                .map(|s| s.name.clone())
+                                .collect(),
+                        );
                         let current = folders
                             .iter()
                             .flat_map(|f| f.sessions.iter())
@@ -8869,10 +9097,15 @@ async fn run_client_loop(
                         // every keystroke.
                         if let crate::protocol::SessionEvent::PaneExited { pane_id, .. } = &event {
                             let mut active_touched = false;
+                            let mut floats_ended = Vec::new();
                             for (vi, view) in views.iter_mut().enumerate() {
-                                for cell in view.cells.iter_mut() {
+                                let floated = view.floated();
+                                for (ci, cell) in view.cells.iter_mut().enumerate() {
                                     if cell.conn == src && cell.pane_id == *pane_id && !cell.exited {
                                         cell.exited = true;
+                                        if floated == Some(ci) {
+                                            floats_ended.push(view.id);
+                                        }
                                         // Drop the last snapshot with it: keeping it
                                         // would keep painting stale content that
                                         // looks live.
@@ -8882,6 +9115,13 @@ async fn run_client_loop(
                                         }
                                     }
                                 }
+                            }
+                            // The client does this, not the server, because a
+                            // cell can alias a pane of another server and only
+                            // the client hears of that pane's death.
+                            for id in floats_ended {
+                                mgr.send(&ConnId::Local, ClientMessage::ViewReleaseFloat { id })
+                                    .await?;
                             }
                             if active_touched {
                                 if let Some(av) = active_view {
@@ -9662,6 +9902,100 @@ async fn run_client_loop(
 
 #[cfg(test)]
 mod tests {
+    use super::session_to_open_file_in;
+    use crate::client::registry::ConnId;
+
+    fn on(conn: &ConnId, session: &str) -> (ConnId, String) {
+        (conn.clone(), session.to_string())
+    }
+
+    fn names(sessions: &[&str]) -> Vec<String> {
+        sessions.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_file_opens_in_the_session_the_view_was_entered_from() {
+        let remote = ConnId::Remote("mini".into());
+        let current = on(&remote, "work");
+        let previous = on(&remote, "older");
+        assert_eq!(
+            session_to_open_file_in(
+                &remote,
+                &names(&["older", "work"]),
+                Some(&current),
+                Some(&previous),
+                None,
+            ),
+            Some("work".to_string()),
+        );
+    }
+
+    #[test]
+    fn a_file_never_opens_in_a_session_of_another_connection() {
+        let remote = ConnId::Remote("mini".into());
+        let elsewhere = ConnId::Remote("other".into());
+        let current = on(&ConnId::Local, "main");
+        let previous = on(&elsewhere, "main");
+        assert_eq!(
+            session_to_open_file_in(
+                &remote,
+                &names(&["main"]),
+                Some(&current),
+                Some(&previous),
+                Some("main"),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_local_file_returns_to_a_local_session_from_a_remote_attachment() {
+        let remote = ConnId::Remote("mini".into());
+        let current = on(&remote, "work");
+        let previous = on(&ConnId::Local, "main");
+        let live = names(&["main", "scratch"]);
+        assert_eq!(
+            session_to_open_file_in(
+                &ConnId::Local,
+                &live,
+                Some(&current),
+                Some(&previous),
+                Some("scratch"),
+            ),
+            Some("main".to_string()),
+        );
+        assert_eq!(
+            session_to_open_file_in(&ConnId::Local, &live, Some(&current), None, Some("scratch")),
+            Some("scratch".to_string()),
+        );
+    }
+
+    #[test]
+    fn a_dead_session_is_skipped_and_none_left_stays_in_the_view() {
+        let current = on(&ConnId::Local, "gone");
+        let previous = on(&ConnId::Local, "main");
+        assert_eq!(
+            session_to_open_file_in(
+                &ConnId::Local,
+                &names(&["main"]),
+                Some(&current),
+                Some(&previous),
+                None,
+            ),
+            Some("main".to_string()),
+        );
+        assert_eq!(
+            session_to_open_file_in(
+                &ConnId::Local,
+                &names(&["unrelated"]),
+                Some(&current),
+                Some(&previous),
+                Some("gone"),
+            ),
+            None,
+        );
+    }
+
     #[test]
     fn a_server_a_client_starts_never_inherits_the_peer_seam() {
         let cmd = super::server_command("remux".into());

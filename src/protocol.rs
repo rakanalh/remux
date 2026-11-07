@@ -222,10 +222,16 @@ pub enum ConnDescriptor {
 /// server message; [`ClientMessage::ViewCycleLayout`] only steps. A 22 server
 /// cannot decode either and drops the connection.
 ///
-/// 23 -> 24: [`RemuxCommand::TabMoveToSession`]. A 23 server cannot decode the
+/// 23 -> 24: a View's zoom follows `[zoom]`. Adds `mode` to
+/// [`ClientMessage::ViewToggleZoom`], [`ClientMessage::ViewReleaseFloat`], and
+/// `zoom_mode` and `float_pct` to [`ViewInfo`]. A 23 server DECODES the new
+/// `ViewToggleZoom` body and ignores `mode`, so a forced float would fill the
+/// view; the bump makes the new client refuse that server at the handshake.
+///
+/// 24 -> 25: [`RemuxCommand::TabMoveToSession`]. A 24 server cannot decode the
 /// command and drops the connection, so the bump turns that into a refused
 /// handshake for the upgraded client.
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -731,8 +737,19 @@ pub enum ClientMessage {
     /// as [`ClientMessage::ViewCycleLayout`] does. A disabled, unknown or
     /// `custom` name is refused and nothing is broadcast.
     ViewSetLayout { id: ViewId, name: String },
-    /// Toggle focus-cell zoom for view `id`.
-    ViewToggleZoom { id: ViewId },
+    /// Toggle focus-cell zoom for view `id`, releasing a zoom of either kind.
+    /// `None` takes the mode from the server's `[zoom]`, because a View's zoom
+    /// is shared state and a client's config may differ from the server's. In
+    /// Monocle a fullscreen zoom is refused and nothing is broadcast.
+    ViewToggleZoom {
+        id: ViewId,
+        #[serde(default)]
+        mode: Option<crate::config::ZoomMode>,
+    },
+    /// End view `id`'s float zoom, if it has one, leaving a fullscreen zoom
+    /// alone. Unlike a toggle it cannot take a zoom, so a press that crosses
+    /// another client's release does not float the cell again.
+    ViewReleaseFloat { id: ViewId },
     /// Switch view `id` to the Master layout and promote its focused cell into
     /// the master slot (dropping any custom tree). The view's own `focused` is
     /// authoritative -- focus is server-owned and set by `ViewSetFocus` -- so no
@@ -1501,9 +1518,21 @@ pub struct ViewInfo {
     /// Index of the focused cell within `cells`.
     #[serde(default)]
     pub focused: usize,
-    /// Whether the focused cell is zoomed to fill the view.
+    /// Whether the focused cell is zoomed.
     #[serde(default)]
     pub zoomed: bool,
+    /// How the zoom is shown. Only meaningful while `zoomed` is set.
+    #[serde(default)]
+    pub zoom_mode: crate::config::ZoomMode,
+    /// The server's `(width_pct, height_pct)` for a float. It travels here
+    /// because `[zoom]` is server config and each terminal computes the box from
+    /// its own size.
+    #[serde(default = "default_float_pct")]
+    pub float_pct: (u8, u8),
+}
+
+fn default_float_pct() -> (u8, u8) {
+    crate::config::ZoomConfig::default().float_pct()
 }
 
 // ---------------------------------------------------------------------------
@@ -4508,7 +4537,11 @@ mod tests {
                 id: 7,
                 name: "rows".into(),
             },
-            ClientMessage::ViewToggleZoom { id: 7 },
+            ClientMessage::ViewToggleZoom {
+                id: 7,
+                mode: Some(crate::config::ZoomMode::Float),
+            },
+            ClientMessage::ViewReleaseFloat { id: 7 },
             ClientMessage::ViewSetMaster { id: 7 },
             ClientMessage::ViewResizeCell {
                 id: 7,
@@ -4545,7 +4578,9 @@ mod tests {
                 layout: crate::server::layout::LayoutMode::Grid(crate::server::layout::GridLayout),
                 custom_tree: None,
                 focused: 0,
-                zoomed: false,
+                zoomed: true,
+                zoom_mode: crate::config::ZoomMode::Float,
+                float_pct: (60, 50),
             }],
         };
         let encoded = encode_message(&msg).unwrap();
@@ -4718,13 +4753,21 @@ mod tests {
         serde_json::from_slice(&encoded[4..4 + len]).unwrap()
     }
 
-    /// 22 introduced agent session restore and 23 the layout switcher in a
-    /// View; a peer on 22 cannot decode `ListViewLayouts` or `ViewSetLayout`,
-    /// so the handshake has to refuse that pairing. 24 adds `TabMoveToSession`,
-    /// which a peer on 23 cannot decode.
+    /// A peer on 23 drops the `mode` of a `ViewToggleZoom` without an error,
+    /// and a peer on 24 cannot decode `TabMoveToSession`, so the handshake has
+    /// to refuse both pairings.
     #[test]
-    fn protocol_version_is_24_for_the_tab_move() {
-        assert_eq!(PROTOCOL_VERSION, 24);
+    fn protocol_version_is_25_for_the_tab_move() {
+        assert_eq!(PROTOCOL_VERSION, 25);
+    }
+
+    #[test]
+    fn a_view_toggle_zoom_with_no_mode_leaves_it_to_the_server() {
+        let msg: ClientMessage = serde_json::from_str(r#"{"ViewToggleZoom":{"id":3}}"#).unwrap();
+        assert!(matches!(
+            msg,
+            ClientMessage::ViewToggleZoom { id: 3, mode: None }
+        ));
     }
 
     #[test]
