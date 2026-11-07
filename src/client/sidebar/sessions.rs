@@ -32,17 +32,22 @@ use super::{blank_grid, draw_text_with, PluginAction, PluginEvent, SidebarPlugin
 use crate::client::context_menu::{self, MenuAction, MenuItem, RenameFor};
 use crate::client::registry::{ConnId, RemoteState};
 use crate::client::tree_model::{ConnTrees, JumpTarget, NodeType, TreeModel};
+use crate::config::sidebar::IconStyle;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
 
-/// Icons are emoji-presentation glyphs because `unicode-width` and terminals
-/// agree that those take two columns. A Nerd Font glyph draws a box without the
-/// font, and a text-presentation pictograph such as U+1F5A5 measures one column
-/// where many terminals draw two, which shifts the rest of the row.
-const FOLDER_ICON: char = '\u{1F4C1}';
-const SESSION_ICON: char = '\u{1F4BB}';
-const TAB_ICON: char = '\u{1F4D1}';
-const PANE_ICON: char = '\u{1F532}';
+/// One icon per row type, as `[folder, session, tab, pane]`.
+///
+/// These are emoji-presentation glyphs because `unicode-width` and terminals
+/// agree that those take two columns. A text-presentation pictograph such as
+/// U+1F5A5 measures one column where many terminals draw two, which shifts the
+/// rest of the row.
+const EMOJI_ICONS: [char; 4] = ['\u{1F4C1}', '\u{1F4BB}', '\u{1F4D1}', '\u{1F532}'];
+
+/// Font Awesome glyphs from the Nerd Font Private Use Area: folder, terminal,
+/// clone and square-o. Each measures one column, and a font can draw one wider
+/// than its cell, so the space after the icon keeps it off the name.
+const NERD_ICONS: [char; 4] = ['\u{F07B}', '\u{F120}', '\u{F24D}', '\u{F096}'];
 
 /// The columns the `▼`/`▶` marker and the space after it take.
 const MARKER_WIDTH: u16 = 2;
@@ -132,12 +137,17 @@ fn closes_under(name: &str, count: usize, noun: &str) -> String {
     }
 }
 
-fn icon_of(node: &NodeType) -> Option<char> {
+fn icon_of(node: &NodeType, style: IconStyle) -> Option<char> {
+    let [folder, session, tab, pane] = match style {
+        IconStyle::Emoji => EMOJI_ICONS,
+        IconStyle::Nerd => NERD_ICONS,
+        IconStyle::None => return None,
+    };
     match node {
-        NodeType::Folder { .. } => Some(FOLDER_ICON),
-        NodeType::Session { .. } => Some(SESSION_ICON),
-        NodeType::Tab { .. } => Some(TAB_ICON),
-        NodeType::Pane { .. } => Some(PANE_ICON),
+        NodeType::Folder { .. } => Some(folder),
+        NodeType::Session { .. } => Some(session),
+        NodeType::Tab { .. } => Some(tab),
+        NodeType::Pane { .. } => Some(pane),
         _ => None,
     }
 }
@@ -156,6 +166,7 @@ pub struct SessionsPlugin {
     /// user's selection.
     trees: Vec<(ConnId, ConnTrees)>,
     model: TreeModel,
+    icons: IconStyle,
     /// The tree index the last `render` started its window at.
     ///
     /// `render` takes `&self` and `on_mouse` is never told the panel's height,
@@ -167,10 +178,11 @@ pub struct SessionsPlugin {
 }
 
 impl SessionsPlugin {
-    pub fn new() -> Self {
+    pub fn new(icons: IconStyle) -> Self {
         Self {
             trees: Vec::new(),
             model: TreeModel::new(),
+            icons,
             last_top: Cell::new(0),
         }
     }
@@ -391,7 +403,7 @@ impl SessionsPlugin {
 
 impl Default for SessionsPlugin {
     fn default() -> Self {
-        Self::new()
+        Self::new(IconStyle::default())
     }
 }
 
@@ -443,7 +455,7 @@ impl SidebarPlugin for SessionsPlugin {
                 _ if row.is_expanded => "\u{25BC} ",
                 _ => "\u{25B6} ",
             };
-            let icon = icon_of(&row.node_type)
+            let icon = icon_of(&row.node_type, self.icons)
                 .map(|icon| format!("{icon} "))
                 .unwrap_or_default();
             let current = if row.is_current { "* " } else { "" };
@@ -821,7 +833,7 @@ mod tests {
 
     #[test]
     fn a_local_tree_populates_the_model() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let rows = painted(&p, 24, 8);
         assert_eq!(rows[0], " sessions");
@@ -842,7 +854,7 @@ mod tests {
 
     #[test]
     fn a_second_connections_tree_adds_a_subtree_without_dropping_the_first() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         p.on_event(&remote_tree());
         let rows = painted(&p, 24, 12);
@@ -858,7 +870,7 @@ mod tests {
     fn a_newly_seen_remote_is_expanded_so_its_sessions_show() {
         // `TreeModel` opens only the LOCAL server node by itself, so without
         // this the remote would arrive as one collapsed row.
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&remote_tree());
         let rows = painted(&p, 24, 8);
         assert!(
@@ -869,7 +881,7 @@ mod tests {
 
     #[test]
     fn connection_lost_drops_only_that_connections_subtree() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         p.on_event(&remote_tree());
         p.on_event(&PluginEvent::ConnectionLost {
@@ -888,7 +900,7 @@ mod tests {
 
     #[test]
     fn a_refresh_does_not_move_a_server_in_the_list() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         p.on_event(&remote_tree());
         let before = painted(&p, 24, 12);
@@ -899,7 +911,7 @@ mod tests {
 
     #[test]
     fn j_and_k_move_the_selection_and_ask_for_a_redraw() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let start = p.model.selected;
         assert_eq!(p.on_key(key(KeyCode::Char('j'))), PluginAction::Redraw);
@@ -913,7 +925,7 @@ mod tests {
 
     #[test]
     fn g_and_shift_g_jump_to_the_ends() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         p.on_key(key(KeyCode::Char('G')));
         assert_eq!(p.model.selected, p.model.rows.len() - 1);
@@ -923,7 +935,7 @@ mod tests {
 
     #[test]
     fn enter_on_a_pane_row_jumps_to_that_pane() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "editor");
         p.on_key(key(KeyCode::Char('l'))); // expand the tab
@@ -943,7 +955,7 @@ mod tests {
     fn enter_on_a_session_or_tab_row_jumps_rather_than_expanding() {
         // The spec's "Enter on any node jumps": above pane level the target is
         // the node, and the server resolves its current focus.
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
 
         select(&mut p, "alpha");
@@ -967,7 +979,7 @@ mod tests {
 
     #[test]
     fn enter_on_a_server_row_expands_rather_than_jumping() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "local");
         assert_eq!(p.on_key(key(KeyCode::Enter)), PluginAction::Redraw);
@@ -980,7 +992,7 @@ mod tests {
 
     #[test]
     fn space_expands_a_session_instead_of_jumping() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "alpha");
         assert_eq!(p.on_key(key(KeyCode::Char(' '))), PluginAction::Redraw);
@@ -993,7 +1005,7 @@ mod tests {
 
     #[test]
     fn h_collapses_and_l_expands_without_flapping() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "alpha");
         p.on_key(key(KeyCode::Char('h')));
@@ -1012,7 +1024,7 @@ mod tests {
 
     #[test]
     fn the_expansion_marker_tracks_the_node_state() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let open = painted(&p, 24, 12);
         assert!(
@@ -1030,7 +1042,7 @@ mod tests {
 
     #[test]
     fn a_pane_row_is_indented_under_its_tab() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "editor");
         p.on_key(key(KeyCode::Char('l')));
@@ -1046,7 +1058,7 @@ mod tests {
 
     #[test]
     fn the_selection_stays_visible_when_it_runs_past_the_panel() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "editor");
         p.on_key(key(KeyCode::Char('l')));
@@ -1062,7 +1074,7 @@ mod tests {
 
     #[test]
     fn render_returns_exactly_the_requested_dimensions() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let theme = CompositorTheme::default();
         let grid = p.render(14, 5, false, &theme);
@@ -1073,7 +1085,7 @@ mod tests {
 
     #[test]
     fn the_selected_row_is_highlighted_only_while_focused() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let theme = CompositorTheme::default();
         let focused = p.render(24, 6, true, &theme);
@@ -1092,7 +1104,7 @@ mod tests {
 
     #[test]
     fn a_click_selects_a_row_and_a_second_click_activates_it() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         // Paint first: the click's row is resolved against what was drawn.
         let _ = painted(&p, 24, 12);
@@ -1127,7 +1139,7 @@ mod tests {
 
     #[test]
     fn a_session_row_offers_switch_rename_and_a_confirmed_kill() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let _ = painted(&p, 24, 12);
         let items = menu_at(&mut p, "alpha");
@@ -1158,7 +1170,7 @@ mod tests {
 
     #[test]
     fn a_tab_row_offers_switch_rename_and_a_confirmed_close() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let _ = painted(&p, 24, 12);
         let items = menu_at(&mut p, "editor");
@@ -1193,7 +1205,7 @@ mod tests {
 
     #[test]
     fn a_folder_row_offers_rename_and_a_confirmed_delete_on_its_own_connection() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         p.on_event(&folder_tree(vec![
             session("a", vec![]),
@@ -1226,7 +1238,7 @@ mod tests {
             (vec![], "Delete folder"),
             (vec![session("a", vec![])], "Delete folder and 1 session"),
         ] {
-            let mut p = SessionsPlugin::new();
+            let mut p = SessionsPlugin::new(IconStyle::Emoji);
             p.on_event(&folder_tree(sessions));
             let _ = painted(&p, 40, 20);
             assert_eq!(menu_at(&mut p, "work")[1].label, label);
@@ -1254,7 +1266,7 @@ mod tests {
 
     #[test]
     fn a_pane_row_offers_switch_and_a_confirmed_close_but_no_rename() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "editor");
         p.on_key(key(KeyCode::Char('l')));
@@ -1302,7 +1314,7 @@ mod tests {
 
     #[test]
     fn a_click_on_either_marker_column_toggles_and_selects_without_jumping() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let down = MouseEventKind::Down(MouseButton::Left);
         let (x, y) = marker_cell(&p, "editor");
@@ -1317,7 +1329,7 @@ mod tests {
 
     #[test]
     fn a_click_just_past_the_marker_is_a_click_on_the_name() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let down = MouseEventKind::Down(MouseButton::Left);
         let (x, y) = marker_cell(&p, "editor");
@@ -1332,7 +1344,7 @@ mod tests {
 
     #[test]
     fn a_click_left_of_the_marker_is_not_a_click_on_it() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let down = MouseEventKind::Down(MouseButton::Left);
         let (x, y) = marker_cell(&p, "editor");
@@ -1342,7 +1354,7 @@ mod tests {
 
     #[test]
     fn a_pane_row_has_no_marker_to_click() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "editor");
         p.on_key(key(KeyCode::Char('l')));
@@ -1361,7 +1373,7 @@ mod tests {
 
     #[test]
     fn a_tab_toggled_by_click_keeps_its_state_across_a_tree_push() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let down = MouseEventKind::Down(MouseButton::Left);
         let (x, y) = marker_cell(&p, "editor");
@@ -1376,7 +1388,7 @@ mod tests {
 
     #[test]
     fn a_collapsed_local_server_stays_collapsed_across_a_tree_push() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let down = MouseEventKind::Down(MouseButton::Left);
         let (x, y) = marker_cell(&p, "local");
@@ -1395,7 +1407,7 @@ mod tests {
 
     #[test]
     fn d_on_a_folder_or_session_opens_a_named_confirmation_on_the_rows_connection() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         p.on_event(&folder_tree(vec![session("a", vec![tab(5, "t", vec![])])]));
         let _ = painted(&p, 40, 20);
@@ -1446,7 +1458,7 @@ mod tests {
 
     #[test]
     fn d_on_a_tab_with_a_sibling_closes_it_with_no_confirmation() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&tree(
             ConnId::Local,
             vec![session(
@@ -1467,7 +1479,7 @@ mod tests {
 
     #[test]
     fn d_on_a_sessions_only_tab_asks_as_d_on_the_session_does() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "editor");
         let PluginAction::OpenMenu {
@@ -1493,7 +1505,7 @@ mod tests {
 
     #[test]
     fn d_and_m_do_nothing_on_a_server_or_a_pane_row() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "editor");
         p.on_key(key(KeyCode::Char('l')));
@@ -1506,7 +1518,7 @@ mod tests {
 
     #[test]
     fn a_chord_on_d_or_m_is_not_the_key() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "editor");
         for c in ['d', 'm', '?'] {
@@ -1520,7 +1532,7 @@ mod tests {
 
     #[test]
     fn m_on_a_session_offers_every_other_folder_and_the_way_out() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&PluginEvent::SessionTree {
             conn: ConnId::Local,
             folders: vec![
@@ -1559,7 +1571,7 @@ mod tests {
 
     #[test]
     fn m_says_so_when_there_is_nowhere_to_go() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "alpha");
         assert_eq!(
@@ -1575,7 +1587,7 @@ mod tests {
 
     #[test]
     fn m_on_a_tab_offers_only_its_own_servers_other_sessions() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&tree(
             ConnId::Local,
             vec![
@@ -1605,7 +1617,7 @@ mod tests {
     /// Every key `on_key` acts on, against the table `?` lists.
     #[test]
     fn the_shortcut_list_is_exactly_what_on_key_handles() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&tree(
             ConnId::Local,
             vec![
@@ -1648,7 +1660,7 @@ mod tests {
 
     #[test]
     fn question_mark_lists_every_shortcut_with_its_key() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let PluginAction::OpenMenu { items, .. } = p.on_key(key(KeyCode::Char('?'))) else {
             panic!("? opened nothing");
@@ -1662,14 +1674,49 @@ mod tests {
     }
 
     #[test]
-    fn every_icon_is_two_columns_wide_and_distinct() {
+    fn each_icon_set_has_the_width_its_style_expects_and_is_distinct() {
         use unicode_width::UnicodeWidthChar;
-        let icons = [FOLDER_ICON, SESSION_ICON, TAB_ICON, PANE_ICON];
-        for icon in icons {
-            assert_eq!(icon.width(), Some(2), "{icon:?}");
+        for (icons, width) in [(EMOJI_ICONS, 2), (NERD_ICONS, 1)] {
+            for icon in icons {
+                assert_eq!(icon.width(), Some(width), "{icon:?}");
+            }
+            let distinct: std::collections::HashSet<char> = icons.into_iter().collect();
+            assert_eq!(distinct.len(), icons.len());
         }
-        let distinct: std::collections::HashSet<char> = icons.into_iter().collect();
-        assert_eq!(distinct.len(), icons.len());
+    }
+
+    #[test]
+    fn a_marker_click_toggles_under_every_icon_style() {
+        for style in [IconStyle::Emoji, IconStyle::Nerd, IconStyle::None] {
+            let mut p = SessionsPlugin::new(style);
+            p.on_event(&filed_tree());
+            let (x, y) = marker_cell(&p, "editor");
+            assert!(!shows(&p, " sh"), "{style:?}");
+            let down = MouseEventKind::Down(crossterm::event::MouseButton::Left);
+            p.on_mouse(x, y, down);
+            assert!(
+                shows(&p, " sh"),
+                "{style:?}: the marker click opened nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn each_style_draws_its_own_icon_between_marker_and_name() {
+        for (style, want) in [
+            (IconStyle::Emoji, format!("{}  alpha", EMOJI_ICONS[1])),
+            (IconStyle::Nerd, format!("{} alpha", NERD_ICONS[1])),
+            (IconStyle::None, "alpha".to_string()),
+        ] {
+            let mut p = SessionsPlugin::new(style);
+            p.on_event(&filed_tree());
+            let rows = painted(&p, 40, 20);
+            let want = format!("\u{25BC} {want}");
+            assert!(
+                rows.iter().any(|r| r.ends_with(&want)),
+                "{style:?}: {rows:?}"
+            );
+        }
     }
 
     fn filed_tree() -> PluginEvent {
@@ -1689,40 +1736,40 @@ mod tests {
 
     #[test]
     fn each_row_type_wears_its_icon_after_the_marker() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&filed_tree());
         select(&mut p, "editor");
         p.on_key(key(KeyCode::Char('l')));
         let rows = painted(&p, 40, 20);
         for (name, icon) in [
-            ("work", FOLDER_ICON),
-            ("alpha", SESSION_ICON),
-            ("editor", TAB_ICON),
+            ("work", EMOJI_ICONS[0]),
+            ("alpha", EMOJI_ICONS[1]),
+            ("editor", EMOJI_ICONS[2]),
         ] {
             let (x, y) = marker_cell(&p, name);
             let row: Vec<char> = rows[y as usize].chars().collect();
             assert_eq!(row[x as usize + 2], icon, "{name}: {row:?}");
         }
         let pane_row = rows.iter().find(|r| r.ends_with(" sh")).unwrap();
-        assert!(pane_row.contains(PANE_ICON), "{pane_row:?}");
+        assert!(pane_row.contains(EMOJI_ICONS[3]), "{pane_row:?}");
         let server = rows.iter().find(|r| r.contains("local")).unwrap();
         assert_eq!(server, " \u{25BC} local");
     }
 
     #[test]
     fn a_current_row_reads_marker_icon_star_name() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         let mut current = session("alpha", Vec::new());
         current.is_current = true;
         p.on_event(&tree(ConnId::Local, vec![current]));
         let rows = painted(&p, 40, 20);
-        let want = format!("   \u{25BC} {SESSION_ICON}  * alpha");
+        let want = format!("   \u{25BC} {}  * alpha", EMOJI_ICONS[1]);
         assert!(rows.contains(&want), "{rows:?}");
     }
 
     #[test]
     fn a_narrow_panel_never_cuts_a_wide_glyph_in_half() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&filed_tree());
         select(&mut p, "editor");
         p.on_key(key(KeyCode::Char('l')));
@@ -1754,7 +1801,7 @@ mod tests {
 
     #[test]
     fn the_header_and_the_rows_below_the_list_have_no_menu() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let _ = painted(&p, 24, 12);
         assert!(p.context_menu(0, 0).is_empty());
@@ -1763,7 +1810,7 @@ mod tests {
 
     #[test]
     fn a_click_on_the_header_or_past_the_last_row_does_nothing() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let _ = painted(&p, 24, 12);
         let down = MouseEventKind::Down(MouseButton::Left);
@@ -1773,7 +1820,7 @@ mod tests {
 
     #[test]
     fn a_click_lands_on_the_row_under_the_cursor_after_scrolling() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "editor");
         p.on_key(key(KeyCode::Char('l')));
@@ -1793,7 +1840,7 @@ mod tests {
     fn a_dormant_session_is_not_listed() {
         // The panel has no way to resurrect one, so an Enter on it would be a
         // visibly dead key.
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&PluginEvent::SessionTree {
             conn: ConnId::Local,
             folders: Vec::new(),
@@ -1812,7 +1859,7 @@ mod tests {
     fn a_server_row_never_wears_a_connection_state_suffix() {
         // The panel synthesizes its roster from the trees it holds, so a node
         // is only ever listed while it is connected.
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&remote_tree());
         let rows = painted(&p, 40, 12);
         assert!(rows.iter().any(|r| r.trim() == "\u{25BC} gpu"), "{rows:?}");
@@ -1822,7 +1869,7 @@ mod tests {
     fn a_folder_the_user_collapsed_survives_a_tree_that_empties_and_refills() {
         // The panel refreshes on EVERY push, so this boundary is its problem in
         // a way it never was for an overlay opened on demand.
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         let full = PluginEvent::SessionTree {
             conn: ConnId::Local,
             folders: vec![FolderTreeEntry {
@@ -1870,7 +1917,7 @@ mod tests {
 
     #[test]
     fn the_tree_has_a_lowercase_header_a_blank_row_and_one_column_of_padding() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let out = painted(&p, 24, 8);
         assert_eq!(out[0], " sessions");
@@ -1880,7 +1927,7 @@ mod tests {
 
     #[test]
     fn the_band_spans_the_row_and_a_click_resolves_below_the_two_row_header() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let theme = CompositorTheme::default();
         let grid = p.render(24, 8, true, &theme);
@@ -1894,7 +1941,7 @@ mod tests {
 
     #[test]
     fn the_header_takes_the_active_colour_only_while_the_panel_has_focus() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let theme = CompositorTheme::default();
         assert_eq!(
@@ -1909,7 +1956,7 @@ mod tests {
 
     #[test]
     fn the_header_is_a_bar_whose_colours_follow_focus() {
-        let mut p = SessionsPlugin::new();
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         let theme = CompositorTheme::default();
         for focused in [false, true] {

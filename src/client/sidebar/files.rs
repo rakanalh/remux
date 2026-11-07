@@ -817,6 +817,7 @@ mod tests {
             plugin: plugin.to_string(),
             weight: 1,
             editor: editor.map(str::to_string),
+            icons: None,
             command: command.map(str::to_string),
         }
     }

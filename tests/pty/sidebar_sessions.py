@@ -49,6 +49,8 @@ What it covers:
  25  `d` on a session's only tab asks, naming the session it ends
  26  killing the session the client is on lands it on a survivor, by right click,
      by `d` and by a folder; with nothing left the client ends
+ 28  `icons` picks each row's glyph, leaves the marker where it is, follows a
+     config reload, and an unknown value keeps the panel on the default
  27  a menu left open when its remote drops: Confirm does not end the client
 
 Run from the repo root:
@@ -692,6 +694,12 @@ def seed_four():
 # ---------------------------------------------------------------------------
 
 MARKERS = "\u25b6\u25bc"
+NERD_ICONS = {
+    "folder": "\uF07B",
+    "session": "\uF120",
+    "tab": "\uF24D",
+    "pane": "\uF096",
+}
 ICONS = {
     "folder": "\U0001F4C1",
     "session": "\U0001F4BB",
@@ -867,6 +875,89 @@ def scenario_icons():
     check("11 the panel's right frame is unbroken by the wide glyphs",
           all(r[SIDEBAR_W - 1] != " " for r in cell_rows(screen)[1:ROWS - 2]),
           [r[:SIDEBAR_W + 1] for r in cell_rows(screen)])
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+def config_with_icons(value):
+    return CFG_SIDEBAR.replace('plugin = "sessions"\n',
+                               f'plugin = "sessions"\n  icons = {value}\n')
+
+
+def glyphs_after_markers(screen):
+    """{row kind: the cell after the marker and its space}, by cell."""
+    rows = cell_rows(screen)
+    got = {}
+    for kind, name in (("folder", "work"), ("session", "home"), ("tab", "tabone")):
+        x, y = marker_of(screen, name)
+        got[kind] = rows[y][x + 2]
+    tab_x, _ = marker_of(screen, "tabone")
+    x, y = must_find(screen, "paneA", 0, SIDEBAR_W)
+    # A pane has a blank marker, one indent right of its tab's.
+    got["pane"] = rows[y][tab_x + 4]
+    return got
+
+
+def check_style(label, want, screen):
+    got = glyphs_after_markers(screen)
+    log(f"{label} icons:", got)
+    for kind, glyph in want.items():
+        check(f"28 {label}: a {kind} row wears {glyph!r}", got[kind] == glyph,
+              f"{got} in {panel_rows(screen)}")
+    others = [i for s in (ICONS, NERD_ICONS) if s != want for i in s.values()]
+    body = "".join(panel_rows(screen))
+    check(f"28 {label}: no other style's glyph is drawn",
+          not any(i in body for i in others), panel_rows(screen))
+
+
+def open_tab_by_marker(label, child, screen, pump):
+    x, y = marker_of(screen, "tabone")
+    press(child, pump, x, y)
+    check(f"28 {label}: a click on the marker opens the tab",
+          any("paneA" in r for r in panel_rows(screen)), panel_rows(screen))
+    return x
+
+
+def scenario_icon_styles():
+    """28: `icons` per panel, read by cell."""
+    print("icon styles")
+    cfg = f"{RUN}/cfg-icons"
+    write_config(cfg, config_with_icons('"nerd"'))
+    seed, child, screen, pump = start_tree(cfg)
+    nerd_x = open_tab_by_marker("nerd", child, screen, pump)
+    check_style("nerd", NERD_ICONS, screen)
+    x, y = must_find(screen, "home", 0, SIDEBAR_W)
+    mx, _ = marker_of(screen, "home")
+    check("28 nerd: a space keeps the glyph off the name",
+          x > mx + 3 and cell_rows(screen)[y][mx + 3] == " ", cell_rows(screen)[y])
+
+    write_config(cfg, config_with_icons('"none"'))
+    pump(2.0)
+    none_x = open_tab_by_marker("none", child, screen, pump)
+    check("28 the marker stays in its column across the styles", none_x == nerd_x,
+          (nerd_x, none_x))
+    body = "".join(panel_rows(screen))
+    check("28 none: no glyph from either style",
+          not any(i in body for s in (ICONS, NERD_ICONS) for i in s.values()),
+          panel_rows(screen))
+    mx, y = marker_of(screen, "tabone")
+    check("28 none: the name follows the marker with no gap",
+          cell_rows(screen)[y][mx + 2:mx + 8] == "tabone", cell_rows(screen)[y])
+
+    write_config(cfg, config_with_icons('"emoji"'))
+    pump(2.0)
+    emoji_x = open_tab_by_marker("emoji", child, screen, pump)
+    check("28 emoji: the marker is in the same column", emoji_x == nerd_x, (nerd_x, emoji_x))
+    check_style("emoji", ICONS, screen)
+
+    write_config(cfg, config_with_icons('"sparkly"'))
+    pump(2.0)
+    open_tab_by_marker("unknown", child, screen, pump)
+    check_style("an unknown value", ICONS, screen)
+    check("28 an unknown value is warned about",
+          "unknown `icons` value \"sparkly\"" in open(f"{RUN}/state/remux/client.log").read())
+    check("28 the client survived", child.isalive())
     check_no_panic(f"{RUN}/state")
     teardown(child)
     seed.close()
@@ -1842,7 +1933,7 @@ def main():
         raise SystemExit(f"{BIN} not found; run `cargo build` first")
     only = [a for a in sys.argv[1:] if a.startswith("scenario_")]
     for scenario in (scenario_local, scenario_remote, scenario_no_sidebar,
-                     scenario_selection_identity, scenario_icons,
+                     scenario_selection_identity, scenario_icons, scenario_icon_styles,
                      scenario_folder_menu, scenario_marker_click,
                      scenario_pane_menu, scenario_tab_menu_expanded,
                      scenario_folder_remote, scenario_right_edge,
