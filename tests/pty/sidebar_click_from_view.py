@@ -109,16 +109,21 @@ def click(t, y, x=5, settle=0.5):
     t.send(sgr(x, y, release=True), settle)
 
 
+def name_x(t, y, name):
+    """The column of a row's name: a click on a session's marker folds it."""
+    return t.cell_rows()[y].index(name)
+
+
 def status(t):
-    return t.rows_text()[-1]
+    return t.cell_rows()[-1]
 
 
 def panel(t):
-    return [r[1:SIDEBAR_W - 1] for r in t.rows_text()[:-1]]
+    return [r[1:SIDEBAR_W - 1] for r in t.cell_rows()[:-1]]
 
 
 def content(t):
-    return "\n".join(r[SIDEBAR_W:] for r in t.rows_text()[:-1])
+    return "\n".join(r[SIDEBAR_W:] for r in t.cell_rows()[:-1])
 
 
 def row_of(t, pred, what):
@@ -382,10 +387,11 @@ def test_click_session_row():
     t, (_, _, p3) = sessions_setup("/tmp/rmx-scfv3")
     fails = []
     y = session_rows(t)[0]
-    click(t, y)
+    x = name_x(t, y, "other")
+    click(t, y, x)
     if not in_view(t):
         fails.append("the first click on an unselected row left the view")
-    click(t, y)
+    click(t, y, x)
     landed(t, fails, p3)
     return finish(t, name, fails)
 
@@ -429,9 +435,10 @@ def test_click_the_session_the_view_aliases():
     panes = [p["id"] for p in w.session("main")["tabs"][0]["panes"]]
     w.close()
     y = row_of(t, lambda s: s.endswith(" main"), "session main")
-    click(t, y)
+    x = name_x(t, y, "main")
+    click(t, y, x)
     if in_view(t):
-        click(t, y)
+        click(t, y, x)
     t.pump(1.0)
     if in_view(t):
         fails.append(f"still in the view: {status(t).rstrip()!r}")
@@ -699,9 +706,10 @@ def test_file_in_view_opens_on_the_panels_remote():
         t.dump("no remote session row")
         raise SystemExit("ABORT: the panel never listed the remote session")
     y = row_of(t, lambda s: s.endswith(" far"), "session far")
-    click(t, y)
+    x = name_x(t, y, "far")
+    click(t, y, x)
     if "far" not in status(t):
-        click(t, y, settle=1.5)
+        click(t, y, x, settle=1.5)
     if "far" not in status(t) or not wait_for_row(t, "sub/"):
         t.dump("not on the remote")
         raise SystemExit("ABORT: never reached the remote session and its listing")
