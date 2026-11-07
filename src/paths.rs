@@ -5,13 +5,10 @@
 //! and `state_dir()` is `None`. That is not a difference remux can leave alone.
 //! An isolated test harness exports `XDG_STATE_HOME` and `XDG_DATA_HOME` to keep
 //! away from the user's real files; on a Mac the server ignored both and wrote the
-//! user's real `state.json`. The socket was the one path that stayed isolated,
-//! because `server::daemon::socket_path` reads `XDG_RUNTIME_DIR` itself.
+//! user's real `state.json`.
 //!
 //! So each resolver here prefers the environment variable and falls back to the
-//! platform. `socket_path` is left as it is: it consults `dirs::runtime_dir()`
-//! first, which reads `XDG_RUNTIME_DIR` on Linux and is `None` on macOS, so it
-//! already lands on the variable on both.
+//! platform. The socket's directory, [`runtime_dir`], follows the same rule.
 //!
 //! Under `cfg(test)` none of this is consulted: every resolver answers with a
 //! directory in `mod sandbox`, so setting `XDG_DATA_HOME` in a unit test does
@@ -38,6 +35,35 @@ fn resolve(env_value: Option<OsString>, platform: Option<PathBuf>) -> Option<Pat
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or(platform)
+}
+
+/// `$XDG_RUNTIME_DIR`: the directory holding the socket and the pid file.
+///
+/// `None` means the caller must use its private fallback under [`temp_dir`].
+/// On macOS `dirs::runtime_dir()` is always `None`, so there the variable is
+/// the only source. A relative value is ignored on both platforms: it was
+/// resolved against the working directory, so a server and a client started
+/// from different directories used different sockets, and a value with `..`
+/// could point the socket at any directory.
+///
+/// Not sandboxed under test, unlike the resolvers above: a pane spawned by a
+/// unit test gets a sandboxed `XDG_RUNTIME_DIR` from `sandbox::pane_env`.
+pub fn runtime_dir() -> Option<PathBuf> {
+    resolve(std::env::var_os("XDG_RUNTIME_DIR"), dirs::runtime_dir())
+}
+
+/// The temporary directory, `$TMPDIR` when it is absolute.
+///
+/// `std::env::temp_dir` returns `TMPDIR` as it is, so a relative or empty
+/// value would put the socket's fallback directory under the working
+/// directory, with the same disagreement between a server and its clients
+/// that [`runtime_dir`] avoids. Such a value gives `/tmp`.
+pub fn temp_dir() -> PathBuf {
+    absolute_temp_dir(std::env::temp_dir())
+}
+
+fn absolute_temp_dir(std_temp: PathBuf) -> PathBuf {
+    resolve(Some(std_temp.into_os_string()), None).unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
 /// `$XDG_DATA_HOME`: the directory holding saved sessions.
@@ -241,6 +267,36 @@ mod tests {
     fn an_unset_env_value_falls_through_to_the_platform_directory() {
         let platform = Some(PathBuf::from("/home/u/.local/share"));
         assert_eq!(resolve(None, platform.clone()), platform);
+    }
+
+    /// `runtime_dir` on macOS, where `dirs::runtime_dir()` is always `None`
+    /// and the variable is the only source. A `None` sends the socket to the
+    /// private fallback under `temp_dir`.
+    #[test]
+    fn the_runtime_dir_with_no_platform_answer_honours_only_an_absolute_value() {
+        assert_eq!(
+            resolve(Some(OsString::from("/run/user/1000")), None),
+            Some(PathBuf::from("/run/user/1000"))
+        );
+        for bad in ["run", "../../run/user/1000", "./run", ""] {
+            assert_eq!(resolve(Some(OsString::from(bad)), None), None, "{bad:?}");
+        }
+        assert_eq!(resolve(None, None), None);
+    }
+
+    #[test]
+    fn an_absolute_temp_dir_is_used_as_it_is() {
+        assert_eq!(
+            absolute_temp_dir(PathBuf::from("/var/tmp/x")),
+            Path::new("/var/tmp/x")
+        );
+    }
+
+    #[test]
+    fn a_relative_or_empty_temp_dir_gives_tmp() {
+        for bad in ["tmp", "../../elsewhere", ""] {
+            assert_eq!(absolute_temp_dir(PathBuf::from(bad)), Path::new("/tmp"));
+        }
     }
 
     #[test]
