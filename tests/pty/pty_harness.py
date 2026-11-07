@@ -8,6 +8,7 @@ import atexit, os, shutil, signal, subprocess, sys, time, pexpect, pyte
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import home_guard  # noqa: E402,F401  (installs the real-HOME refusal)
+import kill_gate  # noqa: E402
 import standin  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
 from harness import guard_rundir, kill_relays, reap_rundir  # noqa: E402,F401
@@ -247,7 +248,7 @@ class Tui:
             pid = int(f.read().strip())
         with open(f"/proc/{pid}/environ", "rb") as f:
             environ = f.read().split(b"\0")
-        if f"XDG_RUNTIME_DIR={run_dir}".encode() in environ:
+        if f"XDG_RUNTIME_DIR={run_dir}".encode() in environ and kill_gate.allows(pid, run_dir):
             os.kill(pid, signal.SIGKILL)
 
     def log(self, which="client"):

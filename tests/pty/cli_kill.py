@@ -34,8 +34,9 @@ from fake_server import FakeServer, _frame, _read_frame  # noqa: E402
 from pty_harness import BIN, PROTOCOL_VERSION, Tui  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
 from harness import Client, Server, remux_daemons  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-clikill"
+RUNDIR = run_dir("rmx-clikill")
 CLI_TIMEOUT = 6.0
 # Past the CLI's own reply deadline, for the case that waits it out.
 SILENT_TIMEOUT = 14.0

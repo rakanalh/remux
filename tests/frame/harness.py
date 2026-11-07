@@ -7,6 +7,7 @@ import atexit, json, os, shutil, signal, socket, struct, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import home_guard  # noqa: E402,F401  (installs the real-HOME refusal)
+import kill_gate  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 
@@ -52,7 +53,11 @@ def _matches(pid, root, kinds):
         environ = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
     except OSError:
         return False
-    if len(argv) < 2 or not argv[0].endswith(b"remux") or argv[1] not in kinds:
+    if len(argv) < 2 or argv[1] not in kinds:
+        return False
+    # `$REMUX_BIN` can name a binary with any file name.
+    if not (argv[0].endswith(b"remux")
+            or os.path.realpath(os.fsdecode(argv[0])) == os.path.realpath(BIN)):
         return False
     env = dict(e.split(b"=", 1) for e in environ if b"=" in e)
     runtime = env.get(b"XDG_RUNTIME_DIR", b"").decode(errors="replace")
@@ -90,14 +95,14 @@ def _kill(pid, root, kinds):
     except ProcessLookupError:
         return
     except (AttributeError, OSError):
-        if _matches(pid, root, kinds):
+        if _matches(pid, root, kinds) and kill_gate.allows(pid, root):
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
         return
     try:
-        if _matches(pid, root, kinds):
+        if _matches(pid, root, kinds) and kill_gate.allows(pid, root):
             signal.pidfd_send_signal(fd, signal.SIGKILL)
     except OSError:
         pass
@@ -125,7 +130,8 @@ def kill_relays(rundir):
 
     Without /proc (macOS) the environment cannot be read, so the fallback is
     that `pkill`, which matches every relay of this binary. A run on macOS can
-    therefore drop a concurrent run's relay.
+    therefore drop a concurrent run's relay. `kill_gate` cannot check this path,
+    because it needs the environment too.
     """
     root = _checked_root(rundir)
     if not os.path.isdir("/proc"):
@@ -252,6 +258,9 @@ class Server:
             "SHELL": os.environ.get("REMUX_TEST_SHELL", "/bin/sh"),
             "ENV": "/dev/null",
             "TERM": "xterm-256color",
+            # The default prompt holds the cwd. From a long cwd it fills a pane
+            # row, and the shell's redraw then wipes output that a check reads.
+            "PS1": "$ ",
         }
         self.proc = subprocess.Popen(
             [BIN, "server"], env=self.env,

@@ -64,8 +64,9 @@ from pty_harness import (  # noqa: E402
     sm_tree,
 )
 from harness import Client  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUNDIR = "/tmp/rmx-smvt"
+RUNDIR = run_dir("rmx-smvt")
 REMOTE_DIR = f"{RUNDIR}-remote"
 VIEWPORT_DIR = f"{RUNDIR}-vp"
 COLLAPSED = "▶"

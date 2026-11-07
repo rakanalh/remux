@@ -789,7 +789,7 @@ try:
     # A body larger than the terminal's input queue and full of newlines, to
     # an agent that takes the probe and then stops reading: none of it, not
     # the tail the writer still held, reaches the agent when it reads again.
-    big_lines = [f"fill{n:04d} " + "a" * 90 for n in range(100)] + ["touch /tmp/rmx-never"]
+    big_lines = [f"fill{n:04d} " + "a" * 90 for n in range(100)] + [f"touch {RUNDIR}/never"]
     big = "\n".join(big_lines)
     Q1, Q1_LOG, Q1_CTL = spawn_agent(paste=True)
     tell(Q1_CTL, Q1_LOG, "probe-only")

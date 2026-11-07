@@ -55,8 +55,9 @@ from pty_harness import (  # noqa: E402
     BIN, PROTOCOL_VERSION, Tui, sm_compose_view, sm_goto, sm_goto_text, sm_open,
 )
 from harness import Client as WireClient, name_of  # noqa: E402
+from rundirs import run_dir  # noqa: E402
 
-RUN = "/tmp/rmx-lsel"
+RUN = run_dir("rmx-lsel")
 VERBOSE = "-v" in sys.argv
 
 OPEN = b"\x1bg"
@@ -504,7 +505,7 @@ def deleted_view_section():
     check_logs(t, "deleted view")
 
 
-REMOTE_RUN = "/tmp/rmx-lselr"
+REMOTE_RUN = run_dir("rmx-lselr")
 
 
 def start_remote_server():
