@@ -140,6 +140,9 @@ const REMOTE_ERROR_MAX: usize = 300;
 pub struct ConnectionManager {
     /// Per-connection writer, keyed by connection id.
     writers: HashMap<ConnId, BoxWriter>,
+    /// Remote writers that failed a write. Later writes to them are dropped
+    /// unsent until the transport is replaced or torn down.
+    broken: std::collections::HashSet<ConnId>,
     /// Remote bookkeeping (config + state + child), keyed by name.
     remotes: HashMap<String, RemoteEntry>,
     /// The connection that currently streams renders / receives input.
@@ -231,6 +234,7 @@ impl ConnectionManager {
             .collect();
         Self {
             writers: HashMap::new(),
+            broken: std::collections::HashSet::new(),
             remotes,
             foreground,
             tx,
@@ -362,7 +366,7 @@ impl ConnectionManager {
             .collect();
         for name in to_remove {
             self.remotes.remove(&name);
-            self.writers.remove(&ConnId::Remote(name));
+            self.drop_writer(&ConnId::Remote(name));
         }
     }
 
@@ -426,6 +430,7 @@ impl ConnectionManager {
         // Capture the reported version before `into_split` consumes it.
         let server_version = client.server_version().to_string();
         let (reader, writer, child) = client.into_split();
+        self.broken.remove(&id);
         self.writers.insert(id.clone(), writer);
         // The reader is tagged with the generation this transport is installed
         // AT, so the bump must happen before it is spawned.
@@ -594,7 +599,7 @@ impl ConnectionManager {
         // the child is still inside the dial task's `RemuxClient`, so it dies when
         // `finish_remote_dial` drops that, which can be as late as the 10s dial
         // timeout. The user-visible state changes immediately either way.
-        self.writers.remove(&ConnId::Remote(name.to_string()));
+        self.drop_writer(&ConnId::Remote(name.to_string()));
         if let Some(entry) = self.remotes.get_mut(name) {
             entry.state = RemoteState::Disconnected;
             entry._child = None;
@@ -609,7 +614,7 @@ impl ConnectionManager {
     /// Mark a remote `Failed` and tear down its transport (writer + child) so
     /// `kill_on_drop` fires on the ssh process.
     pub fn fail_remote(&mut self, name: &str, msg: String) {
-        self.writers.remove(&ConnId::Remote(name.to_string()));
+        self.drop_writer(&ConnId::Remote(name.to_string()));
         if let Some(entry) = self.remotes.get_mut(name) {
             entry.state = RemoteState::Failed(msg);
             entry._child = None;
@@ -621,12 +626,41 @@ impl ConnectionManager {
     // -----------------------------------------------------------------------
 
     /// Send a message to a specific connection.
+    ///
+    /// A failed write to a remote is logged and dropped, and the remote is
+    /// reported `Closed` at once. A dead ssh breaks the pipe before the client
+    /// reads its end of file, and in that window an error from any input path
+    /// would end the client. The end of file can also never come, when something
+    /// the ssh started still holds its output open, so the drop handling cannot
+    /// wait for the reader. The writer is kept, because the `?` on the next
+    /// `send` to a remote with no writer would end the client too; it is only
+    /// marked broken, and later writes to it are dropped unsent. A failed write
+    /// to the local server is still an error, because nothing is left to fall
+    /// back to.
     pub async fn send(&mut self, id: &ConnId, msg: ClientMessage) -> Result<()> {
+        if self.broken.contains(id) {
+            return Ok(());
+        }
         let writer = self
             .writers
             .get_mut(id)
             .with_context(|| format!("no open connection for {id:?}"))?;
-        write_message(writer, &msg).await
+        match write_message(writer, &msg).await {
+            Err(e) if matches!(id, ConnId::Remote(_)) => {
+                log::warn!("registry: a write to {id:?} failed and was dropped: {e:#}");
+                self.broken.insert(id.clone());
+                let generation = self.current_generation(id);
+                let _ = self.tx.send(Incoming::Closed(id.clone(), generation));
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    /// Tear down `id`'s writer, and with it any record that it broke.
+    fn drop_writer(&mut self, id: &ConnId) {
+        self.writers.remove(id);
+        self.broken.remove(id);
     }
 
     /// Send a message to the current foreground connection.
@@ -1089,6 +1123,72 @@ mod tests {
         // Idle remotes never report a mismatch.
         assert_eq!(roster[1].3, None);
         assert_eq!(roster[2].3, None);
+    }
+
+    struct BrokenPipe;
+
+    impl AsyncWrite for BrokenPipe {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_broken_pipe_to_a_remote_is_not_an_error_and_to_local_it_is() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        let alpha = ConnId::Remote("alpha".to_string());
+        mgr.writers.insert(alpha.clone(), Box::new(BrokenPipe));
+        mgr.writers.insert(ConnId::Local, Box::new(BrokenPipe));
+        assert!(mgr.send(&alpha, ClientMessage::ListSessions).await.is_ok());
+        assert!(mgr
+            .send(&ConnId::Local, ClientMessage::ListSessions)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn the_first_broken_write_reports_the_remote_closed_once() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        let alpha = ConnId::Remote("alpha".to_string());
+        mgr.writers.insert(alpha.clone(), Box::new(BrokenPipe));
+        let generation = mgr.current_generation(&alpha);
+        for _ in 0..3 {
+            assert!(mgr.send(&alpha, ClientMessage::ListSessions).await.is_ok());
+        }
+        let mut closed = Vec::new();
+        while let Ok(incoming) = mgr.rx.try_recv() {
+            if let Incoming::Closed(id, generation) = incoming {
+                closed.push((id, generation));
+            }
+        }
+        assert_eq!(closed, vec![(alpha.clone(), generation)]);
+        assert!(
+            mgr.writers.contains_key(&alpha),
+            "the writer is kept for later sends"
+        );
+        mgr.fail_remote("alpha", "connection lost".to_string());
+        assert!(
+            !mgr.broken.contains(&alpha),
+            "a torn-down writer is no longer broken"
+        );
     }
 
     /// `disconnect_remote` is the USER's "stop talking to this remote": the

@@ -8057,6 +8057,34 @@ entries={} error={:?} truncated={}",
     }
 }
 
+/// Tell `client_id` that `session_name` is not a session, and return true, when
+/// it is not one.
+///
+/// Every request that points a client at a session by name checks this before
+/// it touches the client's `session_name`. A client pointed at a name that has
+/// no session is attached to nothing: its keys are dropped and no frame
+/// reaches it, while it still believes it moved.
+async fn refuse_missing_session(
+    client_id: u64,
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> bool {
+    let st = state.lock().await;
+    if st.sessions.contains_key(session_name) {
+        return false;
+    }
+    let cls = clients.lock().await;
+    if let Some(client) = cls.get(&client_id) {
+        let _ = client.tx.send(ServerMessage::Error {
+            req: None,
+            message: format!("session '{}' not found", session_name),
+            code: None,
+        });
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_attach(
     client_id: u64,
@@ -8068,19 +8096,8 @@ async fn handle_attach(
     prev_frames: &PrevFrameCache,
     dormant: &DormantStore,
 ) -> Result<()> {
-    {
-        let st = state.lock().await;
-        if !st.sessions.contains_key(session_name) {
-            let cls = clients.lock().await;
-            if let Some(client) = cls.get(&client_id) {
-                let _ = client.tx.send(ServerMessage::Error {
-                    req: None,
-                    message: format!("session '{}' not found", session_name),
-                    code: None,
-                });
-            }
-            return Ok(());
-        }
+    if refuse_missing_session(client_id, session_name, state, clients).await {
+        return Ok(());
     }
 
     let (cols, rows, left) = {
@@ -9885,6 +9902,10 @@ async fn handle_command(
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::SessionSwitchTab { session, tab_index } => {
+            if refuse_missing_session(client_id, &session, state, clients).await {
+                log::info!("SessionSwitchTab: session '{session}' not found; the client stays");
+                return Ok(());
+            }
             // Attach the client to the specified session and switch to the tab.
             switch_client_session(
                 client_id,
@@ -9934,6 +9955,10 @@ async fn handle_command(
             tab_index,
             pane_id,
         } => {
+            if refuse_missing_session(client_id, &session, state, clients).await {
+                log::info!("SessionSwitchPane: session '{session}' not found; the client stays");
+                return Ok(());
+            }
             // Attach to session, switch tab, and focus pane.
             switch_client_session(
                 client_id,

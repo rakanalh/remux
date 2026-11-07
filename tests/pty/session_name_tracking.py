@@ -42,7 +42,7 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_harness import (  # noqa: E402
-    BIN, Tui, kill_relays, sm_compose_view, sm_expand, sm_goto, sm_open, sm_tree,
+    BIN, Tui, kill_relays, sm_compose_view, sm_expand, sm_goto, sm_open, sm_selected, sm_tree,
 )
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
 from harness import Client, Server  # noqa: E402
@@ -65,6 +65,9 @@ REFUSED_NAME = {
     "view_deleted_after_session_killed": "main",
     "view_exit_with_no_session_left": "main",
     "owes_both_dead": "r1",
+    "stale_jump_attached": "haven",
+    "stale_tab_jump_attached": "haven",
+    "stale_pane_jump_attached": "haven",
 }
 
 # `hand_switch_during_delete` is not here: a tree can tell the client first.
@@ -72,6 +75,12 @@ REFUSAL_REQUIRED = set(REFUSED_NAME) - {"hand_switch_during_delete"}
 
 # argv: delay, control FIFO, remux binary. A line on the FIFO goes to the client
 # at once: `tree` repeats the last `SessionTree` seen, `frame <json>` sends <json>.
+# `cut` stops reading from the client, so its writes fail while what the relay
+# sends still arrives, which is a dead ssh whose end of file is not read yet.
+# The client treats its first failed write as the drop and ends the transport
+# itself, which takes the proxy with it, so the end of file never matters.
+# `drop` ends the proxy if it is still there; the cases send it with `gone_ok`,
+# because by then it normally is not.
 PROXY = r"""
 import collections, os, struct, subprocess, sys, threading, time
 
@@ -79,6 +88,7 @@ delay, control, remux = float(sys.argv[1]), sys.argv[2], sys.argv[3]
 relay = subprocess.Popen([remux, "relay"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 to_client = threading.Lock()
 last_tree = [None]
+cut = [False]
 
 
 def frames(source):
@@ -114,7 +124,8 @@ def pump(source, sink, lock):
         with ready:
             queue.append((time.time() + delay, frame))
             ready.notify()
-    os._exit(0)
+    if not cut[0]:
+        os._exit(0)
 
 
 def controller():
@@ -124,6 +135,13 @@ def controller():
         elif line.startswith(b"frame "):
             body = line[6:].strip()
             send(sys.stdout.buffer, struct.pack(">I", len(body)) + body, to_client)
+        elif line.strip() == b"cut":
+            # The pipe loses its last reader once the read in progress returns,
+            # so the client's next write but one fails.
+            cut[0] = True
+            os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+        elif line.strip() == b"drop":
+            os._exit(0)
 
 
 threading.Thread(target=controller, daemon=True).start()
@@ -300,8 +318,16 @@ class Rig:
         if delay:
             self.t.pump(2 * delay + 1.0)
 
-    def inject(self, line):
-        with open(self.control, "w") as f:
+    def inject(self, line, gone_ok=False):
+        # Non-blocking, because a client that dropped the remote, or exited, took
+        # the proxy with it, and a blocking open of a FIFO nobody reads would hang
+        # the run. `gone_ok` is for an end of file the client need not wait for.
+        try:
+            fd = os.open(self.control, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as e:
+            check(gone_ok, f"the proxy took {line!r} ({e})")
+            return
+        with os.fdopen(fd, "w") as f:
             f.write(line + "\n")
 
     def finish(self, refused_name=None, refusal_required=False):
@@ -661,6 +687,204 @@ def owes_both_dead(r):
     runs_in(t, "after wq and Alt+o", "r3", "ac2")
 
 
+def runs_on_status(t, label, session, tag):
+    """For a tab that moved between sessions, whose shell keeps the
+    `$REMUX_SESSION` it started with: the session is the status bar's, and the
+    assembled marker only proves the input ran."""
+    check(t.alive(), f"{label}: the client is alive")
+    if not t.alive():
+        return
+    check(wait_for(t, lambda: status_names(t, session)),
+          f"{label}: the status bar names {session!r} ({t.rows_text()[-1].strip()[:40]!r})")
+    t.send(f"printf 'RAN:%s\\n' {tag}\r", 0.2)
+    check(wait_for(t, lambda: t.has(f"RAN:{tag}")), f"{label}: typed input ran")
+
+
+def menu_click(t, label):
+    """Click the open context menu's row whose whole text is `label`."""
+    rows = t.rows_text()
+    top = next(y for y, row in enumerate(rows) if "\u250c" in row)
+    left, right = rows[top].index("\u250c"), rows[top].index("\u2510")
+    y = top + 1
+    while rows[y][left] == "\u2502":
+        if rows[y][left + 1:right].strip() == label:
+            x = left + 2
+            t.send(f"\x1b[<0;{x + 1};{y + 1}M\x1b[<0;{x + 1};{y + 1}m".encode(), 1.5)
+            return
+        y += 1
+    raise AssertionError(f"no menu row {label!r}: {rows[top:y]}")
+
+
+def tab_move_follows_server(r):
+    """The server follows the tab it has active, which the menu's tree did not show.
+
+    The picker is built while Tab 1 is in the background. Another client makes it
+    the active tab before the pick, so the server moves this client with it and
+    says nothing but a tree. Alt+o must then return to `main`.
+    """
+    t, c = r.t, r.c
+    create(c, "haven")
+    switch_local(t, "haven")
+    switch_local(t, "main")
+    t.send(b"\x1bt", 0.8)
+    sm_open(t)
+    tree = sm_tree(t)
+    main_row = next(i for i, row in enumerate(tree) if is_session_row(row, "main"))
+    tab_row = next(row for row in tree[main_row + 1:] if "Tab 1" in row.text)
+    sm_goto(t, lambda row: row.y == tab_row.y, "main's Tab 1")
+    t.send("t", 0.3)
+    t.send("m", 0.8)
+    c.send({"Attach": {"session_name": "main"}})
+    c.send({"Resize": {"cols": 120, "rows": 40}})
+    time.sleep(0.3)
+    c.send({"Command": {"SessionSwitchTab": {"session": "main", "tab_index": 0}}})
+    time.sleep(0.5)
+    menu_click(t, "haven")
+    close_manager(t)
+    runs_on_status(t, "the server moved the client", "haven", "ad1")
+    t.send(ALT_O, 1.2)
+    runs_on_status(t, "Alt+o after the move", "main", "ad2")
+
+
+def stale_jump_attached(r):
+    """A jump from a manager whose tree still lists a deleted session.
+
+    The client stays where it is, and Alt+o still returns to the session it
+    named before the jump.
+    """
+    t, c = r.t, r.c
+    create(c, "haven")
+    create(c, "other")
+    switch_local(t, "other")
+    switch_local(t, "main")
+    sm_open(t)
+    goto_session(t, "haven")
+    kill_session(c, "haven")
+    check(any(is_session_row(row, "haven") for row in sm_tree(t)), "the manager still lists 'haven'")
+    t.send("\r", 1.2)
+    runs_in(t, "after the jump", "main", "ae1")
+    t.send(ALT_O, 1.2)
+    runs_in(t, "Alt+o", "other", "ae2")
+
+
+def stale_row_jump(r, row_of, tag):
+    """`stale_jump_attached`, with the cursor on the row `row_of` picks under haven."""
+    t, c = r.t, r.c
+    create(c, "haven")
+    create(c, "other")
+    switch_local(t, "other")
+    switch_local(t, "main")
+    sm_open(t)
+    row = row_of(t)
+    kill_session(c, "haven")
+    check(sm_selected(t).y == row.y, f"the cursor is on {row.text.strip()!r}")
+    t.send("\r", 1.2)
+    runs_in(t, "after the jump", "main", f"{tag}1")
+    t.send(ALT_O, 1.2)
+    runs_in(t, "Alt+o", "other", f"{tag}2")
+
+
+def havens_tab_row(t):
+    tree = sm_tree(t)
+    at = next(i for i, row in enumerate(tree) if is_session_row(row, "haven"))
+    tab = next(row for row in tree[at + 1:] if "Tab 1" in row.text)
+    return sm_goto(t, lambda row: row.y == tab.y, "haven's Tab 1")
+
+
+def stale_tab_jump_attached(r):
+    """A jump to a tab row of a deleted session: the server must refuse the switch too."""
+    stale_row_jump(r, havens_tab_row, "aj")
+
+
+def stale_pane_jump_attached(r):
+    """The same from that tab's pane row."""
+    def havens_pane_row(t):
+        tab = havens_tab_row(t)
+        t.send("l", 0.5)
+        tree = sm_tree(t)
+        pane = tree[next(i for i, row in enumerate(tree) if row.y == tab.y) + 1]
+        return sm_goto(t, lambda row: row.y == pane.y, "the pane under haven's Tab 1")
+
+    stale_row_jump(r, havens_pane_row, "ak")
+
+
+def stale_jump_from_view(r):
+    """The same jump from inside a View: it must not leave the client detached."""
+    t, c = r.t, r.c
+    create(c, "haven")
+    view_over_current_tab(t, "af1")
+    sm_open(t)
+    goto_session(t, "haven")
+    kill_session(c, "haven")
+    check(any(is_session_row(row, "haven") for row in sm_tree(t)), "the manager still lists 'haven'")
+    t.send("\r", 1.2)
+    runs_in(t, "after the jump", "main", "af2")
+
+
+def cut_the_remote(r, t):
+    """Make the client's writes to the remote fail before it reads end of file."""
+    r.inject("cut")
+    t.pump(0.3)
+    # The proxy's read in progress takes this one, so the pipe has no reader after it.
+    t.send("x", 0.6)
+
+
+def dropped_writes_logged(t):
+    check("failed and was dropped" in t.log("client"),
+          "the client logged a dropped write, so the cut took effect")
+
+
+def drop_race_view_exit(r):
+    """`wq` on a remote whose ssh has died, before the client reads end of file."""
+    t = r.t
+    switch_remote(t, "r1")
+    view_over_current_tab(t, "ag1")
+    cut_the_remote(r, t)
+    t.prefix(b"wq", 0.8)
+    check(t.alive(), "the client survived `wq` on a dead pipe")
+    dropped_writes_logged(t)
+    r.inject("drop", gone_ok=True)
+    t.pump(1.5)
+    runs_in(t, "after the drop", "main", "ag2")
+
+
+def drop_race_alt_o(r):
+    """Alt+o on a remote whose ssh has died, before the client reads end of file."""
+    t = r.t
+    switch_remote(t, "r2")
+    switch_remote(t, "r1")
+    cut_the_remote(r, t)
+    t.send(ALT_O, 0.8)
+    check(t.alive(), "the client survived Alt+o on a dead pipe")
+    dropped_writes_logged(t)
+    r.inject("drop", gone_ok=True)
+    t.pump(1.5)
+    runs_in(t, "after the drop", "main", "ah1")
+
+
+def drop_race_typing(r):
+    """Typing into a remote whose ssh has died, before the client reads end of file."""
+    t = r.t
+    switch_remote(t, "r1")
+    cut_the_remote(r, t)
+    t.send("echo lost\r", 0.8)
+    check(t.alive(), "the client survived typing on a dead pipe")
+    dropped_writes_logged(t)
+    r.inject("drop", gone_ok=True)
+    t.pump(1.5)
+    runs_in(t, "after the drop", "main", "ai1")
+
+
+def drop_race_no_end_of_file(r):
+    """A dead pipe whose end of file never comes: the first failed write is the drop."""
+    t = r.t
+    switch_remote(t, "r1")
+    cut_the_remote(r, t)
+    t.send("echo lost\r", 1.5)
+    dropped_writes_logged(t)
+    runs_in(t, "with the remote's output still open", "main", "al1")
+
+
 def typing_during_alt_o(r):
     """Keys typed behind Alt+o go to the session it switched to."""
     t = r.t
@@ -725,6 +949,15 @@ CASES = [
     (owes_both_dead, {"remote": True, "delay": DELAY}),
     (typing_during_alt_o, {"remote": True, "delay": DELAY}),
     (create_with_tree_in_flight, {"remote": True, "delay": DELAY}),
+    (tab_move_follows_server, {}),
+    (stale_jump_attached, {}),
+    (stale_jump_from_view, {}),
+    (drop_race_view_exit, {"remote": True, "delay": 0.01}),
+    (drop_race_alt_o, {"remote": True, "delay": 0.01}),
+    (drop_race_typing, {"remote": True, "delay": 0.01}),
+    (stale_tab_jump_attached, {}),
+    (stale_pane_jump_attached, {}),
+    (drop_race_no_end_of_file, {"remote": True, "delay": 0.01}),
 ]
 
 
