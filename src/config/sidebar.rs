@@ -6,7 +6,7 @@
 //! An unknown `edge`, by contrast, is a typo with no forward-compatible
 //! reading, so serde rejects it.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::client::chrome::{SidebarEdge, SidebarStyle};
 
@@ -20,6 +20,38 @@ fn default_collapse_to_strip() -> bool {
 
 fn default_weight() -> u16 {
     1
+}
+
+/// What the `sessions` panel draws after a row's marker.
+///
+/// `Emoji` is the default because `Nerd` draws glyphs from the Private Use Area,
+/// which render as boxes without a Nerd Font.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IconStyle {
+    #[default]
+    Emoji,
+    Nerd,
+    None,
+}
+
+impl IconStyle {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "emoji" => Some(Self::Emoji),
+            "nerd" => Some(Self::Nerd),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+/// Keep any TOML value as text, so that `make_plugin` can warn about it. A type
+/// error here would fail the whole config and take every sidebar with it.
+fn icons_as_text<'de, D: Deserializer<'de>>(de: D) -> Result<Option<String>, D::Error> {
+    Ok(Some(match toml::Value::deserialize(de)? {
+        toml::Value::String(text) => text,
+        other => other.to_string(),
+    }))
 }
 
 /// One plugin panel inside a sidebar.
@@ -38,6 +70,12 @@ pub struct PanelConfig {
     /// Ignored by every other plugin.
     #[serde(default)]
     pub editor: Option<String>,
+    /// The `sessions` panel's [`IconStyle`] by name, resolved in `make_plugin`,
+    /// which warns about an unknown name and falls back to the default.
+    ///
+    /// Ignored by every other plugin.
+    #[serde(default, deserialize_with = "icons_as_text")]
+    pub icons: Option<String>,
     /// DEPRECATED and ignored. Parsed only so that a config still carrying it
     /// gets a warning naming [`PanelConfig::editor`] instead of silence.
     ///
@@ -64,6 +102,7 @@ impl PanelConfig {
             plugin: plugin.to_string(),
             weight: 1,
             editor: None,
+            icons: None,
             command: None,
         }
     }
@@ -98,6 +137,19 @@ mod tests {
     struct Wrapper {
         #[serde(default)]
         sidebar: Vec<SidebarConfig>,
+    }
+
+    #[test]
+    fn an_icons_value_of_any_type_reaches_make_plugin_as_text() {
+        let toml = |value: &str| {
+            format!(
+                "[[sidebar]]\nedge = \"left\"\nsize = 30\n[[sidebar.panel]]\nplugin = \"sessions\"\n{value}"
+            )
+        };
+        let icons = |value: &str| parse(&toml(value))[0].panel[0].icons.clone();
+        assert_eq!(icons(""), None);
+        assert_eq!(icons("icons = \"nerd\""), Some("nerd".to_string()));
+        assert_eq!(icons("icons = 3"), Some("3".to_string()));
     }
 
     fn parse(s: &str) -> Vec<SidebarConfig> {

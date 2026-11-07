@@ -889,6 +889,11 @@
 #   editor  — the editor the `files` panel opens a file with, OVERRIDING the
 #             server's own $EDITOR. Optional and usually absent; the server
 #             already knows $EDITOR. Ignored by every other plugin.
+#   icons   — what the `sessions` panel draws after a row's marker: "emoji"
+#             (default), "nerd" or "none". "nerd" needs a Nerd Font, and without
+#             one its glyphs are boxes. Use it when the terminal cannot draw
+#             colour emoji. An unknown value warns and uses the default.
+#             Ignored by every other plugin.
 #   command — parsed and then IGNORED, with a warning naming `editor`. See
 #             "Migrating from `browser` / the old `files`" below.
 #

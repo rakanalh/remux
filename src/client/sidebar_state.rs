@@ -333,12 +333,14 @@ mod tests {
             panel: vec![
                 PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: 2,
                 },
                 PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
@@ -453,6 +455,7 @@ mod tests {
                 .iter()
                 .map(|w| PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: *w,
@@ -756,6 +759,7 @@ mod tests {
             collapse_to_strip: false,
             panel: vec![PanelConfig {
                 editor: None,
+                icons: None,
                 command: None,
                 plugin: "placeholder".into(),
                 weight: 1,

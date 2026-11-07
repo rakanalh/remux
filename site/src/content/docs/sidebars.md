@@ -66,6 +66,7 @@ Sizes are clamped so the panes keep at least 20 columns and 5 rows. A sidebar th
 | `plugin` | — (required) | Which plugin to show: `sessions`, `agents`, `views`, `files` or `placeholder`. |
 | `weight` | `1` | This panel's share of the sidebar relative to its siblings. Weights of 2 and 1 split the sidebar two thirds and one third. |
 | `editor` | unset | `files` only: the editor to open files with, overriding the server's `$EDITOR`. Ignored by every other plugin. |
+| `icons` | `emoji` | `sessions` only: what a row shows after its marker, `emoji`, `nerd` or `none`. `nerd` needs a Nerd Font and suits a terminal that cannot draw colour emoji. An unknown value warns and uses the default. Ignored by every other plugin. |
 
 An unknown plugin name is skipped with a warning rather than rejected, so a config written for a newer Remux still loads. A sidebar with no usable panels is dropped entirely. Both tables are also in the [config reference](/remux/config-reference/#sidebar).
 

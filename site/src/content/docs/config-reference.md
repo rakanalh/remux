@@ -186,6 +186,7 @@ Panels stack inside their sidebar in the order written.
 | `plugin` | string | none (required) | `sessions`, `files`, `agents`, `views` or `placeholder`. An unknown name is skipped with a warning. `browser` is accepted as an old name for `files`. |
 | `weight` | integer | `1` | This panel's share of the sidebar relative to its siblings. |
 | `editor` | string | unset | `files` only: the editor to open a file with. Unset uses the server's `$EDITOR`, then `vi`. |
+| `icons` | string | `emoji` | `sessions` only: what a row shows after its marker, `emoji`, `nerd` or `none`. `nerd` needs a Nerd Font. An unknown value warns and uses the default. |
 | `command` | string | unset | **Deprecated and ignored**, with a warning. Use `editor`. |
 
 ```toml

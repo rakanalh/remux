@@ -1319,6 +1319,7 @@ mod focus_tests {
             collapse_to_strip: false,
             panel: vec![PanelConfig {
                 editor: None,
+                icons: None,
                 command: None,
                 plugin: "placeholder".into(),
                 weight: 1,
@@ -1337,6 +1338,7 @@ mod focus_tests {
             collapse_to_strip: false,
             panel: vec![PanelConfig {
                 editor: None,
+                icons: None,
                 command: None,
                 plugin: "files".into(),
                 weight: 1,
@@ -1389,6 +1391,7 @@ mod focus_tests {
             panel: (0..n)
                 .map(|_| PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
@@ -1560,12 +1563,14 @@ mod focus_tests {
                 panel: vec![
                     PanelConfig {
                         editor: None,
+                        icons: None,
                         command: None,
                         plugin: "placeholder".into(),
                         weight: 1,
                     },
                     PanelConfig {
                         editor: None,
+                        icons: None,
                         command: None,
                         plugin: "placeholder".into(),
                         weight: 1,
@@ -1580,6 +1585,7 @@ mod focus_tests {
                 collapse_to_strip: false,
                 panel: vec![PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
@@ -1866,18 +1872,21 @@ mod focus_tests {
             panel: vec![
                 PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: 10,
                 },
                 PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
                 },
                 PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: 10,
@@ -2158,12 +2167,14 @@ mod focus_tests {
             panel: vec![
                 PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
                 },
                 PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
@@ -2258,6 +2269,7 @@ mod resize_tests {
                 .iter()
                 .map(|w| PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: *w,
@@ -2435,6 +2447,7 @@ mod resize_tests {
             panel: (0..panels)
                 .map(|_| PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
@@ -2456,6 +2469,7 @@ mod resize_tests {
                 .iter()
                 .map(|w| PanelConfig {
                     editor: None,
+                    icons: None,
                     command: None,
                     plugin: "placeholder".into(),
                     weight: *w,

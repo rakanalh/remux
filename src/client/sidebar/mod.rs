@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::client::context_menu::{MenuAction, MenuItem};
 use crate::client::registry::ConnId;
 use crate::client::tree_model::JumpTarget;
-use crate::config::sidebar::PanelConfig;
+use crate::config::sidebar::{IconStyle, PanelConfig};
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
 use crate::server::layout::FocusDirection;
@@ -392,7 +392,7 @@ the server's $EDITOR.",
     }
     match cfg.plugin.as_str() {
         "placeholder" => Some(Box::new(placeholder::PlaceholderPlugin::new())),
-        "sessions" => Some(Box::new(sessions::SessionsPlugin::new())),
+        "sessions" => Some(Box::new(sessions::SessionsPlugin::new(icon_style(cfg)))),
         "agents" => Some(Box::new(agents::AgentsPlugin::new())),
         "views" => Some(Box::new(views::ViewsPlugin::new())),
         "files" => Some(Box::new(files::FilesPlugin::new(cfg.editor.clone()))),
@@ -406,6 +406,20 @@ rename it in your config."
         }
         _ => None,
     }
+}
+
+fn icon_style(cfg: &PanelConfig) -> IconStyle {
+    let Some(name) = cfg.icons.as_deref() else {
+        return IconStyle::default();
+    };
+    IconStyle::parse(name).unwrap_or_else(|| {
+        log::warn!(
+            "sidebar: unknown `icons` value {name:?} on panel plugin = {:?}. Expected \
+`emoji`, `nerd` or `none`; using the default.",
+            cfg.plugin
+        );
+        IconStyle::default()
+    })
 }
 
 /// `text` cut to at most `width` display columns.
@@ -588,6 +602,16 @@ pub fn shorten_path(path: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_icons_value_keeps_the_panel_on_the_default_style() {
+        let cfg = PanelConfig {
+            icons: Some("sparkly".to_string()),
+            ..PanelConfig::named("sessions")
+        };
+        assert_eq!(icon_style(&cfg), IconStyle::default());
+        assert!(make_plugin(&cfg).is_some());
+    }
 
     /// The substitution the `files` panel header asks for, and the one shape it
     /// must refuse.
