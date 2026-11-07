@@ -10,7 +10,7 @@ use std::time::Duration;
 use crossterm::event::{KeyEvent, MouseEventKind};
 use unicode_width::UnicodeWidthChar;
 
-use crate::client::context_menu::MenuItem;
+use crate::client::context_menu::{MenuAction, MenuItem};
 use crate::client::registry::ConnId;
 use crate::client::tree_model::JumpTarget;
 use crate::config::sidebar::PanelConfig;
@@ -26,7 +26,7 @@ pub mod sessions;
 pub mod views;
 
 /// What the client should do after handing an event to a plugin.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PluginAction {
     /// Nothing happened; do not repaint.
     None,
@@ -60,6 +60,15 @@ pub enum PluginAction {
     /// is at dispatch time, and an index would name whichever view moved into
     /// that slot.
     EnterView(crate::protocol::ViewId),
+    /// Open a menu by panel row `row`, as a right press does, from a key.
+    /// `confirm` opens it asking to confirm its one item.
+    OpenMenu {
+        items: Vec<MenuItem>,
+        row: u16,
+        confirm: bool,
+    },
+    /// Run what a menu row would run, with no menu.
+    RunMenuAction(MenuAction),
 }
 
 /// One view as the `views` panel lists it. A plain summary of a

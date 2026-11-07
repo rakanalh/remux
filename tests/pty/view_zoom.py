@@ -43,7 +43,7 @@ from pty_harness import Tui, sm_compose_view  # noqa: E402
 from harness import Client as WireClient, name_of  # noqa: E402
 
 COLS, ROWS = 120, 40
-RUNDIR = "/tmp/rmx-vzoom"
+RUNDIR = os.environ.get("REMUX_VZOOM_RUN", "/tmp/rmx-vzoom")
 ALT_Z, ALT_U, ALT_I, ALT_Y = b"\x1bz", b"\x1bu", b"\x1bi", b"\x1by"
 ALT_H, ALT_L, ALT_SPACE = b"\x1bh", b"\x1bl", b"\x1b "
 TRACKER = b"printf '\\033[?1002h\\033[?1006h\\033[?1049h'; cat -v\r"

@@ -227,7 +227,11 @@ pub enum ConnDescriptor {
 /// `zoom_mode` and `float_pct` to [`ViewInfo`]. A 23 server DECODES the new
 /// `ViewToggleZoom` body and ignores `mode`, so a forced float would fill the
 /// view; the bump makes the new client refuse that server at the handshake.
-pub const PROTOCOL_VERSION: u32 = 24;
+///
+/// 24 -> 25: [`RemuxCommand::TabMoveToSession`]. A 24 server cannot decode the
+/// command and drops the connection, so the bump turns that into a refused
+/// handshake for the upgraded client.
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -2431,6 +2435,15 @@ pub enum RemuxCommand {
         #[serde(default)]
         session: Option<String>,
     },
+    /// Move a whole tab, with its panes, from session `from` to session `to` on
+    /// this server. `from` is a cross-check: the move is refused when the tab
+    /// is no longer there, because the client chose it from a tree that may be
+    /// stale. The requester follows the tab only when it was looking at it.
+    TabMoveToSession {
+        tab_id: u64,
+        from: String,
+        to: String,
+    },
     PaneRename(String),
     /// Zoom the focused pane the way `[zoom] mode` says, or release a zoom of
     /// either mode.
@@ -2706,6 +2719,9 @@ impl RemuxCommand {
             // the requester's own session it replaces the whole screen, which is
             // a larger change than `PaneNewInTab`, not a smaller one.
             | RemuxCommand::TabNewInSession { session } => session == attached_session,
+            RemuxCommand::TabMoveToSession { from, to, .. } => {
+                from == attached_session || to == attached_session
+            }
 
             // Entering copy mode or the search prompt FROM a scrolled position
             // is the reason the user scrolled in the first place; snapping
@@ -4704,7 +4720,8 @@ mod tests {
             | RemuxCommand::PaneCloseById { .. }
             | RemuxCommand::PaneRenameById { .. }
             | RemuxCommand::TabMoveByIndex { .. }
-            | RemuxCommand::PaneMoveToTabTarget { .. } => None,
+            | RemuxCommand::PaneMoveToTabTarget { .. }
+            | RemuxCommand::TabMoveToSession { .. } => None,
         }
     }
 
@@ -4736,11 +4753,12 @@ mod tests {
         serde_json::from_slice(&encoded[4..4 + len]).unwrap()
     }
 
-    /// A peer on 23 drops the `mode` of a `ViewToggleZoom` without an error, so
-    /// the handshake has to refuse that pairing.
+    /// A peer on 23 drops the `mode` of a `ViewToggleZoom` without an error,
+    /// and a peer on 24 cannot decode `TabMoveToSession`, so the handshake has
+    /// to refuse both pairings.
     #[test]
-    fn protocol_version_is_24_for_the_view_zoom_mode() {
-        assert_eq!(PROTOCOL_VERSION, 24);
+    fn protocol_version_is_25_for_the_tab_move() {
+        assert_eq!(PROTOCOL_VERSION, 25);
     }
 
     #[test]

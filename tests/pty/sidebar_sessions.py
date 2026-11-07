@@ -27,9 +27,34 @@ What it covers:
      tree OR to the agent list
  10  a push that removes a row ABOVE the selection does not retarget it --
      Enter still jumps to the session the user picked
+ 11  each of folder, session, tab and pane wears its own icon; a server wears none
+ 12  right-clicking a folder offers Rename and a Delete that names the sessions
+     it takes with it; both land, read back from the server
+ 13  a click on a tab's marker shows and hides its panes across tree pushes,
+     never jumps, and a click on its name still does
+ 14  right-clicking a pane offers Switch and Close, and each works
+ 15  right-clicking a tab while another tab is expanded acts on the clicked row
+ 16  a folder's menu on a NON-foreground connection lands on that server, with a
+     same-named local folder left alone
+ 17  marker clicks line up on a right-edge sidebar as well
+ 18  `d`: a tab closes at once, a folder or session asks first and names what
+     closes, Cancel is the default, a pane or server row does nothing
+ 19  `?` lists the shortcuts, `?` and Esc dismiss it, also in a narrow panel
+ 20  `m` on a session moves it between folders and back out
+ 21  `m` on a tab moves it with live panes; moving the last one removes the
+     session and leaves the client on a live one
+ 22  `t m` in the session manager does the same through the same menu
+ 23  `d` and `m` on a remote's rows land on that server
+ 24  `m` says so when there is nowhere to go
+ 25  `d` on a session's only tab asks, naming the session it ends
+ 26  killing the session the client is on lands it on a survivor, by right click,
+     by `d` and by a folder; with nothing left the client ends
+ 27  a menu left open when its remote drops: Confirm does not end the client
 
 Run from the repo root:
-    python3 tests/pty/sidebar_sessions.py [-v]
+    python3 tests/pty/sidebar_sessions.py [-v] [scenario_<name> ...]
+
+Set REMUX_SBS_RUN to a short path to run beside another copy of this harness.
 """
 import json
 import os
@@ -43,8 +68,11 @@ import time
 import pexpect
 import pyte
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pty_harness import sm_open, sm_tree
+
 BIN = os.path.abspath("target/debug/remux")
-RUN = "/tmp/rmx-sbs"
+RUN = os.environ.get("REMUX_SBS_RUN", "/tmp/rmx-sbs")
 SOCK1 = f"{RUN}/run/remux.sock"
 SOCK2 = f"{RUN}/run2/remux.sock"
 VERBOSE = "-v" in sys.argv
@@ -260,6 +288,19 @@ FRAME = 1
 HEADER_ROWS = 2
 
 
+def cell_rows(screen):
+    """Every screen row with one character per CELL, so an index is a column.
+
+    `screen.display` drops the second cell of a wide glyph, which shifts
+    everything to its right one column left per icon: a slice at the sidebar's
+    edge then takes in the frame and the pane beside it.
+    """
+    return [
+        "".join((screen.buffer[y][x].data or " ") for x in range(screen.columns))
+        for y in range(screen.lines)
+    ]
+
+
 def panel_rows(screen):
     """The panel's INTERIOR rows, one string per PANEL row.
 
@@ -269,7 +310,7 @@ def panel_rows(screen):
     """
     return [
         r[FRAME : SIDEBAR_W - FRAME].rstrip()
-        for r in screen.display[FRAME : len(screen.display) - FRAME]
+        for r in cell_rows(screen)[FRAME : screen.lines - FRAME]
     ]
 
 
@@ -279,7 +320,7 @@ def indent(row):
 
 def content_rows(screen):
     """Everything to the RIGHT of the sidebar."""
-    return [r[SIDEBAR_W:] for r in screen.display]
+    return [r[SIDEBAR_W:] for r in cell_rows(screen)]
 
 
 def panel_row_of(screen, needle):
@@ -646,14 +687,1174 @@ def seed_four():
     return out
 
 
+# ---------------------------------------------------------------------------
+# the mouse on the tree: real SGR events through the real client
+# ---------------------------------------------------------------------------
+
+MARKERS = "\u25b6\u25bc"
+ICONS = {
+    "folder": "\U0001F4C1",
+    "session": "\U0001F4BB",
+    "tab": "\U0001F4D1",
+    "pane": "\U0001F532",
+}
+
+
+def find_cell(screen, needle, lo=0, hi=None):
+    """0-based `(col, row)` of `needle` between columns `lo` and `hi`, or None."""
+    for y, row in enumerate(cell_rows(screen)):
+        x = row[lo:hi].find(needle)
+        if x >= 0:
+            return x + lo, y
+    return None
+
+
+def must_find(screen, needle, lo=0, hi=None):
+    pos = find_cell(screen, needle, lo, hi)
+    assert pos is not None, f"{needle!r} is not on screen:\n" + "\n".join(
+        r.rstrip() for r in cell_rows(screen)
+    )
+    return pos
+
+
+def press(child, pump, x, y, button=0, wait=0.5):
+    """A press and release at the 0-based cell, as a terminal reports it."""
+    child.send(f"\x1b[<{button};{x + 1};{y + 1}M".encode())
+    pump(0.1)
+    child.send(f"\x1b[<{button};{x + 1};{y + 1}m".encode())
+    pump(wait)
+
+
+def marker_of(screen, name, lo=0, hi=SIDEBAR_W):
+    """The cell of the marker on `name`'s row, read off the screen.
+
+    Located by the glyph a person aims at, so the harness does not share the
+    column arithmetic it is testing.
+    """
+    _, y = must_find(screen, name, lo, hi)
+    row = cell_rows(screen)[y]
+    hits = [x for x in range(lo, hi) if row[x] in MARKERS]
+    assert len(hits) == 1, f"no single marker on {row.rstrip()!r}"
+    return hits[0], y
+
+
+def server_tree(sock):
+    """`(folders, unfiled)` as the SERVER holds them, from a fresh connection."""
+    w = Wire(sock)
+    try:
+        w.send("ListSessionTree")
+        while True:
+            msg = w.recv()
+            if isinstance(msg, dict) and "SessionTree" in msg:
+                t = msg["SessionTree"]
+                return t["folders"], t["unfiled"]
+    finally:
+        w.close()
+
+
+def folder_names(sock):
+    return sorted(f["name"] for f in server_tree(sock)[0])
+
+
+def all_sessions(sock):
+    folders, unfiled = server_tree(sock)
+    return unfiled + [s for f in folders for s in f["sessions"]]
+
+
+def session_names(sock):
+    return sorted(s["name"] for s in all_sessions(sock))
+
+
+def session_entry(sock, name):
+    return next(s for s in all_sessions(sock) if s["name"] == name)
+
+
+def tab_names(sock, session):
+    return [t["name"] for t in session_entry(sock, session)["tabs"]]
+
+
+def pane_names(sock, session, tab):
+    entry = session_entry(sock, session)
+    return [p["name"] for t in entry["tabs"] if t["name"] == tab for p in t["panes"]]
+
+
+def seed_tree(sock=None):
+    """`home`: tabone (paneA | paneB), tabtwo (paneC), the session the client
+    attaches to, unfiled. `work` holds wone and wtwo, `junk` holds jone, and
+    `spare` is empty. Each pane prints a marker, to tell where a jump landed."""
+    sock = sock or SOCK1
+    w = Wire(sock)
+    w.send({"CreateSession": {"name": "home", "folder": None}})
+    w.send({"Attach": {"session_name": "home"}})
+    w.send({"Resize": {"cols": 74, "rows": 29}})
+    time.sleep(0.4)
+    w.send({"Command": {"TabRename": "tabone"}})
+    w.send({"Command": {"PaneRename": "paneA"}})
+    w.type("echo MARK_A\n")
+    w.send({"Command": "PaneSplitVertical"})
+    time.sleep(0.4)
+    w.send({"Command": {"PaneRename": "paneB"}})
+    w.type("echo MARK_B\n")
+    w.send({"Command": "TabNew"})
+    time.sleep(0.4)
+    w.send({"Command": {"TabRename": "tabtwo"}})
+    w.send({"Command": {"PaneRename": "paneC"}})
+    w.type("echo MARK_C\n")
+    w.send({"Command": {"SessionSwitchTab": {"session": "home", "tab_index": 0}}})
+    time.sleep(0.3)
+    for folder, sessions in (("work", ("wone", "wtwo")), ("junk", ("jone",)), ("spare", ())):
+        w.send({"Command": {"FolderNew": folder}})
+        time.sleep(0.1)
+        for name in sessions:
+            c = Wire(sock)
+            c.send({"CreateSession": {"name": name, "folder": folder}})
+            time.sleep(0.3)
+            c.close()
+    time.sleep(0.5)
+    return w
+
+
+def provoke_push(sock, pump, name):
+    """Make the server push a tree nobody in this terminal asked for."""
+    w = Wire(sock)
+    w.send({"CreateSession": {"name": name, "folder": None}})
+    pump(1.2)
+    w.close()
+
+
+def start_tree(cfgdir=None):
+    return start_tree_at(cfgdir)
+
+
+def start_tree_at(cfgdir):
+    start_server(SOCK1, env_local(cfgdir or f"{RUN}/cfg"))
+    seed = seed_tree()
+    child, screen, pump = spawn(env_local(cfgdir or f"{RUN}/cfg"))
+    pump(2.0)
+    must_find(screen, "tabone")
+    return seed, child, screen, pump
+
+
+def scenario_icons():
+    """11: each row type carries its own glyph, in the cell after the marker."""
+    print("icons")
+    seed, child, screen, pump = start_tree()
+    x, y = marker_of(screen, "tabone")
+    press(child, pump, x, y)
+
+    def icon_of(name):
+        mx, my = marker_of(screen, name) if name != "paneA" else (None, None)
+        if mx is None:
+            nx, my = must_find(screen, name, 0, SIDEBAR_W)
+            row = cell_rows(screen)[my]
+            return next((c for c in row[:nx] if ord(c) > 0x2FFF), None)
+        return cell_rows(screen)[my][mx + 2]
+
+    got = {
+        "folder": icon_of("work"),
+        "session": icon_of("home"),
+        "tab": icon_of("tabone"),
+        "pane": icon_of("paneA"),
+    }
+    log("icons:", got)
+    for kind, want in ICONS.items():
+        check(f"11 a {kind} row wears its icon", got[kind] == want,
+              f"{got} in {panel_rows(screen)}")
+    check("11 the four icons are distinct", len(set(got.values())) == 4, got)
+    server = next(r for r in panel_rows(screen) if "local" in r)
+    check("11 a server row wears no icon",
+          not any(i in server for i in ICONS.values()), server)
+    check("11 the panel's right frame is unbroken by the wide glyphs",
+          all(r[SIDEBAR_W - 1] != " " for r in cell_rows(screen)[1:ROWS - 2]),
+          [r[:SIDEBAR_W + 1] for r in cell_rows(screen)])
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+def scenario_folder_menu():
+    """12: the folder menu, locally."""
+    print("folder menu")
+    seed, child, screen, pump = start_tree()
+
+    x, y = must_find(screen, "work", 0, SIDEBAR_W)
+    press(child, pump, x, y, button=2)
+    check("12 a folder row opens a menu with Rename",
+          find_cell(screen, "Rename") is not None, cell_rows(screen))
+    check("12 Delete says it takes the folder's two sessions",
+          find_cell(screen, "Delete folder and 2 sessions") is not None,
+          cell_rows(screen))
+    mx, my = must_find(screen, "Rename")
+    press(child, pump, mx + 1, my)
+    check("12 Rename opens a prompt titled for a folder",
+          find_cell(screen, "Folder") is not None, cell_rows(screen))
+    child.send(b"office\r")
+    pump(1.2)
+    check("12 Rename renames the folder on the server",
+          "office" in folder_names(SOCK1) and "work" not in folder_names(SOCK1),
+          folder_names(SOCK1))
+    check("12 the sessions stay in the renamed folder",
+          {"wone", "wtwo"} <= set(session_names(SOCK1)), session_names(SOCK1))
+    check("12 the panel shows the new name",
+          any("office" in r for r in panel_rows(screen)), panel_rows(screen))
+
+    # Enter on an empty prompt must not leave a folder with no name.
+    x, y = must_find(screen, "office", 0, SIDEBAR_W)
+    press(child, pump, x, y, button=2)
+    mx, my = must_find(screen, "Rename")
+    press(child, pump, mx + 1, my)
+    child.send(b"\r")
+    pump(1.0)
+    check("12 an empty name leaves the folder as it was",
+          "office" in folder_names(SOCK1) and "" not in folder_names(SOCK1),
+          folder_names(SOCK1))
+
+    # Delete asks first, and a dismissed confirmation deletes nothing.
+    x, y = must_find(screen, "junk", 0, SIDEBAR_W)
+    press(child, pump, x, y, button=2)
+    check("12 one session is not pluralised",
+          find_cell(screen, "Delete folder and 1 session") is not None
+          and find_cell(screen, "1 sessions") is None, cell_rows(screen))
+    mx, my = must_find(screen, "Delete folder")
+    press(child, pump, mx + 1, my)
+    check("12 Delete asks for confirmation",
+          find_cell(screen, "Confirm: Delete folder") is not None, cell_rows(screen))
+    child.send(b"\x1b")
+    pump(0.8)
+    check("12 Esc on the confirmation deletes nothing",
+          "junk" in folder_names(SOCK1) and "jone" in session_names(SOCK1),
+          folder_names(SOCK1))
+
+    press(child, pump, x, y, button=2)
+    mx, my = must_find(screen, "Delete folder")
+    press(child, pump, mx + 1, my)
+    mx, my = must_find(screen, "Confirm: Delete folder")
+    press(child, pump, mx + 1, my, wait=1.2)
+    check("12 Delete removes the folder", "junk" not in folder_names(SOCK1),
+          folder_names(SOCK1))
+    check("12 Delete kills the folder's session, as its label says",
+          "jone" not in session_names(SOCK1), session_names(SOCK1))
+    check("12 sessions outside the folder survive",
+          {"home", "wone", "wtwo"} <= set(session_names(SOCK1)), session_names(SOCK1))
+    check("12 the panel drops the folder",
+          not any("junk" in r for r in panel_rows(screen)), panel_rows(screen))
+
+    # An empty folder has nothing to warn about.
+    x, y = must_find(screen, "spare", 0, SIDEBAR_W)
+    press(child, pump, x, y, button=2)
+    check("12 an empty folder's Delete mentions no sessions",
+          find_cell(screen, "Delete folder") is not None
+          and find_cell(screen, "Delete folder and") is None, cell_rows(screen))
+    child.send(b"\x1b")
+    pump(0.5)
+    check("12 the client survived", child.isalive())
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+def scenario_marker_click():
+    """13: the marker toggles, the name selects then jumps."""
+    print("marker click")
+    seed, child, screen, pump = start_tree()
+
+    def shown(name):
+        return any(name in r for r in panel_rows(screen))
+
+    check("13 a tab starts collapsed", not shown("paneA"), panel_rows(screen))
+    x, y = marker_of(screen, "tabone")
+    press(child, pump, x, y)
+    check("13 a click on the marker shows the tab's panes",
+          shown("paneA") and shown("paneB"), panel_rows(screen))
+    panes_y = [i for i, r in enumerate(panel_rows(screen)) if "paneA" in r or "paneB" in r]
+    tab_y = panel_row_of(screen, "tabone")
+    check("13 the panes sit directly beneath their tab",
+          panes_y == [tab_y + 1, tab_y + 2], panel_rows(screen))
+
+    provoke_push(SOCK1, pump, "push1")
+    check("13 an opened tab stays open across a tree push",
+          shown("push1") and shown("paneA"), panel_rows(screen))
+
+    x, y = marker_of(screen, "tabone")
+    press(child, pump, x + 1, y)
+    check("13 the marker's second column hides the panes again",
+          not shown("paneA"), panel_rows(screen))
+    provoke_push(SOCK1, pump, "push2")
+    check("13 a closed tab stays closed across a tree push",
+          shown("push2") and not shown("paneA"), panel_rows(screen))
+
+    # A double click toggles twice and goes nowhere, on a tab that is not active.
+    x, y = marker_of(screen, "tabtwo")
+    child.send(f"\x1b[<0;{x + 1};{y + 1}M\x1b[<0;{x + 1};{y + 1}m".encode())
+    child.send(f"\x1b[<0;{x + 1};{y + 1}M\x1b[<0;{x + 1};{y + 1}m".encode())
+    pump(1.0)
+    body = "\n".join(content_rows(screen))
+    check("13 a double click on a marker leaves the tab closed", not shown("paneC"),
+          panel_rows(screen))
+    check("13 a double click on a marker does not jump",
+          "MARK_A" in body and "MARK_C" not in body, body[-300:])
+
+    # The marker click selected the row, so Enter acts on it.
+    press(child, pump, x, y)
+    check("13 the marker opens an inactive tab", shown("paneC"), panel_rows(screen))
+    body = "\n".join(content_rows(screen))
+    check("13 a single marker click does not jump",
+          "MARK_A" in body and "MARK_C" not in body, body[-300:])
+
+    # A click past the marker is the name: select first, jump on the second.
+    x, y = must_find(screen, "tabone", 0, SIDEBAR_W)
+    press(child, pump, x, y)
+    check("13 a first click on a name neither toggles nor jumps",
+          not shown("paneA") and "MARK_A" in "\n".join(content_rows(screen)),
+          panel_rows(screen))
+    x, y = must_find(screen, "tabtwo", 0, SIDEBAR_W)
+    press(child, pump, x, y)
+    press(child, pump, x, y, wait=1.2)
+    body = "\n".join(content_rows(screen))
+    check("13 a second click on a tab's name jumps to it",
+          "MARK_C" in body and "MARK_A" not in body, body[-300:])
+
+    # The same marker on a server, a folder and a session.
+    for name, child_row in (("work", "wone"), ("wone", None), ("local", "home")):
+        x, y = marker_of(screen, name)
+        before = panel_rows(screen)
+        press(child, pump, x, y)
+        after = panel_rows(screen)
+        check(f"13 the marker on {name!r} toggles it", before != after, after)
+        if child_row:
+            check(f"13 closing {name!r} hides {child_row!r}", not shown(child_row), after)
+            provoke_push(SOCK1, pump, f"push-{name}")
+            check(f"13 a tree push leaves {name!r} closed", not shown(child_row),
+                  panel_rows(screen))
+        x, y = marker_of(screen, name)
+        press(child, pump, x, y)
+
+    check("13 the client survived", child.isalive())
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+def scenario_pane_menu():
+    """14: Switch and Close on an inner pane row."""
+    print("pane menu")
+    seed, child, screen, pump = start_tree()
+    x, y = marker_of(screen, "tabone")
+    press(child, pump, x, y)
+
+    x, y = must_find(screen, "paneA", 0, SIDEBAR_W)
+    press(child, pump, x, y, button=2)
+    check("14 a pane row offers Switch", find_cell(screen, "Switch") is not None,
+          cell_rows(screen))
+    check("14 a pane row offers Close", find_cell(screen, "Close pane") is not None,
+          cell_rows(screen))
+    check("14 a pane row offers no Rename", find_cell(screen, "Rename") is None,
+          cell_rows(screen))
+
+    # The split left focus on paneB, so landing in paneA is a real move: the
+    # marker assembled by the shell appears in that pane's half of the screen.
+    mx, my = must_find(screen, "Switch")
+    press(child, pump, mx + 1, my, wait=1.2)
+    child.send(b"printf 'HERE:%s\\n' a\r")
+    pump(1.0)
+    pos = find_cell(screen, "HERE:a", SIDEBAR_W)
+    mark = find_cell(screen, "MARK_A", SIDEBAR_W)
+    other = find_cell(screen, "MARK_B", SIDEBAR_W)
+    check("14 Switch focuses the clicked pane",
+          pos is not None and mark is not None and other is not None
+          and abs(pos[0] - mark[0]) < abs(pos[0] - other[0]),
+          f"HERE {pos} MARK_A {mark} MARK_B {other}")
+
+    x, y = must_find(screen, "paneB", 0, SIDEBAR_W)
+    press(child, pump, x, y, button=2)
+    mx, my = must_find(screen, "Close pane")
+    press(child, pump, mx + 1, my)
+    check("14 Close asks for confirmation",
+          find_cell(screen, "Confirm: Close pane") is not None, cell_rows(screen))
+    mx, my = must_find(screen, "Confirm: Close pane")
+    press(child, pump, mx + 1, my, wait=1.2)
+    check("14 Close closes the clicked pane on the server",
+          pane_names(SOCK1, "home", "tabone") == ["paneA"],
+          pane_names(SOCK1, "home", "tabone"))
+    check("14 the panel drops the row",
+          not any("paneB" in r for r in panel_rows(screen)), panel_rows(screen))
+    check("14 the client survived", child.isalive())
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+def scenario_tab_menu_expanded():
+    """15: rows shift under an expanded tab; the menu must follow the click."""
+    print("tab menu while expanded")
+    seed, child, screen, pump = start_tree()
+    x, y = marker_of(screen, "tabone")
+    press(child, pump, x, y)
+
+    x, y = must_find(screen, "tabtwo", 0, SIDEBAR_W)
+    press(child, pump, x, y, button=2)
+    mx, my = must_find(screen, "Switch")
+    press(child, pump, mx + 1, my, wait=1.2)
+    body = "\n".join(content_rows(screen))
+    check("15 Switch lands on the tab that was clicked",
+          "MARK_C" in body and "MARK_A" not in body, body[-300:])
+
+    x, y = must_find(screen, "tabtwo", 0, SIDEBAR_W)
+    press(child, pump, x, y, button=2)
+    mx, my = must_find(screen, "Close tab")
+    press(child, pump, mx + 1, my)
+    mx, my = must_find(screen, "Confirm: Close tab")
+    press(child, pump, mx + 1, my, wait=1.2)
+    check("15 Close closes the tab that was clicked",
+          tab_names(SOCK1, "home") == ["tabone"], tab_names(SOCK1, "home"))
+    check("15 the expanded tab keeps its panes on show",
+          any("paneA" in r for r in panel_rows(screen)), panel_rows(screen))
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+def scenario_folder_remote():
+    """16: the folder lives on the background connection. Both servers hold a
+    folder of the same name, so a command that went to the foreground would act
+    on the WRONG folder rather than on nothing."""
+    print("folder menu on a remote")
+    start_server(SOCK2, env_remote())
+    r = Wire(SOCK2)
+    r.send({"CreateSession": {"name": "rhome", "folder": None}})
+    time.sleep(0.4)
+    r.send({"Command": {"FolderNew": "shared"}})
+    r.send({"Command": {"FolderNew": "rgone"}})
+    time.sleep(0.2)
+    for name, folder in (("rone", "shared"), ("rtwo", "rgone")):
+        c = Wire(SOCK2)
+        c.send({"CreateSession": {"name": name, "folder": folder}})
+        time.sleep(0.3)
+        c.close()
+
+    start_server(SOCK1, env_local(f"{RUN}/cfg-remote"))
+    seed = seed_tree()
+    seed.send({"Command": {"FolderNew": "shared"}})
+    seed.send({"Command": {"FolderNew": "rgone"}})
+    time.sleep(0.3)
+    child, screen, pump = spawn(env_local(f"{RUN}/cfg-remote"))
+    pump(3.0)
+
+    # Collapsed local folders first, so the remote's rows fit on screen.
+    x, y = marker_of(screen, "local")
+    press(child, pump, x, y)
+    x, y = must_find(screen, "shared", 0, SIDEBAR_W)
+    check("16 the remote's folder is the one on screen",
+          y > must_find(screen, "mini", 0, SIDEBAR_W)[1], panel_rows(screen))
+    press(child, pump, x, y, button=2)
+    mx, my = must_find(screen, "Rename")
+    press(child, pump, mx + 1, my)
+    child.send(b"moved\r")
+    pump(1.5)
+    check("16 Rename lands on the remote",
+          "moved" in folder_names(SOCK2) and "shared" not in folder_names(SOCK2),
+          folder_names(SOCK2))
+    check("16 the local folder of that name is untouched",
+          "shared" in folder_names(SOCK1) and "moved" not in folder_names(SOCK1),
+          folder_names(SOCK1))
+
+    x, y = must_find(screen, "rgone", 0, SIDEBAR_W)
+    press(child, pump, x, y, button=2)
+    mx, my = must_find(screen, "Delete folder")
+    press(child, pump, mx + 1, my)
+    mx, my = must_find(screen, "Confirm: Delete folder")
+    press(child, pump, mx + 1, my, wait=1.5)
+    check("16 Delete lands on the remote",
+          "rgone" not in folder_names(SOCK2) and "rtwo" not in session_names(SOCK2),
+          (folder_names(SOCK2), session_names(SOCK2)))
+    check("16 the local folder of that name is untouched",
+          "rgone" in folder_names(SOCK1), folder_names(SOCK1))
+    check("16 the client survived", child.isalive())
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+    r.close()
+
+
+def scenario_right_edge():
+    """17: `on_mouse` gets panel-local columns wherever the panel sits."""
+    print("marker click on a right-edge sidebar")
+    cfg = f"{RUN}/cfg-right"
+    write_config(cfg, CFG_SIDEBAR.replace('edge = "left"', 'edge = "right"'))
+    start_server(SOCK1, env_local(cfg))
+    seed = seed_tree()
+    child, screen, pump = spawn(env_local(cfg))
+    pump(2.0)
+    lo = COLS - SIDEBAR_W
+    x, y = marker_of(screen, "tabone", lo, COLS)
+    press(child, pump, x, y)
+    check("17 a marker click opens the tab", find_cell(screen, "paneA", lo) is not None,
+          cell_rows(screen))
+    x, y = marker_of(screen, "tabone", lo, COLS)
+    press(child, pump, x, y)
+    check("17 a second marker click closes it", find_cell(screen, "paneA", lo) is None,
+          cell_rows(screen))
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+def focus_panel(child, pump):
+    child.send(b"\x1b2")
+    pump(0.5)
+
+
+def menu_rows(screen):
+    """The open context menu's rows as `(col, row, text)`, off its square frame."""
+    rows = cell_rows(screen)
+    top = next((y for y, r in enumerate(rows) if "\u250c" in r), None)
+    if top is None:
+        return []
+    left = rows[top].index("\u250c")
+    right = rows[top].index("\u2510")
+    out = []
+    y = top + 1
+    while y < len(rows) and rows[y][left] == "\u2502":
+        out.append((left + 1, y, rows[y][left + 1:right].strip()))
+        y += 1
+    return out
+
+
+def menu_labels(screen):
+    return [text for _, _, text in menu_rows(screen)]
+
+
+def menu_choose(child, pump, screen, label, wait=1.2):
+    hit = next(((x, y) for x, y, text in menu_rows(screen) if text == label), None)
+    assert hit is not None, f"no menu row {label!r} in {menu_labels(screen)}"
+    press(child, pump, hit[0] + 1, hit[1], wait=wait)
+
+
+def current_row(screen):
+    """The panel's row marked as the client's session."""
+    return next((r for r in panel_rows(screen) if "* " in r), "")
+
+
+def tabs_of(sock):
+    return {s["name"]: [t["name"] for t in s["tabs"]] for s in all_sessions(sock)}
+
+
+def folders_of(sock):
+    folders, unfiled = server_tree(sock)
+    out = {f["name"]: sorted(s["name"] for s in f["sessions"]) for f in folders}
+    out[None] = sorted(s["name"] for s in unfiled)
+    return out
+
+
+def scenario_d_key():
+    """18: `d` on each row type, with Enter unharmed."""
+    print("d key")
+    seed, child, screen, pump = start_tree()
+    focus_panel(child, pump)
+
+    select_row(child, screen, pump, "tabtwo")
+    child.send(b"d")
+    pump(1.2)
+    check("18 d on a tab shows no dialog", menu_rows(screen) == [], cell_rows(screen))
+    check("18 d on a tab closes it", tab_names(SOCK1, "home") == ["tabone"],
+          tab_names(SOCK1, "home"))
+
+    select_row(child, screen, pump, "tabone")
+    child.send(b"l")
+    pump(0.5)
+    before = folders_of(SOCK1), tabs_of(SOCK1), pane_names(SOCK1, "home", "tabone")
+    for name in ("paneA", "local"):
+        select_row(child, screen, pump, name)
+        child.send(b"d")
+        pump(0.8)
+        check(f"18 d on {name!r} shows nothing", menu_rows(screen) == [], menu_rows(screen))
+        check(f"18 d on {name!r} changes nothing",
+              (folders_of(SOCK1), tabs_of(SOCK1), pane_names(SOCK1, "home", "tabone")) == before)
+
+    before = folders_of(SOCK1), tabs_of(SOCK1)
+    select_row(child, screen, pump, "work")
+    child.send(b"d")
+    pump(0.7)
+    labels = menu_labels(screen)
+    check("18 d on a folder warns, naming it and what goes",
+          "Closes everything under 'work': 2 sessions" in labels, labels)
+    check("18 the folder dialog has Confirm and Cancel",
+          "Confirm: Delete folder and 2 sessions" in labels and "Cancel" in labels, labels)
+    child.send(b"\x1b")
+    pump(0.8)
+    check("18 Esc on the folder dialog changes nothing",
+          (folders_of(SOCK1), tabs_of(SOCK1)) == before and menu_rows(screen) == [])
+    child.send(b"d")
+    pump(0.7)
+    child.send(b"\r")
+    pump(0.8)
+    check("18 Enter on the opened dialog is Cancel",
+          (folders_of(SOCK1), tabs_of(SOCK1)) == before, folders_of(SOCK1))
+    child.send(b"d")
+    pump(0.7)
+    menu_choose(child, pump, screen, "Confirm: Delete folder and 2 sessions")
+    check("18 Confirm removes the folder and its sessions",
+          "work" not in folders_of(SOCK1)
+          and not {"wone", "wtwo"} & set(session_names(SOCK1)), folders_of(SOCK1))
+
+    before = folders_of(SOCK1), tabs_of(SOCK1)
+    select_row(child, screen, pump, "jone")
+    child.send(b"d")
+    pump(0.7)
+    labels = menu_labels(screen)
+    check("18 d on a session warns, naming it and what goes",
+          "Closes everything under 'jone': 1 tab" in labels
+          and "Confirm: Kill session" in labels, labels)
+    child.send(b"\x1b")
+    pump(0.8)
+    check("18 Esc on the session dialog changes nothing",
+          (folders_of(SOCK1), tabs_of(SOCK1)) == before)
+    child.send(b"d")
+    pump(0.7)
+    menu_choose(child, pump, screen, "Confirm: Kill session")
+    check("18 Confirm kills the session", "jone" not in session_names(SOCK1),
+          session_names(SOCK1))
+    check("18 the folder that held it stays", "junk" in folders_of(SOCK1), folders_of(SOCK1))
+
+    select_row(child, screen, pump, "spare")
+    child.send(b"d")
+    pump(0.7)
+    check("18 an empty folder's dialog says so", "'spare' is empty" in menu_labels(screen),
+          menu_labels(screen))
+    child.send(b"\x1b")
+    pump(0.5)
+
+    provoke_push(SOCK1, pump, "enterme")
+    select_row(child, screen, pump, "enterme")
+    child.send(b"\r")
+    pump(1.5)
+    check("18 Enter still switches to a session", "enterme" in current_row(screen),
+          panel_rows(screen))
+    check("18 the client survived", child.isalive())
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+SHORTCUT_TEXT = ("Next row", "Previous row", "First row", "Last row", "Switch to row",
+                 "Expand or collapse", "Collapse", "Expand", "Delete folder, session or tab",
+                 "Move session or tab", "Show or hide this list", "Leave the panel")
+
+
+def scenario_shortcuts():
+    """19: `?` reaches the panel, shows the list, and goes away."""
+    print("? key")
+    cfg = f"{RUN}/cfg-narrow"
+    write_config(cfg, CFG_SIDEBAR.replace(f"size = {SIDEBAR_W}", "size = 14"))
+    for label, cfgdir in (("wide", None), ("narrow", cfg)):
+        seed, child, screen, pump = start_tree_at(cfgdir)
+        focus_panel(child, pump)
+        child.send(b"?")
+        pump(0.7)
+        rows = menu_labels(screen)
+        for text in SHORTCUT_TEXT:
+            check(f"19 {label}: {text!r} is listed", any(r.startswith(text) for r in rows), rows)
+        for key in ("j/Down", "Enter", "Space", "h/Left", "Esc"):
+            check(f"19 {label}: key {key!r} is shown", any(r.endswith(key) for r in rows), rows)
+        child.send(b"?")
+        pump(0.7)
+        check(f"19 {label}: ? dismisses it", menu_rows(screen) == [], menu_rows(screen))
+        child.send(b"?")
+        pump(0.7)
+        check(f"19 {label}: ? reopens it", menu_rows(screen) != [])
+        child.send(b"\x1b")
+        pump(0.7)
+        check(f"19 {label}: Esc dismisses it", menu_rows(screen) == [], menu_rows(screen))
+        child.send(b"?")
+        pump(0.7)
+        check(f"19 {label}: the panel kept the keyboard after Esc", menu_rows(screen) != [])
+        child.send(b"\x1b")
+        pump(0.4)
+        check_no_panic(f"{RUN}/state")
+        teardown(child)
+        seed.close()
+        stop_servers()
+        time.sleep(0.3)
+        setup_dirs()
+        write_config(cfg, CFG_SIDEBAR.replace(f"size = {SIDEBAR_W}", "size = 14"))
+
+
+def scenario_m_session():
+    """20: into a folder, between folders, back out."""
+    print("m on a session")
+    seed, child, screen, pump = start_tree()
+    focus_panel(child, pump)
+    before = folders_of(SOCK1)
+
+    select_row(child, screen, pump, "wone")
+    child.send(b"m")
+    pump(0.7)
+    labels = menu_labels(screen)
+    check("20 the picker names the session", "Move session 'wone' to:" in labels, labels)
+    check("20 it offers the other folders and the way out",
+          {"junk", "spare", "(no folder)"} <= set(labels), labels)
+    check("20 it omits the session's current folder", "work" not in labels, labels)
+    child.send(b"\x1b")
+    pump(0.7)
+    check("20 Esc changes nothing", folders_of(SOCK1) == before, folders_of(SOCK1))
+
+    child.send(b"m")
+    pump(0.7)
+    menu_choose(child, pump, screen, "spare")
+    check("20 it moves between folders",
+          "wone" in folders_of(SOCK1)["spare"] and "wone" not in folders_of(SOCK1)["work"],
+          folders_of(SOCK1))
+
+    select_row(child, screen, pump, "wone")
+    child.send(b"m")
+    pump(0.7)
+    menu_choose(child, pump, screen, "(no folder)")
+    check("20 it moves out of its folder", "wone" in folders_of(SOCK1)[None], folders_of(SOCK1))
+
+    select_row(child, screen, pump, "wone")
+    child.send(b"m")
+    pump(0.7)
+    labels = menu_labels(screen)
+    check("20 an unfiled session has no way out to offer", "(no folder)" not in labels, labels)
+    menu_choose(child, pump, screen, "junk")
+    check("20 an unfiled session moves into a folder", "wone" in folders_of(SOCK1)["junk"],
+          folders_of(SOCK1))
+    check("20 the client survived", child.isalive())
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+def assert_moved_pane_runs(child, screen, pump, tag):
+    child.send(f"clear; printf 'RAN:%s\\n' {tag}\r".encode())
+    pump(1.0)
+    return find_cell(screen, f"RAN:{tag}", SIDEBAR_W) is not None
+
+
+def scenario_m_tab():
+    """21: the background tab, then the last one."""
+    print("m on a tab")
+    seed, child, screen, pump = start_tree()
+    focus_panel(child, pump)
+    before = tabs_of(SOCK1)
+
+    select_row(child, screen, pump, "tabtwo")
+    child.send(b"m")
+    pump(0.7)
+    labels = menu_labels(screen)
+    check("21 the picker names the tab", "Move tab 'tabtwo' to:" in labels, labels)
+    check("21 it offers the other sessions", {"jone", "wone", "wtwo"} <= set(labels), labels)
+    check("21 it omits the tab's own session", "home" not in labels, labels)
+    child.send(b"\x1b")
+    pump(0.7)
+    check("21 Esc changes nothing", tabs_of(SOCK1) == before, tabs_of(SOCK1))
+
+    child.send(b"m")
+    pump(0.7)
+    menu_choose(child, pump, screen, "wone")
+    check("21 the tab moved", "tabtwo" in tabs_of(SOCK1)["wone"]
+          and "tabtwo" not in tabs_of(SOCK1)["home"], tabs_of(SOCK1))
+    check("21 a background tab leaves the client where it was",
+          "home" in current_row(screen), panel_rows(screen))
+
+    select_row(child, screen, pump, "tabone")
+    child.send(b"m")
+    pump(0.7)
+    menu_choose(child, pump, screen, "jone", wait=2.0)
+    check("21 the session that lost its last tab is gone",
+          "home" not in session_names(SOCK1), session_names(SOCK1))
+    check("21 the tab arrived with both panes",
+          pane_names(SOCK1, "jone", "tabone") == ["paneA", "paneB"],
+          pane_names(SOCK1, "jone", "tabone"))
+    check("21 the client followed the tab", "jone" in current_row(screen), panel_rows(screen))
+    check("21 the client is alive", child.isalive())
+    body = "\n".join(content_rows(screen))
+    check("21 the panes' own output came with them",
+          "MARK_A" in body and "MARK_B" in body, body[-400:])
+    child.send(b"\x1b")
+    pump(0.5)
+    check("21 a command in the moved pane runs there",
+          assert_moved_pane_runs(child, screen, pump, "tab"), cell_rows(screen))
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+def scenario_m_tab_follow():
+    """21: a followed move counts as a switch, so Alt+o goes back."""
+    print("m on the active tab, then Alt+o")
+    seed, child, screen, pump = start_tree()
+    focus_panel(child, pump)
+    select_row(child, screen, pump, "tabone")
+    child.send(b"m")
+    pump(0.7)
+    menu_choose(child, pump, screen, "wone", wait=2.0)
+    check("21 the client followed the active tab", "wone" in current_row(screen),
+          panel_rows(screen))
+    child.send(b"\x1b")
+    pump(0.4)
+    child.send(b"\x1bo")
+    pump(1.5)
+    check("21 Alt+o returns to the session it came from", "home" in current_row(screen),
+          panel_rows(screen))
+    teardown(child)
+    seed.close()
+
+
+class Drive:
+    """What `pty_harness`'s session-manager helpers read, on cell-true rows."""
+
+    def __init__(self, child, screen, pump):
+        self.child, self.screen, self.pump = child, screen, pump
+        self.rows = screen.lines
+
+    def rows_text(self):
+        return cell_rows(self.screen)
+
+    def send(self, data, t=0.4):
+        self.child.send(data)
+        self.pump(t)
+
+    def prefix(self, keys, t=0.4):
+        self.child.send(b"\x01")
+        self.pump(0.15)
+        self.child.send(keys)
+        self.pump(t)
+
+
+def manager_goto(d, needle):
+    """`sm_goto_text`, which stops after one popup of rows, past a scrolled tree."""
+    for _ in range(40):
+        if any(needle in r.text and r.selected for r in sm_tree(d)):
+            return
+        d.send(b"j", 0.15)
+    raise AssertionError(f"never reached {needle!r} in {sm_tree(d)}")
+
+
+def scenario_tm_manager():
+    """22: the session manager's chord, on the same menu."""
+    print("t m in the session manager")
+    seed, child, screen, pump = start_tree()
+    d = Drive(child, screen, pump)
+    sm_open(d)
+    before = tabs_of(SOCK1)
+
+    manager_goto(d, "wone")
+    d.send(b"t", 0.2)
+    d.send(b"m", 0.7)
+    check("22 t m on a session row opens nothing", menu_rows(screen) == [], menu_rows(screen))
+
+    manager_goto(d, "tabtwo")
+    d.send(b"t", 0.4)
+    check("22 the pending-chord hint lists tab move", find_cell(screen, "tab move") is not None,
+          cell_rows(screen))
+    d.send(b"m", 0.8)
+    labels = menu_labels(screen)
+    check("22 t m on a tab opens the picker", "Move tab 'tabtwo' to:" in labels, labels)
+    check("22 it omits the tab's own session", "home" not in labels, labels)
+    child.send(b"\x1b")
+    pump(0.8)
+    check("22 Esc on the picker changes nothing", tabs_of(SOCK1) == before, tabs_of(SOCK1))
+    check("22 Esc leaves the manager open", any("tabtwo" in r.text for r in sm_tree(d)))
+
+    d.send(b"t", 0.2)
+    d.send(b"m", 0.8)
+    menu_choose(child, pump, screen, "wone")
+    check("22 the tab moved", "tabtwo" in tabs_of(SOCK1)["wone"], tabs_of(SOCK1))
+    check("22 the manager shows it under its new session",
+          [r.text for r in sm_tree(d)].index(
+              next(r.text for r in sm_tree(d) if "tabtwo" in r.text))
+          > [r.text for r in sm_tree(d)].index(
+              next(r.text for r in sm_tree(d) if "wone" in r.text)), sm_tree(d))
+
+    manager_goto(d, "tabone")
+    d.send(b"t", 0.2)
+    d.send(b"m", 0.8)
+    menu_choose(child, pump, screen, "jone", wait=2.0)
+    check("22 the emptied session is gone", "home" not in session_names(SOCK1),
+          session_names(SOCK1))
+    check("22 the tab arrived with its panes",
+          pane_names(SOCK1, "jone", "tabone") == ["paneA", "paneB"],
+          pane_names(SOCK1, "jone", "tabone"))
+    check("22 the client is alive", child.isalive())
+    child.send(b"\x1b")
+    pump(0.8)
+    check("22 a command in the moved pane runs there",
+          assert_moved_pane_runs(child, screen, pump, "mgr"), cell_rows(screen))
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+def scenario_keys_remote():
+    """23: the foreground is local. Both servers hold a session and a folder of
+    the same names where they can, so a wrong route acts instead of no-ops."""
+    print("d and m on a remote's rows")
+    start_server(SOCK2, env_remote())
+    r = Wire(SOCK2)
+    r.send({"CreateSession": {"name": "rhome", "folder": None}})
+    r.send({"Attach": {"session_name": "rhome"}})
+    r.send({"Resize": {"cols": 74, "rows": 29}})
+    time.sleep(0.4)
+    r.send({"Command": {"TabRename": "rtab"}})
+    r.send({"Command": "TabNew"})
+    time.sleep(0.4)
+    r.send({"Command": {"TabRename": "rkeep"}})
+    r.send({"Command": {"FolderNew": "shared"}})
+    time.sleep(0.2)
+    for name, folder in (("rone", None), ("rtwo", None)):
+        c = Wire(SOCK2)
+        c.send({"CreateSession": {"name": name, "folder": folder}})
+        time.sleep(0.3)
+        c.close()
+
+    start_server(SOCK1, env_local(f"{RUN}/cfg-remote"))
+    seed = seed_tree()
+    seed.send({"Command": {"FolderNew": "shared"}})
+    time.sleep(0.3)
+    child, screen, pump = spawn(env_local(f"{RUN}/cfg-remote"))
+    pump(3.0)
+    x, y = marker_of(screen, "local")
+    press(child, pump, x, y)
+    focus_panel(child, pump)
+    local_before = folders_of(SOCK1), tabs_of(SOCK1)
+
+    select_row(child, screen, pump, "rone")
+    child.send(b"m")
+    pump(0.7)
+    menu_choose(child, pump, screen, "shared")
+    check("23 m on a session lands on the remote", "rone" in folders_of(SOCK2)["shared"],
+          folders_of(SOCK2))
+
+    select_row(child, screen, pump, "rtab")
+    child.send(b"m")
+    pump(0.7)
+    labels = menu_labels(screen)
+    check("23 a remote tab is offered only that server's sessions",
+          "rone" in labels and "home" not in labels and "wone" not in labels, labels)
+    menu_choose(child, pump, screen, "rtwo")
+    check("23 m on a tab lands on the remote", "rtab" in tabs_of(SOCK2)["rtwo"],
+          tabs_of(SOCK2))
+
+    select_row(child, screen, pump, "rtab")
+    child.send(b"d")
+    pump(1.2)
+    check("23 d on a tab lands on the remote", "rtab" not in tabs_of(SOCK2)["rtwo"],
+          tabs_of(SOCK2))
+
+    select_row(child, screen, pump, "rone")
+    child.send(b"d")
+    pump(0.7)
+    menu_choose(child, pump, screen, "Confirm: Kill session")
+    check("23 d on a session lands on the remote", "rone" not in session_names(SOCK2),
+          session_names(SOCK2))
+    check("23 the local server is untouched",
+          (folders_of(SOCK1), tabs_of(SOCK1)) == local_before, tabs_of(SOCK1))
+    check("23 the client survived", child.isalive())
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+    r.close()
+
+
+def scenario_menu_after_remote_drop():
+    """27: a menu's action names its connection, which can go while it is open."""
+    print("a confirm menu outlives its remote")
+    start_server(SOCK2, env_remote())
+    r = Wire(SOCK2)
+    r.send({"CreateSession": {"name": "rone", "folder": None}})
+    time.sleep(0.4)
+    start_server(SOCK1, env_local(f"{RUN}/cfg-remote"))
+    seed = seed_tree()
+    child, screen, pump = spawn(env_local(f"{RUN}/cfg-remote"))
+    pump(3.0)
+    focus_panel(child, pump)
+    select_row(child, screen, pump, "rone")
+    child.send(b"d")
+    pump(0.7)
+    check("27 setup: the confirm is open",
+          "Confirm: Kill session" in menu_labels(screen), menu_labels(screen))
+
+    # By position: the drop repaints the panel over the menu, which stays open.
+    mx, my = must_find(screen, "Confirm: Kill session")
+
+    subprocess.run(["pkill", "-x", "-f", f"{BIN} relay"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pump(2.0)
+    check("27 setup: the remote's rows are gone",
+          not any("rone" in r for r in panel_rows(screen)), panel_rows(screen))
+    press(child, pump, mx + 1, my, wait=2.0)
+    check("27 the client survived", child.isalive())
+    check("27 the failed send is in the log",
+          "context menu: the action failed" in open(f"{RUN}/state/remux/client.log").read())
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+    r.close()
+
+
+def scenario_nowhere():
+    """24: one session, no folders."""
+    print("m with nowhere to go")
+    start_server(SOCK1, env_local())
+    w = Wire(SOCK1)
+    w.send({"CreateSession": {"name": "only", "folder": None}})
+    w.send({"Attach": {"session_name": "only"}})
+    time.sleep(0.4)
+    w.send({"Command": {"TabRename": "lonetab"}})
+    time.sleep(0.2)
+    child, screen, pump = spawn(env_local())
+    pump(2.0)
+    focus_panel(child, pump)
+    for row, text in (("only", "No folders to move to"),
+                      ("lonetab", "No other session on this server")):
+        select_row(child, screen, pump, row)
+        child.send(b"m")
+        pump(0.7)
+        check(f"24 m on {row!r} says so", menu_labels(screen) == [text], menu_labels(screen))
+        child.send(b"\r")
+        pump(0.4)
+        check(f"24 Enter does nothing on {row!r}'s note", menu_labels(screen) == [text],
+              menu_labels(screen))
+        child.send(b"\x1b")
+        pump(0.5)
+        check(f"24 Esc closes it on {row!r}", menu_rows(screen) == [])
+    check("24 the client survived", child.isalive())
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    w.close()
+
+
+def scenario_d_only_tab():
+    """25: the key press would end the session, so it asks."""
+    print("d on a session's only tab")
+    seed, child, screen, pump = start_tree()
+    focus_panel(child, pump)
+    before = session_names(SOCK1)
+
+    select_row(child, screen, pump, "jone")
+    child.send(b"j")
+    pump(0.3)
+    child.send(b"d")
+    pump(0.7)
+    labels = menu_labels(screen)
+    check("25 it names the session it will close",
+          "Closes everything under 'jone': 1 tab" in labels
+          and "Confirm: Kill session" in labels, labels)
+    child.send(b"\x1b")
+    pump(0.8)
+    check("25 Esc changes nothing", session_names(SOCK1) == before, session_names(SOCK1))
+    child.send(b"d")
+    pump(0.7)
+    menu_choose(child, pump, screen, "Confirm: Kill session")
+    check("25 Confirm ends the session", "jone" not in session_names(SOCK1),
+          session_names(SOCK1))
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+def assert_on_survivor(child, screen, pump, label, gone):
+    pump(0.8)
+    check(f"26 {label}: the client is alive", child.isalive())
+    row = current_row(screen)
+    names = session_names(SOCK1)
+    on = next((n for n in names if n in row), None)
+    check(f"26 {label}: it is on a live session", on is not None, (row, names))
+    check(f"26 {label}: the removed session is gone", not set(gone) & set(names), names)
+    child.send(b"\x1b")
+    pump(0.5)
+    child.send(f"printf 'ALIVE:%s\\n' {label.split()[0]}\r".encode())
+    pump(0.8)
+    check(f"26 {label}: its keys reach a shell",
+          find_cell(screen, f"ALIVE:{label.split()[0]}", SIDEBAR_W) is not None,
+          cell_rows(screen))
+    return on
+
+
+def scenario_kill_attached():
+    """26: every way of removing the session on screen."""
+    print("removing the attached session")
+    seed, child, screen, pump = start_tree()
+    seed.send({"Attach": {"session_name": "wtwo"}})
+    pump(0.3)
+    for name in ("stay", "gone2"):
+        provoke_push(SOCK1, pump, name)
+
+    # Right-click Kill session.
+    x, y = must_find(screen, "home", 0, SIDEBAR_W)
+    press(child, pump, x, y, button=2)
+    menu_choose(child, pump, screen, "Kill session", wait=0.5)
+    menu_choose(child, pump, screen, "Confirm: Kill session", wait=1.5)
+    assert_on_survivor(child, screen, pump, "rightclick kill", ["home"])
+
+    # `d` on the session the client is on.
+    focus_panel(child, pump)
+    select_row(child, screen, pump, "gone2")
+    child.send(b"\r")
+    pump(1.2)
+    check("26 setup: on gone2", "gone2" in current_row(screen), panel_rows(screen))
+    focus_panel(child, pump)
+    select_row(child, screen, pump, "gone2")
+    child.send(b"d")
+    pump(0.7)
+    menu_choose(child, pump, screen, "Confirm: Kill session", wait=1.5)
+    assert_on_survivor(child, screen, pump, "dkey kill", ["gone2"])
+
+    # A folder holding the session the client is on, and another client's.
+    focus_panel(child, pump)
+    select_row(child, screen, pump, "wone")
+    child.send(b"\r")
+    pump(1.2)
+    check("26 setup: on wone", "wone" in current_row(screen), panel_rows(screen))
+    focus_panel(child, pump)
+    select_row(child, screen, pump, "work")
+    child.send(b"d")
+    pump(0.7)
+    menu_choose(child, pump, screen, "Confirm: Delete folder and 2 sessions", wait=1.5)
+    assert_on_survivor(child, screen, pump, "folder delete", ["wone", "wtwo"])
+
+    # Nothing left: the client ends, as it always has.
+    for name in list(session_names(SOCK1)):
+        focus_panel(child, pump)
+        select_row(child, screen, pump, name)
+        child.send(b"d")
+        pump(0.7)
+        menu_choose(child, pump, screen, "Confirm: Kill session", wait=1.5)
+    pump(1.0)
+    check("26 no sessions are left", session_names(SOCK1) == [], session_names(SOCK1))
+    check("26 with nothing left the client ends", not child.isalive())
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    seed.close()
+
+
+def run_scenario(scenario):
+    """A missing row stops one scenario, not the ones after it."""
+    try:
+        scenario()
+    except AssertionError as e:
+        check(f"{scenario.__name__} ran to its end", False, str(e)[:1500])
+
+
 def main():
     if not os.path.exists(BIN):
         raise SystemExit(f"{BIN} not found; run `cargo build` first")
+    only = [a for a in sys.argv[1:] if a.startswith("scenario_")]
     for scenario in (scenario_local, scenario_remote, scenario_no_sidebar,
-                     scenario_selection_identity):
+                     scenario_selection_identity, scenario_icons,
+                     scenario_folder_menu, scenario_marker_click,
+                     scenario_pane_menu, scenario_tab_menu_expanded,
+                     scenario_folder_remote, scenario_right_edge,
+                     scenario_d_key, scenario_shortcuts, scenario_m_session,
+                     scenario_m_tab, scenario_m_tab_follow, scenario_tm_manager,
+                     scenario_keys_remote, scenario_d_only_tab, scenario_kill_attached,
+                     scenario_menu_after_remote_drop, scenario_nowhere):
+        if only and scenario.__name__ not in only:
+            continue
         setup_dirs()
         try:
-            scenario()
+            run_scenario(scenario)
         finally:
             stop_servers()
             time.sleep(0.3)

@@ -808,8 +808,18 @@ pub enum MoveRefused {
     TargetNotFound,
     TargetSessionMismatch,
     TargetIsSourceTab,
+    TargetIsSourceSession,
     SolePaneInSoleTab,
     TargetLayoutMissingFocus,
+}
+
+/// What [`ServerState::move_tab_to_session`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabMoveOutcome {
+    /// Every pane the tab took with it, popup included.
+    pub panes: Vec<PaneId>,
+    /// The move emptied the source and removed it.
+    pub source_removed: bool,
 }
 
 struct MovePlan {
@@ -1396,6 +1406,9 @@ impl ServerState {
         if old_name == new_name {
             return Ok(());
         }
+        if new_name.is_empty() {
+            bail!("a folder needs a name");
+        }
         if self.folders.contains_key(new_name) {
             bail!("folder '{}' already exists", new_name);
         }
@@ -1697,6 +1710,80 @@ impl ServerState {
             target_idx,
             source_removed,
             source_tab_popup,
+        })
+    }
+
+    /// Decide whether [`ServerState::move_tab_to_session`] would move the tab,
+    /// without changing anything, and where the tab sits in `from`.
+    pub fn check_move_tab_to_session(
+        &self,
+        tab_id: TabId,
+        from: &str,
+        to: &str,
+    ) -> std::result::Result<usize, MoveRefused> {
+        let source = self.sessions.get(from).ok_or(MoveRefused::NoSession)?;
+        if !self.sessions.contains_key(to) {
+            return Err(MoveRefused::NoSession);
+        }
+        if from == to {
+            return Err(MoveRefused::TargetIsSourceSession);
+        }
+        let Some(index) = source.tabs.iter().position(|t| t.id == tab_id) else {
+            let elsewhere = self
+                .sessions
+                .values()
+                .any(|s| s.tabs.iter().any(|t| t.id == tab_id));
+            return Err(if elsewhere {
+                MoveRefused::TargetSessionMismatch
+            } else {
+                MoveRefused::TargetNotFound
+            });
+        };
+        // While a popup is up the user works in it, and it moves with its tab.
+        if index == source.active_tab && source.visible_popup().is_some() {
+            return Err(MoveRefused::PopupVisible);
+        }
+        Ok(index)
+    }
+
+    /// Move a tab from one session to another, keeping its id, its layout and
+    /// its panes. `activate` makes it the target's active tab; otherwise the
+    /// target keeps showing what it showed.
+    ///
+    /// Only the bookkeeping changes: the caller owns the PTYs. A source left
+    /// with no tabs is removed. Every refusal is decided before the first
+    /// mutation, so a refused move leaves every session exactly as it was.
+    pub fn move_tab_to_session(
+        &mut self,
+        tab_id: TabId,
+        from: &str,
+        to: &str,
+        activate: bool,
+    ) -> std::result::Result<TabMoveOutcome, MoveRefused> {
+        let index = self.check_move_tab_to_session(tab_id, from, to)?;
+        let source = self.sessions.get_mut(from).ok_or(MoveRefused::NoSession)?;
+        let tab = source.tabs.remove(index);
+        let mut panes = tab.pane_order.clone();
+        panes.extend(tab.popup_pane);
+        let source_removed = source.tabs.is_empty();
+        if source_removed {
+            self.remove_emptied_session(from);
+        } else {
+            source.after_tab_removed(index);
+            debug_check_invariant(source, "move_tab_to_session source");
+        }
+        let target = self.sessions.get_mut(to).ok_or(MoveRefused::NoSession)?;
+        target.tabs.push(tab);
+        if activate {
+            target.active_tab = target.tabs.len() - 1;
+            let tab = &mut target.tabs[target.active_tab];
+            tab.activity = TabActivity::None;
+            tab.last_output = None;
+        }
+        debug_check_invariant(target, "move_tab_to_session");
+        Ok(TabMoveOutcome {
+            panes,
+            source_removed,
         })
     }
 
@@ -3758,6 +3845,15 @@ mod popup_invariant_tests {
     }
 
     #[test]
+    fn a_folder_cannot_be_renamed_to_nothing() {
+        let mut state = ServerState::new();
+        state.create_folder("work").unwrap();
+        assert!(state.rename_folder("work", "").is_err());
+        assert!(state.folders.contains_key("work"));
+        assert!(!state.folders.contains_key(""));
+    }
+
+    #[test]
     fn delete_folder_cascade_returns_every_tabs_popup_pane() {
         let (mut st, _, popup) = state_with_popup_on(2, false, true);
         st.create_folder("work").expect("create_folder");
@@ -4802,6 +4898,117 @@ mod move_pane_to_tab_tests {
         assert_eq!(s.tabs[1].name, "Tab 3");
         assert_eq!(s.active_tab, 1);
         assert_popup_invariant(s, "new tab from emptied source");
+    }
+
+    fn two_sessions() -> (ServerState, Vec<Vec<Vec<PaneId>>>) {
+        state_with_sessions(&[
+            ("main", &[(2, bsp()), (1, bsp()), (1, bsp())]),
+            ("other", &[(1, bsp())]),
+        ])
+    }
+
+    #[test]
+    fn move_tab_to_session_keeps_the_tabs_id_panes_and_focus() {
+        let (mut st, ids) = two_sessions();
+        let id = sess_named(&st, "main").tabs[0].id;
+        let focused = sess_named(&st, "main").tabs[0].focused_pane;
+
+        let moved = st.move_tab_to_session(id, "main", "other", false).unwrap();
+
+        assert_eq!(moved.panes, ids[0][0]);
+        assert!(!moved.source_removed);
+        assert_eq!(sess_named(&st, "main").tabs.len(), 2);
+        let other = sess_named(&st, "other");
+        assert_eq!(other.tabs.len(), 2);
+        assert_eq!(other.tabs[1].id, id);
+        assert_eq!(other.tabs[1].pane_order, ids[0][0]);
+        assert_eq!(other.tabs[1].focused_pane, focused);
+        assert_eq!(
+            other.active_tab, 0,
+            "the target keeps showing what it showed"
+        );
+    }
+
+    #[test]
+    fn move_tab_to_session_activates_the_tab_when_asked() {
+        let (mut st, _) = two_sessions();
+        let id = sess_named(&st, "main").tabs[1].id;
+        st.move_tab_to_session(id, "main", "other", true).unwrap();
+        assert_eq!(sess_named(&st, "other").active_tab, 1);
+    }
+
+    #[test]
+    fn move_tab_to_session_keeps_the_sources_active_tab_on_the_same_tab() {
+        let (mut st, _) = two_sessions();
+        st.sessions.get_mut("main").unwrap().active_tab = 2;
+        let active = sess_named(&st, "main").tabs[2].id;
+        let id = sess_named(&st, "main").tabs[0].id;
+        st.move_tab_to_session(id, "main", "other", false).unwrap();
+        let main = sess_named(&st, "main");
+        assert_eq!(main.tabs[main.active_tab].id, active);
+    }
+
+    #[test]
+    fn move_tab_to_session_clamps_a_source_that_lost_its_last_active_tab() {
+        let (mut st, _) = two_sessions();
+        st.sessions.get_mut("main").unwrap().active_tab = 2;
+        let id = sess_named(&st, "main").tabs[2].id;
+        st.move_tab_to_session(id, "main", "other", true).unwrap();
+        assert_eq!(sess_named(&st, "main").active_tab, 1);
+    }
+
+    #[test]
+    fn move_tab_to_session_removes_an_emptied_source_and_its_folder_entry() {
+        let (mut st, _) = state_with_sessions(&[("main", &[(1, bsp())]), ("other", &[(1, bsp())])]);
+        st.create_folder("work").unwrap();
+        st.move_session("main", Some("work")).unwrap();
+        let id = sess_named(&st, "main").tabs[0].id;
+
+        let moved = st.move_tab_to_session(id, "main", "other", true).unwrap();
+
+        assert!(moved.source_removed);
+        assert!(!st.sessions.contains_key("main"));
+        assert!(st.folders["work"].session_ids.is_empty());
+    }
+
+    #[test]
+    fn move_tab_to_session_takes_a_hidden_popup_with_it() {
+        let (mut st, _) = two_sessions();
+        let popup = st.next_pane_id();
+        st.sessions.get_mut("main").unwrap().tabs[1].popup_pane = Some(popup);
+        let id = sess_named(&st, "main").tabs[1].id;
+        let moved = st.move_tab_to_session(id, "main", "other", false).unwrap();
+        assert!(moved.panes.contains(&popup));
+        assert_eq!(sess_named(&st, "other").tabs[1].popup_pane, Some(popup));
+    }
+
+    #[test]
+    fn move_tab_to_session_refusals_change_nothing() {
+        let (mut st, _) = two_sessions();
+        let id = sess_named(&st, "main").tabs[0].id;
+        let there = sess_named(&st, "other").tabs[0].id;
+        let popup = st.next_pane_id();
+        {
+            let s = st.sessions.get_mut("main").unwrap();
+            s.tabs[0].popup_pane = Some(popup);
+            s.tabs[0].popup_visible = true;
+        }
+        let before = (snapshot(&st), snapshot_of(&st, "other"));
+        for (tab, from, to, why) in [
+            (id, "main", "ghost", MoveRefused::NoSession),
+            (id, "ghost", "other", MoveRefused::NoSession),
+            (id, "main", "main", MoveRefused::TargetIsSourceSession),
+            (9_999, "main", "other", MoveRefused::TargetNotFound),
+            (there, "main", "other", MoveRefused::TargetSessionMismatch),
+            (id, "main", "other", MoveRefused::PopupVisible),
+        ] {
+            assert_eq!(
+                st.move_tab_to_session(tab, from, to, true),
+                Err(why),
+                "{tab} {from} -> {to}"
+            );
+            assert_eq!((snapshot(&st), snapshot_of(&st, "other")), before);
+        }
     }
 
     #[test]

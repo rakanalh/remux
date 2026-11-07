@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::client::registry::ConnId;
 use crate::client::sidebar::PluginRequest;
-use crate::client::tree_model::JumpTarget;
+use crate::client::tree_model::{JumpTarget, TreeModel};
 use crate::client::whichkey::DrawCommand;
 use crate::config::theme::Theme;
 use crate::config::ZoomMode;
@@ -34,6 +34,9 @@ pub enum MenuAction {
     JumpThen(JumpTarget, Box<MenuAction>),
     /// Kill a session, as the session manager's delete does.
     KillSession { conn: ConnId, name: String },
+    /// Delete a folder and kill every session in it, as the session manager's
+    /// delete does.
+    DeleteFolder { conn: ConnId, name: String },
     /// Close a tab by its id, so a tab moved since the menu opened is still the
     /// one closed.
     CloseTab {
@@ -46,6 +49,21 @@ pub enum MenuAction {
         conn: ConnId,
         session: String,
         pane_id: u64,
+    },
+    /// Move a session into a folder, or out of its folder with `None`.
+    MoveSession {
+        conn: ConnId,
+        session: String,
+        folder: Option<String>,
+    },
+    /// Move a tab to another session of its server. `follows` says the client
+    /// is looking at the tab, so the server takes it along.
+    MoveTab {
+        conn: ConnId,
+        tab_id: u64,
+        from: String,
+        to: String,
+        follows: bool,
     },
     /// Hand a request to the client, as a sidebar plugin does.
     Request(PluginRequest),
@@ -65,6 +83,8 @@ pub enum RenameFor {
     Tab(u64),
     /// A session on any connection, by name.
     Session { conn: ConnId, name: String },
+    /// A folder on any connection, by name.
+    Folder { conn: ConnId, name: String },
     /// A tab of a session on any connection, by id.
     SessionTab {
         conn: ConnId,
@@ -80,6 +100,7 @@ impl RenameFor {
             RenameFor::Pane(_) => "Pane",
             RenameFor::Tab(_) | RenameFor::SessionTab { .. } => "Tab",
             RenameFor::Session { .. } => "Session",
+            RenameFor::Folder { .. } => "Folder",
         }
     }
 
@@ -92,6 +113,13 @@ impl RenameFor {
             RenameFor::Session { conn, name: old } => (
                 Some(conn.clone()),
                 RemuxCommand::SessionRenameByName {
+                    old: old.clone(),
+                    new: name,
+                },
+            ),
+            RenameFor::Folder { conn, name: old } => (
+                Some(conn.clone()),
+                RemuxCommand::FolderRename {
                     old: old.clone(),
                     new: name,
                 },
@@ -136,6 +164,8 @@ pub struct MenuItem {
     pub enabled: bool,
     /// Whether choosing the row first asks for confirmation, in the same menu.
     pub confirm: bool,
+    /// What the confirmation states above its Confirm row.
+    pub warning: Option<String>,
     pub action: MenuAction,
 }
 
@@ -146,6 +176,7 @@ impl MenuItem {
             hint: None,
             enabled: true,
             confirm: false,
+            warning: None,
             action,
         }
     }
@@ -163,6 +194,16 @@ impl MenuItem {
     pub fn confirm(mut self) -> Self {
         self.confirm = true;
         self
+    }
+
+    pub fn warning(mut self, warning: String) -> Self {
+        self.warning = Some(warning);
+        self
+    }
+
+    /// A row that only states something.
+    pub fn note(label: impl Into<String>) -> Self {
+        Self::new(label, MenuAction::Cancel).enabled(false)
     }
 }
 
@@ -215,6 +256,13 @@ impl ContextMenu {
         Some(menu)
     }
 
+    /// A menu that opens already asking to confirm `item`.
+    pub fn open_confirm(item: MenuItem, anchor: (u16, u16), screen: (u16, u16)) -> Option<Self> {
+        let mut menu = Self::open(vec![item], anchor, screen)?;
+        menu.activate(0);
+        Some(menu)
+    }
+
     pub fn rect(&self) -> Rect {
         self.rect
     }
@@ -263,11 +311,12 @@ impl ContextMenu {
     }
 
     /// A key while the menu is open. `j`/`k` and the arrows move the
-    /// highlight, Enter chooses it and Esc closes the menu. Every other key is
+    /// highlight, Enter chooses it and Esc, `q` or `?` closes the menu, `?`
+    /// being the key that opens the shortcut list. Every other key is
     /// swallowed: the menu is modal.
     pub fn key(&mut self, key: KeyEvent) -> MenuOutcome {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => MenuOutcome::Close,
+            KeyCode::Esc | KeyCode::Char('q' | '?') => MenuOutcome::Close,
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Enter => match self.selected {
@@ -326,12 +375,14 @@ impl ContextMenu {
         if !item.confirm {
             return MenuOutcome::Run(item.action);
         }
-        self.items = vec![
-            MenuItem::new(format!("Confirm: {}", item.label), item.action),
-            MenuItem::new("Cancel", MenuAction::Cancel),
-        ];
+        self.items = item.warning.map(MenuItem::note).into_iter().collect();
+        self.items.push(MenuItem::new(
+            format!("Confirm: {}", item.label),
+            item.action,
+        ));
+        self.items.push(MenuItem::new("Cancel", MenuAction::Cancel));
         self.relayout();
-        self.selected = Some(1);
+        self.selected = Some(self.items.len() - 1);
         MenuOutcome::Redraw
     }
 
@@ -413,6 +464,71 @@ impl ContextMenu {
         });
         out
     }
+}
+
+/// The rows that move `session` to a folder of its server: every folder but
+/// the one it is in, and a way out of that one.
+pub fn move_session_items(model: &TreeModel, conn: &ConnId, session: &str) -> Vec<MenuItem> {
+    let current = model.folder_of(conn, session).map(str::to_owned);
+    let target = |folder: Option<String>| MenuAction::MoveSession {
+        conn: conn.clone(),
+        session: session.to_owned(),
+        folder,
+    };
+    let mut rows: Vec<MenuItem> = model
+        .folder_names_for(conn)
+        .into_iter()
+        .filter(|name| Some(name) != current.as_ref())
+        .map(|name| MenuItem::new(name.clone(), target(Some(name))))
+        .collect();
+    if current.is_some() {
+        rows.push(MenuItem::new("(no folder)", target(None)));
+    }
+    if rows.is_empty() {
+        return vec![MenuItem::note("No folders to move to")];
+    }
+    rows.insert(0, MenuItem::note(format!("Move session '{session}' to:")));
+    rows
+}
+
+/// The rows that move tab `tab_index` of `session` to another session. A tab's
+/// PTYs live on its server, so only that server's sessions are offered. Used by
+/// the sessions panel and the session manager alike.
+pub fn move_tab_items(
+    model: &TreeModel,
+    conn: &ConnId,
+    session: &str,
+    tab_index: usize,
+) -> Vec<MenuItem> {
+    let sessions = model.sessions_for(conn);
+    let Some(source) = sessions.iter().find(|s| s.name == session) else {
+        return Vec::new();
+    };
+    let Some(tab) = source.tabs.get(tab_index) else {
+        return Vec::new();
+    };
+    let follows = source.is_current && tab.is_active;
+    let mut rows: Vec<MenuItem> = sessions
+        .iter()
+        .filter(|s| s.name != session)
+        .map(|s| {
+            MenuItem::new(
+                s.name.clone(),
+                MenuAction::MoveTab {
+                    conn: conn.clone(),
+                    tab_id: tab.id,
+                    from: session.to_owned(),
+                    to: s.name.clone(),
+                    follows,
+                },
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        return vec![MenuItem::note("No other session on this server")];
+    }
+    rows.insert(0, MenuItem::note(format!("Move tab '{}' to:", tab.name)));
+    rows
 }
 
 /// The rows for a right-click on what the server reported. `hint` maps an
@@ -550,6 +666,32 @@ mod tests {
 
     fn cmd(name: &str, c: RemuxCommand) -> MenuItem {
         MenuItem::new(name, MenuAction::Command(c))
+    }
+
+    #[test]
+    fn a_confirmation_states_its_warning_and_rests_on_cancel() {
+        let item = cmd("Kill", RemuxCommand::PaneToggleZoom)
+            .confirm()
+            .warning("Closes everything".to_string());
+        let mut menu = ContextMenu::open_confirm(item, (0, 0), (80, 24)).unwrap();
+        let labels: Vec<&str> = menu.items().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Closes everything", "Confirm: Kill", "Cancel"]);
+        assert!(!menu.items()[0].enabled);
+        assert_eq!(menu.key(key(KeyCode::Enter)), MenuOutcome::Close);
+    }
+
+    #[test]
+    fn question_mark_closes_a_menu() {
+        let mut menu = ContextMenu::open(three(), (0, 0), (80, 24)).unwrap();
+        assert_eq!(menu.key(key(KeyCode::Char('?'))), MenuOutcome::Close);
+    }
+
+    #[test]
+    fn a_menu_of_notes_has_no_row_to_choose() {
+        let mut menu =
+            ContextMenu::open(vec![MenuItem::note("Nothing here")], (0, 0), (80, 24)).unwrap();
+        assert_eq!(menu.selected(), None);
+        assert_eq!(menu.key(key(KeyCode::Enter)), MenuOutcome::Ignored);
     }
 
     fn three() -> Vec<MenuItem> {

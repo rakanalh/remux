@@ -126,6 +126,8 @@ pub enum CreatePhase {
 /// Actions that the session manager produces in response to key input.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionManagerAction {
+    /// Open a context menu over the overlay.
+    OpenMenu(Vec<crate::client::context_menu::MenuItem>),
     /// Expand a not-yet-connected remote server node (triggers a lazy connect).
     ConnectRemote(String),
     /// Disconnect a connected remote at the user's request, so it stops
@@ -324,6 +326,7 @@ fn binding_label(b: SessionManagerBinding) -> &'static str {
         TabRename => "tab rename",
         TabMoveLeft => "tab \u{2190}",
         TabMoveRight => "tab \u{2192}",
+        TabMoveToSession => "tab move",
         PaneNew => "pane new",
         PaneClose => "pane close",
         PaneRename => "pane rename",
@@ -1124,6 +1127,21 @@ impl SessionManagerState {
                         tab_index: *tab_index,
                         delta,
                     }
+                }
+                _ => SessionManagerAction::None,
+            },
+            TabMoveToSession => match &node {
+                NodeType::Tab {
+                    server,
+                    session,
+                    tab_index,
+                } if self.is_connected(server) => {
+                    SessionManagerAction::OpenMenu(crate::client::context_menu::move_tab_items(
+                        &self.model,
+                        server,
+                        session,
+                        *tab_index,
+                    ))
                 }
                 _ => SessionManagerAction::None,
             },

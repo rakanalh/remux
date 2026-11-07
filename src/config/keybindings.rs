@@ -1416,6 +1416,7 @@ pub enum SessionManagerBinding {
     TabRename,
     TabMoveLeft,
     TabMoveRight,
+    TabMoveToSession,
     PaneNew,
     PaneClose,
     PaneRename,
@@ -1445,6 +1446,7 @@ impl SessionManagerBinding {
             "TabRename" => Self::TabRename,
             "TabMoveLeft" => Self::TabMoveLeft,
             "TabMoveRight" => Self::TabMoveRight,
+            "TabMoveToSession" => Self::TabMoveToSession,
             "PaneNew" => Self::PaneNew,
             "PaneClose" => Self::PaneClose,
             "PaneRename" => Self::PaneRename,
@@ -1474,6 +1476,7 @@ fn default_session_manager_chords() -> Vec<(&'static str, SessionManagerBinding)
         ("tr", TabRename),
         ("th", TabMoveLeft),
         ("tl", TabMoveRight),
+        ("tm", TabMoveToSession),
         ("pn", PaneNew),
         ("px", PaneClose),
         ("pr", PaneRename),
@@ -3088,10 +3091,14 @@ mod tests {
     #[test]
     fn session_manager_bindings_defaults() {
         let b = SessionManagerBindings::default();
-        // All 19 default chords are present.
-        assert_eq!(b.len(), 19);
+        // All 20 default chords are present.
+        assert_eq!(b.len(), 20);
         assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
         assert_eq!(b.chord('t', 'r'), Some(SessionManagerBinding::TabRename));
+        assert_eq!(
+            b.chord('t', 'm'),
+            Some(SessionManagerBinding::TabMoveToSession)
+        );
         assert_eq!(b.chord('s', 'x'), Some(SessionManagerBinding::SessionClose));
         assert_eq!(b.chord('f', 'r'), Some(SessionManagerBinding::FolderRename));
         assert_eq!(b.chord('v', 'a'), Some(SessionManagerBinding::AddToView));
@@ -3126,7 +3133,7 @@ mod tests {
         // An empty table (section absent) yields exactly the defaults.
         let value = toml::Value::Table(toml::map::Map::new());
         let b = SessionManagerBindings::from_toml(&value);
-        assert_eq!(b.len(), 19);
+        assert_eq!(b.len(), 20);
         assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
     }
 
@@ -3156,7 +3163,7 @@ mod tests {
         "#;
         let value: toml::Value = toml_str.parse().unwrap();
         let b = SessionManagerBindings::from_toml(&value);
-        assert_eq!(b.len(), 19);
+        assert_eq!(b.len(), 20);
         assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
     }
 

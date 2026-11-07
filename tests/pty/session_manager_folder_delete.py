@@ -22,7 +22,7 @@ from pty_harness import BIN, Tui, sm_open, sm_goto_text, sm_selected  # noqa: E4
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
 from harness import Client  # noqa: E402
 
-RUNDIR = "/tmp/rmx-smfd"
+RUNDIR = os.environ.get("REMUX_SMFD_RUN", "/tmp/rmx-smfd")
 
 fails = []
 

@@ -23,17 +23,132 @@
 
 use std::cell::Cell;
 
-use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 
 #[cfg(test)]
 use super::nav::LIST_HEADER_ROWS;
 use super::nav::{self, ListLayout, NavKey};
 use super::{blank_grid, draw_text_with, PluginAction, PluginEvent, SidebarPlugin};
-use crate::client::context_menu::{MenuAction, MenuItem, RenameFor};
+use crate::client::context_menu::{self, MenuAction, MenuItem, RenameFor};
 use crate::client::registry::{ConnId, RemoteState};
 use crate::client::tree_model::{ConnTrees, JumpTarget, NodeType, TreeModel};
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
+
+/// Icons are emoji-presentation glyphs because `unicode-width` and terminals
+/// agree that those take two columns. A Nerd Font glyph draws a box without the
+/// font, and a text-presentation pictograph such as U+1F5A5 measures one column
+/// where many terminals draw two, which shifts the rest of the row.
+const FOLDER_ICON: char = '\u{1F4C1}';
+const SESSION_ICON: char = '\u{1F4BB}';
+const TAB_ICON: char = '\u{1F4D1}';
+const PANE_ICON: char = '\u{1F532}';
+
+/// The columns the `▼`/`▶` marker and the space after it take.
+const MARKER_WIDTH: u16 = 2;
+
+/// The columns one level of the tree indents by.
+const INDENT_WIDTH: u16 = 2;
+
+/// One line of the `?` list. `keys` are the keys it stands for, which is what
+/// lets a test hold this table to what `on_key` handles.
+struct Shortcut {
+    keys: &'static [KeyCode],
+    shown: &'static str,
+    does: &'static str,
+}
+
+const SHORTCUTS: &[Shortcut] = &[
+    Shortcut {
+        keys: &[KeyCode::Char('j'), KeyCode::Down],
+        shown: "j/Down",
+        does: "Next row",
+    },
+    Shortcut {
+        keys: &[KeyCode::Char('k'), KeyCode::Up],
+        shown: "k/Up",
+        does: "Previous row",
+    },
+    Shortcut {
+        keys: &[KeyCode::Char('g')],
+        shown: "g",
+        does: "First row",
+    },
+    Shortcut {
+        keys: &[KeyCode::Char('G')],
+        shown: "G",
+        does: "Last row",
+    },
+    Shortcut {
+        keys: &[KeyCode::Enter],
+        shown: "Enter",
+        does: "Switch to row",
+    },
+    Shortcut {
+        keys: &[KeyCode::Char(' ')],
+        shown: "Space",
+        does: "Expand or collapse",
+    },
+    Shortcut {
+        keys: &[KeyCode::Char('h'), KeyCode::Left],
+        shown: "h/Left",
+        does: "Collapse",
+    },
+    Shortcut {
+        keys: &[KeyCode::Char('l'), KeyCode::Right],
+        shown: "l/Right",
+        does: "Expand",
+    },
+    Shortcut {
+        keys: &[KeyCode::Char('d')],
+        shown: "d",
+        does: "Delete folder, session or tab",
+    },
+    Shortcut {
+        keys: &[KeyCode::Char('m')],
+        shown: "m",
+        does: "Move session or tab",
+    },
+    Shortcut {
+        keys: &[KeyCode::Char('?')],
+        shown: "?",
+        does: "Show or hide this list",
+    },
+];
+
+/// The client handles Esc before a panel sees a key.
+const LEAVE_SHORTCUT: Shortcut = Shortcut {
+    keys: &[],
+    shown: "Esc",
+    does: "Leave the panel",
+};
+
+/// What a confirmation says will close with `name`.
+fn closes_under(name: &str, count: usize, noun: &str) -> String {
+    match count {
+        0 => format!("'{name}' is empty"),
+        1 => format!("Closes everything under '{name}': 1 {noun}"),
+        n => format!("Closes everything under '{name}': {n} {noun}s"),
+    }
+}
+
+fn icon_of(node: &NodeType) -> Option<char> {
+    match node {
+        NodeType::Folder { .. } => Some(FOLDER_ICON),
+        NodeType::Session { .. } => Some(SESSION_ICON),
+        NodeType::Tab { .. } => Some(TAB_ICON),
+        NodeType::Pane { .. } => Some(PANE_ICON),
+        _ => None,
+    }
+}
+
+/// Whether a node has children to show or hide, and so wears a marker.
+fn is_expandable(node: &NodeType) -> bool {
+    !matches!(
+        node,
+        NodeType::Pane { .. } | NodeType::DormantSession { .. }
+    )
+}
 
 pub struct SessionsPlugin {
     /// Per-connection tree data, in arrival order. Order is stable across
@@ -111,19 +226,158 @@ impl SessionsPlugin {
             .map(|t| t.id)
     }
 
+    /// How many sessions the panel holds in `folder` on `conn`.
+    fn folder_session_count(&self, conn: &ConnId, folder: &str) -> usize {
+        self.trees
+            .iter()
+            .find(|(id, _)| id == conn)
+            .and_then(|(_, trees)| trees.folders.iter().find(|f| f.name == folder))
+            .map_or(0, |f| f.sessions.len())
+    }
+
+    /// The row that deletes `folder`, for its menu and for `d`.
+    fn delete_folder_item(&self, server: &ConnId, folder: &str) -> MenuItem {
+        // The server kills a deleted folder's sessions, so the row says how
+        // many go with it.
+        let count = self.folder_session_count(server, folder);
+        let label = match count {
+            0 => "Delete folder".to_string(),
+            1 => "Delete folder and 1 session".to_string(),
+            n => format!("Delete folder and {n} sessions"),
+        };
+        MenuItem::new(
+            label,
+            MenuAction::DeleteFolder {
+                conn: server.clone(),
+                name: folder.to_string(),
+            },
+        )
+        .confirm()
+        .warning(closes_under(folder, count, "session"))
+    }
+
+    /// The row that kills `session`, for its menu and for `d`.
+    fn kill_session_item(&self, server: &ConnId, session: &str) -> MenuItem {
+        let tabs = self
+            .model
+            .sessions_for(server)
+            .iter()
+            .find(|s| s.name == session)
+            .map_or(0, |s| s.tabs.len());
+        MenuItem::new(
+            "Kill session",
+            MenuAction::KillSession {
+                conn: server.clone(),
+                name: session.to_string(),
+            },
+        )
+        .confirm()
+        .warning(closes_under(session, tabs, "tab"))
+    }
+
+    /// The panel row the selection is drawn on.
+    fn selected_y(&self) -> u16 {
+        self.layout()
+            .row_of(self.model.selected.saturating_sub(self.last_top.get()))
+    }
+
+    fn open_menu(&self, items: Vec<MenuItem>, confirm: bool) -> PluginAction {
+        PluginAction::OpenMenu {
+            items,
+            row: self.selected_y(),
+            confirm,
+        }
+    }
+
+    fn is_only_tab(&self, server: &ConnId, session: &str) -> bool {
+        self.model
+            .sessions_for(server)
+            .iter()
+            .any(|s| s.name == session && s.tabs.len() == 1)
+    }
+
+    /// `d`: a folder or a session asks first, because the rest of the tree goes
+    /// with it, and so does a session's only tab, because closing it ends the
+    /// session. Any other tab closes at once. Other rows have nothing to delete.
+    fn delete_selected(&self) -> PluginAction {
+        let Some(row) = self.model.selected_row() else {
+            return PluginAction::None;
+        };
+        match &row.node_type {
+            NodeType::Folder { server, name } => {
+                self.open_menu(vec![self.delete_folder_item(server, name)], true)
+            }
+            NodeType::Session { server, name } => {
+                self.open_menu(vec![self.kill_session_item(server, name)], true)
+            }
+            NodeType::Tab {
+                server,
+                session,
+                tab_index,
+            } if self.is_only_tab(server, session) => {
+                self.open_menu(vec![self.kill_session_item(server, session)], true)
+            }
+            NodeType::Tab {
+                server,
+                session,
+                tab_index,
+            } => match self.tab_id(server, session, *tab_index) {
+                Some(tab_id) => PluginAction::RunMenuAction(MenuAction::CloseTab {
+                    conn: server.clone(),
+                    session: session.clone(),
+                    tab_id,
+                }),
+                None => PluginAction::None,
+            },
+            _ => PluginAction::None,
+        }
+    }
+
+    /// `m`: pick where a session or a tab goes. Other rows do not move.
+    fn move_selected(&self) -> PluginAction {
+        let items = match self.model.selected_row().map(|r| &r.node_type) {
+            Some(NodeType::Session { server, name }) => {
+                context_menu::move_session_items(&self.model, server, name)
+            }
+            Some(NodeType::Tab {
+                server,
+                session,
+                tab_index,
+            }) => context_menu::move_tab_items(&self.model, server, session, *tab_index),
+            _ => return PluginAction::None,
+        };
+        self.open_menu(items, false)
+    }
+
+    fn show_shortcuts(&self) -> PluginAction {
+        let items = SHORTCUTS
+            .iter()
+            .chain(std::iter::once(&LEAVE_SHORTCUT))
+            .map(|s| MenuItem::new(s.does, MenuAction::Cancel).hint(Some(s.shown.to_string())))
+            .collect();
+        self.open_menu(items, false)
+    }
+
     /// Whether the selected node has children to show or hide.
     fn selected_is_expandable(&self) -> bool {
-        !matches!(
-            self.model.selected_row().map(|r| &r.node_type),
-            None | Some(NodeType::Pane { .. } | NodeType::DormantSession { .. })
-        )
+        self.model
+            .selected_row()
+            .is_some_and(|r| is_expandable(&r.node_type))
+    }
+
+    /// Whether panel column `x` is on the marker of tree row `index`.
+    fn is_on_marker(&self, x: u16, index: usize) -> bool {
+        self.model.rows.get(index).is_some_and(|row| {
+            let start = self.layout().pad() + INDENT_WIDTH * row.indent as u16;
+            is_expandable(&row.node_type) && (start..start + MARKER_WIDTH).contains(&x)
+        })
     }
 
     /// Enter / a second click: toggle an expandable node, jump from a leaf.
     ///
     /// A session and a tab are BOTH: they expand and they are jump targets. The
     /// spec settles the tie -- "Enter on any node jumps" -- so Enter jumps and
-    /// `Space`/`h`/`l` do the expanding.
+    /// `Space`/`h`/`l` and a click on the marker do the expanding.
     fn activate(&mut self) -> PluginAction {
         match self.model.jump_target() {
             Some(target) => PluginAction::JumpTo(target),
@@ -185,15 +439,19 @@ impl SidebarPlugin for SessionsPlugin {
             // reads the same on both surfaces. An expandable node with nothing
             // under it still carries a marker.
             let marker = match &row.node_type {
-                NodeType::Pane { .. } | NodeType::DormantSession { .. } => "  ".to_string(),
-                _ if row.is_expanded => "\u{25BC} ".to_string(),
-                _ => "\u{25B6} ".to_string(),
+                node if !is_expandable(node) => "  ",
+                _ if row.is_expanded => "\u{25BC} ",
+                _ => "\u{25B6} ",
             };
+            let icon = icon_of(&row.node_type)
+                .map(|icon| format!("{icon} "))
+                .unwrap_or_default();
             let current = if row.is_current { "* " } else { "" };
             let text = format!(
-                "{}{}{}{}",
-                "  ".repeat(row.indent),
+                "{}{}{}{}{}",
+                " ".repeat(usize::from(INDENT_WIDTH) * row.indent),
                 marker,
+                icon,
                 current,
                 row.display_name
             );
@@ -222,6 +480,15 @@ impl SidebarPlugin for SessionsPlugin {
                 }
                 return PluginAction::Redraw;
             }
+            // A chord such as Ctrl-d reaches the panel too, and must not delete.
+            KeyCode::Char('d' | 'm' | '?')
+                if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() =>
+            {
+                return PluginAction::None;
+            }
+            KeyCode::Char('d') => return self.delete_selected(),
+            KeyCode::Char('m') => return self.move_selected(),
+            KeyCode::Char('?') => return self.show_shortcuts(),
             _ => {}
         }
         match nav::nav_key(&key) {
@@ -239,7 +506,7 @@ impl SidebarPlugin for SessionsPlugin {
         }
     }
 
-    fn on_mouse(&mut self, _x: u16, y: u16, kind: MouseEventKind) -> PluginAction {
+    fn on_mouse(&mut self, x: u16, y: u16, kind: MouseEventKind) -> PluginAction {
         if !nav::is_select_click(kind) {
             return PluginAction::None;
         }
@@ -250,6 +517,15 @@ impl SidebarPlugin for SessionsPlugin {
             self.model.selected,
             self.model.rows.len(),
         );
+        // The marker is decided before `action_for_hit`, so a press on it never
+        // counts as the second click that jumps from a session or a tab.
+        if let nav::Hit::Select(index) | nav::Hit::Activate(index) = hit {
+            if self.is_on_marker(x, index) {
+                self.model.selected = index;
+                self.model.toggle_expand();
+                return PluginAction::Redraw;
+            }
+        }
         // The free function, not `NavList::click`: this panel's cursor lives in
         // its `TreeModel`, which re-points itself by identity on every refresh,
         // so a `NavList` here would be a second reconciler on one cursor.
@@ -275,6 +551,16 @@ impl SidebarPlugin for SessionsPlugin {
             return Vec::new();
         };
         match row.node_type.clone() {
+            NodeType::Folder { server, name } => {
+                let delete = self.delete_folder_item(&server, &name);
+                vec![
+                    MenuItem::new(
+                        "Rename",
+                        MenuAction::Rename(RenameFor::Folder { conn: server, name }),
+                    ),
+                    delete,
+                ]
+            }
             NodeType::Session { server, name } => {
                 let target = JumpTarget::Session {
                     conn: server.clone(),
@@ -289,11 +575,7 @@ impl SidebarPlugin for SessionsPlugin {
                             name: name.clone(),
                         }),
                     ),
-                    MenuItem::new(
-                        "Kill session",
-                        MenuAction::KillSession { conn: server, name },
-                    )
-                    .confirm(),
+                    self.kill_session_item(&server, &name),
                 ]
             }
             NodeType::Tab {
@@ -333,6 +615,31 @@ impl SidebarPlugin for SessionsPlugin {
                     );
                 }
                 items
+            }
+            NodeType::Pane {
+                server,
+                session,
+                tab_index,
+                pane_id,
+            } => {
+                let target = JumpTarget::Pane {
+                    conn: server.clone(),
+                    session: session.clone(),
+                    tab_index,
+                    pane_id,
+                };
+                vec![
+                    MenuItem::new("Switch", MenuAction::Jump(target)).hint(Some("Enter".into())),
+                    MenuItem::new(
+                        "Close pane",
+                        MenuAction::ClosePane {
+                            conn: server,
+                            session,
+                            pane_id,
+                        },
+                    )
+                    .confirm(),
+                ]
             }
             _ => Vec::new(),
         }
@@ -392,7 +699,9 @@ impl SidebarPlugin for SessionsPlugin {
 mod tests {
     use super::*;
     use crate::client::tree_model::JumpTarget;
-    use crate::protocol::{FolderTreeEntry, PaneTreeEntry, SessionTreeEntry, TabTreeEntry};
+    use crate::protocol::{
+        FolderTreeEntry, PaneTreeEntry, RemuxCommand, SessionTreeEntry, TabTreeEntry,
+    };
     use crossterm::event::MouseButton;
     use crossterm::event::{KeyEventKind, KeyModifiers};
 
@@ -868,6 +1177,579 @@ mod tests {
             })
         );
         assert!(items[2].confirm);
+    }
+
+    fn folder_tree(sessions: Vec<SessionTreeEntry>) -> PluginEvent {
+        PluginEvent::SessionTree {
+            conn: remote("gpu"),
+            folders: vec![FolderTreeEntry {
+                name: "work".to_string(),
+                sessions,
+            }],
+            unfiled: Vec::new(),
+            dormant: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_folder_row_offers_rename_and_a_confirmed_delete_on_its_own_connection() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        p.on_event(&folder_tree(vec![
+            session("a", vec![]),
+            session("b", vec![]),
+        ]));
+        let _ = painted(&p, 40, 20);
+        let items = menu_at(&mut p, "work");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Rename", "Delete folder and 2 sessions"]);
+        assert_eq!(
+            items[0].action,
+            MenuAction::Rename(RenameFor::Folder {
+                conn: remote("gpu"),
+                name: "work".to_string()
+            })
+        );
+        assert_eq!(
+            items[1].action,
+            MenuAction::DeleteFolder {
+                conn: remote("gpu"),
+                name: "work".to_string()
+            }
+        );
+        assert!(items[1].confirm && !items[0].confirm);
+    }
+
+    #[test]
+    fn a_folder_delete_counts_only_the_sessions_it_takes() {
+        for (sessions, label) in [
+            (vec![], "Delete folder"),
+            (vec![session("a", vec![])], "Delete folder and 1 session"),
+        ] {
+            let mut p = SessionsPlugin::new();
+            p.on_event(&folder_tree(sessions));
+            let _ = painted(&p, 40, 20);
+            assert_eq!(menu_at(&mut p, "work")[1].label, label);
+        }
+    }
+
+    #[test]
+    fn a_folder_rename_goes_to_the_folders_connection() {
+        let rename = RenameFor::Folder {
+            conn: remote("gpu"),
+            name: "work".to_string(),
+        };
+        assert_eq!(rename.label(), "Folder");
+        assert_eq!(
+            rename.command("play".to_string()),
+            (
+                Some(remote("gpu")),
+                RemuxCommand::FolderRename {
+                    old: "work".to_string(),
+                    new: "play".to_string()
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn a_pane_row_offers_switch_and_a_confirmed_close_but_no_rename() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        select(&mut p, "editor");
+        p.on_key(key(KeyCode::Char('l')));
+        let _ = painted(&p, 24, 12);
+        let items = menu_at(&mut p, "top");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Switch", "Close pane"]);
+        assert_eq!(
+            items[0].action,
+            MenuAction::Jump(JumpTarget::Pane {
+                conn: ConnId::Local,
+                session: "alpha".to_string(),
+                tab_index: 0,
+                pane_id: 11,
+            })
+        );
+        assert_eq!(
+            items[1].action,
+            MenuAction::ClosePane {
+                conn: ConnId::Local,
+                session: "alpha".to_string(),
+                pane_id: 11,
+            }
+        );
+        assert!(items[1].confirm && !items[0].confirm);
+    }
+
+    /// The `(x, y)` of the marker on `name`'s row, found on the painted grid.
+    fn marker_cell(p: &SessionsPlugin, name: &str) -> (u16, u16) {
+        let rows = painted(p, 40, 20);
+        let y = rows
+            .iter()
+            .position(|r| r.contains(name))
+            .unwrap_or_else(|| panic!("no row {name:?} in {rows:?}"));
+        let x = rows[y]
+            .chars()
+            .position(|c| c == '\u{25B6}' || c == '\u{25BC}')
+            .unwrap_or_else(|| panic!("no marker on {:?}", rows[y]));
+        (x as u16, y as u16)
+    }
+
+    fn shows(p: &SessionsPlugin, name: &str) -> bool {
+        painted(p, 40, 20).iter().any(|r| r.contains(name))
+    }
+
+    #[test]
+    fn a_click_on_either_marker_column_toggles_and_selects_without_jumping() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let (x, y) = marker_cell(&p, "editor");
+
+        assert_eq!(p.on_mouse(x, y, down), PluginAction::Redraw);
+        assert!(shows(&p, "top"), "the first click did not open the tab");
+        assert_eq!(p.model.selected_row().unwrap().display_name, "editor");
+
+        assert_eq!(p.on_mouse(x + 1, y, down), PluginAction::Redraw);
+        assert!(!shows(&p, "top"), "the second click did not close the tab");
+    }
+
+    #[test]
+    fn a_click_just_past_the_marker_is_a_click_on_the_name() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let (x, y) = marker_cell(&p, "editor");
+        assert_eq!(p.on_mouse(x + 2, y, down), PluginAction::Redraw);
+        assert!(!shows(&p, "top"));
+        assert!(matches!(
+            p.on_mouse(x + 2, y, down),
+            PluginAction::JumpTo(JumpTarget::Tab { .. })
+        ));
+        assert!(!shows(&p, "top"));
+    }
+
+    #[test]
+    fn a_click_left_of_the_marker_is_not_a_click_on_it() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let (x, y) = marker_cell(&p, "editor");
+        p.on_mouse(x - 1, y, down);
+        assert!(!shows(&p, "top"));
+    }
+
+    #[test]
+    fn a_pane_row_has_no_marker_to_click() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        select(&mut p, "editor");
+        p.on_key(key(KeyCode::Char('l')));
+        let rows = painted(&p, 40, 20);
+        let y = rows.iter().position(|r| r.contains("top")).unwrap() as u16;
+        let (tab_x, _) = marker_cell(&p, "editor");
+        let down = MouseEventKind::Down(MouseButton::Left);
+        // Where a marker would sit: the row one level below the tab's.
+        let x = tab_x + INDENT_WIDTH;
+        assert_eq!(p.on_mouse(x, y, down), PluginAction::Redraw);
+        assert!(matches!(
+            p.on_mouse(x, y, down),
+            PluginAction::JumpTo(JumpTarget::Pane { pane_id: 11, .. })
+        ));
+    }
+
+    #[test]
+    fn a_tab_toggled_by_click_keeps_its_state_across_a_tree_push() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let (x, y) = marker_cell(&p, "editor");
+        p.on_mouse(x, y, down);
+        p.on_event(&local_tree());
+        assert!(shows(&p, "top"), "a push closed the opened tab");
+        let (x, y) = marker_cell(&p, "editor");
+        p.on_mouse(x, y, down);
+        p.on_event(&local_tree());
+        assert!(!shows(&p, "top"), "a push reopened the closed tab");
+    }
+
+    #[test]
+    fn a_collapsed_local_server_stays_collapsed_across_a_tree_push() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let (x, y) = marker_cell(&p, "local");
+        p.on_mouse(x, y, down);
+        assert!(!shows(&p, "alpha"));
+        p.on_event(&local_tree());
+        assert!(!shows(&p, "alpha"), "a push reopened the local server");
+    }
+
+    fn labels_of(action: &PluginAction) -> Vec<String> {
+        match action {
+            PluginAction::OpenMenu { items, .. } => items.iter().map(|i| i.label.clone()).collect(),
+            other => panic!("no menu: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn d_on_a_folder_or_session_opens_a_named_confirmation_on_the_rows_connection() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        p.on_event(&folder_tree(vec![session("a", vec![tab(5, "t", vec![])])]));
+        let _ = painted(&p, 40, 20);
+
+        select(&mut p, "work");
+        let PluginAction::OpenMenu {
+            items,
+            confirm: true,
+            ..
+        } = p.on_key(key(KeyCode::Char('d')))
+        else {
+            panic!("d on a folder opened no confirmation");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].warning.as_deref(),
+            Some("Closes everything under 'work': 1 session")
+        );
+        assert_eq!(
+            items[0].action,
+            MenuAction::DeleteFolder {
+                conn: remote("gpu"),
+                name: "work".to_string()
+            }
+        );
+
+        select(&mut p, "a");
+        let PluginAction::OpenMenu {
+            items,
+            confirm: true,
+            ..
+        } = p.on_key(key(KeyCode::Char('d')))
+        else {
+            panic!("d on a session opened no confirmation");
+        };
+        assert_eq!(
+            items[0].warning.as_deref(),
+            Some("Closes everything under 'a': 1 tab")
+        );
+        assert_eq!(
+            items[0].action,
+            MenuAction::KillSession {
+                conn: remote("gpu"),
+                name: "a".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn d_on_a_tab_with_a_sibling_closes_it_with_no_confirmation() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&tree(
+            ConnId::Local,
+            vec![session(
+                "alpha",
+                vec![tab(1, "editor", vec![]), tab(2, "logs", vec![])],
+            )],
+        ));
+        select(&mut p, "editor");
+        assert_eq!(
+            p.on_key(key(KeyCode::Char('d'))),
+            PluginAction::RunMenuAction(MenuAction::CloseTab {
+                conn: ConnId::Local,
+                session: "alpha".to_string(),
+                tab_id: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn d_on_a_sessions_only_tab_asks_as_d_on_the_session_does() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        select(&mut p, "editor");
+        let PluginAction::OpenMenu {
+            items,
+            confirm: true,
+            ..
+        } = p.on_key(key(KeyCode::Char('d')))
+        else {
+            panic!("d on the only tab did not ask");
+        };
+        assert_eq!(
+            items[0].warning.as_deref(),
+            Some("Closes everything under 'alpha': 1 tab")
+        );
+        assert_eq!(
+            items[0].action,
+            MenuAction::KillSession {
+                conn: ConnId::Local,
+                name: "alpha".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn d_and_m_do_nothing_on_a_server_or_a_pane_row() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        select(&mut p, "editor");
+        p.on_key(key(KeyCode::Char('l')));
+        for row in ["local", "top"] {
+            select(&mut p, row);
+            assert_eq!(p.on_key(key(KeyCode::Char('d'))), PluginAction::None);
+            assert_eq!(p.on_key(key(KeyCode::Char('m'))), PluginAction::None);
+        }
+    }
+
+    #[test]
+    fn a_chord_on_d_or_m_is_not_the_key() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        select(&mut p, "editor");
+        for c in ['d', 'm', '?'] {
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                let mut chord = key(KeyCode::Char(c));
+                chord.modifiers = modifiers;
+                assert_eq!(p.on_key(chord), PluginAction::None, "{c} {modifiers:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn m_on_a_session_offers_every_other_folder_and_the_way_out() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&PluginEvent::SessionTree {
+            conn: ConnId::Local,
+            folders: vec![
+                FolderTreeEntry {
+                    name: "work".to_string(),
+                    sessions: vec![session("a", vec![])],
+                },
+                FolderTreeEntry {
+                    name: "play".to_string(),
+                    sessions: vec![],
+                },
+            ],
+            unfiled: vec![session("b", vec![])],
+            dormant: Vec::new(),
+        });
+        select(&mut p, "a");
+        assert_eq!(
+            labels_of(&p.on_key(key(KeyCode::Char('m')))),
+            ["Move session 'a' to:", "play", "(no folder)"]
+        );
+        select(&mut p, "b");
+        let action = p.on_key(key(KeyCode::Char('m')));
+        assert_eq!(labels_of(&action), ["Move session 'b' to:", "work", "play"]);
+        let PluginAction::OpenMenu { items, .. } = action else {
+            unreachable!()
+        };
+        assert_eq!(
+            items[1].action,
+            MenuAction::MoveSession {
+                conn: ConnId::Local,
+                session: "b".to_string(),
+                folder: Some("work".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn m_says_so_when_there_is_nowhere_to_go() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        select(&mut p, "alpha");
+        assert_eq!(
+            labels_of(&p.on_key(key(KeyCode::Char('m')))),
+            ["No folders to move to"]
+        );
+        select(&mut p, "editor");
+        assert_eq!(
+            labels_of(&p.on_key(key(KeyCode::Char('m')))),
+            ["No other session on this server"]
+        );
+    }
+
+    #[test]
+    fn m_on_a_tab_offers_only_its_own_servers_other_sessions() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&tree(
+            ConnId::Local,
+            vec![
+                session("alpha", vec![tab(1, "editor", vec![pane(10, "sh")])]),
+                session("gamma", vec![]),
+            ],
+        ));
+        p.on_event(&remote_tree());
+        select(&mut p, "editor");
+        let action = p.on_key(key(KeyCode::Char('m')));
+        assert_eq!(labels_of(&action), ["Move tab 'editor' to:", "gamma"]);
+        let PluginAction::OpenMenu { items, .. } = action else {
+            unreachable!()
+        };
+        assert_eq!(
+            items[1].action,
+            MenuAction::MoveTab {
+                conn: ConnId::Local,
+                tab_id: 1,
+                from: "alpha".to_string(),
+                to: "gamma".to_string(),
+                follows: false,
+            }
+        );
+    }
+
+    /// Every key `on_key` acts on, against the table `?` lists.
+    #[test]
+    fn the_shortcut_list_is_exactly_what_on_key_handles() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&tree(
+            ConnId::Local,
+            vec![
+                session("alpha", vec![tab(1, "editor", vec![pane(10, "sh")])]),
+                session("gamma", vec![]),
+            ],
+        ));
+        let mut candidates: Vec<KeyCode> = (0x20u8..0x7f)
+            .map(|b| KeyCode::Char(char::from(b)))
+            .collect();
+        candidates.extend([
+            KeyCode::Enter,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Tab,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+        ]);
+        let handled: Vec<KeyCode> = candidates
+            .into_iter()
+            .filter(|&code| {
+                select(&mut p, "alpha");
+                p.on_key(key(code)) != PluginAction::None
+            })
+            .collect();
+        let listed: Vec<KeyCode> = SHORTCUTS.iter().flat_map(|s| s.keys).copied().collect();
+        for code in &handled {
+            assert!(listed.contains(code), "{code:?} is handled but not listed");
+        }
+        for code in &listed {
+            assert!(handled.contains(code), "{code:?} is listed but not handled");
+        }
+    }
+
+    #[test]
+    fn question_mark_lists_every_shortcut_with_its_key() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let PluginAction::OpenMenu { items, .. } = p.on_key(key(KeyCode::Char('?'))) else {
+            panic!("? opened nothing");
+        };
+        assert_eq!(items.len(), SHORTCUTS.len() + 1);
+        for (item, shortcut) in items.iter().zip(SHORTCUTS) {
+            assert_eq!(item.label, shortcut.does);
+            assert_eq!(item.hint.as_deref(), Some(shortcut.shown));
+        }
+        assert_eq!(items.last().unwrap().hint.as_deref(), Some("Esc"));
+    }
+
+    #[test]
+    fn every_icon_is_two_columns_wide_and_distinct() {
+        use unicode_width::UnicodeWidthChar;
+        let icons = [FOLDER_ICON, SESSION_ICON, TAB_ICON, PANE_ICON];
+        for icon in icons {
+            assert_eq!(icon.width(), Some(2), "{icon:?}");
+        }
+        let distinct: std::collections::HashSet<char> = icons.into_iter().collect();
+        assert_eq!(distinct.len(), icons.len());
+    }
+
+    fn filed_tree() -> PluginEvent {
+        PluginEvent::SessionTree {
+            conn: ConnId::Local,
+            folders: vec![FolderTreeEntry {
+                name: "work".to_string(),
+                sessions: vec![session(
+                    "alpha",
+                    vec![tab(1, "editor", vec![pane(10, "sh")])],
+                )],
+            }],
+            unfiled: Vec::new(),
+            dormant: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn each_row_type_wears_its_icon_after_the_marker() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&filed_tree());
+        select(&mut p, "editor");
+        p.on_key(key(KeyCode::Char('l')));
+        let rows = painted(&p, 40, 20);
+        for (name, icon) in [
+            ("work", FOLDER_ICON),
+            ("alpha", SESSION_ICON),
+            ("editor", TAB_ICON),
+        ] {
+            let (x, y) = marker_cell(&p, name);
+            let row: Vec<char> = rows[y as usize].chars().collect();
+            assert_eq!(row[x as usize + 2], icon, "{name}: {row:?}");
+        }
+        let pane_row = rows.iter().find(|r| r.ends_with(" sh")).unwrap();
+        assert!(pane_row.contains(PANE_ICON), "{pane_row:?}");
+        let server = rows.iter().find(|r| r.contains("local")).unwrap();
+        assert_eq!(server, " \u{25BC} local");
+    }
+
+    #[test]
+    fn a_current_row_reads_marker_icon_star_name() {
+        let mut p = SessionsPlugin::new();
+        let mut current = session("alpha", Vec::new());
+        current.is_current = true;
+        p.on_event(&tree(ConnId::Local, vec![current]));
+        let rows = painted(&p, 40, 20);
+        let want = format!("   \u{25BC} {SESSION_ICON}  * alpha");
+        assert!(rows.contains(&want), "{rows:?}");
+    }
+
+    #[test]
+    fn a_narrow_panel_never_cuts_a_wide_glyph_in_half() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&filed_tree());
+        select(&mut p, "editor");
+        p.on_key(key(KeyCode::Char('l')));
+        let theme = CompositorTheme::default();
+        let min_cols = p.min_size().0;
+        for cols in min_cols..min_cols + 4 {
+            for selected in 0..p.model.rows.len() {
+                p.model.selected = selected;
+                let grid = p.render(cols, 12, true, &theme);
+                for row in &grid {
+                    assert_eq!(row.len(), usize::from(cols));
+                    for (x, cell) in row.iter().enumerate() {
+                        if cell.width == 2 {
+                            assert_eq!(row[x + 1].width, 0, "no second half at {cols} cols");
+                        }
+                        if cell.width == 0 {
+                            assert_eq!(row[x - 1].width, 2, "an orphan half at {cols} cols");
+                        }
+                    }
+                }
+                let band = &grid[selected + LIST_HEADER_ROWS];
+                assert!(
+                    band.iter().all(|c| c.bg == theme.sidebar_selection_bg),
+                    "the band has a gap at {cols} cols"
+                );
+            }
+        }
     }
 
     #[test]

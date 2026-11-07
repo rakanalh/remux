@@ -651,8 +651,8 @@
 #     using that same char is dropped (prefix wins).
 #   • An empty value ("") unbinds a (possibly default) chord.
 #
-# Actions: TabNew, TabClose, TabRename, TabMoveLeft, TabMoveRight, PaneNew,
-#          PaneClose, PaneRename, SessionNew, SessionClose, SessionRename,
+# Actions: TabNew, TabClose, TabRename, TabMoveLeft, TabMoveRight,
+#          TabMoveToSession, PaneNew, PaneClose, PaneRename, SessionNew, SessionClose, SessionRename,
 #          SessionMove, FolderNew, FolderDelete, FolderRename, AddToView,
 #          ViewRename, ViewRemoveCell, ViewDelete.
 #
@@ -662,6 +662,7 @@
 # tr = "TabRename"
 # th = "TabMoveLeft"
 # tl = "TabMoveRight"
+# tm = "TabMoveToSession"
 # pn = "PaneNew"
 # px = "PaneClose"
 # pr = "PaneRename"

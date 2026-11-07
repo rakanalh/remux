@@ -518,6 +518,30 @@ impl TreeModel {
             .any(|(id, _, state, _)| id == server && matches!(state, RemoteState::Connected))
     }
 
+    /// A given server's sessions, filed ones first.
+    pub fn sessions_for(&self, server: &ConnId) -> Vec<&SessionTreeEntry> {
+        self.trees
+            .get(server)
+            .map(|(folders, unfiled)| {
+                folders
+                    .iter()
+                    .flat_map(|f| f.sessions.iter())
+                    .chain(unfiled.iter())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The folder holding `session` on `server`, if it is filed.
+    pub fn folder_of(&self, server: &ConnId, session: &str) -> Option<&str> {
+        self.trees
+            .get(server)?
+            .0
+            .iter()
+            .find(|f| f.sessions.iter().any(|s| s.name == session))
+            .map(|f| f.name.as_str())
+    }
+
     /// A given server's folder names.
     pub fn folder_names_for(&self, server: &ConnId) -> Vec<String> {
         self.trees
@@ -675,11 +699,7 @@ impl TreeModel {
 
     /// Replace the server roster (order + labels + states) and rebuild rows.
     pub fn set_roster(&mut self, roster: Vec<(ConnId, String, RemoteState, Option<String>)>) {
-        // Ensure Local is always expanded by default the first time we see it.
         for (id, _, _, _) in &roster {
-            if matches!(id, ConnId::Local) {
-                self.expanded.insert(server_key(id));
-            }
             self.trees.entry(id.clone()).or_default();
         }
         self.roster = roster;

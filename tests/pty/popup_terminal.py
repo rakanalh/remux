@@ -76,7 +76,7 @@ def no_sidebar_case():
     tui.send(b"echo BASE_PANE_MARK\r")
     tui.pump(1.0)
 
-    rows_before = list(tui.rows_text())
+    rows_before = list(tui.cell_rows())
     boxes_before = boxes_in(rows_before, COLS)
     check(any("BASE_PANE_MARK" in r for r in rows_before),
           "baseline: the client is up and the shell echoes")
@@ -89,7 +89,7 @@ def no_sidebar_case():
     print("\n[1] Alt-p opens the popup")
     tui.send(ALT_P)
     tui.pump(1.6)
-    rows_open = list(tui.rows_text())
+    rows_open = list(tui.cell_rows())
     boxes_open = boxes_in(rows_open, COLS)
     print(f"        boxes open:   {boxes_open}")
     check(exp in boxes_open, f"a bordered box appeared at {exp}")
@@ -106,7 +106,7 @@ def no_sidebar_case():
     print("\n[3] typing goes into the popup")
     tui.send(b"echo PTY_POPUP_MARK\r")
     tui.pump(1.4)
-    rows_typed = list(tui.rows_text())
+    rows_typed = list(tui.cell_rows())
     hit_rows = [y for y, r in enumerate(rows_typed) if "PTY_POPUP_MARK" in r]
     check(bool(hit_rows), "the marker was echoed somewhere on screen")
     in_popup = all(exp["y"] < y < exp["y"] + exp["height"] - 1 for y in hit_rows)
@@ -125,7 +125,7 @@ def no_sidebar_case():
     print("\n[4] Alt-p closes the popup")
     tui.send(ALT_P)
     tui.pump(1.6)
-    rows_closed = list(tui.rows_text())
+    rows_closed = list(tui.cell_rows())
     boxes_closed = boxes_in(rows_closed, COLS)
     check(exp not in boxes_closed, f"the popup box is gone (boxes {boxes_closed})")
     check(boxes_closed == boxes_before,
@@ -138,7 +138,7 @@ def no_sidebar_case():
     # Input after closing must reach the real pane again.
     tui.send(b"echo AFTER_POPUP_MARK\r")
     tui.pump(1.4)
-    check(any("AFTER_POPUP_MARK" in r for r in tui.rows_text()),
+    check(any("AFTER_POPUP_MARK" in r for r in tui.cell_rows()),
           "input after toggle-off reaches the real pane again")
 
     # -- 5: the Ctrl-a p o chord. ------------------------------------------
@@ -149,11 +149,11 @@ def no_sidebar_case():
     tui.pump(0.5)
     tui.send(b"o")
     tui.pump(1.8)
-    boxes_chord = boxes_in(list(tui.rows_text()), COLS)
+    boxes_chord = boxes_in(list(tui.cell_rows()), COLS)
     check(exp in boxes_chord, f"Ctrl-a p o opened the popup (boxes {boxes_chord})")
     tui.send(b"echo CHORD_POPUP_MARK\r")
     tui.pump(1.4)
-    rows_chord = list(tui.rows_text())
+    rows_chord = list(tui.cell_rows())
     chord_rows = [y for y, r in enumerate(rows_chord) if "CHORD_POPUP_MARK" in r]
     check(bool(chord_rows) and all(
         exp["y"] < y < exp["y"] + exp["height"] - 1 for y in chord_rows),
@@ -165,14 +165,14 @@ def no_sidebar_case():
     tui.pump(0.4)
     tui.send(b"o")
     tui.pump(1.8)
-    check(exp not in boxes_in(list(tui.rows_text()), COLS),
+    check(exp not in boxes_in(list(tui.cell_rows()), COLS),
           "the chord closes it again")
 
     # -- 6: alive + no panic. ----------------------------------------------
     print("\n[6] the client survived and nothing panicked")
     check(tui.alive(), "the client process is still alive")
 
-    print("\n" + "\n".join(tui.rows_text()))
+    print("\n" + "\n".join(tui.cell_rows()))
 
     logs = tui.log("client") + tui.log("server")
     check("panic" not in logs.lower(), "no panic in client.log / server.log")
@@ -246,12 +246,12 @@ def float_over_sidebar_case():
     check = make_check(fails)
     tui = start("/tmp/rmxpop/sb_float", cfg())
     try:
-        before = list(tui.rows_text())
+        before = list(tui.cell_rows())
         check(before[0][0] == "\u256d" and before[5][SIDEBAR_W - 1] == "\u2502",
               "the sidebar is framed at the left")
         tui.send(ALT_P)
         tui.pump(1.8)
-        rows = list(tui.rows_text())
+        rows = list(tui.cell_rows())
         # Box (16, 5, 128, 37), not (47, ...): it is centred on the WHOLE
         # window, over the sidebar.
         check(rows[5][16] == "\u256d" and rows[5][143] == "\u256e",
@@ -267,14 +267,14 @@ def float_over_sidebar_case():
               f"the cursor ({cx},{cy}) is inside the popup interior")
         tui.send(b"echo SB_FLOAT_MARK\r")
         tui.pump(1.2)
-        rows = list(tui.rows_text())
+        rows = list(tui.cell_rows())
         hits = [(y, r.index("SB_FLOAT_MARK")) for y, r in enumerate(rows)
                 if "SB_FLOAT_MARK" in r]
         check(bool(hits) and all(6 <= y <= 40 and x >= 17 for y, x in hits),
               f"typed text lands in the box ({hits})")
         tui.send(ALT_P)
         tui.pump(1.8)
-        after = list(tui.rows_text())
+        after = list(tui.cell_rows())
         check(all(after[y][:SIDEBAR_W] == before[y][:SIDEBAR_W]
                   for y in range(SB_ROWS)),
               "the sidebar is restored after the popup closes")
@@ -295,7 +295,7 @@ def left_case():
     try:
         tui.send(ALT_P)
         tui.pump(1.8)
-        rows = list(tui.rows_text())
+        rows = list(tui.cell_rows())
         # Box (34, 0, 100, 47): right of the sidebar, no left border column.
         check(rows[0][133] == "\u256e" and rows[46][133] == "\u256f",
               f"right corners at x=133 (row 0: {rows[0][128:137]!r})")
@@ -328,7 +328,7 @@ def top_case():
     try:
         tui.send(ALT_P)
         tui.pump(1.8)
-        rows = list(tui.rows_text())
+        rows = list(tui.cell_rows())
         # Box (0, 0, 160, 37): covers the sidebar's columns, open at the top.
         check(rows[0][0] == "\u2502" and rows[0][159] == "\u2502",
               f"row 0 starts with the side borders, not a corner ({rows[0][:3]!r})")
@@ -363,11 +363,11 @@ def live_reload_case():
     try:
         tui.send(ALT_P)
         tui.pump(1.8)
-        check(list(tui.rows_text())[5][16] == "\u256d", "the float is open")
+        check(list(tui.cell_rows())[5][16] == "\u256d", "the float is open")
         baseline = tui.log("client").count("client: config reloaded")
         write_config(tui, cfg("left", wpct=50))
         check(wait_for_reload(tui, baseline), "the client logged the reload")
-        rows = list(tui.rows_text())
+        rows = list(tui.cell_rows())
         # Left, 50% of the 126-column content: box (34, 0, 63, 47).
         check(rows[0][96] == "\u256e" and rows[46][96] == "\u256f",
               f"the box moved to the left drawer (row 0: {rows[0][90:100]!r})")
@@ -387,13 +387,13 @@ def runtime_resize_case():
     try:
         tui.send(ALT_P)
         tui.pump(1.8)
-        before = top_right_corner(list(tui.rows_text())[0], SIDEBAR_W)
+        before = top_right_corner(list(tui.cell_rows())[0], SIDEBAR_W)
         check(before == 96, f"the drawer's right corner is at column 96 before ({before})")
         # Ctrl-a p R l: the sticky resize group, one step to the right.
         tui.prefix(b"pR", 0.8)
         tui.send(b"l", 1.2)
         tui.send(b"\x1b", 1.0)
-        after = top_right_corner(list(tui.rows_text())[0], SIDEBAR_W)
+        after = top_right_corner(list(tui.cell_rows())[0], SIDEBAR_W)
         check(after > before, f"the drawer is wider after ({before} -> {after})")
         check(tui.alive(), "the client is alive")
     finally:
@@ -424,10 +424,10 @@ def per_tab_case():
         tui.pump(1.0)
         tui.send(ALT_P)
         tui.pump(1.8)
-        check(list(tui.rows_text())[5][16] == "\u256d", "tab 2's own popup opens")
+        check(list(tui.cell_rows())[5][16] == "\u256d", "tab 2's own popup opens")
         tui.send(b"pwd\r")
         tui.pump(1.2)
-        rows = list(tui.rows_text())
+        rows = list(tui.cell_rows())
         # A path on its own line inside the popup, not the typed command or a
         # prompt (which carries the `$`).
         check(any("/tmp/rmxpop/tab2dir" in r[17:143] and "$" not in r[17:143]
@@ -438,7 +438,7 @@ def per_tab_case():
         tui.prefix(b"t1", 1.8)
         check(tui.has("TAB1_POPUP_MARK"),
               "back on tab 1 its popup is still open with its marker")
-        check(list(tui.rows_text())[5][16] == "\u256d", "and it is drawn as a box")
+        check(list(tui.cell_rows())[5][16] == "\u256d", "and it is drawn as a box")
 
         # Close tab 2: the client survives.
         tui.prefix(b"t2", 1.8)
@@ -481,27 +481,27 @@ def toggle_position_case():
     try:
         tui.send(ALT_MINUS)
         tui.pump(1.8)
-        rows = list(tui.rows_text())
+        rows = list(tui.cell_rows())
         check(bottom_open(rows), "Alt-- opens the popup at the bottom")
         check(not right_open(rows), "and not on the right")
         tui.send(ALT_BACKSLASH)
         tui.pump(1.8)
-        rows = list(tui.rows_text())
+        rows = list(tui.cell_rows())
         check(not bottom_open(rows) and not right_open(rows),
               "Alt-\\ while it is open closes it rather than moving it")
         tui.send(ALT_BACKSLASH)
         tui.pump(1.8)
-        rows = list(tui.rows_text())
+        rows = list(tui.cell_rows())
         check(right_open(rows), "Alt-\\ opens it on the right")
         check(not bottom_open(rows), "and not at the bottom")
         tui.send(ALT_P)
         tui.pump(1.8)
-        rows = list(tui.rows_text())
+        rows = list(tui.cell_rows())
         check(not bottom_open(rows) and not right_open(rows),
               "Alt-p while it is open closes it")
         tui.send(ALT_P)
         tui.pump(1.8)
-        check(list(tui.rows_text())[5][16] == "\u256d",
+        check(list(tui.cell_rows())[5][16] == "\u256d",
               "Alt-p opens it at the configured float")
         check(tui.alive(), "the client is alive")
         logs = tui.log("client") + tui.log("server")
@@ -532,16 +532,16 @@ def sized_float_case():
         plain = {"x": 44, "y": 13, "width": 72, "height": 21}
         tui.send(ALT_P)
         tui.pump(1.8)
-        found = boxes_in(list(tui.rows_text()), SB_COLS)
+        found = boxes_in(list(tui.cell_rows()), SB_COLS)
         check(sized in found, f"Alt-p (float 80) opens an 80% float; boxes: {found}")
         check(plain not in found, "and not the configured 45%")
         tui.send(ALT_P)
         tui.pump(1.8)
-        check(sized not in boxes_in(list(tui.rows_text()), SB_COLS),
+        check(sized not in boxes_in(list(tui.cell_rows()), SB_COLS),
               "Alt-p while it is open closes it")
         tui.send(ALT_O)
         tui.pump(1.8)
-        found = boxes_in(list(tui.rows_text()), SB_COLS)
+        found = boxes_in(list(tui.cell_rows()), SB_COLS)
         check(plain in found, f"a plain key opens the configured 45% float; boxes: {found}")
         check(sized not in found, "and not the 80% one")
         check(tui.alive(), "the client is alive")
@@ -564,11 +564,11 @@ def tab_switch_no_resize_case():
     try:
         tui.send(ALT_BACKSLASH)
         tui.pump(1.8)
-        check(right_open(list(tui.rows_text())), "tab 1's popup opens on the right")
+        check(right_open(list(tui.cell_rows())), "tab 1's popup opens on the right")
         before = popup_resizes()
         tui.prefix(b"tn", 1.8)
         tui.prefix(b"t1", 1.8)
-        check(right_open(list(tui.rows_text())), "back on tab 1 it is still on the right")
+        check(right_open(list(tui.cell_rows())), "back on tab 1 it is still on the right")
         after = popup_resizes()
         check(after == before,
               f"no popup PTY resize across the switch ({before} -> {after})")
@@ -581,7 +581,7 @@ def tab_switch_no_resize_case():
 def output_at(tui, needle):
     """`(x, y)` of `needle` on screen. Markers are printed as `FOC$((40+n))`,
     so the output text never appears in the typed command."""
-    for y, row in enumerate(tui.rows_text()):
+    for y, row in enumerate(tui.cell_rows()):
         x = row.find(needle)
         if x >= 0:
             return (x, y)
@@ -606,7 +606,7 @@ def focus_return_case():
                                           ("PopupToggle right", ALT_BACKSLASH)]):
             tui.send(key)
             tui.pump(1.8)
-            rows = list(tui.rows_text())
+            rows = list(tui.cell_rows())
             check(rows[5][16] == "\u256d" or right_open(rows), f"{label} opens the popup")
             tui.send(key)
             tui.pump(1.8)
@@ -614,7 +614,7 @@ def focus_return_case():
             tui.send(f"echo FOC$((40+{3 + n}))\r".encode())
             tui.pump(1.0)
             at = output_at(tui, marker)
-            rows = list(tui.rows_text())
+            rows = list(tui.cell_rows())
             # The same column with no pane divider between them: the same pane,
             # not one stacked below it.
             same_pane = (at is not None and home is not None and at[0] == home[0]
@@ -636,7 +636,7 @@ def sgr_click(col, row):
 
 
 def popup_open(tui):
-    return list(tui.rows_text())[5][16] == "\u256d"
+    return list(tui.cell_rows())[5][16] == "\u256d"
 
 
 def dismiss_case():
@@ -741,7 +741,7 @@ def tab_click_case():
         check(popup_open(tui) and tui.has("TABCLICK_MARK"),
               "tab 1's popup is up with its marker")
         # The sidebar is shown, so the client draws the bar on the last row.
-        bar = list(tui.rows_text())[SB_ROWS - 1]
+        bar = list(tui.cell_rows())[SB_ROWS - 1]
         x = bar.find("Tab 2")
         check(x >= 0, f"tab 2's label is on the bar ({bar.strip()!r})")
         tui.send(sgr_click(x + 1, SB_ROWS - 1), 1.8)
@@ -786,7 +786,7 @@ def focus_key_sidebar_case():
 def popup_line_with(tui, needle):
     """Whether a line of the float's interior holds `needle` as output: not the
     typed command or a prompt, which carry the `$`."""
-    rows = list(tui.rows_text())
+    rows = list(tui.cell_rows())
     return any(needle in r[17:143] and "$" not in r[17:143] for r in rows[6:41])
 
 
@@ -811,7 +811,7 @@ def in_tab_cwd_case():
         tui.send(b"\x1bl", 0.8)
         tui.send(ALT_P)
         tui.pump(1.8)
-        check(list(tui.rows_text())[5][16] == "\u256d", "the popup opens")
+        check(list(tui.cell_rows())[5][16] == "\u256d", "the popup opens")
         tui.send(b"pwd\r")
         tui.pump(1.2)
         check(popup_line_with(tui, dir_b),

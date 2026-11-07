@@ -172,6 +172,16 @@ class Tui:
     def rows_text(self):
         return self.screen.display
 
+    def cell_rows(self):
+        """Every row with one character per CELL, so an index is a column.
+
+        `screen.display` drops the second cell of a wide glyph, which moves
+        everything to its right one column left per glyph.
+        """
+        s = self.screen
+        return ["".join((s.buffer[y][x].data or " ") for x in range(s.columns))
+                for y in range(s.lines)]
+
     def dump(self, label=""):
         print(f"----- screen {label} -----")
         for i, r in enumerate(self.rows_text()):
