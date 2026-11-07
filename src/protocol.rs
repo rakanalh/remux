@@ -221,7 +221,11 @@ pub enum ConnDescriptor {
 /// layout is shared state on the local server, so choosing one by name needs a
 /// server message; [`ClientMessage::ViewCycleLayout`] only steps. A 22 server
 /// cannot decode either and drops the connection.
-pub const PROTOCOL_VERSION: u32 = 23;
+///
+/// 23 -> 24: [`RemuxCommand::TabMoveToSession`]. A 23 server cannot decode the
+/// command and drops the connection, so the bump turns that into a refused
+/// handshake for the upgraded client.
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -2402,6 +2406,15 @@ pub enum RemuxCommand {
         #[serde(default)]
         session: Option<String>,
     },
+    /// Move a whole tab, with its panes, from session `from` to session `to` on
+    /// this server. `from` is a cross-check: the move is refused when the tab
+    /// is no longer there, because the client chose it from a tree that may be
+    /// stale. The requester follows the tab only when it was looking at it.
+    TabMoveToSession {
+        tab_id: u64,
+        from: String,
+        to: String,
+    },
     PaneRename(String),
     /// Zoom the focused pane the way `[zoom] mode` says, or release a zoom of
     /// either mode.
@@ -2677,6 +2690,9 @@ impl RemuxCommand {
             // the requester's own session it replaces the whole screen, which is
             // a larger change than `PaneNewInTab`, not a smaller one.
             | RemuxCommand::TabNewInSession { session } => session == attached_session,
+            RemuxCommand::TabMoveToSession { from, to, .. } => {
+                from == attached_session || to == attached_session
+            }
 
             // Entering copy mode or the search prompt FROM a scrolled position
             // is the reason the user scrolled in the first place; snapping
@@ -4669,7 +4685,8 @@ mod tests {
             | RemuxCommand::PaneCloseById { .. }
             | RemuxCommand::PaneRenameById { .. }
             | RemuxCommand::TabMoveByIndex { .. }
-            | RemuxCommand::PaneMoveToTabTarget { .. } => None,
+            | RemuxCommand::PaneMoveToTabTarget { .. }
+            | RemuxCommand::TabMoveToSession { .. } => None,
         }
     }
 
@@ -4703,10 +4720,11 @@ mod tests {
 
     /// 22 introduced agent session restore and 23 the layout switcher in a
     /// View; a peer on 22 cannot decode `ListViewLayouts` or `ViewSetLayout`,
-    /// so the handshake has to refuse that pairing.
+    /// so the handshake has to refuse that pairing. 24 adds `TabMoveToSession`,
+    /// which a peer on 23 cannot decode.
     #[test]
-    fn protocol_version_is_23_for_the_view_layout_switcher() {
-        assert_eq!(PROTOCOL_VERSION, 23);
+    fn protocol_version_is_24_for_the_tab_move() {
+        assert_eq!(PROTOCOL_VERSION, 24);
     }
 
     #[test]

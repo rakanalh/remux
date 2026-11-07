@@ -295,7 +295,7 @@ tx = ""            # remove a default chord
 | `px` | `PaneClose` | `fr` | `FolderRename` |
 | `pr` | `PaneRename` | `va` | `AddToView` |
 | `vr` | `ViewRename` | `vx` | `ViewRemoveCell` |
-| `vd` | `ViewDelete` | | |
+| `vd` | `ViewDelete` | `tm` | `TabMoveToSession` |
 
 - A chord is one or two printable characters. An invalid chord or an unknown action is skipped with a warning.
 - If a character starts any two-key chord, a one-key chord on that same character is dropped, because the two-key chord wins.

@@ -241,6 +241,11 @@ class Server:
             "SHELL": os.environ.get("REMUX_TEST_SHELL", "/bin/sh"),
             "ENV": "/dev/null",
             "TERM": "xterm-256color",
+            # A prompt holding the working directory is as long as that path. A
+            # client attaching before it resizes narrows every pane to 80 columns
+            # for a moment, and a prompt that wraps there makes the shell redraw
+            # over the row above it, which erases output a harness then looks for.
+            "PS1": os.environ.get("PS1", "$ "),
         }
         self.proc = subprocess.Popen(
             [BIN, "server"], env=self.env,

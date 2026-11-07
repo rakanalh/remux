@@ -665,6 +665,8 @@ pub enum RenameTarget {
     Pane,
     Tab,
     Session,
+    /// Only ever paired with `rename_explicit`, which names the folder.
+    Folder,
     NewSession,
     /// Naming a brand-new client-side View (prompted before it is created).
     NewView,
@@ -3757,12 +3759,14 @@ impl InputHandler {
                     RenameTarget::NewSession => InputAction::NewSession(name),
                     RenameTarget::NewView => InputAction::NewView(name),
                     RenameTarget::ViewRename => InputAction::ViewRename(name),
+                    RenameTarget::Folder => InputAction::None,
                     _ => {
                         let cmd = match target {
                             RenameTarget::Pane => RemuxCommand::PaneRename(name),
                             RenameTarget::Tab => RemuxCommand::TabRename(name),
                             RenameTarget::Session => RemuxCommand::SessionRename(name),
-                            RenameTarget::NewSession
+                            RenameTarget::Folder
+                            | RenameTarget::NewSession
                             | RenameTarget::NewView
                             | RenameTarget::ViewRename => unreachable!(),
                         };

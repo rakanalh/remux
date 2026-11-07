@@ -1855,6 +1855,11 @@ async fn handle_plugin_action(
             chrome.paint(renderer, c, r, theme, focused_pane_rect)?;
             renderer.flush()?;
         }
+        // Only `on_key` yields these, and the key gate runs them where it can
+        // reach the menu state this function cannot.
+        PluginAction::OpenMenu { .. } | PluginAction::RunMenuAction(_) => {
+            log::warn!("sidebar: a menu action reached the plain action path");
+        }
         PluginAction::LeaveTo(dir) => {
             log::debug!("sidebar: plugin asked to leave towards {dir:?}");
             chrome.leave_sidebar();
@@ -1980,6 +1985,7 @@ async fn open_rename_prompt(
         crate::client::context_menu::RenameFor::Session { .. } => {
             (RenameTarget::Session, "Session")
         }
+        crate::client::context_menu::RenameFor::Folder { .. } => (RenameTarget::Folder, "Folder"),
     };
     debug_assert_eq!(label, what.label());
     input.rename_overlay = Some(crate::client::input::RenameOverlay {
@@ -2014,6 +2020,7 @@ async fn run_menu_action(
     last_local_session: &mut Option<String>,
     current_attached: &mut Option<(ConnId, String)>,
     previous_attached: &mut Option<(ConnId, String)>,
+    move_follow: &mut MoveFollow,
     view_paint: ViewPaint<'_>,
 ) -> Result<()> {
     use crate::client::context_menu::MenuAction;
@@ -2072,6 +2079,43 @@ async fn run_menu_action(
         }
         MenuAction::KillSession { conn, name } => {
             mgr.send(&conn, ClientMessage::KillSession { name }).await?;
+            mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+        }
+        MenuAction::MoveSession {
+            conn,
+            session,
+            folder,
+        } => {
+            mgr.send(
+                &conn,
+                ClientMessage::Command(RemuxCommand::FolderMoveSession { session, folder }),
+            )
+            .await?;
+            mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+        }
+        MenuAction::MoveTab {
+            conn,
+            tab_id,
+            from,
+            to,
+            follows,
+        } => {
+            if follows {
+                move_follow.arm((conn.clone(), to.clone()));
+            }
+            mgr.send(
+                &conn,
+                ClientMessage::Command(RemuxCommand::TabMoveToSession { tab_id, from, to }),
+            )
+            .await?;
+            mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+        }
+        MenuAction::DeleteFolder { conn, name } => {
+            mgr.send(
+                &conn,
+                ClientMessage::Command(RemuxCommand::FolderDelete(name)),
+            )
+            .await?;
             mgr.send(&conn, ClientMessage::ListSessionTree).await?;
         }
         MenuAction::CloseTab {
@@ -2674,6 +2718,7 @@ fn relay_overlays(
             RenameTarget::Tab => "Tab",
             RenameTarget::Pane => "Pane",
             RenameTarget::Session => "Session",
+            RenameTarget::Folder => "Folder",
             RenameTarget::NewSession => "New Session",
             RenameTarget::NewView => "New View",
             RenameTarget::ViewRename => "Rename View",
@@ -4315,6 +4360,7 @@ async fn run_client_loop(
                     &mut last_local_session,
                     &mut current_attached,
                     &mut previous_attached,
+                    &mut move_follow,
                     ViewPaint {
                         whichkey: &whichkey,
                         theme: &theme,
@@ -4514,6 +4560,41 @@ async fn run_client_loop(
                                         let plugin_action = chrome.sidebars[sidebar].panels[panel]
                                             .plugin
                                             .on_key(key);
+                                        use crate::client::sidebar::PluginAction;
+                                        let plugin_action = match plugin_action {
+                                            PluginAction::OpenMenu { mut items, row, confirm } => {
+                                                use crate::client::context_menu::ContextMenu;
+                                                let anchor = chrome
+                                                    .panel_rects(tc, tr)
+                                                    .into_iter()
+                                                    .find(|(a, b, _)| *a == sidebar && *b == panel)
+                                                    .map_or((0, 0), |(_, _, r)| (r.x + 1, r.y + row + 1));
+                                                input.context_menu = match (confirm, items.pop()) {
+                                                    (true, Some(item)) => ContextMenu::open_confirm(item, anchor, (tc, tr)),
+                                                    (false, Some(last)) => {
+                                                        items.push(last);
+                                                        ContextMenu::open(items, anchor, (tc, tr))
+                                                    }
+                                                    (_, None) => None,
+                                                };
+                                                repaint_overlays(
+                                                    &mut renderer,
+                                                    &input,
+                                                    &whichkey,
+                                                    &theme,
+                                                    &which_key_position,
+                                                    viewport_top,
+                                                    focused_pane_rect.as_ref(),
+                                                    (last_cursor_x, last_cursor_y, last_cursor_visible),
+                                                )?;
+                                                continue;
+                                            }
+                                            PluginAction::RunMenuAction(action) => {
+                                                apply_menu_outcome!(crate::client::context_menu::MenuOutcome::Run(action));
+                                                continue;
+                                            }
+                                            other => other,
+                                        };
                                         handle_plugin_action(
                                             plugin_action,
                                             &mut chrome,
@@ -5129,6 +5210,7 @@ async fn run_client_loop(
                                     Some(RenameTarget::Tab) => "Tab",
                                     Some(RenameTarget::Pane) => "Pane",
                                     Some(RenameTarget::Session) => "Session",
+                                    Some(RenameTarget::Folder) => "Folder",
                                     Some(RenameTarget::NewSession) => "New Session",
                                     Some(RenameTarget::NewView) => "New View",
                                     Some(RenameTarget::ViewRename) => "Rename View",
@@ -5291,6 +5373,7 @@ async fn run_client_loop(
                                     RenameTarget::Tab => "Tab",
                                     RenameTarget::Pane => "Pane",
                                     RenameTarget::Session => "Session",
+                                    RenameTarget::Folder => "Folder",
                                     RenameTarget::NewSession => "New Session",
                                     RenameTarget::NewView => "New View",
                                     RenameTarget::ViewRename => "Rename View",
@@ -5919,6 +6002,20 @@ async fn run_client_loop(
                                     SessionManagerAction::DeleteSession { server, name } => {
                                         mgr.send(&server, ClientMessage::KillSession { name: name.clone() }).await?;
                                         mgr.send(&server, ClientMessage::ListSessionTree).await?;
+                                    }
+                                    SessionManagerAction::OpenMenu(items) => {
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        input.context_menu = crate::client::context_menu::ContextMenu::open(items, (c / 3, r / 3), (c, r));
+                                        repaint_overlays(
+                                            &mut renderer,
+                                            &input,
+                                            &whichkey,
+                                            &theme,
+                                            &which_key_position,
+                                            viewport_top,
+                                            focused_pane_rect.as_ref(),
+                                            (last_cursor_x, last_cursor_y, last_cursor_visible),
+                                        )?;
                                     }
                                     SessionManagerAction::DeleteFolder { server, name } => {
                                         mgr.send(&server, ClientMessage::Command(RemuxCommand::FolderDelete(name.clone()))).await?;

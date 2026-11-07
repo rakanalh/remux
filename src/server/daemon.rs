@@ -7225,7 +7225,17 @@ async fn handle_client_message(
         }
         ClientMessage::ListSessions => handle_list_sessions(client_id, state, clients).await,
         ClientMessage::KillSession { name } => {
-            let result = handle_kill_session(&name, state, panes, clients).await;
+            let result = handle_kill_session(
+                client_id,
+                &name,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
             save_if_enabled(state, panes, config, dormant).await;
             mark_session_tree_dirty();
             result
@@ -8558,6 +8568,7 @@ async fn handle_command(
                     | RemuxCommand::TabMoveByIndex { .. }
                     | RemuxCommand::TabCloseById { .. }
                     | RemuxCommand::TabRenameById { .. }
+                    | RemuxCommand::TabMoveToSession { .. }
             ) {
                 String::new()
             } else {
@@ -8830,6 +8841,15 @@ async fn handle_command(
         if let Err(why) = st.check_move_pane_to_tab(&session_name, pane, &target) {
             log::info!(
                 "server: PaneMoveToTabTarget pane_id={pane} target={target:?} refused: {why:?}"
+            );
+            return Ok(());
+        }
+    }
+    if let RemuxCommand::TabMoveToSession { tab_id, from, to } = &cmd {
+        let st = state.lock().await;
+        if let Err(why) = st.check_move_tab_to_session(*tab_id, from, to) {
+            log::info!(
+                "server: TabMoveToSession tab_id={tab_id} {from:?} -> {to:?} refused: {why:?}"
             );
             return Ok(());
         }
@@ -9455,6 +9475,79 @@ async fn handle_command(
             .await;
             mark_agents_dirty();
         }
+        RemuxCommand::TabMoveToSession { tab_id, from, to } => {
+            let (follows, outcome) = {
+                let mut st = state.lock().await;
+                // The requester follows only the tab it is looking at, so a tab
+                // moved from a list does not pull it away from its work. That
+                // also covers an emptied source: its only tab is the active one.
+                let follows = session_name == from
+                    && st
+                        .sessions
+                        .get(&from)
+                        .and_then(|s| s.tabs.get(s.active_tab))
+                        .is_some_and(|t| t.id == tab_id);
+                (follows, st.move_tab_to_session(tab_id, &from, &to, follows))
+            };
+            let moved = match outcome {
+                Ok(moved) => moved,
+                Err(why) => {
+                    log::info!(
+                        "server: TabMoveToSession tab_id={tab_id} {from:?} -> {to:?} refused: {why:?}"
+                    );
+                    return Ok(());
+                }
+            };
+            log::debug!(
+                "server: TabMoveToSession tab_id={tab_id} {from:?} -> {to:?} panes={} \
+                 follows={follows} source_removed={}",
+                moved.panes.len(),
+                moved.source_removed.is_some()
+            );
+            if let Some(reap) = &moved.source_removed {
+                reap_panes(reap, panes, clients).await;
+            }
+            // As for a moved pane: a scroll offset left behind would make the
+            // broadcast skip that client when the pane is focused again.
+            {
+                let mut cls = clients.lock().await;
+                for c in cls.values_mut() {
+                    for pane in &moved.panes {
+                        c.session_scroll.remove(pane);
+                        if c.prev_scroll_pane == Some(*pane) {
+                            c.prev_scroll_pane = None;
+                            c.prev_scroll_offset = 0;
+                        }
+                    }
+                }
+            }
+            // Before the source is handled, so that `handle_session_removed`
+            // does not land the requester on an arbitrary session.
+            if follows {
+                handle_attach(
+                    client_id,
+                    &to,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                    dormant,
+                )
+                .await?;
+            }
+            if moved.source_removed.is_some() {
+                handle_session_removed(&from, state, panes, clients, config, prev_frames).await;
+            } else {
+                resize_session_panes(&from, state, panes, clients, config).await?;
+                invalidate_session_baselines(&from, clients, prev_frames).await;
+                broadcast_full_render(&from, state, panes, clients, config, prev_frames).await;
+            }
+            resize_session_panes(&to, state, panes, clients, config).await?;
+            invalidate_session_baselines(&to, clients, prev_frames).await;
+            broadcast_full_render(&to, state, panes, clients, config, prev_frames).await;
+            mark_agents_dirty();
+        }
         RemuxCommand::PaneStackAdd => {
             create_pane_in_tab(
                 &session_name,
@@ -9949,22 +10042,18 @@ async fn handle_command(
                     .collect();
                 reap_panes(&doomed, panes, clients).await;
             }
-            {
-                let mut cls = clients.lock().await;
-                for (session_name, _) in &deleted_sessions {
-                    for client in cls.values_mut() {
-                        if client.session_name.as_deref() == Some(session_name) {
-                            client.session_name = None;
-                            let _ =
-                                client
-                                    .tx
-                                    .send(ServerMessage::Event(SessionEvent::SessionDeleted(
-                                        session_name.clone(),
-                                    )));
-                        }
-                    }
-                }
-            }
+            let removed: Vec<String> = deleted_sessions.into_iter().map(|(n, _)| n).collect();
+            rehome_clients_of_removed(
+                client_id,
+                &removed,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await?;
         }
         RemuxCommand::FolderMoveSession { session, folder } => {
             let mut st = state.lock().await;
@@ -11382,11 +11471,16 @@ async fn handle_list_session_tree(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_kill_session(
+    client_id: u64,
     name: &str,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
 ) -> Result<()> {
     let pane_ids = {
         let mut st = state.lock().await;
@@ -11397,16 +11491,58 @@ async fn handle_kill_session(
         pane_ids.len()
     );
     reap_panes(&pane_ids, panes, clients).await;
-    let mut cls = clients.lock().await;
-    for client in cls.values_mut() {
-        if client.session_name.as_deref() == Some(name) {
-            client.session_name = None;
-            let _ = client
-                .tx
-                .send(ServerMessage::Event(SessionEvent::SessionDeleted(
-                    name.to_string(),
-                )));
-        }
+    rehome_clients_of_removed(
+        client_id,
+        &[name.to_string()],
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        dormant,
+    )
+    .await
+}
+
+/// Move every client off `removed`, sessions already gone from the state, so
+/// that each survivor is the only place a client can land.
+///
+/// The requester is attached first, because `handle_attach` tells it the new
+/// session's border style and `handle_session_removed` does not. With no session
+/// left, `handle_session_removed` sends `SessionDeleted`, which ends the client.
+#[allow(clippy::too_many_arguments)]
+async fn rehome_clients_of_removed(
+    client_id: u64,
+    removed: &[String],
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
+) -> Result<()> {
+    let requester_was_there = clients
+        .lock()
+        .await
+        .get(&client_id)
+        .and_then(|c| c.session_name.as_ref())
+        .is_some_and(|name| removed.contains(name));
+    let survivor = state.lock().await.sessions.keys().next().cloned();
+    if let (true, Some(survivor)) = (requester_was_there, survivor) {
+        handle_attach(
+            client_id,
+            &survivor,
+            state,
+            panes,
+            clients,
+            config,
+            prev_frames,
+            dormant,
+        )
+        .await?;
+    }
+    for name in removed {
+        handle_session_removed(name, state, panes, clients, config, prev_frames).await;
     }
     Ok(())
 }
