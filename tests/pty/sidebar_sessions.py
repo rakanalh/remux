@@ -53,6 +53,7 @@ What it covers:
  28  `icons` picks each row's glyph, leaves the marker where it is, follows a
      config reload, and an unknown value keeps the panel on the default
  27  a menu left open when its remote drops: Confirm does not end the client
+ 29  `d` on a remote's server row disconnects it; on the local row it does nothing
 
 Run from the repo root:
     python3 tests/pty/sidebar_sessions.py [-v] [scenario_<name> ...]
@@ -1939,7 +1940,7 @@ def server_row(screen, name):
 
 
 def scenario_d_server():
-    """27: `d` on the LOCAL server row does nothing; on a connected remote's
+    """29: `d` on the LOCAL server row does nothing; on a connected remote's
     server row it disconnects that remote, with no confirm, and the remote's
     sessions keep running on its own server."""
     print("d on server rows")
@@ -1949,20 +1950,20 @@ def scenario_d_server():
     rseed = seed_remote()
     child, screen, pump = spawn(env_local(f"{RUN}/cfg-remote"))
     pump(3.0)
-    check("27 setup: the remote's server row is listed",
+    check("29 setup: the remote's server row is listed",
           server_row(screen, "mini") is not None, panel_rows(screen))
-    check("27 setup: the remote's session is listed",
+    check("29 setup: the remote's session is listed",
           panel_row_of(screen, "mini1") is not None, panel_rows(screen))
 
     focus_panel(child, pump)
     select_row(child, screen, pump, "local")
     child.send(b"d")
     pump(1.0)
-    check("27 d on the local server row opens no menu", menu_rows(screen) == [],
+    check("29 d on the local server row opens no menu", menu_rows(screen) == [],
           cell_rows(screen))
-    check("27 d on the local server row leaves its sessions",
+    check("29 d on the local server row leaves its sessions",
           sorted(session_names(SOCK1)) == ["alpha", "beta"], session_names(SOCK1))
-    check("27 d on the local server row disconnects nothing",
+    check("29 d on the local server row disconnects nothing",
           "disconnected by the user" not in client_log(), client_log()[-1500:])
 
     y = next((y for y, r in enumerate(panel_rows(screen)) if r.endswith(" mini")), None)
@@ -1975,19 +1976,19 @@ def scenario_d_server():
     child.send(b"d")
     pump(2.0)
     body = client_log()
-    check("27 d on the remote's server row disconnects it, by the user's request",
+    check("29 d on the remote's server row disconnects it, by the user's request",
           "registry: remote 'mini' disconnected by the user" in body
           and "disconnecting remote 'mini' at the user's request" in body,
           body[-1500:])
-    check("27 d on a remote opens no confirm", menu_rows(screen) == [], cell_rows(screen))
-    check("27 the remote's rows leave the panel",
+    check("29 d on a remote opens no confirm", menu_rows(screen) == [], cell_rows(screen))
+    check("29 the remote's rows leave the panel",
           server_row(screen, "mini") is None and panel_row_of(screen, "mini1") is None,
           panel_rows(screen))
-    check("27 the local subtree stays", panel_row_of(screen, "alpha") is not None,
+    check("29 the local subtree stays", panel_row_of(screen, "alpha") is not None,
           panel_rows(screen))
-    check("27 the remote's session keeps running on its server",
+    check("29 the remote's session keeps running on its server",
           "mini1" in session_names(SOCK2), session_names(SOCK2))
-    check("27 the client is still alive", child.isalive())
+    check("29 the client is still alive", child.isalive())
     check_no_panic(f"{RUN}/state", f"{RUN}/state2")
     teardown(child)
     for w in seeds:
