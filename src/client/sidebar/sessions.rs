@@ -113,7 +113,7 @@ const SHORTCUTS: &[Shortcut] = &[
     Shortcut {
         keys: &[KeyCode::Char('d')],
         shown: "d",
-        does: "Delete folder, session or tab",
+        does: "Delete folder, session or tab; disconnect remote",
     },
     Shortcut {
         keys: &[KeyCode::Char('m')],
@@ -317,12 +317,18 @@ impl SessionsPlugin {
 
     /// `d`: a folder or a session asks first, because the rest of the tree goes
     /// with it, and so does a session's only tab, because closing it ends the
-    /// session. Any other tab closes at once. Other rows have nothing to delete.
+    /// session. Any other tab closes at once. A remote server disconnects at
+    /// once, because its sessions keep running and it can be reconnected. Other
+    /// rows have nothing to delete.
     fn delete_selected(&self) -> PluginAction {
         let Some(row) = self.model.selected_row() else {
             return PluginAction::None;
         };
         match &row.node_type {
+            NodeType::Server {
+                id: ConnId::Remote(name),
+                ..
+            } => PluginAction::RunMenuAction(MenuAction::DisconnectRemote(name.clone())),
             NodeType::Folder { server, name } => {
                 self.open_menu(vec![self.delete_folder_item(server, name)], true)
             }
@@ -570,6 +576,13 @@ impl SidebarPlugin for SessionsPlugin {
             return Vec::new();
         };
         match row.node_type.clone() {
+            NodeType::Server {
+                id: ConnId::Remote(name),
+                ..
+            } => vec![
+                MenuItem::new("Disconnect", MenuAction::DisconnectRemote(name))
+                    .hint(Some("d".into())),
+            ],
             NodeType::Folder { server, name } => {
                 let delete = self.delete_folder_item(&server, &name);
                 vec![
@@ -1513,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn d_and_m_do_nothing_on_a_server_or_a_pane_row() {
+    fn d_and_m_do_nothing_on_the_local_server_or_a_pane_row() {
         let mut p = SessionsPlugin::new(IconStyle::Emoji);
         p.on_event(&local_tree());
         select(&mut p, "editor");
@@ -1523,6 +1536,38 @@ mod tests {
             assert_eq!(p.on_key(key(KeyCode::Char('d'))), PluginAction::None);
             assert_eq!(p.on_key(key(KeyCode::Char('m'))), PluginAction::None);
         }
+    }
+
+    #[test]
+    fn d_on_a_remote_server_row_disconnects_that_remote() {
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
+        p.on_event(&local_tree());
+        p.on_event(&remote_tree());
+        select(&mut p, "gpu");
+        assert_eq!(
+            p.on_key(key(KeyCode::Char('d'))),
+            PluginAction::RunMenuAction(MenuAction::DisconnectRemote("gpu".to_string()))
+        );
+        assert_eq!(p.on_key(key(KeyCode::Char('m'))), PluginAction::None);
+        let mut chord = key(KeyCode::Char('d'));
+        chord.modifiers = KeyModifiers::CONTROL;
+        assert_eq!(p.on_key(chord), PluginAction::None);
+    }
+
+    #[test]
+    fn only_a_remote_server_row_offers_disconnect() {
+        let mut p = SessionsPlugin::new(IconStyle::Emoji);
+        p.on_event(&local_tree());
+        p.on_event(&remote_tree());
+        let _ = painted(&p, 24, 12);
+        let items = menu_at(&mut p, "gpu");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "Disconnect");
+        assert_eq!(
+            items[0].action,
+            MenuAction::DisconnectRemote("gpu".to_string())
+        );
+        assert!(menu_at(&mut p, "local").is_empty());
     }
 
     #[test]

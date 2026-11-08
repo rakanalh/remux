@@ -2251,6 +2251,9 @@ async fn run_menu_action(
                 log::error!("Failed to copy to clipboard: {e}");
             }
         }
+        MenuAction::DisconnectRemote(name) => {
+            log::warn!("context menu: disconnect '{name}' reached run_menu_action; ignored");
+        }
         MenuAction::Cancel => {}
     }
     Ok(())
@@ -4610,7 +4613,41 @@ async fn run_client_loop(
                     }
                 }
             };
-            if let Some(action) = chosen {
+            if let Some(crate::client::context_menu::MenuAction::DisconnectRemote(name)) = &chosen {
+                // A disconnect needs the drop cleanup's whole `DropCtx`, which
+                // `run_menu_action` does not hold.
+                match disconnect_remote_now(
+                    name,
+                    DropCtx {
+                        mgr,
+                        renderer: &mut renderer,
+                        chrome: &mut chrome,
+                        views: &mut views,
+                        active_view: &mut active_view,
+                        input: &mut input,
+                        whichkey: &whichkey,
+                        theme: &theme,
+                        compositor_theme: &compositor_theme,
+                        view_border_style: &view_border_style,
+                        which_key_position: &which_key_position,
+                        viewport_top,
+                        focused_pane_rect: focused_pane_rect.as_ref(),
+                        last_local_session: &last_local_session,
+                        attach_check: &mut attach_check,
+                        creating_session: &mut creating_session,
+                        live_sessions: &mut live_sessions,
+                        move_follow: &mut move_follow,
+                        wants_session_tree,
+                        wants_agents,
+                    },
+                )
+                .await
+                {
+                    Ok(AfterDrop::ExitClient) => return Ok(()),
+                    Ok(AfterDrop::Continue) => {}
+                    Err(e) => log::warn!("context menu: the disconnect failed: {e:#}"),
+                }
+            } else if let Some(action) = chosen {
                 let ran = run_menu_action(
                     action,
                     &mut input,
