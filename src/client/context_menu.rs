@@ -65,6 +65,8 @@ pub enum MenuAction {
         to: String,
         follows: bool,
     },
+    /// Disconnect a remote, as the session manager's disconnect does.
+    DisconnectRemote(String),
     /// Hand a request to the client, as a sidebar plugin does.
     Request(PluginRequest),
     /// Copy text to the clipboard.

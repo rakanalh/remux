@@ -1436,7 +1436,8 @@ def scenario_d_key():
 
 
 SHORTCUT_TEXT = ("Next row", "Previous row", "First row", "Last row", "Switch to row",
-                 "Expand or collapse", "Collapse", "Expand", "Delete folder, session or tab",
+                 "Expand or collapse", "Collapse", "Expand",
+                 "Delete folder, session or tab; disconnect remote",
                  "Move session or tab", "Show or hide this list", "Leave the panel")
 
 
@@ -1927,6 +1928,73 @@ def scenario_kill_attached():
     seed.close()
 
 
+def client_log(state=f"{RUN}/state"):
+    path = f"{state}/remux/client.log"
+    return open(path, errors="replace").read() if os.path.exists(path) else ""
+
+
+def server_row(screen, name):
+    """The panel row of server `name`, matched whole so `mini` is not `mini1`."""
+    return next((r for r in panel_rows(screen) if r.endswith(f" {name}")), None)
+
+
+def scenario_d_server():
+    """27: `d` on the LOCAL server row does nothing; on a connected remote's
+    server row it disconnects that remote, with no confirm, and the remote's
+    sessions keep running on its own server."""
+    print("d on server rows")
+    start_server(SOCK1, env_local())
+    start_server(SOCK2, env_remote())
+    seeds = seed_local()
+    rseed = seed_remote()
+    child, screen, pump = spawn(env_local(f"{RUN}/cfg-remote"))
+    pump(3.0)
+    check("27 setup: the remote's server row is listed",
+          server_row(screen, "mini") is not None, panel_rows(screen))
+    check("27 setup: the remote's session is listed",
+          panel_row_of(screen, "mini1") is not None, panel_rows(screen))
+
+    focus_panel(child, pump)
+    select_row(child, screen, pump, "local")
+    child.send(b"d")
+    pump(1.0)
+    check("27 d on the local server row opens no menu", menu_rows(screen) == [],
+          cell_rows(screen))
+    check("27 d on the local server row leaves its sessions",
+          sorted(session_names(SOCK1)) == ["alpha", "beta"], session_names(SOCK1))
+    check("27 d on the local server row disconnects nothing",
+          "disconnected by the user" not in client_log(), client_log()[-1500:])
+
+    y = next((y for y, r in enumerate(panel_rows(screen)) if r.endswith(" mini")), None)
+    assert y is not None, panel_rows(screen)
+    child.send(b"g")
+    pump(0.3)
+    for _ in range(y - HEADER_ROWS):
+        child.send(b"j")
+        pump(0.12)
+    child.send(b"d")
+    pump(2.0)
+    body = client_log()
+    check("27 d on the remote's server row disconnects it, by the user's request",
+          "registry: remote 'mini' disconnected by the user" in body
+          and "disconnecting remote 'mini' at the user's request" in body,
+          body[-1500:])
+    check("27 d on a remote opens no confirm", menu_rows(screen) == [], cell_rows(screen))
+    check("27 the remote's rows leave the panel",
+          server_row(screen, "mini") is None and panel_row_of(screen, "mini1") is None,
+          panel_rows(screen))
+    check("27 the local subtree stays", panel_row_of(screen, "alpha") is not None,
+          panel_rows(screen))
+    check("27 the remote's session keeps running on its server",
+          "mini1" in session_names(SOCK2), session_names(SOCK2))
+    check("27 the client is still alive", child.isalive())
+    check_no_panic(f"{RUN}/state", f"{RUN}/state2")
+    teardown(child)
+    for w in seeds:
+        w.close()
+    rseed.close()
+
+
 def run_scenario(scenario):
     """A missing row stops one scenario, not the ones after it."""
     try:
@@ -1947,7 +2015,8 @@ def main():
                      scenario_d_key, scenario_shortcuts, scenario_m_session,
                      scenario_m_tab, scenario_m_tab_follow, scenario_tm_manager,
                      scenario_keys_remote, scenario_d_only_tab, scenario_kill_attached,
-                     scenario_menu_after_remote_drop, scenario_nowhere):
+                     scenario_menu_after_remote_drop, scenario_nowhere,
+                     scenario_d_server):
         if only and scenario.__name__ not in only:
             continue
         setup_dirs()
