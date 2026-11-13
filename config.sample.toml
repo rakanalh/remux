@@ -612,6 +612,7 @@
 #   L     = "LayoutQuickSwitch"              — open the layout switcher
 #   z     = "PaneToggleZoom; EnterNormal"    — zoom the focused pane
 #   ":"   = "CommandPaletteOpen"             — open the command palette
+#   r     = "Redraw"                         — repaint everything, e.g. after Cmd+K
 #   a     = "SendKey Ctrl-a; EnterNormal"    — send the prefix key to the terminal
 #   "}"   = "TabNext; EnterNormal"           — quick next tab
 #   "{"   = "TabPrev; EnterNormal"           — quick prev tab

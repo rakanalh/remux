@@ -23,14 +23,31 @@ use crate::server::daemon::{read_message, socket_path, write_message};
 /// Put the terminal into raw mode and switch to the alternate screen.
 pub fn setup_terminal() -> Result<()> {
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
+    enable_terminal_modes().context("setting up alternate screen")
+}
+
+/// Send the modes the client runs under: the alternate screen, the input
+/// modes of [`enable_input_modes`], and a hidden cursor.
+///
+/// [`setup_terminal`] sends them at startup and a redraw sends them again,
+/// because a terminal reset drops all of them. Only call this when a full
+/// repaint follows: xterm and most terminals that copy it clear the alternate
+/// screen on `CSI ? 1049 h` even when it is already active.
+pub fn enable_terminal_modes() -> Result<()> {
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    enable_input_modes()?;
+    crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
+    Ok(())
+}
+
+/// Send bracketed paste and mouse capture. Both are idempotent and change
+/// nothing on screen, so they are safe to send without a repaint.
+pub fn enable_input_modes() -> Result<()> {
     crossterm::execute!(
         std::io::stdout(),
-        crossterm::terminal::EnterAlternateScreen,
         crossterm::event::EnableBracketedPaste,
         crossterm::event::EnableMouseCapture,
-        crossterm::cursor::Hide,
-    )
-    .context("setting up alternate screen")?;
+    )?;
     Ok(())
 }
 

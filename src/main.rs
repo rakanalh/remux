@@ -3510,6 +3510,21 @@ async fn unsubscribe_view_cells(
     Ok(())
 }
 
+/// Send mouse capture and bracketed paste again after a remote's ssh child,
+/// which writes its stderr to the client's terminal, may have turned them off.
+///
+/// The alternate screen is not sent here because entering it clears the
+/// screen and no repaint follows. A `Redraw` sends the full set.
+///
+/// A failure is logged and not returned, because the client still works
+/// without mouse capture.
+fn reassert_input_modes(why: &str) {
+    log::debug!("terminal: sending the input modes again: {why}");
+    if let Err(e) = crate::client::terminal::enable_input_modes() {
+        log::warn!("terminal: sending the input modes failed: {e:#}");
+    }
+}
+
 /// Record that `name`'s transport is gone -- unless the USER is the reason it is.
 ///
 /// A user disconnect kills the ssh child, so its pipe reports EOF a moment later
@@ -3641,6 +3656,9 @@ async fn handle_connection_drop(
         wants_agents,
     } = cx;
     log::debug!("srv: connection closed src={:?}", src);
+    if matches!(src, ConnId::Remote(_)) {
+        reassert_input_modes("a remote dropped");
+    }
     live_sessions.remove(src);
     forget_pending_on(src, attach_check, creating_session);
     // An open agent switcher must not offer a jump to a machine that is gone.
@@ -4822,6 +4840,9 @@ async fn run_client_loop(
     }
 
     loop {
+        if mgr.take_modes_reassert() {
+            reassert_input_modes("a remote connected");
+        }
         // Lay the panels out and act on what they ask for, before anything can
         // block in the `select!` below. This is the pass on which a `files`
         // panel that has just been given a rect asks for its first listing.
@@ -7389,6 +7410,26 @@ async fn run_client_loop(
                                     )
                                     .await?;
                                 }
+                            }
+                            InputAction::Redraw => {
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                }
+                                crate::client::terminal::enable_terminal_modes()?;
+                                // The front buffer holds what the client last
+                                // painted, chrome and View cells included, so
+                                // replaying it restores the screen with no
+                                // server round trip, even while scrolled back.
+                                repaint_overlays(
+                                    &mut renderer,
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                    (last_cursor_x, last_cursor_y, last_cursor_visible),
+                                )?;
                             }
                             InputAction::ViewLayoutNext => {
                                 if whichkey.visible {

@@ -477,6 +477,7 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `}` | Next tab *(→ Normal)* |
 | `{` | Previous tab *(→ Normal)* |
 | `:` | Open the command palette |
+| `r` | Redraw the screen, e.g. after the terminal's own clear (Cmd+K) wiped it |
 | `a` | Send the literal prefix key (`Ctrl-a`) to the app *(→ Normal)* |
 
 #### Pane (`p`)

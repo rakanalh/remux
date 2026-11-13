@@ -492,6 +492,8 @@ pub enum InputAction {
     ViewAddPaneOpen,
     /// Remove the focused cell from the active view.
     ViewRemovePane,
+    /// Repaint the whole screen and re-send the terminal modes.
+    Redraw,
     /// Rename the active view to the given name (empty = no-op).
     ViewRename(String),
     /// Cycle the active view's layout (Grid -> Monocle -> ...).
@@ -2540,6 +2542,10 @@ impl InputHandler {
             ClientAction::SidebarCycle => {
                 self.mode = Mode::Normal;
                 InputAction::Sidebar(SidebarIntent::Cycle)
+            }
+            ClientAction::Redraw => {
+                self.mode = Mode::Normal;
+                InputAction::Redraw
             }
         }
     }
