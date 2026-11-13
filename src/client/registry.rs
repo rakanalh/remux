@@ -167,6 +167,12 @@ pub struct ConnectionManager {
     /// which read it when their handshake completes, so a config reload during
     /// a dial still reaches that remote.
     look: std::sync::Arc<std::sync::Mutex<Look>>,
+    /// Set when a remote transport is installed. The ssh child shares the
+    /// client's terminal through its stderr, so whatever the remote side
+    /// prints there (a login banner, a ProxyCommand, a terminal reset) can
+    /// switch off the client's mouse and paste modes. The event loop sends the
+    /// modes again when it takes this flag.
+    modes_reassert: bool,
 }
 
 impl ConnectionManager {
@@ -242,7 +248,13 @@ impl ConnectionManager {
             local_server_version: None,
             initial_view_infos: None,
             look: std::sync::Arc::new(std::sync::Mutex::new(Look::default())),
+            modes_reassert: false,
         }
+    }
+
+    /// Whether a remote was installed since the last call, clearing the flag.
+    pub fn take_modes_reassert(&mut self) -> bool {
+        std::mem::take(&mut self.modes_reassert)
     }
 
     /// Take the startup shared-view registry snapshot captured from the local
@@ -443,6 +455,7 @@ impl ConnectionManager {
             generation = entry.generation;
         }
         self.spawn_reader(id, generation, reader);
+        self.modes_reassert = true;
         log::info!("registry: remote '{name}' connected (generation {generation})");
     }
 
