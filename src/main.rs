@@ -8273,6 +8273,7 @@ async fn run_client_loop(
                                 if popup_local.is_none()
                                     && crate::client::chrome::past_the_server_bar(
                                     content,
+                                    renderer.frame_size().map_or(0, |(cols, _)| cols),
                                     tc,
                                     tr,
                                     mouse.column,
@@ -8412,6 +8413,7 @@ async fn run_client_loop(
                                 if popup_local.is_some()
                                     || !crate::client::chrome::past_the_server_bar(
                                         content,
+                                        renderer.frame_size().map_or(0, |(cols, _)| cols),
                                         tc,
                                         tr,
                                         mouse.column,
