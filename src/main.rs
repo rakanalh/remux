@@ -7390,6 +7390,26 @@ async fn run_client_loop(
                                     .await?;
                                 }
                             }
+                            InputAction::Redraw => {
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                }
+                                crate::client::terminal::enable_terminal_modes()?;
+                                // The front buffer holds what the client last
+                                // painted, chrome and View cells included, so
+                                // replaying it restores the screen with no
+                                // server round trip, even while scrolled back.
+                                repaint_overlays(
+                                    &mut renderer,
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                    (last_cursor_x, last_cursor_y, last_cursor_visible),
+                                )?;
+                            }
                             InputAction::ViewLayoutNext => {
                                 if whichkey.visible {
                                     whichkey.hide();

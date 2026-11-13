@@ -2868,6 +2868,10 @@ pub enum ClientAction {
     SidebarFocusBottom,
     /// Cycle focus through every visible panel, then back to the content area.
     SidebarCycle,
+    /// Repaint the whole screen from the client's own state. The outer
+    /// terminal can clear its screen without telling the client (Cmd+K on
+    /// macOS), and the diff renderer then repaints only the cells that change.
+    Redraw,
 }
 
 /// What an action string resolves to: either a command the server executes or
@@ -3061,6 +3065,7 @@ pub fn action_specs() -> &'static [ActionSpec] {
                 .label("focus bottom sidebar"),
             ActionSpec::client("SidebarCycle", ClientAction::SidebarCycle)
                 .label("cycle sidebar focus"),
+            ActionSpec::client("Redraw", ClientAction::Redraw).label("redraw screen"),
         ]
     })
 }

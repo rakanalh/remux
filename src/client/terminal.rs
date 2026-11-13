@@ -23,14 +23,23 @@ use crate::server::daemon::{read_message, socket_path, write_message};
 /// Put the terminal into raw mode and switch to the alternate screen.
 pub fn setup_terminal() -> Result<()> {
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
+    enable_terminal_modes().context("setting up alternate screen")
+}
+
+/// Send the modes the client runs under: the alternate screen, bracketed
+/// paste and mouse capture, with the cursor hidden.
+///
+/// [`setup_terminal`] sends them once at startup, and a redraw sends them
+/// again because a terminal reset drops all of them. Each one is idempotent
+/// on a terminal that still has it set.
+pub fn enable_terminal_modes() -> Result<()> {
     crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
         crossterm::event::EnableBracketedPaste,
         crossterm::event::EnableMouseCapture,
         crossterm::cursor::Hide,
-    )
-    .context("setting up alternate screen")?;
+    )?;
     Ok(())
 }
 

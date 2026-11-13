@@ -335,6 +335,8 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
     // Command palette.
     root.insert(':', leaf("command palette", "CommandPaletteOpen"));
 
+    root.insert('r', leaf("redraw", "Redraw"));
+
     // Send the prefix key (Ctrl-a) to the terminal.
     root.insert(
         'a',
@@ -3334,6 +3336,7 @@ mod tests {
             ("ViewLayoutNext", ClientAction::ViewLayoutNext),
             ("ViewClose", ClientAction::ViewClose),
             ("ViewDelete", ClientAction::ViewDelete),
+            ("Redraw", ClientAction::Redraw),
         ] {
             assert_eq!(resolve_action(name), Some(Action::Client(want)));
             // A client action is not a server command.
