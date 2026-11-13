@@ -812,16 +812,14 @@ impl Screen {
         //    information, and keeping them means every shrink shoves real
         //    content off into the scrollback -- so a zoom/unzoom cycle would
         //    permanently inflate it with blanks.
-        //    A dropped row that an erase coloured comes back in step 6 with the
-        //    same background, as the padding rows at the bottom of the grid.
+        //    The dropped rows come back in step 6 as the padding rows at the
+        //    bottom of the grid, with their own cells cut or extended the way a
+        //    line's tail is, so an erase's colour stays where it was.
         let mut end = stream.len();
         while end > cursor_abs + 1 && stream[end - 1].cells.iter().all(Self::is_padding) {
             end -= 1;
         }
-        let dropped_pads: Vec<Cell> = stream
-            .drain(end..)
-            .map(|row| Self::pad_template(&row.cells))
-            .collect();
+        let dropped: Vec<Vec<Cell>> = stream.drain(end..).map(|row| row.cells).collect();
 
         // 3. Join rows into logical lines: a row starts a new one unless the row
         //    before it is flagged `wrapped`. The cursor's *logical* coordinates
@@ -894,11 +892,14 @@ impl Screen {
         let grid_start = total.saturating_sub(rows_us);
         let mut grid = new_lines.split_off(grid_start);
         let mut scrollback: VecDeque<Row> = VecDeque::from(new_lines);
-        let mut pads = dropped_pads.into_iter();
+        let mut dropped = dropped.into_iter();
         while grid.len() < rows_us {
-            let pad = pads.next().unwrap_or_default();
+            let mut cells = dropped.next().unwrap_or_default();
+            let pad = Self::pad_template(&cells);
+            cells.truncate(cols as usize);
+            cells.resize(cols as usize, pad);
             grid.push(Row {
-                cells: vec![pad; cols as usize],
+                cells,
                 wrapped: false,
             });
         }
@@ -3522,6 +3523,67 @@ mod tests {
             );
         }
         assert_eq!(row_text(&s, 0).trim_end(), "ab");
+    }
+
+    #[test]
+    fn reflow_never_splits_a_trailing_wide_glyph() {
+        let mut s = Screen::new(10, 2, 100);
+        // The cursor leaves the row, so reflow trims the row's padding.
+        s.process_output("ab中\r\n".as_bytes());
+        s.resize(8, 2);
+        s.resize(10, 2);
+        let line = &s.grid[0];
+        for x in 0..line.len() {
+            match line[x].width {
+                2 => assert!(
+                    line.get(x + 1).is_some_and(|c| c.width == 0),
+                    "the lead at col {x} has no continuation"
+                ),
+                0 => assert!(
+                    x > 0 && line[x - 1].width == 2,
+                    "the continuation at col {x} has no lead"
+                ),
+                _ => {}
+            }
+        }
+        assert_eq!((line[2].c, line[2].width), ('中', 2));
+    }
+
+    #[test]
+    fn reflow_puts_a_partly_coloured_tail_back_where_it_was() {
+        let mut s = Screen::new(20, 3, 100);
+        // Default padding from col 2, then a blue erase from col 12. The cursor
+        // then leaves the row, so all of cols 2-19 is the line's tail.
+        s.process_output(b"zz\x1b[1;13H\x1b[44m\x1b[K\x1b[0m\r\n");
+        s.resize(15, 3);
+        assert_eq!(s.grid[0][5].attrs.bg, Color::Default, "col 5 stays default");
+        assert_eq!(
+            s.grid[0][12].attrs.bg,
+            Color::Indexed(4),
+            "col 12 stays blue"
+        );
+        assert_eq!(
+            s.grid[0][14].attrs.bg,
+            Color::Indexed(4),
+            "the new edge is blue"
+        );
+    }
+
+    #[test]
+    fn reflow_rebuilds_partly_coloured_rows_below_the_cursor_cell_by_cell() {
+        // Row 1 is blue from col 12; row 2 is blue up to col 9 and default after.
+        let mut s = Screen::new(20, 4, 100);
+        s.process_output(b"ab\x1b[2;13H\x1b[44m\x1b[K\x1b[3;10H\x1b[1K\x1b[0m\x1b[H");
+
+        s.resize(15, 4);
+
+        assert_eq!(s.grid[1][5].attrs.bg, Color::Default, "row 1 col 5");
+        assert_eq!(s.grid[1][12].attrs.bg, Color::Indexed(4), "row 1 col 12");
+        assert_eq!(s.grid[1][14].attrs.bg, Color::Indexed(4), "row 1 new edge");
+        assert_eq!(s.grid[2][0].attrs.bg, Color::Indexed(4), "row 2 col 0");
+        assert_eq!(s.grid[2][9].attrs.bg, Color::Indexed(4), "row 2 col 9");
+        assert_eq!(s.grid[2][10].attrs.bg, Color::Default, "row 2 col 10");
+        assert_eq!(s.grid[2][14].attrs.bg, Color::Default, "row 2 new edge");
     }
 
     #[test]
