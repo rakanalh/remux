@@ -38,7 +38,7 @@ function collectOffRanges(root) {
  * so the OS chooser can switch between them with CSS alone and a page without JS still reads
  * correctly. Code blocks are skipped because they hold config, which spells the modifier `Alt-`
  * on every platform; `<!-- os-keys: off -->` … `<!-- os-keys: on -->` exempts prose that
- * documents that spelling.
+ * documents that spelling. It is a Markdown hast plugin, so it runs on .md pages only, not .mdx.
  */
 export const osKeys = {
 	name: 'remux-os-keys',

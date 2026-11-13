@@ -39,7 +39,7 @@ It prints the crate version, for example `remux 0.1.0`.
 
 ## macOS: make Option work as Alt
 
-A Mac keyboard has no Alt key. Remux's `Alt` shortcuts use the Option key (⌥) instead, but most macOS terminals send Option as a key for typing special characters (Option-b types `∫`), so those shortcuts never reach Remux. Set your terminal to send Option as Meta, an Esc prefix, which is what Remux reads as Alt:
+A Mac keyboard has no Alt key. Remux's Alt shortcuts use the Option key (⌥) instead, but most macOS terminals send Option as a key for typing special characters (Option-b types `∫`), so those shortcuts never reach Remux. Set your terminal to send Option as Meta, an Esc prefix, which is what Remux reads as Alt:
 
 | Terminal | Setting |
 |---|---|
@@ -92,5 +92,5 @@ If you use [remotes](/remux/remotes/), build the **same commit** on every machin
 ## Next steps
 
 - [Quick start](/remux/quick-start/): open a session, split panes and detach.
-- [macOS setup](#macos-make-option-work-as-alt): make the Option key work for the `Alt` shortcuts.
+- [macOS setup](#macos-make-option-work-as-alt): make the Option key work for the Alt shortcuts.
 - [Concepts](/remux/concepts/): how servers, sessions, tabs and panes fit together.
