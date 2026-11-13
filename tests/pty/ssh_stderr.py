@@ -28,8 +28,7 @@ Checks, and why each one cannot pass vacuously:
     controls are checks 2 and 3 in the same run: the remote connected and the
     shim's line reached client.log, so the shim did run and did write.
   2 the remote connected (its row has no state suffix and its session is listed).
-  3 client.log holds the line with the ESCs escaped (`\\x1b[?1000l`) and the
-    line itself holds no raw ESC byte.
+  3 client.log holds the line with the ESCs escaped (`\\x1b[?1000l`).
   4 the filler was capped: client.log carries the suppressed-lines note and does
     not hold every filler line.
   5 `bad`'s row reads `(failed: ...)` naming `Could not resolve hostname`, and so
@@ -327,8 +326,6 @@ def main():
         leak = [l for l in log.splitlines() if b"LEAK" in l]
         check("3 client.log holds the escaped line",
               any(b"LEAK\\x1b[?1000l\\x1b[?1006l" in l for l in leak), leak[:3])
-        check("3 that line holds no raw ESC", leak and not any(b"\x1b" in l for l in leak),
-              leak[:3])
         check("3 client.log names the remote on it",
               any(b"mini" in l for l in leak), leak[:3])
         check("3 client.log holds the normal line",

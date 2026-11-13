@@ -125,6 +125,19 @@ impl Record {
         self.tail.iter().cloned().collect::<Vec<_>>().join(" | ")
     }
 
+    /// [`tail_line`](Self::tail_line) in at most `max` characters. The oldest
+    /// lines go first, because the newest is the one that says why ssh gave
+    /// up and the lines before it are often a warning block. A newest line
+    /// that alone is too long keeps its start, which is where ssh names the
+    /// failure.
+    fn tail_within(&self, max: usize) -> String {
+        let mut lines: Vec<&str> = self.tail.iter().map(String::as_str).collect();
+        while lines.len() > 1 && lines.join(" | ").chars().count() > max {
+            lines.remove(0);
+        }
+        crate::client::cli_common::escape_bounded(&lines.join(" | "), max)
+    }
+
     /// The line logged when the connection ends, once, and only when some
     /// line was not logged on its own.
     fn summary(&mut self) -> Option<String> {
@@ -211,18 +224,18 @@ impl SshStderr {
         record.connected = true;
     }
 
-    /// The last lines ssh wrote, joined on one line, once the stream has
-    /// closed or `wait` has passed. The bound exists because a process ssh
+    /// The last lines ssh wrote, joined on one line in at most `max`
+    /// characters, once the stream has closed or `wait` has passed. The bound exists because a process ssh
     /// started (a ProxyCommand, a ControlPersist master) can hold the stream
     /// open after ssh itself exits. Past the bound the drain is stopped, so
     /// that process cannot keep this end of the pipe open either.
-    pub async fn tail(&mut self, wait: Duration) -> String {
+    pub async fn tail(&mut self, wait: Duration, max: usize) -> String {
         if let Some(done) = self.done.take() {
             if tokio::time::timeout(wait, done).await.is_err() {
                 self.task.abort();
             }
         }
-        lock(&self.record).tail_line()
+        lock(&self.record).tail_within(max)
     }
 }
 
@@ -319,6 +332,34 @@ mod tests {
     }
 
     #[test]
+    fn a_bounded_tail_drops_the_oldest_lines_and_keeps_the_newest() {
+        let mut record = Record::default();
+        let warning = "** WARNING: connection is not using a post-quantum key exchange algorithm.";
+        routed(&mut record, warning, true);
+        routed(
+            &mut record,
+            "** This session may be vulnerable to \"store now, decrypt later\" attacks.",
+            true,
+        );
+        routed(
+            &mut record,
+            "user@host: Permission denied (publickey).",
+            true,
+        );
+        assert_eq!(
+            record.tail_within(150),
+            "** This session may be vulnerable to \"store now, decrypt later\" attacks. | \
+             user@host: Permission denied (publickey)."
+        );
+        assert_eq!(
+            record.tail_within(60),
+            "user@host: Permission denied (publickey)."
+        );
+        assert_eq!(record.tail_within(20), "user@host: Permis...");
+        assert_eq!(record.tail_within(1000), record.tail_line());
+    }
+
+    #[test]
     fn the_echo_is_capped_and_stops_once_the_terminal_is_taken() {
         let mut record = Record::default();
         for _ in 0..ECHO_LINES_MAX {
@@ -343,7 +384,7 @@ mod tests {
             b"one\ntwo\nPermission denied (publickey).\nssh: \x1b]0;x\x07end\n";
         let mut drain = SshStderr::spawn("t", input);
         assert_eq!(
-            drain.tail(Duration::from_secs(5)).await,
+            drain.tail(Duration::from_secs(5), 1000).await,
             "two | Permission denied (publickey). | ssh: \\x1b]0;x\\x07end"
         );
     }
@@ -356,7 +397,7 @@ mod tests {
             .unwrap();
         let mut drain = SshStderr::spawn("t", read);
         let started = std::time::Instant::now();
-        let tail = drain.tail(Duration::from_millis(200)).await;
+        let tail = drain.tail(Duration::from_millis(200), 1000).await;
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(tail, "held open");
         drop(held);

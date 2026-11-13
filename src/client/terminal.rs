@@ -349,10 +349,13 @@ async fn dial_failed(
             .and_then(Result::ok)
     };
     let _ = child.start_kill();
-    let tail = stderr.tail(wait).await;
+    let tail = stderr.tail(wait, DIAL_TAIL_MAX).await;
     let cause = match exited {
         Some(status) if !status.success() => {
-            log::debug!("terminal: connect_ssh {label}: {cause:#}");
+            log::debug!(
+                "terminal: connect_ssh {label}: {}",
+                crate::client::cli_common::escape_bounded(&format!("{cause:#}"), 300)
+            );
             match status.code() {
                 Some(code) => anyhow::anyhow!("ssh exited {code}"),
                 None => anyhow::anyhow!("ssh exited: {status}"),
@@ -363,7 +366,6 @@ async fn dial_failed(
     if tail.is_empty() {
         return cause;
     }
-    let tail = crate::client::cli_common::escape_bounded(&tail, DIAL_TAIL_MAX);
     anyhow::anyhow!("{cause:#}; stderr: {tail}")
 }
 
