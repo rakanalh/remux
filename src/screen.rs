@@ -422,6 +422,8 @@ impl Screen {
         } else {
             // Height first, then width, the order tmux's screen_resize uses.
             self.resize_height(rows);
+            // A height-only resize skips the re-split of every scrollback line,
+            // which would change nothing at an unchanged width.
             if cols != self.cols {
                 self.reflow(cols, rows);
             }
@@ -446,6 +448,11 @@ impl Screen {
     fn history_cleared_from_view(&mut self) {
         if !self.alt_screen_active {
             self.resize_scrolled = 0;
+            // A line that wrapped from the scrollback onto the cleared screen
+            // ends at the clear, or reflow would join the prompt onto it.
+            if let Some(last) = self.scrollback.back_mut() {
+                last.wrapped = false;
+            }
         }
     }
 
@@ -3957,6 +3964,18 @@ mod tests {
 
     fn shows_cleared_history(s: &Screen) -> bool {
         screen_text(s).iter().any(|row| row.starts_with('H'))
+    }
+
+    #[test]
+    fn a_line_wrapped_across_the_clear_does_not_join_the_prompt() {
+        let mut s = Screen::new(20, 4, 100);
+        // The X line's first row is the last scrollback row and still wraps
+        // onto the screen when the screen is cleared.
+        s.process_output(format!("a\r\nb\r\nc\r\n{}\r\nd\r\ne\r\nf", "X".repeat(30)).as_bytes());
+        s.process_output(b"\x1b[2J\x1b[H$ ");
+        s.resize(40, 4);
+        assert_eq!(screen_text(&s), ["$", "", "", ""]);
+        assert_eq!((s.cursor_x, s.cursor_y), (2, 0));
     }
 
     #[test]

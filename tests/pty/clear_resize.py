@@ -16,10 +16,17 @@ What it covers:
      it and fit when zoomed) and the prompt: after the zoom and the unzoom the
      first long line is on the top row, all three are on screen, and no
      numbered line has come back into view above them
-  4  the client stays alive and neither log holds a panic
+  4  a line that wraps across the top of the screen when it is cleared (its
+     first row in the scrollback, the rest on the top row), then one line of
+     output: after the zoom and the unzoom that output is alone on the top
+     row, with no part of the wrapped line or of the numbered lines on screen.
+     The output, not the prompt, is what gets checked, because the shell
+     redraws its prompt row on every resize and that would hide a join there
+  5  the client stays alive and neither log holds a panic
 
-The numbered lines are printed as `N:<n>` and the long ones as `W<n>:000...`
-by printf, so the typed command line never matches what the check looks for.
+The numbered lines are printed as `N:<n>`, the long ones as `W<n>:000...` and
+`Y:000...` by printf, so the typed command line never matches what the check
+looks for.
 
 Run from the repo root: python3 tests/pty/clear_resize.py [-v]
 """
@@ -67,6 +74,13 @@ def verify_long(t, label):
     check(not shown, f"{label}: no numbered line is on screen ({shown[:3]})")
 
 
+def verify_alone(t, label):
+    pane = left_pane(t)
+    check(pane[0].rstrip() == "Z:1", f"{label}: the output is alone on the top row ({pane[0].rstrip()[:30]!r})")
+    shown = [r.strip()[:12] for r in pane if NUMBERED.search(r) or "Y:0" in r]
+    check(not shown, f"{label}: no earlier output is on screen ({shown[:3]})")
+
+
 def main():
     rundir = run_dir("rmxclrz")
     t = Tui(rundir, cols=COLS, rows=ROWS, extra_env={"XDG_CACHE_HOME": f"{rundir}/cache"})
@@ -87,13 +101,28 @@ def main():
         verify_long(t, "3 zoomed")
         t.prefix(b"z", 1.2)
         verify_long(t, "3 unzoomed")
+        # Numbered lines put the cursor on the bottom row; the Y line then takes
+        # two rows, and `height - 2` newlines leave its first row as the last
+        # scrollback row and its second on the top row when the clear runs.
+        height = len(left_pane(t))
+        t.send(
+            "i=0; while [ $i -lt 200 ]; do printf 'N:%s\\n' $i; i=$((i+1)); done; "
+            f"printf 'Y:%0100d\\n' 0; printf '\\n%.0s' $(seq {height - 2}); "
+            "printf '\\033[H\\033[2J'; printf 'Z:%s\\n' 1\r",
+            1.5,
+        )
+        verify_alone(t, "4 after the clear")
+        t.prefix(b"z", 1.2)
+        verify_alone(t, "4 zoomed")
+        t.prefix(b"z", 1.2)
+        verify_alone(t, "4 unzoomed")
         if fails:
             t.dump("at failure")
-        check(t.alive(), "4 the client is alive")
+        check(t.alive(), "5 the client is alive")
     finally:
         t.kill()
     for which in ("client", "server"):
-        check("panicked at" not in t.log(which), f"4 no panic in {which}.log")
+        check("panicked at" not in t.log(which), f"5 no panic in {which}.log")
     print(f"{'FAIL' if fails else 'PASS'}  clear_resize: {len(fails)} failure(s)")
     return 1 if fails else 0
 
