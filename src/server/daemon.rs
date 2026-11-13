@@ -12422,7 +12422,7 @@ async fn handle_mouse_scroll(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
-    let (session_name, cols, rows, mode, naming, theme, asking) = {
+    let (session_name, mode, naming, theme, asking) = {
         let cls = clients.lock().await;
         let client = match cls.get(&client_id) {
             Some(c) => c,
@@ -12430,8 +12430,6 @@ async fn handle_mouse_scroll(
         };
         (
             client.session_name.clone(),
-            client.cols,
-            client.rows,
             client.mode.clone(),
             client.naming(),
             client.theme(config),
@@ -12442,6 +12440,9 @@ async fn handle_mouse_scroll(
         Some(s) => s,
         None => return Ok(()),
     };
+
+    // Hit-tested at the render size, for the reason given in `handle_mouse_button`.
+    let (cols, rows) = session_render_size(&session_name, clients).await;
 
     // Build composite to get hit regions and pane rects.
     update_auto_pane_names(&session_name, state, panes).await;
@@ -12897,7 +12898,7 @@ async fn handle_mouse_button(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
-    let (session_name, cols, rows, mode, naming, theme, asking) = {
+    let (session_name, mode, naming, theme, asking) = {
         let mut cls = clients.lock().await;
         let client = match cls.get_mut(&client_id) {
             Some(c) => c,
@@ -12916,8 +12917,6 @@ async fn handle_mouse_button(
         client.autoscroll_repeat = None;
         (
             client.session_name.clone(),
-            client.cols,
-            client.rows,
             client.mode.clone(),
             client.naming(),
             client.theme(config),
@@ -12928,6 +12927,12 @@ async fn handle_mouse_button(
         Some(s) => s,
         None => return Ok(()),
     };
+
+    // The frame this client sees was composited at the session's render size,
+    // the smallest of its attached clients, so the hit regions must be built
+    // at that size too. The requester's own size would put the tab bar and the
+    // dividers where a larger client does not draw them.
+    let (cols, rows) = session_render_size(&session_name, clients).await;
 
     // Build composite to get hit regions and pane rects.
     update_auto_pane_names(&session_name, state, panes).await;
@@ -13494,7 +13499,7 @@ async fn handle_mouse_drag(
     log::debug!(
         "server: MouseDrag client_id={client_id} start=({start_x},{start_y}) end=({end_x},{end_y}) is_final={is_final} popup={popup_local}"
     );
-    let (session_name, cols, rows, mode, naming, theme, asking) = {
+    let (session_name, mode, naming, theme, asking) = {
         let cls = clients.lock().await;
         let client = match cls.get(&client_id) {
             Some(c) => c,
@@ -13502,8 +13507,6 @@ async fn handle_mouse_drag(
         };
         (
             client.session_name.clone(),
-            client.cols,
-            client.rows,
             client.mode.clone(),
             client.naming(),
             client.theme(config),
@@ -13517,6 +13520,9 @@ async fn handle_mouse_drag(
             return Ok(());
         }
     };
+
+    // Hit-tested at the render size, for the reason given in `handle_mouse_button`.
+    let (cols, rows) = session_render_size(&session_name, clients).await;
 
     // Build composite to get pane rects for coordinate mapping.
     update_auto_pane_names(&session_name, state, panes).await;
