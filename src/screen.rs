@@ -921,6 +921,30 @@ impl Screen {
         }
     }
 
+    /// Blank the cells `start..end` of `row`, together with the other half of
+    /// any wide glyph the span cuts through. A lead left over a blanked
+    /// continuation, or a continuation left after a blanked lead, would be a
+    /// width-0 cell the client never paints, so that column keeps whatever the
+    /// terminal last drew there.
+    fn erase_cells(&mut self, row: usize, start: usize, end: usize) {
+        let Some(line) = self.grid.get_mut(row) else {
+            return;
+        };
+        let end = end.min(line.len());
+        if start >= end {
+            return;
+        }
+        if start > 0 && line[start].width == 0 {
+            line[start - 1] = Cell::default();
+        }
+        if end < line.len() && line[end].width == 0 {
+            line[end] = Cell::default();
+        }
+        for cell in &mut line.cells[start..end] {
+            *cell = Cell::default();
+        }
+    }
+
     /// Perform a DECAWM autowrap: mark the row the cursor is leaving as
     /// continuing onto the next one, then move to column 0 of that next row
     /// (scrolling the region when we were sitting on its last line).
@@ -1309,9 +1333,7 @@ impl vte::Perform for Screen {
                         let row = self.cursor_y as usize;
                         let col = self.cursor_x as usize;
                         if row < self.grid.len() {
-                            for c in col..self.grid[row].len() {
-                                self.grid[row][c] = Cell::default();
-                            }
+                            self.erase_cells(row, col, self.grid[row].len());
                             // Erased text cannot continue anywhere: drop the
                             // wrap flag on every row we touched, or reflow would
                             // later glue this row onto whatever is printed next.
@@ -1329,10 +1351,7 @@ impl vte::Perform for Screen {
                             self.grid[r] = Row::new(self.cols);
                         }
                         if row < self.grid.len() {
-                            for c in 0..=std::cmp::min(col, self.grid[row].len().saturating_sub(1))
-                            {
-                                self.grid[row][c] = Cell::default();
-                            }
+                            self.erase_cells(row, 0, col + 1);
                             self.grid[row].wrapped = false;
                         }
                     }
@@ -1370,15 +1389,11 @@ impl vte::Perform for Screen {
                 match mode {
                     0 => {
                         // Erase from cursor to end of line.
-                        for c in (self.cursor_x as usize)..cols {
-                            self.grid[row][c] = Cell::default();
-                        }
+                        self.erase_cells(row, self.cursor_x as usize, cols);
                     }
                     1 => {
                         // Erase from start of line to cursor.
-                        for c in 0..=std::cmp::min(self.cursor_x as usize, cols.saturating_sub(1)) {
-                            self.grid[row][c] = Cell::default();
-                        }
+                        self.erase_cells(row, 0, self.cursor_x as usize + 1);
                     }
                     2 => {
                         // Erase entire line.
@@ -1392,6 +1407,31 @@ impl vte::Perform for Screen {
                 // ever being fully rewritten -- a stale flag here is the classic
                 // "two unrelated lines get joined" bug.
                 if mode <= 2 {
+                    self.grid[row].wrapped = false;
+                }
+            }
+            // ECH - Erase Characters. Neovim ends every line of a window
+            // narrower than the screen with ECH, because EL would also clear
+            // the window beside it. Neovim on macOS also uses ECH in a
+            // full-width window, to erase only the part of the old text that
+            // the new line does not cover; on Linux it uses EL there. If ECH is
+            // dropped, a line redrawn after a scroll keeps the old row's text
+            // past its own end, so the row reads as a copy of the line that was
+            // there before.
+            'X' => {
+                let n = Self::csi_param(params, 0, 1) as usize;
+                let row = self.cursor_y as usize;
+                if row >= self.grid.len() {
+                    return;
+                }
+                let start = self.cursor_x as usize;
+                self.erase_cells(row, start, start.saturating_add(n));
+                // As in xterm: an erase cancels a deferred wrap, so the next
+                // character lands in the last column instead of on a new row.
+                self.pending_wrap = false;
+                // Text that ends before the row's last cell no longer runs on
+                // into the next row, and reflow would otherwise join them.
+                if start.saturating_add(n) >= self.grid[row].len() {
                     self.grid[row].wrapped = false;
                 }
             }
@@ -2965,6 +3005,135 @@ mod tests {
     /// Row `r` of the grid as a plain string.
     fn row_text(s: &Screen, r: usize) -> String {
         s.grid[r].iter().map(|c| c.c).collect()
+    }
+
+    #[test]
+    fn ech_erases_n_cells_from_the_cursor_without_moving_it() {
+        let mut s = Screen::new(20, 3, 100);
+        s.process_output(b"abcdefghij\x1b[1;3H\x1b[4X");
+        assert_eq!(row_text(&s, 0).trim_end(), "ab    ghij");
+        assert_eq!((s.cursor_x, s.cursor_y), (2, 0));
+    }
+
+    #[test]
+    fn ech_defaults_to_one_cell_and_treats_zero_as_one() {
+        let mut s = Screen::new(20, 3, 100);
+        s.process_output(b"abcdef\x1b[1;2H\x1b[X\x1b[1;4H\x1b[0X");
+        assert_eq!(row_text(&s, 0).trim_end(), "a c ef");
+    }
+
+    #[test]
+    fn ech_blanks_both_halves_of_wide_glyphs_it_cuts_at_either_edge() {
+        let mut s = Screen::new(10, 2, 100);
+        // 中 at 0-1, 文 at 2-3, 字 at 4-5. Erase cols 1..5: it starts on 中's
+        // continuation and ends on 字's lead.
+        s.process_output("中文字ab".as_bytes());
+        s.process_output(b"\x1b[1;2H\x1b[4X");
+        for x in 0..6 {
+            let cell = &s.grid[0][x];
+            assert_eq!(
+                (cell.c, cell.width),
+                (' ', 1),
+                "col {x} must be a blank narrow cell"
+            );
+        }
+        assert_eq!(row_text(&s, 0).trim_end(), "      ab");
+        assert_eq!((s.cursor_x, s.cursor_y), (1, 0));
+    }
+
+    #[test]
+    fn el_blanks_the_wide_glyph_it_cuts_at_the_cursor() {
+        let mut s = Screen::new(10, 2, 100);
+        s.process_output("ab中cd".as_bytes());
+        // EL 0 from 中's continuation: the lead at col 2 must go too.
+        s.process_output(b"\x1b[1;4H\x1b[K");
+        assert_eq!((s.grid[0][2].c, s.grid[0][2].width), (' ', 1));
+        assert_eq!(row_text(&s, 0).trim_end(), "ab");
+
+        let mut s = Screen::new(10, 2, 100);
+        s.process_output("ab中cd".as_bytes());
+        // EL 1 up to 中's lead: the continuation at col 3 must go too.
+        s.process_output(b"\x1b[1;3H\x1b[1K");
+        assert_eq!((s.grid[0][3].c, s.grid[0][3].width), (' ', 1));
+        assert_eq!(row_text(&s, 0), "    cd    ");
+    }
+
+    #[test]
+    fn ech_cancels_a_pending_wrap() {
+        let mut s = Screen::new(10, 3, 100);
+        s.process_output(b"0123456789");
+        assert!(s.pending_wrap, "a full row leaves the wrap pending");
+        s.process_output(b"\x1b[XZ");
+        assert_eq!(row_text(&s, 0), "012345678Z");
+        assert_eq!(row_text(&s, 1).trim_end(), "");
+    }
+
+    #[test]
+    fn ech_to_the_row_end_clears_the_wrapped_flag() {
+        let mut s = Screen::new(10, 3, 100);
+        s.process_output(b"0123456789abcde");
+        assert!(
+            s.grid[0].wrapped,
+            "the overflowing row continues onto the next"
+        );
+        s.process_output(b"\x1b[1;6H\x1b[2X");
+        assert!(
+            s.grid[0].wrapped,
+            "an erase inside the row keeps it continuing"
+        );
+        s.process_output(b"\x1b[1;6H\x1b[10X");
+        assert!(
+            !s.grid[0].wrapped,
+            "an erase that reaches the row end ends the line"
+        );
+    }
+
+    #[test]
+    fn ech_stops_at_the_end_of_the_row() {
+        let mut s = Screen::new(10, 2, 100);
+        s.process_output(b"0123456789\r\nnext\x1b[1;8H\x1b[500X");
+        assert_eq!(row_text(&s, 0), "0123456   ");
+        assert_eq!(row_text(&s, 1).trim_end(), "next");
+    }
+
+    /// The shape of Neovim's redraw of a window narrower than the screen, as
+    /// `nvim --clean +vsplit` emits it: the line number, the text, then ECH over
+    /// the rest of the window. An empty file line is the number and ECH alone,
+    /// so an ignored ECH shows the text of the line that was there before the
+    /// scroll as if it were this line.
+    #[test]
+    fn ech_clears_stale_text_under_a_neovim_window_redraw() {
+        let mut s = Screen::new(40, 2, 100);
+        s.process_output(b"  2 line 2 xxxxxxxxxx    \xe2\x94\x82 right");
+        s.process_output(b"\x1b[1;1H  3 \x1b[20X");
+        assert_eq!(
+            row_text(&s, 0).trim_end(),
+            format!("  3{}\u{2502} right", " ".repeat(22))
+        );
+    }
+
+    /// The shape Neovim on macOS emits when a full-width window scrolls by
+    /// redrawing its rows: each row is a jump past the gutter, the new text,
+    /// and an ECH that ends where the row's old text ended rather than at the
+    /// right edge, because Neovim knows the cells past it are already blank. A dropped ECH
+    /// leaves the old line's tail after the new, shorter line, so the row reads
+    /// as a copy of the line that was there before the scroll.
+    #[test]
+    fn ech_clears_the_old_tail_when_a_full_width_window_redraws_its_rows() {
+        let mut s = Screen::new(40, 5, 100);
+        s.process_output(b"\x1b[1;1Hbar");
+        s.process_output(b"\x1b[2;1H 21 \xe2\x94\x82 the twenty-first line, long");
+        s.process_output(b"\x1b[3;1H 22 \xe2\x94\x82 short one");
+        s.process_output(b"\x1b[5;1Hstatus");
+        s.process_output(b"\x1b[2;2H22 \xe2\x94\x82 short one\x1b[18X");
+        s.process_output(b"\x1b[3;2H23 \xe2\x94\x82 the twenty-third line, long");
+        assert_eq!(row_text(&s, 0).trim_end(), "bar");
+        assert_eq!(row_text(&s, 1).trim_end(), " 22 \u{2502} short one");
+        assert_eq!(
+            row_text(&s, 2).trim_end(),
+            " 23 \u{2502} the twenty-third line, long"
+        );
+        assert_eq!(row_text(&s, 4).trim_end(), "status");
     }
 
     #[test]
