@@ -8216,6 +8216,7 @@ async fn run_client_loop(
                         let (cx, cy) = popup_local.unwrap_or_else(|| {
                             crate::client::chrome::content_point(
                                 content,
+                                renderer.frame_rows(),
                                 tc,
                                 tr,
                                 mouse.column,

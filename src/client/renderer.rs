@@ -267,6 +267,11 @@ impl Renderer {
         self.status_row_owned = owned;
     }
 
+    /// Row count of the last server frame, or 0 before the first one.
+    pub fn frame_rows(&self) -> u16 {
+        u16::try_from(self.frame_rows).unwrap_or(u16::MAX)
+    }
+
     /// The server frame's last row as it stands after the latest frame and
     /// diffs. Only maintained while the status row is owned.
     pub fn frame_status_row(&self) -> &[RenderCell] {
