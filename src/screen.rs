@@ -57,6 +57,11 @@ pub struct Cell {
     /// OSC 8 hyperlink target URI for this cell, if any. `None` for the common
     /// case of a non-linked cell.
     pub hyperlink: Option<String>,
+    /// Filled by an erase or a scroll rather than written. Such a blank may
+    /// carry the current background (back-colour erase), and reflow must still
+    /// trim it as padding: counting a coloured erase as text would make every
+    /// erased row as long as the old width and wrap it when the pane narrows.
+    pub erased: bool,
 }
 
 impl Default for Cell {
@@ -67,6 +72,7 @@ impl Default for Cell {
             attrs: CellAttrs::default(),
             combining: Vec::new(),
             hyperlink: None,
+            erased: false,
         }
     }
 }
@@ -635,8 +641,30 @@ impl Screen {
     fn is_padding(cell: &Cell) -> bool {
         cell.c == ' '
             && cell.combining.is_empty()
-            && cell.attrs.bg == Color::Default
-            && !cell.attrs.reverse
+            && (cell.erased || (cell.attrs.bg == Color::Default && !cell.attrs.reverse))
+    }
+
+    /// The cell every erase, insert, delete and scroll fills with. It takes the
+    /// current background and nothing else, as tmux and xterm do: the pane's
+    /// TERM is xterm-256color, which declares `bce`, so programs clear a
+    /// coloured area with an erase and expect the colour to stay.
+    fn blank(&self) -> Cell {
+        Cell {
+            attrs: CellAttrs {
+                bg: self.current_attrs.bg.clone(),
+                ..CellAttrs::default()
+            },
+            erased: true,
+            ..Cell::default()
+        }
+    }
+
+    /// A whole row of `blank()` cells.
+    fn blank_row(&self) -> Row {
+        Row {
+            cells: vec![self.blank(); self.cols as usize],
+            wrapped: false,
+        }
     }
 
     /// Pad a row under construction out to exactly `cols` cells and stamp its
@@ -699,6 +727,7 @@ impl Screen {
                         attrs: cell.attrs.clone(),
                         combining: Vec::new(),
                         hyperlink: cell.hyperlink.clone(),
+                        erased: false,
                     },
                 };
                 row.push(spacer);
@@ -886,7 +915,7 @@ impl Screen {
         for r in top..bottom {
             self.grid[r] = self.grid[r + 1].clone();
         }
-        self.grid[bottom] = Row::new(self.cols);
+        self.grid[bottom] = self.blank_row();
         self.break_wrap_above(top);
     }
 
@@ -903,7 +932,7 @@ impl Screen {
         for r in (top + 1..=bottom).rev() {
             self.grid[r] = self.grid[r - 1].clone();
         }
-        self.grid[top] = Row::new(self.cols);
+        self.grid[top] = self.blank_row();
         self.break_wrap_above(top);
     }
 
@@ -927,6 +956,7 @@ impl Screen {
     /// width-0 cell the client never paints, so that column keeps whatever the
     /// terminal last drew there.
     fn erase_cells(&mut self, row: usize, start: usize, end: usize) {
+        let blank = self.blank();
         let Some(line) = self.grid.get_mut(row) else {
             return;
         };
@@ -935,13 +965,13 @@ impl Screen {
             return;
         }
         if start > 0 && line[start].width == 0 {
-            line[start - 1] = Cell::default();
+            line[start - 1] = blank.clone();
         }
         if end < line.len() && line[end].width == 0 {
-            line[end] = Cell::default();
+            line[end] = blank.clone();
         }
         for cell in &mut line.cells[start..end] {
-            *cell = Cell::default();
+            *cell = blank.clone();
         }
     }
 
@@ -1017,6 +1047,7 @@ impl Screen {
                 attrs: self.current_attrs.clone(),
                 combining: Vec::new(),
                 hyperlink: self.current_hyperlink.clone(),
+                erased: false,
             };
 
             if width == 2 {
@@ -1028,6 +1059,7 @@ impl Screen {
                         attrs: self.current_attrs.clone(),
                         combining: Vec::new(),
                         hyperlink: self.current_hyperlink.clone(),
+                        erased: false,
                     };
                 }
             } else if old_width == 2 && col + 1 < self.grid[row].len() {
@@ -1339,7 +1371,7 @@ impl vte::Perform for Screen {
                             // later glue this row onto whatever is printed next.
                             self.grid[row].wrapped = false;
                             for r in (row + 1)..self.grid.len() {
-                                self.grid[r] = Row::new(self.cols);
+                                self.grid[r] = self.blank_row();
                             }
                         }
                     }
@@ -1348,7 +1380,7 @@ impl vte::Perform for Screen {
                         let row = self.cursor_y as usize;
                         let col = self.cursor_x as usize;
                         for r in 0..row {
-                            self.grid[r] = Row::new(self.cols);
+                            self.grid[r] = self.blank_row();
                         }
                         if row < self.grid.len() {
                             self.erase_cells(row, 0, col + 1);
@@ -1357,7 +1389,7 @@ impl vte::Perform for Screen {
                     }
                     2 => {
                         // Erase entire display.
-                        self.grid = Self::make_grid(self.cols, self.rows);
+                        self.grid = vec![self.blank_row(); self.rows as usize];
                     }
                     3 => {
                         // xterm ED 3: erase the saved lines (scrollback).
@@ -1397,7 +1429,7 @@ impl vte::Perform for Screen {
                     }
                     2 => {
                         // Erase entire line.
-                        self.grid[row] = Row::new(self.cols);
+                        self.grid[row] = self.blank_row();
                     }
                     _ => {}
                 }
@@ -1444,7 +1476,7 @@ impl vte::Perform for Screen {
                 for _ in 0..n {
                     if row <= bottom && bottom < self.grid.len() {
                         self.grid.remove(bottom);
-                        self.grid.insert(row, Row::new(self.cols));
+                        self.grid.insert(row, self.blank_row());
                     }
                 }
                 // Blank lines were pushed in at `row`, so the row above no
@@ -1460,7 +1492,7 @@ impl vte::Perform for Screen {
                 for _ in 0..n {
                     if row <= bottom && row < self.grid.len() {
                         self.grid.remove(row);
-                        self.grid.insert(bottom, Row::new(self.cols));
+                        self.grid.insert(bottom, self.blank_row());
                     }
                 }
                 // Lines were pulled up into `row`; whatever the row above used
@@ -1473,11 +1505,13 @@ impl vte::Perform for Screen {
                 let row = self.cursor_y as usize;
                 let col = self.cursor_x as usize;
                 if row < self.grid.len() {
+                    let blank = self.blank();
+                    let cols = self.cols as usize;
                     let line = &mut self.grid[row];
                     for _ in 0..n {
                         if col < line.len() {
-                            line.insert(col, Cell::default());
-                            line.truncate(self.cols as usize);
+                            line.insert(col, blank.clone());
+                            line.truncate(cols);
                         }
                     }
                 }
@@ -1488,11 +1522,12 @@ impl vte::Perform for Screen {
                 let row = self.cursor_y as usize;
                 let col = self.cursor_x as usize;
                 if row < self.grid.len() {
+                    let blank = self.blank();
                     let line = &mut self.grid[row];
                     for _ in 0..n {
                         if col < line.len() {
                             line.remove(col);
-                            line.push(Cell::default());
+                            line.push(blank.clone());
                         }
                     }
                 }
@@ -3304,6 +3339,112 @@ mod tests {
         assert_eq!(row_text(&s, 0).trim_end(), "line0");
         assert_eq!(row_text(&s, 1).trim_end(), "w".repeat(45));
         assert!(!s.grid[1].wrapped);
+    }
+
+    /// A 10x4 screen with every row full of text, then SGR blue background
+    /// with underline and reverse, inside an open OSC 8 link, so a blank that
+    /// took anything but the background shows it.
+    fn bce_screen() -> Screen {
+        let mut s = Screen::new(10, 4, 100);
+        for r in 1..=4 {
+            s.process_output(format!("\x1b[{r};1H0123456789").as_bytes());
+        }
+        s.process_output(b"\x1b[44;4;7m\x1b]8;;http://x\x1b\\");
+        s
+    }
+
+    /// The first cell of `cols` on `row` that is not a blank carrying only the
+    /// blue background, described for the failure message.
+    fn bce_mismatch(s: &Screen, row: usize, cols: std::ops::Range<usize>) -> Option<String> {
+        let want = CellAttrs {
+            bg: Color::Indexed(4),
+            ..CellAttrs::default()
+        };
+        cols.map(|x| (x, &s.grid[row][x]))
+            .find(|(_, cell)| cell.c != ' ' || cell.attrs != want || cell.hyperlink.is_some())
+            .map(|(x, cell)| {
+                format!(
+                    "({row},{x}) = {:?} {:?} {:?}",
+                    cell.c, cell.attrs, cell.hyperlink
+                )
+            })
+    }
+
+    /// A row and the columns on it that an operation must have blanked.
+    type BceSpan = (usize, std::ops::Range<usize>);
+
+    #[test]
+    fn erases_and_scrolls_fill_with_the_current_background() {
+        let cases: &[(&str, &[u8], &[BceSpan])] = &[
+            ("EL 0", b"\x1b[1;4H\x1b[K", &[(0, 3..10)]),
+            ("EL 1", b"\x1b[1;4H\x1b[1K", &[(0, 0..4)]),
+            ("EL 2", b"\x1b[1;4H\x1b[2K", &[(0, 0..10)]),
+            (
+                "ED 0",
+                b"\x1b[2;4H\x1b[J",
+                &[(1, 3..10), (2, 0..10), (3, 0..10)],
+            ),
+            ("ED 1", b"\x1b[2;4H\x1b[1J", &[(0, 0..10), (1, 0..4)]),
+            (
+                "ED 2",
+                b"\x1b[2J",
+                &[(0, 0..10), (1, 0..10), (2, 0..10), (3, 0..10)],
+            ),
+            ("ECH", b"\x1b[1;3H\x1b[3X", &[(0, 2..5)]),
+            ("ICH", b"\x1b[1;3H\x1b[2@", &[(0, 2..4)]),
+            ("DCH", b"\x1b[1;3H\x1b[2P", &[(0, 8..10)]),
+            ("IL", b"\x1b[2;1H\x1b[L", &[(1, 0..10)]),
+            ("DL", b"\x1b[2;1H\x1b[M", &[(3, 0..10)]),
+            ("SU", b"\x1b[S", &[(3, 0..10)]),
+            ("SD", b"\x1b[T", &[(0, 0..10)]),
+            ("LF at the bottom", b"\x1b[4;1H\n", &[(3, 0..10)]),
+            ("IND at the bottom", b"\x1b[4;1H\x1bD", &[(3, 0..10)]),
+            ("RI at the top", b"\x1b[1;1H\x1bM", &[(0, 0..10)]),
+            ("LF in a region", b"\x1b[2;3r\x1b[3;1H\n", &[(2, 0..10)]),
+            ("autowrap scroll", b"\x1b[4;10HXY", &[(3, 1..10)]),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|(op, bytes, spans)| {
+                let mut s = bce_screen();
+                s.process_output(bytes);
+                spans
+                    .iter()
+                    .find_map(|(row, cols)| bce_mismatch(&s, *row, cols.clone()))
+                    .map(|m| format!("{op}: {m}"))
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "blanks without the current background:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn an_erase_with_the_default_background_leaves_a_default_blank() {
+        let mut s = Screen::new(10, 2, 100);
+        s.process_output(b"0123456789\x1b[1;4H\x1b[K");
+        for x in 3..10 {
+            assert_eq!(s.grid[0][x].attrs, CellAttrs::default());
+            assert_eq!(s.grid[0][x].c, ' ');
+        }
+    }
+
+    #[test]
+    fn reflow_trims_a_coloured_erase_like_padding() {
+        let mut s = Screen::new(20, 3, 100);
+        s.process_output(b"ab\x1b[44m\x1b[K\x1b[0m\r\ncd");
+        assert_eq!(s.grid[0][19].attrs.bg, Color::Indexed(4));
+
+        s.resize(10, 3);
+
+        assert!(
+            !s.grid[0].wrapped,
+            "an erased tail is not text, so the row must not wrap"
+        );
+        assert_eq!(row_text(&s, 0).trim_end(), "ab");
+        assert_eq!(row_text(&s, 1).trim_end(), "cd");
     }
 
     #[test]
