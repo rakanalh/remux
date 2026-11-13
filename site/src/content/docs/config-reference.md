@@ -129,6 +129,8 @@ The leader, the command-mode key tree and the Alt shortcuts. Reloads live. The f
 | `leader` | key notation | Key that enters Command mode. Default `"Ctrl-a"`. |
 | `"<Mod>-<key>"` (e.g. `"Alt-h"`) | action chain, `"@<group>"`, or `""` | A shortcut that works in Normal mode without the leader. The key needs a modifier. |
 | a single character (e.g. `v`) | action chain or `""` | A binding pressed right after the leader. |
+| `Left`, `Right`, `Up`, `Down` | action chain or `""` | An arrow key, at the top level or in a group. |
+| `"Shift-Left"` etc., inside a group | action chain or `""` | Shift with an arrow key. At the top level the same key is a Normal-mode shortcut instead. |
 | `[keybindings.command.<char>]` | table | A group of bindings. `_label` sets the name the which-key popup shows. |
 
 An empty string (`""`) removes a default binding.

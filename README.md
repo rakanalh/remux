@@ -595,7 +595,7 @@ There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h
 | Shortcut | Action |
 |----------|--------|
 | `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` | Focus pane left / down / up / right — and into or out of a sidebar on that edge |
-| `Alt-Left` / `Alt-Down` / `Alt-Up` / `Alt-Right` | The same as `Alt-h/j/k/l` (on macOS this needs a terminal that sends Option+arrow as Alt: Terminal.app's default sends `ESC b` / `ESC f`, which is word-jump) |
+| `Alt-Left` / `Alt-Down` / `Alt-Up` / `Alt-Right` | The same as `Alt-h/j/k/l` (on macOS this needs a terminal that sends Option+arrow as Alt: Terminal.app's default sends `ESC b` / `ESC f`, which is word-jump). If a program in the pane needs Alt+arrows (fish or zsh word-jump, Neovim `<M-Up>`), unbind them: `"Alt-Left" = ""` under `[keybindings.command]` |
 | `Alt-H` / `Alt-J` / `Alt-K` / `Alt-L` | Move (swap) pane left / down / up / right |
 | `Alt-Shift-Left` / `Down` / `Up` / `Right` | The same as `Alt-H/J/K/L` |
 | `Alt-,` / `Alt-.` | Previous / next tab |

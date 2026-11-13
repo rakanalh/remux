@@ -1,10 +1,16 @@
 const ALT_KEY = /^Alt(?:[-+](.+))?$/;
 const MARKER = /^<!--\s*os-keys:\s*(off|on)\s*-->$/;
 
+const ARROWS = { Left: '←', Right: '→', Up: '↑', Down: '↓' };
+
 function macForm(key) {
 	if (key === undefined) return { text: '⌥ Option' };
 	if (/^[A-Z]$/.test(key)) return { text: `⌥⇧${key}`, title: `Option-Shift-${key.toLowerCase()}` };
-	return { text: `⌥${key}`, title: `Option-${key}` };
+	const shifted = /^Shift-(.+)$/.exec(key);
+	const name = shifted ? shifted[1] : key;
+	const shift = shifted ? '⇧' : '';
+	const title = `Option-${shifted ? 'Shift-' : ''}${name}`;
+	return { text: `⌥${shift}${ARROWS[name] ?? name}`, title };
 }
 
 function span(className, text, title) {

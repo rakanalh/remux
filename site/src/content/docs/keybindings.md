@@ -69,11 +69,13 @@ c = "TabClose; EnterNormal"         # Prefix t c (added)
 x = ""                              # Prefix t x (default removed)
 ```
 
-- Keys in the tree are single characters. Uppercase counts as a different key (`p H` is not `p h`). Use `" "` for the space bar.
-- Only plain characters reach the tree. `Tab`, `Enter`, arrows and modified keys cannot be bound inside a group.
+- Keys in the tree are single characters, or an arrow key written `Left`, `Down`, `Up` or `Right`. Uppercase counts as a different key (`p H` is not `p h`). Use `" "` for the space bar.
+- Inside a group, `"Shift-Left"` (and `Shift-Down`, `Shift-Up`, `Shift-Right`) binds Shift with that arrow. At the top level of `[keybindings.command]`, `"Shift-Left"` is a [shortcut](#shortcuts) that works in Normal mode, not a key after the leader.
+- Only plain characters, arrows and Shift+arrows reach the tree. `Tab`, `Enter` and keys with Ctrl or Alt cannot be bound inside a group.
+- Wherever `h`/`j`/`k`/`l` pick a direction in the default tree (focus, move, stack, unstack, resize and `Prefix t m`), the arrows do the same, and Shift+arrows do what `H`/`J`/`K`/`L` do. The which-key popup shows a key and its arrow on one row, as `h/←`. Rebind the letter and the arrow keeps its old action and gets a row of its own.
 - Groups nest: `[keybindings.command.p.S]` is the `Prefix p S` group.
 - A group you re-declare is merged with the default one. Only the keys you list change.
-- The built-in Resize group (`Prefix p R`) is **sticky**: after a resize the popup stays open so you can press `h`/`j`/`k`/`l` again. `Esc` or any unbound key closes it. Groups you define yourself are not sticky.
+- The built-in Resize group (`Prefix p R`) is **sticky**: after a resize the popup stays open so you can press `h`/`j`/`k`/`l` or an arrow again. `Esc` or any unbound key closes it. Groups you define yourself are not sticky.
 - In the which-key popup, a binding you added is labelled with its action string.
 
 ### Action chains
@@ -118,6 +120,13 @@ Shortcuts are the `"<Modifier>-<key>"` entries under `[keybindings.command]`. Th
 - The value is an action chain, `""` to unbind, or `@<path>` to open a group of the tree (`"@p"`, `"@pR"`). An `@` path that is not a group is reported as an error.
 - A shortcut stays in Normal mode. It does not need `EnterNormal`.
 - A shortcut on your leader key replaces the leader.
+- A shortcut takes its key away from the program in the pane. The default `Alt-Left`, `Alt-Down`, `Alt-Up` and `Alt-Right` (focus) and `Alt-Shift-Left` … `Alt-Shift-Right` (move) take keys that some programs use: word jumps in fish and zsh, `<M-Up>` in Neovim. Unbind the ones you need in the pane; `Alt-h/j/k/l` still focus:
+
+```toml
+[keybindings.command]
+"Alt-Left" = ""
+"Alt-Right" = ""
+```
 
 <!-- os-keys: off -->
 
@@ -128,11 +137,11 @@ Used by `leader`, shortcut keys and `SendKey`.
 | Form | Examples |
 |---|---|
 | A single character | `a`, `H`, `,`, `1` |
-| One modifier + a key | `Ctrl-a`, `Alt-h`, `Alt-Space`, `Shift-Tab` |
+| Modifiers + a key | `Ctrl-a`, `Alt-h`, `Alt-Space`, `Shift-Tab`, `Alt-Shift-Left`, `Ctrl-Alt-x` |
 | A named key | `Enter`, `Esc`, `Tab`, `BackTab`, `Space`, `Backspace`, `Up`, `Down`, `Left`, `Right`, `F1`–`F12` |
 
-- Modifiers are `Ctrl-`, `Alt-` and `Shift-`. Only **one** is allowed. `Ctrl-Alt-x` does not parse.
-- For Alt with Shift, write the uppercase character: `Alt-H` is `Alt+Shift+h`.
+- Modifiers are `Ctrl-`, `Alt-` and `Shift-`. They stack in any order: `Alt-Shift-Left` and `Shift-Alt-Left` are the same key.
+- For Alt with Shift on a character, write the uppercase character: `Alt-H` is `Alt+Shift+h`. On a named key such as an arrow, write `Shift-`: `Alt-Shift-Left`.
 - Names are case-sensitive: `Ctrl-a`, not `ctrl-a` or `C-a`.
 - On macOS, `Alt-` is the Option key, and the config still spells it `Alt-`. See [macOS setup](/remux/install/#macos-make-option-work-as-alt).
 
@@ -170,8 +179,8 @@ Only characters are sent. `Ctrl-<letter>` sends the control character; `Alt` and
 | `x` | `PaneClose` | |
 | `v` | `PaneSplitVertical` | New pane to the right |
 | `s` | `PaneSplitHorizontal` | New pane below |
-| `h` `j` `k` `l` | `PaneFocusLeft/Down/Up/Right` | |
-| `H` `J` `K` `L` | `PaneMoveLeft/Down/Up/Right` | |
+| `h` `j` `k` `l` | `PaneFocusLeft/Down/Up/Right` | The arrows too |
+| `H` `J` `K` `L` | `PaneMoveLeft/Down/Up/Right` | Shift+arrows too |
 | `z` | `PaneToggleZoom` | Same as `Prefix z` |
 | `o` | `PopupToggle` | Popup terminal |
 | `m` | `SetMaster` | |
@@ -179,9 +188,9 @@ Only characters are sent. `Ctrl-<letter>` sends the control character; `Alt` and
 | `t` | `PaneMoveToTab` | Opens a tab picker |
 | `a` | `PaneStackAdd` | |
 | `]` / `[` | `PaneStackNext` / `PaneStackPrev` | |
-| `S h/j/k/l` | `PaneStackIntoLeft/Down/Up/Right` | Join the neighbour's stack |
-| `U h/j/k/l` | `PaneUnstackLeft/Down/Up/Right` | Leave the stack |
-| `R h/j/k/l` | `ResizeLeft/Down/Up/Right 5` | Sticky: keep pressing |
+| `S h/j/k/l` | `PaneStackIntoLeft/Down/Up/Right` | Join the neighbour's stack. The arrows too |
+| `U h/j/k/l` | `PaneUnstackLeft/Down/Up/Right` | Leave the stack. The arrows too |
+| `R h/j/k/l` | `ResizeLeft/Down/Up/Right 5` | Sticky: keep pressing. The arrows too |
 | **Tab**: `Prefix t …` | | |
 | `n` | `TabNew` | |
 | `x` | `TabClose` | |
@@ -220,7 +229,9 @@ The `SidebarFocus*` actions have no default key. `Alt-h/j/k/l` move into and out
 | Key | Action |
 |---|---|
 | `Alt-h` `Alt-j` `Alt-k` `Alt-l` | `PaneFocusLeft/Down/Up/Right` |
+| `Alt-Left` `Alt-Down` `Alt-Up` `Alt-Right` | `PaneFocusLeft/Down/Up/Right` |
 | `Alt-H` `Alt-J` `Alt-K` `Alt-L` | `PaneMoveLeft/Down/Up/Right` |
+| `Alt-Shift-Left` `Alt-Shift-Down` `Alt-Shift-Up` `Alt-Shift-Right` | `PaneMoveLeft/Down/Up/Right` |
 | `Alt-,` / `Alt-.` | `TabPrev` / `TabNext` |
 | `Alt-1` … `Alt-9` | `TabGoto 0` … `TabGoto 8` |
 | `Alt-t` | `TabNew` |
