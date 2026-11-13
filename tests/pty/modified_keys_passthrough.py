@@ -5,8 +5,10 @@ round trip: feed the client the xterm sequence for Ctrl+Right, and the app
 inside the pane must receive that same sequence -- not a bare cursor key with
 the modifier flattened away.
 
-Alt is checked in its folded form (`ESC [ 1 ; 3 A`), which is what xterm/tmux
-send; the client used to emit a doubled-ESC prefix instead.
+Alt is checked in its folded form (`ESC [ 5 ; 3 ~`), which is what xterm/tmux
+send; the client used to emit a doubled-ESC prefix instead. Alt+PageUp is used
+because no default shortcut takes it: Alt+arrows focus panes, so they never
+reach the app.
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -23,7 +25,7 @@ CAT = "cat -vt" if sys.platform == "darwin" else "cat -vT"
 CASES = [
     ("Ctrl+Right", b"\x1b[1;5C", "^[[1;5C"),
     ("Shift+Down", b"\x1b[1;2B", "^[[1;2B"),
-    ("Alt+Up",     b"\x1b[1;3A", "^[[1;3A"),
+    ("Alt+PageUp", b"\x1b[5;3~", "^[[5;3~"),
     ("Ctrl+PageUp", b"\x1b[5;5~", "^[[5;5~"),
     ("plain Right", b"\x1b[C",    "^[[C"),
 ]

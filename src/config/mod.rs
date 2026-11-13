@@ -882,6 +882,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::keybindings::tree_path;
 
     #[test]
     fn default_config_values() {
@@ -1053,9 +1054,9 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         let tree = config.keybinding_tree();
         // Default 'n' for tab should still exist.
-        assert!(tree.lookup(&['t', 'n']).is_some());
+        assert!(tree.lookup(&tree_path("tn")).is_some());
         // User-added 'x' should also exist.
-        assert!(tree.lookup(&['t', 'x']).is_some());
+        assert!(tree.lookup(&tree_path("tx")).is_some());
     }
 
     #[test]
@@ -1068,14 +1069,14 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         let tree = config.keybinding_tree();
         // User-added 'x' via deprecated [keybindings.normal] should work.
-        assert!(tree.lookup(&['t', 'x']).is_some());
+        assert!(tree.lookup(&tree_path("tx")).is_some());
     }
 
     #[test]
     fn keybinding_tree_default_when_no_overrides() {
         let config = Config::default();
         let tree = config.keybinding_tree();
-        assert!(tree.lookup(&['t', 'n']).is_some());
+        assert!(tree.lookup(&tree_path("tn")).is_some());
     }
 
     #[test]

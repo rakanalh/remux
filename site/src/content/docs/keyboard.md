@@ -36,6 +36,7 @@ These work directly in Normal mode, with no prefix. On a Mac they use the Option
 |---|---|
 | Focus left / down / up / right (also into and out of a sidebar) | `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` |
 | Move the pane left / down / up / right | `Alt-H` / `Alt-J` / `Alt-K` / `Alt-L` |
+| The same with the arrows: focus, and move with Shift | `Alt-Left` … `Alt-Right`, `Alt-Shift-Left` … `Alt-Shift-Right` |
 | Previous / next tab | `Alt-,` / `Alt-.` |
 | Jump to tab 1 to 9 | `Alt-1` … `Alt-9` |
 | New tab | `Alt-t` |
@@ -93,6 +94,8 @@ Keys below follow `Ctrl-a`. For the action name behind each key, which is what y
 Inside a stack, `p H` and `p L` move the pane one place along the stack, and past its end take it out into its own slot. `p J` and `p K` take it out below or above at once.
 
 The resize group `p R` stays open after each key, so `Ctrl-a p R l l l` resizes three steps in a row. Press `Esc` when you're done.
+
+Each `h`/`j`/`k`/`l` above also works as the matching arrow key, and each `H`/`J`/`K`/`L` as Shift with the arrow: `Ctrl-a p R → → →` resizes the same three steps.
 
 ### Tabs: `t`
 

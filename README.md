@@ -461,6 +461,8 @@ Full details: [https://rakanalh.github.io/remux/keybindings/](https://rakanalh.g
 
 Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you to Normal mode after running; the rest leave you in Command mode for chaining.
 
+Wherever `h` / `j` / `k` / `l` pick a direction to focus, move, stack, unstack or resize a pane (and in `t m`), the arrow keys do the same, and `Shift`+arrow stands in for `H` / `J` / `K` / `L`. The which-key popup shows both on one row, as `h/←`.
+
 #### Root
 
 | Key | Action |
@@ -593,7 +595,9 @@ There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h
 | Shortcut | Action |
 |----------|--------|
 | `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` | Focus pane left / down / up / right — and into or out of a sidebar on that edge |
+| `Alt-Left` / `Alt-Down` / `Alt-Up` / `Alt-Right` | The same as `Alt-h/j/k/l` (on macOS this needs a terminal that sends Option+arrow as Alt: Terminal.app's default sends `ESC b` / `ESC f`, which is word-jump). If a program in the pane needs Alt+arrows (fish or zsh word-jump, Neovim `<M-Up>`), unbind them: `"Alt-Left" = ""` under `[keybindings.command]` |
 | `Alt-H` / `Alt-J` / `Alt-K` / `Alt-L` | Move (swap) pane left / down / up / right |
+| `Alt-Shift-Left` / `Down` / `Up` / `Right` | The same as `Alt-H/J/K/L` |
 | `Alt-,` / `Alt-.` | Previous / next tab |
 | `Alt-1` … `Alt-9` | Jump to tab 1–9 |
 | `Alt-t` | New tab |

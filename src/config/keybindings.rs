@@ -8,6 +8,134 @@ use crate::protocol::{action_spec, Action, RemuxCommand};
 // Data structures
 // ---------------------------------------------------------------------------
 
+/// An arrow key, in h/j/k/l order so that sorted arrows read like the letters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Arrow {
+    Left,
+    Down,
+    Up,
+    Right,
+}
+
+impl Arrow {
+    fn name(self) -> &'static str {
+        match self {
+            Arrow::Left => "Left",
+            Arrow::Down => "Down",
+            Arrow::Up => "Up",
+            Arrow::Right => "Right",
+        }
+    }
+
+    fn glyph(self) -> char {
+        match self {
+            Arrow::Left => '\u{2190}',
+            Arrow::Down => '\u{2193}',
+            Arrow::Up => '\u{2191}',
+            Arrow::Right => '\u{2192}',
+        }
+    }
+
+    fn from_code(code: KeyCode) -> Option<Self> {
+        match code {
+            KeyCode::Left => Some(Arrow::Left),
+            KeyCode::Down => Some(Arrow::Down),
+            KeyCode::Up => Some(Arrow::Up),
+            KeyCode::Right => Some(Arrow::Right),
+            _ => None,
+        }
+    }
+}
+
+/// One key of a prefix-tree path: a character, or an arrow with or without
+/// Shift.
+///
+/// Characters order before arrows. `path_for` breaks ties on the lowest key,
+/// so a binding hint names `h` rather than `Left` when both run an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TreeKey {
+    Char(char),
+    Arrow { arrow: Arrow, shift: bool },
+}
+
+impl TreeKey {
+    /// The tree key a key press in Command mode stands for. Ctrl and Alt
+    /// never reach the tree, and only an arrow keeps a Shift bit, because a
+    /// character's case already records Shift.
+    pub fn from_key_event(key: &KeyEvent) -> Option<Self> {
+        let chord = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if chord {
+            return None;
+        }
+        if let KeyCode::Char(c) = key.code {
+            return Some(TreeKey::Char(c));
+        }
+        let arrow = Arrow::from_code(key.code)?;
+        Some(TreeKey::Arrow {
+            arrow,
+            shift: key.modifiers.contains(KeyModifiers::SHIFT),
+        })
+    }
+
+    /// Parse a TOML key of `[keybindings.command]`: one character, or an
+    /// arrow name (`Left`, `Shift-Left`, ...). Anything else is not a tree
+    /// key, which keeps `leader` and other multi-character keys out of the
+    /// tree.
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut chars = s.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            return Some(TreeKey::Char(c));
+        }
+        let (name, shift) = match s.strip_prefix("Shift-") {
+            Some(rest) => (rest, true),
+            None => (s, false),
+        };
+        let arrow = [Arrow::Left, Arrow::Down, Arrow::Up, Arrow::Right]
+            .into_iter()
+            .find(|a| a.name() == name)?;
+        Some(TreeKey::Arrow { arrow, shift })
+    }
+
+    /// The key as the which-key popup shows it.
+    pub fn label(self) -> String {
+        match self {
+            TreeKey::Char(' ') => "\u{2423}".to_string(),
+            TreeKey::Char(c) => c.to_string(),
+            TreeKey::Arrow { arrow, shift } => arrow_glyph(arrow, shift),
+        }
+    }
+}
+
+/// The config spelling, the inverse of [`TreeKey::parse`].
+impl std::fmt::Display for TreeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TreeKey::Char(c) => write!(f, "{c}"),
+            TreeKey::Arrow { arrow, shift: true } => write!(f, "Shift-{}", arrow.name()),
+            TreeKey::Arrow {
+                arrow,
+                shift: false,
+            } => f.write_str(arrow.name()),
+        }
+    }
+}
+
+fn arrow_glyph(arrow: Arrow, shift: bool) -> String {
+    if shift {
+        format!("\u{21e7}{}", arrow.glyph())
+    } else {
+        arrow.glyph().to_string()
+    }
+}
+
+/// A prefix-tree path written as characters, for tests.
+#[cfg(test)]
+pub fn tree_path(keys: &str) -> Vec<TreeKey> {
+    keys.chars().map(TreeKey::Char).collect()
+}
+
 /// A node in the keybinding tree. Either a group of sub-keys or a leaf that
 /// maps to one or more action strings (an action chain).
 #[derive(Debug, Clone)]
@@ -15,7 +143,7 @@ pub enum KeyNode {
     /// An intermediate group that contains sub-keys.
     Group {
         label: String,
-        children: HashMap<char, KeyNode>,
+        children: HashMap<TreeKey, KeyNode>,
         /// When true, executing a leaf inside this group keeps the which-key
         /// menu open (the state drops back to this group) so the user can keep
         /// triggering the group's actions (e.g. the Resize submenu). Only ESC
@@ -33,7 +161,7 @@ pub enum KeyNode {
 /// The full keybinding tree used in Normal mode.
 #[derive(Debug, Clone)]
 pub struct KeybindingTree {
-    pub root: HashMap<char, KeyNode>,
+    pub root: HashMap<TreeKey, KeyNode>,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,28 +196,86 @@ pub fn leaf_chain(label: &str, actions: &[&str]) -> KeyNode {
 fn group(label: &str, children: Vec<(char, KeyNode)>) -> KeyNode {
     KeyNode::Group {
         label: label.to_string(),
-        children: children.into_iter().collect(),
+        children: char_keyed(children),
         sticky: false,
     }
 }
 
-/// Helper to build a sticky group node. Executing a leaf in a sticky group
-/// keeps the which-key menu open so the user can keep triggering actions.
-fn group_sticky(label: &str, children: Vec<(char, KeyNode)>) -> KeyNode {
+/// A group whose h/j/k/l (and H/J/K/L) leaves are also bound to the arrows
+/// (and Shift+arrows), so a direction can be picked either way.
+fn group_with_arrows(label: &str, children: Vec<(char, KeyNode)>) -> KeyNode {
     KeyNode::Group {
         label: label.to_string(),
-        children: children.into_iter().collect(),
+        children: with_arrow_aliases(children),
+        sticky: false,
+    }
+}
+
+fn char_keyed(children: Vec<(char, KeyNode)>) -> HashMap<TreeKey, KeyNode> {
+    children
+        .into_iter()
+        .map(|(c, node)| (TreeKey::Char(c), node))
+        .collect()
+}
+
+fn with_arrow_aliases(children: Vec<(char, KeyNode)>) -> HashMap<TreeKey, KeyNode> {
+    let mut map = HashMap::new();
+    for (c, node) in children {
+        if let Some(alias) = arrow_alias(c) {
+            map.insert(alias, node.clone());
+        }
+        map.insert(TreeKey::Char(c), node);
+    }
+    map
+}
+
+/// The vim direction key for an arrow, the inverse of [`arrow_alias`].
+fn arrow_letter(arrow: Arrow, shift: bool) -> char {
+    let letter = match arrow {
+        Arrow::Left => 'h',
+        Arrow::Down => 'j',
+        Arrow::Up => 'k',
+        Arrow::Right => 'l',
+    };
+    if shift {
+        letter.to_ascii_uppercase()
+    } else {
+        letter
+    }
+}
+
+/// The arrow that means the same direction as a vim direction key.
+fn arrow_alias(c: char) -> Option<TreeKey> {
+    let arrow = match c.to_ascii_lowercase() {
+        'h' => Arrow::Left,
+        'j' => Arrow::Down,
+        'k' => Arrow::Up,
+        'l' => Arrow::Right,
+        _ => return None,
+    };
+    Some(TreeKey::Arrow {
+        arrow,
+        shift: c.is_ascii_uppercase(),
+    })
+}
+
+/// Helper to build a sticky group node. Executing a leaf in a sticky group
+/// keeps the which-key menu open so the user can keep triggering actions.
+fn group_sticky_with_arrows(label: &str, children: Vec<(char, KeyNode)>) -> KeyNode {
+    KeyNode::Group {
+        label: label.to_string(),
+        children: with_arrow_aliases(children),
         sticky: true,
     }
 }
 
-fn build_default_tree() -> HashMap<char, KeyNode> {
+fn build_default_tree() -> HashMap<TreeKey, KeyNode> {
     let mut root = HashMap::new();
 
     // p: Pane
     root.insert(
         'p',
-        group(
+        group_with_arrows(
             "Pane",
             vec![
                 ('n', leaf_chain("new", &["PaneNew", "EnterNormal"])),
@@ -150,7 +336,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ),
                 (
                     'S',
-                    group(
+                    group_with_arrows(
                         "Stack into",
                         vec![
                             (
@@ -171,7 +357,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ),
                 (
                     'U',
-                    group(
+                    group_with_arrows(
                         "Unstack",
                         vec![
                             ('h', leaf_chain("left", &["PaneUnstackLeft", "EnterNormal"])),
@@ -186,7 +372,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ),
                 (
                     'R',
-                    group_sticky(
+                    group_sticky_with_arrows(
                         "Resize",
                         vec![
                             ('h', leaf("left", "ResizeLeft 5")),
@@ -213,7 +399,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ('[', leaf_chain("prev", &["TabPrev", "EnterNormal"])),
                 (
                     'm',
-                    group(
+                    group_with_arrows(
                         "Move",
                         vec![
                             ('h', leaf_chain("left", &["TabMoveBy -1", "EnterNormal"])),
@@ -294,9 +480,9 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
     // the search-mode refactor, and nothing else claims it at root.
     //
     // Cycle sits on `b` rather than the Tab key the plan named: the which-key
-    // tree is keyed by `char` and `handle_command_key` only ever dispatches an
-    // unmodified `KeyCode::Char`, so `KeyCode::Tab` never reaches the tree and
-    // a `'\t'` entry would be unreachable. `b b` reads as "sidebar again".
+    // tree holds only characters and arrows (`TreeKey`), so `KeyCode::Tab`
+    // never reaches the tree and a `'\t'` entry would be unreachable. `b b`
+    // reads as "sidebar again".
     root.insert(
         'b',
         group(
@@ -343,7 +529,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         leaf_chain("send prefix", &["SendKey Ctrl-a", "EnterNormal"]),
     );
 
-    root
+    char_keyed(root.into_iter().collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -351,9 +537,9 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
 // ---------------------------------------------------------------------------
 
 impl KeybindingTree {
-    /// Look up the node at the given key path (e.g. `['t', 'n']` maps to the
+    /// Look up the node at the given key path (e.g. `t n` maps to the
     /// `TabNew` leaf).
-    pub fn lookup(&self, path: &[char]) -> Option<&KeyNode> {
+    pub fn lookup(&self, path: &[TreeKey]) -> Option<&KeyNode> {
         if path.is_empty() {
             return None;
         }
@@ -370,11 +556,17 @@ impl KeybindingTree {
         Some(current)
     }
 
-    /// Return the `(key, label)` pairs for all children at the given path.
+    /// Return the `(key, label)` pairs for all children at the given path,
+    /// with each key as the which-key popup shows it.
+    ///
+    /// An arrow bound to the same action chain as a character sibling is
+    /// folded into that sibling's key (`h/\u{2190}`), so the arrow aliases
+    /// do not double the popup. An arrow with no such twin, for example
+    /// after a user rebinds `h`, keeps a row of its own.
     ///
     /// If `path` is empty, returns the root-level children.
     /// Returns `None` if the path does not lead to a group.
-    pub fn children_at(&self, path: &[char]) -> Option<Vec<(char, String)>> {
+    pub fn children_at(&self, path: &[TreeKey]) -> Option<Vec<(String, String)>> {
         let children = if path.is_empty() {
             &self.root
         } else {
@@ -384,25 +576,49 @@ impl KeybindingTree {
             }
         };
 
-        let mut result: Vec<(char, String)> = children
-            .iter()
-            .map(|(&key, node)| {
-                let label = match node {
-                    KeyNode::Group { label, .. } | KeyNode::Leaf { label, .. } => label.clone(),
+        let mut sorted: Vec<(&TreeKey, &KeyNode)> = children.iter().collect();
+        sorted.sort_by_key(|(key, _)| display_order(**key));
+
+        let mut result: Vec<(TreeKey, String, String)> = Vec::new();
+        for (&key, node) in sorted {
+            if let (TreeKey::Arrow { arrow, shift }, KeyNode::Leaf { action, .. }) = (key, node) {
+                let same_chain = |k: &TreeKey| {
+                    matches!(k, TreeKey::Char(_))
+                        && matches!(children.get(k), Some(KeyNode::Leaf { action: a, .. }) if a == action)
                 };
-                // Show ␣ (U+2423) for the space key so it's visible in which-key.
-                let display_key = if key == ' ' { '␣' } else { key };
-                (display_key, label)
-            })
-            .collect();
-        result.sort_by_key(|(k, _)| *k);
-        Some(result)
+                // The arrow's own letter wins over another letter that happens
+                // to run the same chain, so Left folds into `h`.
+                let own = TreeKey::Char(arrow_letter(arrow, shift));
+                let twin = match result
+                    .iter()
+                    .position(|(k, _, _)| *k == own && same_chain(k))
+                {
+                    Some(i) => Some(i),
+                    None => result.iter().position(|(k, _, _)| same_chain(k)),
+                };
+                if let Some((_, shown, _)) = twin.map(|i| &mut result[i]) {
+                    shown.push('/');
+                    shown.push_str(&key.label());
+                    continue;
+                }
+            }
+            let label = match node {
+                KeyNode::Group { label, .. } | KeyNode::Leaf { label, .. } => label.clone(),
+            };
+            result.push((key, key.label(), label));
+        }
+        Some(
+            result
+                .into_iter()
+                .map(|(_, shown, label)| (shown, label))
+                .collect(),
+        )
     }
 
     /// Collect every leaf in the tree as `(key path, action chain)`, depth
     /// first. Used by config validation to name the binding that carries a
     /// bad action string.
-    pub fn leaves(&self) -> Vec<(Vec<char>, Vec<String>)> {
+    pub fn leaves(&self) -> Vec<(Vec<TreeKey>, Vec<String>)> {
         let mut out = Vec::new();
         collect_leaves(&self.root, &mut Vec::new(), &mut out);
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -412,7 +628,7 @@ impl KeybindingTree {
     /// The key path that runs `action`, as the first non-`EnterNormal` action
     /// of a leaf's chain. When several leaves run it, the shortest path wins,
     /// then the lowest keys, so the answer does not depend on map order.
-    pub fn path_for(&self, action: &str) -> Option<Vec<char>> {
+    pub fn path_for(&self, action: &str) -> Option<Vec<TreeKey>> {
         self.leaves()
             .into_iter()
             .filter(|(_, chain)| {
@@ -434,10 +650,20 @@ impl KeybindingTree {
     }
 }
 
+/// The which-key order: characters by the glyph shown (so the space key's
+/// `\u{2423}` sorts after the letters), then arrows.
+fn display_order(key: TreeKey) -> (u8, char, Option<(Arrow, bool)>) {
+    match key {
+        TreeKey::Char(' ') => (0, '\u{2423}', None),
+        TreeKey::Char(c) => (0, c, None),
+        TreeKey::Arrow { arrow, shift } => (1, ' ', Some((arrow, shift))),
+    }
+}
+
 fn collect_leaves(
-    nodes: &HashMap<char, KeyNode>,
-    path: &mut Vec<char>,
-    out: &mut Vec<(Vec<char>, Vec<String>)>,
+    nodes: &HashMap<TreeKey, KeyNode>,
+    path: &mut Vec<TreeKey>,
+    out: &mut Vec<(Vec<TreeKey>, Vec<String>)>,
 ) {
     for (&key, node) in nodes {
         path.push(key);
@@ -449,7 +675,7 @@ fn collect_leaves(
     }
 }
 
-fn merge_maps(base: &mut HashMap<char, KeyNode>, overrides: &HashMap<char, KeyNode>) {
+fn merge_maps(base: &mut HashMap<TreeKey, KeyNode>, overrides: &HashMap<TreeKey, KeyNode>) {
     for (key, override_node) in overrides {
         // If the override is a leaf with an empty action chain, remove the key.
         if let KeyNode::Leaf { action, .. } = override_node {
@@ -569,12 +795,12 @@ impl std::hash::Hash for NormalizedKeyEvent {
 }
 
 /// Action to perform when a modifier shortcut binding matches.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterceptAction {
     /// Execute commands and stay in Normal mode.
     Command(Vec<String>),
     /// Enter Command mode at the given keybinding tree group path.
-    GroupPrefix(Vec<char>),
+    GroupPrefix(Vec<TreeKey>),
 }
 
 /// Modifier-based keybindings that are checked in Normal mode before
@@ -605,11 +831,15 @@ impl ShortcutBindings {
                         .map(String::as_str)
                         == Some(action) =>
                 {
-                    Some(format_key_notation(key))
+                    Some((
+                        !matches!(key.code, KeyCode::Char(_)),
+                        format_key_notation(key),
+                    ))
                 }
                 _ => None,
             })
             .min()
+            .map(|(_, notation)| notation)
     }
 
     /// Merge another set of bindings on top of this one.
@@ -639,7 +869,7 @@ impl ShortcutBindings {
                 match tree.lookup(path) {
                     Some(KeyNode::Group { .. }) => {}
                     _ => {
-                        let path_str: String = path.iter().collect();
+                        let path_str: String = path.iter().map(TreeKey::to_string).collect();
                         log::error!(
                             "shortcut binding references invalid group '@{path_str}': \
                              no such group in keybinding tree"
@@ -701,7 +931,7 @@ impl ShortcutBindings {
             let normalized = NormalizedKeyEvent::new(key_event.code, key_event.modifiers);
 
             let action = if let Some(group_path) = action_str.strip_prefix('@') {
-                InterceptAction::GroupPrefix(group_path.chars().collect())
+                InterceptAction::GroupPrefix(group_path.chars().map(TreeKey::Char).collect())
             } else {
                 let cmds: Vec<String> = action_str
                     .split(';')
@@ -724,30 +954,68 @@ impl ShortcutBindings {
     ///   command, e.g. `PaneFocusLeft` -> `"focus left"`.
     /// - `GroupPrefix` actions are labelled `"→ <path>"` (the group's own label
     ///   is not resolvable without the tree here, so the path is shown).
+    /// - An arrow shortcut that runs the same action as a character shortcut
+    ///   with the same Ctrl and Alt bits is folded into it (`Alt-h/\u{2190}`),
+    ///   so the arrow aliases do not double the popup's Alt section.
     pub fn entries(&self) -> Vec<(String, String)> {
-        let mut result: Vec<(String, String)> = self
-            .bindings
-            .iter()
-            .map(|(key, action)| {
-                let notation = format_key_notation(key);
-                let label = match action {
-                    InterceptAction::Command(cmds) => {
-                        let cmd = cmds
-                            .iter()
-                            .find(|c| c.as_str() != "EnterNormal")
-                            .or_else(|| cmds.first());
-                        match cmd {
-                            Some(c) => humanize_command(c),
-                            None => String::new(),
-                        }
-                    }
-                    InterceptAction::GroupPrefix(path) => {
-                        let path_str: String = path.iter().collect();
-                        format!("\u{2192} {path_str}")
-                    }
+        let mut sorted: Vec<(&NormalizedKeyEvent, &InterceptAction)> =
+            self.bindings.iter().collect();
+        // Characters first, so an arrow's twin is already in `result`.
+        sorted.sort_by_key(|(key, _)| {
+            (
+                Arrow::from_code(key.code).is_some(),
+                format_key_notation(key),
+            )
+        });
+
+        let mut result: Vec<(&NormalizedKeyEvent, String, String)> = Vec::new();
+        for (key, action) in sorted {
+            if let Some(arrow) = Arrow::from_code(key.code) {
+                let chord = key.modifiers - KeyModifiers::SHIFT;
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                let same_action = |k: &NormalizedKeyEvent| {
+                    matches!(k.code, KeyCode::Char(_))
+                        && k.modifiers == chord
+                        && self.bindings.get(k) == Some(action)
                 };
-                (notation, label)
-            })
+                let own = KeyCode::Char(arrow_letter(arrow, shift));
+                let twin = match result
+                    .iter()
+                    .position(|(k, _, _)| k.code == own && same_action(k))
+                {
+                    Some(i) => Some(i),
+                    None => result.iter().position(|(k, _, _)| same_action(k)),
+                };
+                if let Some((_, notation, _)) = twin.map(|i| &mut result[i]) {
+                    notation.push('/');
+                    notation.push_str(&arrow_glyph(
+                        arrow,
+                        key.modifiers.contains(KeyModifiers::SHIFT),
+                    ));
+                    continue;
+                }
+            }
+            let label = match action {
+                InterceptAction::Command(cmds) => {
+                    let cmd = cmds
+                        .iter()
+                        .find(|c| c.as_str() != "EnterNormal")
+                        .or_else(|| cmds.first());
+                    match cmd {
+                        Some(c) => humanize_command(c),
+                        None => String::new(),
+                    }
+                }
+                InterceptAction::GroupPrefix(path) => {
+                    let path_str: String = path.iter().map(TreeKey::to_string).collect();
+                    format!("\u{2192} {path_str}")
+                }
+            };
+            result.push((key, format_key_notation(key), label));
+        }
+        let mut result: Vec<(String, String)> = result
+            .into_iter()
+            .map(|(_, notation, label)| (notation, label))
             .collect();
         result.sort_by(|(a, _), (b, _)| a.cmp(b));
         result
@@ -853,6 +1121,18 @@ fn alt_key(c: char) -> NormalizedKeyEvent {
     NormalizedKeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
 }
 
+/// Alt+arrow, or Alt+Shift+arrow. Unlike a letter, an arrow keeps its
+/// `SHIFT` bit, which matches the `CSI 1;4D` that xterm sends for
+/// Alt+Shift+Left.
+fn alt_arrow(code: KeyCode, shift: bool) -> NormalizedKeyEvent {
+    let modifiers = if shift {
+        KeyModifiers::ALT | KeyModifiers::SHIFT
+    } else {
+        KeyModifiers::ALT
+    };
+    NormalizedKeyEvent::new(code, modifiers)
+}
+
 /// Helper to build an `InterceptAction::Command` from a single command string.
 fn cmd(command: &str) -> InterceptAction {
     InterceptAction::Command(vec![command.to_string()])
@@ -867,6 +1147,10 @@ impl Default for ShortcutBindings {
         bindings.insert(alt_key('j'), cmd("PaneFocusDown"));
         bindings.insert(alt_key('k'), cmd("PaneFocusUp"));
         bindings.insert(alt_key('l'), cmd("PaneFocusRight"));
+        bindings.insert(alt_arrow(KeyCode::Left, false), cmd("PaneFocusLeft"));
+        bindings.insert(alt_arrow(KeyCode::Down, false), cmd("PaneFocusDown"));
+        bindings.insert(alt_arrow(KeyCode::Up, false), cmd("PaneFocusUp"));
+        bindings.insert(alt_arrow(KeyCode::Right, false), cmd("PaneFocusRight"));
 
         // Move panes directionally (Alt-Shift-h/j/k/l -> Alt-H/J/K/L). These
         // match `parse_key_notation("Alt-H")`, i.e. an uppercase char with the
@@ -875,6 +1159,10 @@ impl Default for ShortcutBindings {
         bindings.insert(alt_key('J'), cmd("PaneMoveDown"));
         bindings.insert(alt_key('K'), cmd("PaneMoveUp"));
         bindings.insert(alt_key('L'), cmd("PaneMoveRight"));
+        bindings.insert(alt_arrow(KeyCode::Left, true), cmd("PaneMoveLeft"));
+        bindings.insert(alt_arrow(KeyCode::Down, true), cmd("PaneMoveDown"));
+        bindings.insert(alt_arrow(KeyCode::Up, true), cmd("PaneMoveUp"));
+        bindings.insert(alt_arrow(KeyCode::Right, true), cmd("PaneMoveRight"));
 
         // Tab navigation (Alt-, / Alt-.) and direct jumps (Alt-1..Alt-9).
         bindings.insert(alt_key(','), cmd("TabPrev"));
@@ -913,12 +1201,15 @@ impl KeybindingTree {
     /// TOML config. The `value` should be the table at that path.
     pub fn from_toml(value: &toml::Value) -> Option<Self> {
         let table = value.as_table()?;
-        let root = parse_toml_table(table);
+        let root = parse_toml_table(table, true);
         Some(KeybindingTree { root })
     }
 }
 
-fn parse_toml_table(table: &toml::map::Map<String, toml::Value>) -> HashMap<char, KeyNode> {
+fn parse_toml_table(
+    table: &toml::map::Map<String, toml::Value>,
+    is_root: bool,
+) -> HashMap<TreeKey, KeyNode> {
     let mut map = HashMap::new();
 
     for (key, value) in table {
@@ -927,11 +1218,17 @@ fn parse_toml_table(table: &toml::map::Map<String, toml::Value>) -> HashMap<char
             continue;
         }
 
-        // Key must be a single character.
-        let ch = match key.chars().next() {
-            Some(c) if key.len() == c.len_utf8() => c,
-            _ => continue,
+        let Some(tree_key) = TreeKey::parse(key) else {
+            continue;
         };
+        // The root table is shared with the modifier shortcuts, and
+        // `ShortcutBindings::from_toml` already reads a root `Shift-Left` as
+        // a Normal-mode shortcut. Reading it as a tree key as well would bind
+        // one line in two places, so Shift+arrow keys count only inside a
+        // group.
+        if is_root && matches!(tree_key, TreeKey::Arrow { shift: true, .. }) {
+            continue;
+        }
 
         let node = match value {
             toml::Value::String(action_str) => {
@@ -952,7 +1249,7 @@ fn parse_toml_table(table: &toml::map::Map<String, toml::Value>) -> HashMap<char
                     .and_then(|v| v.as_str())
                     .unwrap_or(key)
                     .to_string();
-                let children = parse_toml_table(sub);
+                let children = parse_toml_table(sub, false);
                 KeyNode::Group {
                     label: sub_label,
                     children,
@@ -965,7 +1262,7 @@ fn parse_toml_table(table: &toml::map::Map<String, toml::Value>) -> HashMap<char
             _ => continue,
         };
 
-        map.insert(ch, node);
+        map.insert(tree_key, node);
     }
 
     map
@@ -1086,7 +1383,7 @@ pub fn unresolved_actions(tree: &KeybindingTree, shortcuts: &ShortcutBindings) -
     let mut problems = Vec::new();
 
     for (path, actions) in tree.leaves() {
-        let key_path: Vec<String> = path.iter().map(|c| c.to_string()).collect();
+        let key_path: Vec<String> = path.iter().map(TreeKey::to_string).collect();
         let key_path = key_path.join(" ");
         for action in &actions {
             if let Some(problem) = action_problem(action) {
@@ -1294,49 +1591,34 @@ fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
 ///
 /// Returns `None` if the notation is not recognised.
 pub fn parse_key_notation(notation: &str) -> Option<KeyEvent> {
-    // Check for modifier prefixes.
-    if let Some(rest) = notation.strip_prefix("Ctrl-") {
-        let (code, mods) = parse_key_code(rest)?;
-        return Some(KeyEvent::new_with_kind_and_state(
-            code,
-            mods | KeyModifiers::CONTROL,
-            KeyEventKind::Press,
-            KeyEventState::NONE,
-        ));
-    }
-    if let Some(rest) = notation.strip_prefix("Alt-") {
-        let (code, mods) = parse_key_code(rest)?;
-        return Some(KeyEvent::new_with_kind_and_state(
-            code,
-            mods | KeyModifiers::ALT,
-            KeyEventKind::Press,
-            KeyEventState::NONE,
-        ));
-    }
-    if let Some(rest) = notation.strip_prefix("Shift-") {
-        // Shift-Tab is represented as BackTab in crossterm.
-        if rest == "Tab" {
-            return Some(KeyEvent::new_with_kind_and_state(
-                KeyCode::BackTab,
-                KeyModifiers::SHIFT,
-                KeyEventKind::Press,
-                KeyEventState::NONE,
-            ));
-        }
-        let (code, mods) = parse_key_code(rest)?;
-        return Some(KeyEvent::new_with_kind_and_state(
-            code,
-            mods | KeyModifiers::SHIFT,
-            KeyEventKind::Press,
-            KeyEventState::NONE,
-        ));
+    // Modifiers stack in any order (`Alt-Shift-Left`), because
+    // `format_key_notation` writes them that way and a user copies a
+    // shortcut's spelling from the which-key popup or an error message.
+    let mut modifiers = KeyModifiers::NONE;
+    let mut rest = notation;
+    loop {
+        let (bit, tail) = if let Some(tail) = rest.strip_prefix("Ctrl-") {
+            (KeyModifiers::CONTROL, tail)
+        } else if let Some(tail) = rest.strip_prefix("Alt-") {
+            (KeyModifiers::ALT, tail)
+        } else if let Some(tail) = rest.strip_prefix("Shift-") {
+            (KeyModifiers::SHIFT, tail)
+        } else {
+            break;
+        };
+        modifiers |= bit;
+        rest = tail;
     }
 
-    // No modifier prefix: parse as bare key.
-    let (code, mods) = parse_key_code(notation)?;
+    // Shift-Tab is represented as BackTab in crossterm.
+    let (code, implied) = if modifiers.contains(KeyModifiers::SHIFT) && rest == "Tab" {
+        (KeyCode::BackTab, KeyModifiers::NONE)
+    } else {
+        parse_key_code(rest)?
+    };
     Some(KeyEvent::new_with_kind_and_state(
         code,
-        mods,
+        modifiers | implied,
         KeyEventKind::Press,
         KeyEventState::NONE,
     ))
@@ -1670,9 +1952,9 @@ mod tests {
     #[test]
     fn a_leaf_that_runs_an_action_gives_its_key_path() {
         let tree = KeybindingTree::default();
-        assert_eq!(tree.path_for("PaneClose"), Some(vec!['p', 'x']));
-        assert_eq!(tree.path_for("TabClose"), Some(vec!['t', 'x']));
-        assert_eq!(tree.path_for("PaneRename"), Some(vec!['p', 'r']));
+        assert_eq!(tree.path_for("PaneClose"), Some(tree_path("px")));
+        assert_eq!(tree.path_for("TabClose"), Some(tree_path("tx")));
+        assert_eq!(tree.path_for("PaneRename"), Some(tree_path("pr")));
         assert_eq!(tree.path_for("NoSuchAction"), None);
     }
 
@@ -1991,7 +2273,7 @@ mod tests {
     #[test]
     fn session_group_has_last_session_leaf() {
         let tree = KeybindingTree::default();
-        let node = tree.lookup(&['x', 'o']).unwrap();
+        let node = tree.lookup(&tree_path("xo")).unwrap();
         match node {
             KeyNode::Leaf { action, label, .. } => {
                 assert_eq!(action, &vec!["SessionSwitchLast".to_string()]);
@@ -2097,23 +2379,23 @@ mod tests {
     #[test]
     fn default_tree_has_expected_groups() {
         let tree = KeybindingTree::default();
-        assert!(tree.root.contains_key(&'t'));
-        assert!(tree.root.contains_key(&'p'));
-        assert!(tree.root.contains_key(&'s')); // Search group
-        assert!(tree.root.contains_key(&'x')); // Session group (moved from 's')
-        assert!(tree.root.contains_key(&'z')); // Zoom pane toggle
-        assert!(!tree.root.contains_key(&'f')); // moved to 'z'
-        assert!(tree.root.contains_key(&'v'));
-        assert!(tree.root.contains_key(&'g'));
+        assert!(tree.root.contains_key(&TreeKey::Char('t')));
+        assert!(tree.root.contains_key(&TreeKey::Char('p')));
+        assert!(tree.root.contains_key(&TreeKey::Char('s'))); // Search group
+        assert!(tree.root.contains_key(&TreeKey::Char('x'))); // Session group (moved from 's')
+        assert!(tree.root.contains_key(&TreeKey::Char('z'))); // Zoom pane toggle
+        assert!(!tree.root.contains_key(&TreeKey::Char('f'))); // moved to 'z'
+        assert!(tree.root.contains_key(&TreeKey::Char('v')));
+        assert!(tree.root.contains_key(&TreeKey::Char('g')));
         // 'b' was the Buffer group, removed in the search-mode refactor and
         // reclaimed by the Sidebar group.
-        assert!(tree.root.contains_key(&'b'));
+        assert!(tree.root.contains_key(&TreeKey::Char('b')));
         // 'i' (EnterInsertMode) was removed in the leader-key-modes refactor.
-        assert!(!tree.root.contains_key(&'i'));
+        assert!(!tree.root.contains_key(&TreeKey::Char('i')));
     }
 
     /// Every leaf in the Sidebar group must name an action the registry knows,
-    /// or the key is silently inert. `contains_key(&'b')` alone would not catch
+    /// or the key is silently inert. `contains_key(&TreeKey::Char('b'))` alone would not catch
     /// a typo in an action string.
     #[test]
     fn sidebar_group_leaves_all_resolve() {
@@ -2126,7 +2408,7 @@ mod tests {
         ];
         for (key, name) in expected {
             let node = tree
-                .lookup(&['b', key])
+                .lookup(&[TreeKey::Char('b'), TreeKey::Char(key)])
                 .unwrap_or_else(|| panic!("no leaf at 'b {key}'"));
             match node {
                 KeyNode::Leaf { action, .. } => {
@@ -2155,7 +2437,8 @@ mod tests {
             ('J', "SidebarFocusBottom"),
         ] {
             assert!(
-                tree.lookup(&['b', key]).is_none(),
+                tree.lookup(&[TreeKey::Char('b'), TreeKey::Char(key)])
+                    .is_none(),
                 "'b {key}' still has a default binding"
             );
             assert!(
@@ -2168,7 +2451,7 @@ mod tests {
     #[test]
     fn lookup_leaf() {
         let tree = KeybindingTree::default();
-        let node = tree.lookup(&['t', 'n']).unwrap();
+        let node = tree.lookup(&tree_path("tn")).unwrap();
         match node {
             KeyNode::Leaf { action, .. } => {
                 assert!(action.contains(&"TabNew".to_string()));
@@ -2180,15 +2463,15 @@ mod tests {
     #[test]
     fn lookup_group() {
         let tree = KeybindingTree::default();
-        let node = tree.lookup(&['t']).unwrap();
+        let node = tree.lookup(&tree_path("t")).unwrap();
         assert!(matches!(node, KeyNode::Group { .. }));
     }
 
     #[test]
     fn lookup_missing() {
         let tree = KeybindingTree::default();
-        assert!(tree.lookup(&['q']).is_none());
-        assert!(tree.lookup(&['t', 'q']).is_none());
+        assert!(tree.lookup(&tree_path("q")).is_none());
+        assert!(tree.lookup(&tree_path("tq")).is_none());
     }
 
     #[test]
@@ -2202,29 +2485,29 @@ mod tests {
         let tree = KeybindingTree::default();
         let children = tree.children_at(&[]).unwrap();
         assert!(!children.is_empty());
-        assert!(children.iter().any(|(k, _)| *k == 'v'));
+        assert!(children.iter().any(|(k, _)| k == "v"));
     }
 
     #[test]
     fn children_at_group() {
         let tree = KeybindingTree::default();
-        let children = tree.children_at(&['t']).unwrap();
-        let keys: Vec<char> = children.iter().map(|(k, _)| *k).collect();
-        assert!(keys.contains(&'n'));
-        assert!(keys.contains(&'x'));
+        let children = tree.children_at(&tree_path("t")).unwrap();
+        let keys: Vec<&str> = children.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"n"));
+        assert!(keys.contains(&"x"));
     }
 
     #[test]
     fn children_at_leaf_returns_none() {
         let tree = KeybindingTree::default();
-        assert!(tree.children_at(&['t', 'n']).is_none());
+        assert!(tree.children_at(&tree_path("tn")).is_none());
     }
 
     #[test]
     fn default_tree_has_toggle_style() {
         let tree = KeybindingTree::default();
-        assert!(tree.root.contains_key(&'g'));
-        let node = tree.lookup(&['g']).unwrap();
+        assert!(tree.root.contains_key(&TreeKey::Char('g')));
+        let node = tree.lookup(&tree_path("g")).unwrap();
         match node {
             KeyNode::Leaf { action, label, .. } => {
                 assert!(action.contains(&"ToggleStyle".to_string()));
@@ -2237,11 +2520,11 @@ mod tests {
     #[test]
     fn pane_group_contains_stack_add() {
         let tree = KeybindingTree::default();
-        let children = tree.children_at(&['p']).unwrap();
+        let children = tree.children_at(&tree_path("p")).unwrap();
         assert!(
             children
                 .iter()
-                .any(|(k, label)| *k == 'a' && label == "stack add"),
+                .any(|(k, label)| k == "a" && label == "stack add"),
             "expected 'a' -> 'stack add' in Pane group, got: {children:?}"
         );
     }
@@ -2249,7 +2532,7 @@ mod tests {
     #[test]
     fn pane_group_has_rename_leaf() {
         let tree = KeybindingTree::default();
-        let node = tree.lookup(&['p', 'r']).unwrap();
+        let node = tree.lookup(&tree_path("pr")).unwrap();
         match node {
             KeyNode::Leaf { action, label, .. } => {
                 assert_eq!(action, &vec!["PaneRename".to_string()]);
@@ -2263,7 +2546,7 @@ mod tests {
     fn pane_group_has_move_and_resize() {
         let tree = KeybindingTree::default();
         // 'H' is now a move-pane leaf.
-        let mv = tree.lookup(&['p', 'H']).unwrap();
+        let mv = tree.lookup(&tree_path("pH")).unwrap();
         match mv {
             KeyNode::Leaf { action, label, .. } => {
                 assert!(action.contains(&"PaneMoveLeft".to_string()));
@@ -2272,9 +2555,9 @@ mod tests {
             other => panic!("expected leaf for 'p' -> 'H', got {other:?}"),
         }
         // 'R' is now the Resize group.
-        let resize = tree.lookup(&['p', 'R']).unwrap();
+        let resize = tree.lookup(&tree_path("pR")).unwrap();
         assert!(matches!(resize, KeyNode::Group { .. }));
-        let down = tree.lookup(&['p', 'R', 'j']).unwrap();
+        let down = tree.lookup(&tree_path("pRj")).unwrap();
         match down {
             KeyNode::Leaf { action, .. } => assert_eq!(action, &vec!["ResizeDown 5".to_string()]),
             other => panic!("expected leaf for 'p' -> 'R' -> 'j', got {other:?}"),
@@ -2285,13 +2568,13 @@ mod tests {
     fn tab_group_has_close_and_goto() {
         let tree = KeybindingTree::default();
         // 'x' closes the tab.
-        let close = tree.lookup(&['t', 'x']).unwrap();
+        let close = tree.lookup(&tree_path("tx")).unwrap();
         match close {
             KeyNode::Leaf { action, .. } => assert!(action.contains(&"TabClose".to_string())),
             other => panic!("expected leaf for 't' -> 'x', got {other:?}"),
         }
         // '1' jumps to the first tab (0-indexed).
-        let goto = tree.lookup(&['t', '1']).unwrap();
+        let goto = tree.lookup(&tree_path("t1")).unwrap();
         match goto {
             KeyNode::Leaf { action, .. } => assert!(action.contains(&"TabGoto 0".to_string())),
             other => panic!("expected leaf for 't' -> '1', got {other:?}"),
@@ -2301,7 +2584,7 @@ mod tests {
     #[test]
     fn session_group_has_switch_leaf() {
         let tree = KeybindingTree::default();
-        let node = tree.lookup(&['x', 's']).unwrap();
+        let node = tree.lookup(&tree_path("xs")).unwrap();
         match node {
             KeyNode::Leaf { action, label, .. } => {
                 assert_eq!(action, &vec!["SessionQuickSwitch".to_string()]);
@@ -2315,7 +2598,7 @@ mod tests {
     fn default_tree_has_quick_tab_navigation() {
         let tree = KeybindingTree::default();
 
-        let next = tree.lookup(&['}']).unwrap();
+        let next = tree.lookup(&tree_path("}")).unwrap();
         match next {
             KeyNode::Leaf { action, label, .. } => {
                 assert!(action.contains(&"TabNext".to_string()));
@@ -2324,7 +2607,7 @@ mod tests {
             other => panic!("expected leaf for '}}', got {other:?}"),
         }
 
-        let prev = tree.lookup(&['{']).unwrap();
+        let prev = tree.lookup(&tree_path("{")).unwrap();
         match prev {
             KeyNode::Leaf { action, label, .. } => {
                 assert!(action.contains(&"TabPrev".to_string()));
@@ -2337,7 +2620,7 @@ mod tests {
     #[test]
     fn default_tree_tab_move_is_a_left_right_group() {
         let tree = KeybindingTree::default();
-        match tree.lookup(&['t', 'm']).unwrap() {
+        match tree.lookup(&tree_path("tm")).unwrap() {
             KeyNode::Group {
                 label,
                 children,
@@ -2345,14 +2628,22 @@ mod tests {
             } => {
                 assert_eq!(label, "Move");
                 assert!(!sticky);
-                let mut keys: Vec<char> = children.keys().copied().collect();
+                let mut keys: Vec<TreeKey> = children.keys().copied().collect();
                 keys.sort_unstable();
-                assert_eq!(keys, vec!['h', 'l']);
+                let mut expected = tree_path("hl");
+                expected.extend([Arrow::Left, Arrow::Right].map(|arrow| TreeKey::Arrow {
+                    arrow,
+                    shift: false,
+                }));
+                assert_eq!(keys, expected);
             }
             other => panic!("expected group for 't' -> 'm', got {other:?}"),
         }
         for (key, cmd) in [('h', "TabMoveBy -1"), ('l', "TabMoveBy 1")] {
-            match tree.lookup(&['t', 'm', key]).unwrap() {
+            match tree
+                .lookup(&[TreeKey::Char('t'), TreeKey::Char('m'), TreeKey::Char(key)])
+                .unwrap()
+            {
                 KeyNode::Leaf { action, .. } => {
                     assert_eq!(action, &vec![cmd.to_string(), "EnterNormal".to_string()]);
                 }
@@ -2366,10 +2657,10 @@ mod tests {
     #[test]
     fn merge_unbinds_with_empty_action() {
         let mut base = KeybindingTree::default();
-        assert!(base.root.contains_key(&'v'));
+        assert!(base.root.contains_key(&TreeKey::Char('v')));
         let overrides = KeybindingTree {
             root: HashMap::from([(
-                'v',
+                TreeKey::Char('v'),
                 KeyNode::Leaf {
                     label: String::new(),
                     action: vec![String::new()],
@@ -2378,7 +2669,7 @@ mod tests {
         };
         base.merge(&overrides);
         assert!(
-            !base.root.contains_key(&'v'),
+            !base.root.contains_key(&TreeKey::Char('v')),
             "'v' key should have been removed by empty-action override"
         );
     }
@@ -2387,15 +2678,15 @@ mod tests {
     fn merge_unbinds_within_group() {
         let mut base = KeybindingTree::default();
         // Verify 'n' exists in Tab group.
-        assert!(base.lookup(&['t', 'n']).is_some());
+        assert!(base.lookup(&tree_path("tn")).is_some());
 
         let overrides = KeybindingTree {
             root: HashMap::from([(
-                't',
+                TreeKey::Char('t'),
                 KeyNode::Group {
                     label: "Tab".into(),
                     children: HashMap::from([(
-                        'n',
+                        TreeKey::Char('n'),
                         KeyNode::Leaf {
                             label: String::new(),
                             action: vec![String::new()],
@@ -2407,9 +2698,9 @@ mod tests {
         };
         base.merge(&overrides);
         // 'n' should be removed from the Tab group.
-        assert!(base.lookup(&['t', 'n']).is_none());
+        assert!(base.lookup(&tree_path("tn")).is_none());
         // Other Tab children should still exist.
-        assert!(base.lookup(&['t', 'x']).is_some());
+        assert!(base.lookup(&tree_path("tx")).is_some());
     }
 
     #[test]
@@ -2418,11 +2709,11 @@ mod tests {
         // (split vertical) to leaves.
         let mut base = KeybindingTree::default();
         assert!(matches!(
-            base.lookup(&['p', 's']),
+            base.lookup(&tree_path("ps")),
             Some(KeyNode::Leaf { .. })
         ));
         assert!(matches!(
-            base.lookup(&['p', 'v']),
+            base.lookup(&tree_path("pv")),
             Some(KeyNode::Leaf { .. })
         ));
 
@@ -2440,21 +2731,21 @@ mod tests {
 
         // `p s` is gone; the sibling `p v` (and other Pane children) survive.
         assert!(
-            base.lookup(&['p', 's']).is_none(),
+            base.lookup(&tree_path("ps")).is_none(),
             "'p s' should have been unbound by the empty-string override"
         );
         assert!(
-            base.lookup(&['p', 'v']).is_some(),
+            base.lookup(&tree_path("pv")).is_some(),
             "sibling 'p v' must remain bound after unbinding 'p s'"
         );
-        assert!(base.lookup(&['p', 'n']).is_some());
+        assert!(base.lookup(&tree_path("pn")).is_some());
     }
 
     #[test]
     fn merge_nonempty_toml_override_replaces_not_removes() {
         // A non-empty override replaces the leaf rather than removing it.
         let mut base = KeybindingTree::default();
-        assert!(base.lookup(&['p', 's']).is_some());
+        assert!(base.lookup(&tree_path("ps")).is_some());
 
         let toml_str = r#"
             [p]
@@ -2465,7 +2756,7 @@ mod tests {
         base.merge(&overrides);
 
         // Still resolves, now to the replacement action chain.
-        match base.lookup(&['p', 's']) {
+        match base.lookup(&tree_path("ps")) {
             Some(KeyNode::Leaf { action, .. }) => {
                 assert_eq!(
                     action,
@@ -2483,7 +2774,7 @@ mod tests {
         let mut base = KeybindingTree::default();
         let overrides = KeybindingTree {
             root: HashMap::from([(
-                'x',
+                TreeKey::Char('x'),
                 KeyNode::Leaf {
                     label: "custom".into(),
                     action: vec!["TabNew".into()],
@@ -2491,7 +2782,7 @@ mod tests {
             )]),
         };
         base.merge(&overrides);
-        assert!(base.root.contains_key(&'x'));
+        assert!(base.root.contains_key(&TreeKey::Char('x')));
     }
 
     #[test]
@@ -2499,7 +2790,7 @@ mod tests {
         let mut base = KeybindingTree::default();
         let overrides = KeybindingTree {
             root: HashMap::from([(
-                'v',
+                TreeKey::Char('v'),
                 KeyNode::Leaf {
                     label: "custom".into(),
                     action: vec!["SessionDetach".into()],
@@ -2507,7 +2798,7 @@ mod tests {
             )]),
         };
         base.merge(&overrides);
-        match &base.root[&'v'] {
+        match &base.root[&TreeKey::Char('v')] {
             KeyNode::Leaf { action, .. } => assert_eq!(action, &vec!["SessionDetach".to_string()]),
             other => panic!("expected leaf, got {other:?}"),
         }
@@ -2518,11 +2809,11 @@ mod tests {
         let mut base = KeybindingTree::default();
         let overrides = KeybindingTree {
             root: HashMap::from([(
-                't',
+                TreeKey::Char('t'),
                 KeyNode::Group {
                     label: "Tab".into(),
                     children: HashMap::from([(
-                        'x',
+                        TreeKey::Char('x'),
                         KeyNode::Leaf {
                             label: "extra".into(),
                             action: vec!["TabNew".into()],
@@ -2534,9 +2825,9 @@ mod tests {
         };
         base.merge(&overrides);
         // Original 'n' should still exist.
-        assert!(base.lookup(&['t', 'n']).is_some());
+        assert!(base.lookup(&tree_path("tn")).is_some());
         // New 'x' should be added.
-        assert!(base.lookup(&['t', 'x']).is_some());
+        assert!(base.lookup(&tree_path("tx")).is_some());
     }
 
     // -- TOML parsing tests ---------------------------------------------------
@@ -2551,7 +2842,7 @@ mod tests {
         "#;
         let value: toml::Value = toml_str.parse().unwrap();
         let tree = KeybindingTree::from_toml(&value).unwrap();
-        let node = tree.lookup(&['t', 'n']).unwrap();
+        let node = tree.lookup(&tree_path("tn")).unwrap();
         match node {
             KeyNode::Leaf { action, .. } => assert_eq!(action, &vec!["TabNew".to_string()]),
             other => panic!("expected leaf, got {other:?}"),
@@ -2565,7 +2856,7 @@ mod tests {
         "#;
         let value: toml::Value = toml_str.parse().unwrap();
         let tree = KeybindingTree::from_toml(&value).unwrap();
-        let node = tree.lookup(&['n']).unwrap();
+        let node = tree.lookup(&tree_path("n")).unwrap();
         match node {
             KeyNode::Leaf { action, .. } => {
                 assert_eq!(
@@ -2589,7 +2880,7 @@ mod tests {
         "#;
         let value: toml::Value = toml_str.parse().unwrap();
         let tree = KeybindingTree::from_toml(&value).unwrap();
-        let node = tree.lookup(&['t', 's', 'a']).unwrap();
+        let node = tree.lookup(&tree_path("tsa")).unwrap();
         match node {
             KeyNode::Leaf { action, .. } => assert_eq!(action, &vec!["TabClose".to_string()]),
             other => panic!("expected leaf, got {other:?}"),
@@ -2739,7 +3030,7 @@ mod tests {
 
     #[test]
     fn prefix_p_l_moves_the_pane_right() {
-        match KeybindingTree::default().lookup(&['p', 'L']) {
+        match KeybindingTree::default().lookup(&tree_path("pL")) {
             Some(KeyNode::Leaf { action, .. }) => {
                 assert!(action.contains(&"PaneMoveRight".to_string()))
             }
@@ -2806,7 +3097,7 @@ mod tests {
 
     #[test]
     fn prefix_l_opens_the_layout_switcher() {
-        match KeybindingTree::default().lookup(&['L']) {
+        match KeybindingTree::default().lookup(&tree_path("L")) {
             Some(KeyNode::Leaf { action, .. }) => {
                 assert_eq!(action, &vec!["LayoutQuickSwitch".to_string()])
             }
@@ -2915,7 +3206,7 @@ mod tests {
             KeyEventState::NONE,
         );
         match bindings.lookup(&key).unwrap() {
-            InterceptAction::GroupPrefix(path) => assert_eq!(path, &['s']),
+            InterceptAction::GroupPrefix(path) => assert_eq!(path, &tree_path("s")),
             other => panic!("expected GroupPrefix, got {other:?}"),
         }
     }
@@ -3011,7 +3302,7 @@ mod tests {
         let mut bindings = ShortcutBindings::default();
         bindings
             .bindings
-            .insert(alt_key('z'), InterceptAction::GroupPrefix(vec!['q']));
+            .insert(alt_key('z'), InterceptAction::GroupPrefix(tree_path("q")));
         let tree = KeybindingTree::default();
         assert!(!bindings.validate_group_refs(&tree));
     }
@@ -3022,8 +3313,8 @@ mod tests {
     fn shortcut_entries_include_expected_pairs() {
         let entries = ShortcutBindings::default().entries();
         assert!(
-            entries.contains(&("Alt-h".to_string(), "focus left".to_string())),
-            "expected Alt-h -> focus left, got: {entries:?}"
+            entries.contains(&("Alt-h/\u{2190}".to_string(), "focus left".to_string())),
+            "expected Alt-h/\u{2190} -> focus left, got: {entries:?}"
         );
         assert!(
             entries.contains(&("Alt-.".to_string(), "next tab".to_string())),
@@ -3044,7 +3335,7 @@ mod tests {
         let mut bindings = ShortcutBindings::default();
         bindings
             .bindings
-            .insert(alt_key('p'), InterceptAction::GroupPrefix(vec!['p']));
+            .insert(alt_key('p'), InterceptAction::GroupPrefix(tree_path("p")));
         let entries = bindings.entries();
         assert!(
             entries.contains(&("Alt-p".to_string(), "\u{2192} p".to_string())),
@@ -3378,9 +3669,12 @@ mod tests {
             leaves.len() > 40,
             "expected the default tree to have leaves"
         );
-        assert!(leaves
-            .iter()
-            .any(|(path, actions)| path == &['w', 'n'] && actions == &["ViewNew".to_string()]));
+        assert!(
+            leaves
+                .iter()
+                .any(|(path, actions)| path == &tree_path("wn")
+                    && actions == &["ViewNew".to_string()])
+        );
     }
 
     /// A typo in a binding is reported, naming the key path AND the bad name.
@@ -3465,5 +3759,315 @@ mod tests {
         // including strings that are not in the registry at all.
         assert_eq!(humanize_command("PaneFocusLeft"), "focus left");
         assert_eq!(humanize_command("SomethingUnknown"), "something unknown");
+    }
+
+    // -- Arrow keys --------------------------------------------------------------
+
+    fn arrow(arrow: Arrow, shift: bool) -> TreeKey {
+        TreeKey::Arrow { arrow, shift }
+    }
+
+    fn leaf_actions(tree: &KeybindingTree, path: &[TreeKey]) -> Vec<String> {
+        match tree.lookup(path) {
+            Some(KeyNode::Leaf { action, .. }) => action.clone(),
+            other => panic!("expected a leaf at {path:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tree_key_parses_characters_and_arrow_names() {
+        assert_eq!(TreeKey::parse("h"), Some(TreeKey::Char('h')));
+        assert_eq!(TreeKey::parse("\u{e9}"), Some(TreeKey::Char('\u{e9}')));
+        assert_eq!(TreeKey::parse("Left"), Some(arrow(Arrow::Left, false)));
+        assert_eq!(TreeKey::parse("Down"), Some(arrow(Arrow::Down, false)));
+        assert_eq!(TreeKey::parse("Up"), Some(arrow(Arrow::Up, false)));
+        assert_eq!(TreeKey::parse("Right"), Some(arrow(Arrow::Right, false)));
+        assert_eq!(TreeKey::parse("Shift-Up"), Some(arrow(Arrow::Up, true)));
+        for not_a_key in ["leader", "left", "Shift-h", "Alt-Left", "Enter", ""] {
+            assert_eq!(TreeKey::parse(not_a_key), None, "{not_a_key:?}");
+        }
+        for key in ["h", "Left", "Shift-Right"] {
+            assert_eq!(TreeKey::parse(key).unwrap().to_string(), key);
+        }
+    }
+
+    #[test]
+    fn tree_key_from_a_key_event_keeps_shift_only_on_arrows() {
+        let ev = |code, modifiers| KeyEvent::new(code, modifiers);
+        assert_eq!(
+            TreeKey::from_key_event(&ev(KeyCode::Left, KeyModifiers::NONE)),
+            Some(arrow(Arrow::Left, false))
+        );
+        assert_eq!(
+            TreeKey::from_key_event(&ev(KeyCode::Left, KeyModifiers::SHIFT)),
+            Some(arrow(Arrow::Left, true))
+        );
+        assert_eq!(
+            TreeKey::from_key_event(&ev(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+            Some(TreeKey::Char('H'))
+        );
+        assert_eq!(
+            TreeKey::from_key_event(&ev(KeyCode::Left, KeyModifiers::ALT)),
+            None
+        );
+        assert_eq!(
+            TreeKey::from_key_event(&ev(KeyCode::Tab, KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn every_default_direction_leaf_has_an_arrow_twin() {
+        let tree = KeybindingTree::default();
+        let pairs = [
+            ('h', Arrow::Left),
+            ('j', Arrow::Down),
+            ('k', Arrow::Up),
+            ('l', Arrow::Right),
+        ];
+        for group in ["p", "pS", "pU", "pR"] {
+            for (c, dir) in pairs {
+                let mut by_char = tree_path(group);
+                by_char.push(TreeKey::Char(c));
+                let mut by_arrow = tree_path(group);
+                by_arrow.push(arrow(dir, false));
+                assert_eq!(
+                    leaf_actions(&tree, &by_arrow),
+                    leaf_actions(&tree, &by_char),
+                    "{group} {c}"
+                );
+            }
+        }
+        for (c, dir) in pairs {
+            let mut by_char = tree_path("p");
+            by_char.push(TreeKey::Char(c.to_ascii_uppercase()));
+            let mut by_arrow = tree_path("p");
+            by_arrow.push(arrow(dir, true));
+            assert_eq!(
+                leaf_actions(&tree, &by_arrow),
+                leaf_actions(&tree, &by_char)
+            );
+        }
+        assert_eq!(
+            leaf_actions(
+                &tree,
+                &tree_path("pR")
+                    .into_iter()
+                    .chain([arrow(Arrow::Left, false)])
+                    .collect::<Vec<_>>()
+            ),
+            vec!["ResizeLeft 5".to_string()]
+        );
+        // The Sidebar group's h/j/l name edges to toggle, not a direction to
+        // move in, so it gets no arrows.
+        assert!(tree
+            .lookup(&[TreeKey::Char('b'), arrow(Arrow::Left, false)])
+            .is_none());
+    }
+
+    #[test]
+    fn which_key_folds_an_arrow_into_its_character_twin() {
+        let tree = KeybindingTree::default();
+        let resize = tree.children_at(&tree_path("pR")).unwrap();
+        let keys: Vec<&str> = resize.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["h/\u{2190}", "j/\u{2193}", "k/\u{2191}", "l/\u{2192}"]
+        );
+
+        let pane = tree.children_at(&tree_path("p")).unwrap();
+        let keys: Vec<&str> = pane.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"H/\u{21e7}\u{2190}"), "{keys:?}");
+        assert!(keys.contains(&"h/\u{2190}"), "{keys:?}");
+        assert!(!keys.iter().any(|k| k.starts_with('\u{2190}')), "{keys:?}");
+        let Some(KeyNode::Group { children, .. }) = tree.lookup(&tree_path("p")) else {
+            panic!("p is a group");
+        };
+        let letters = children
+            .keys()
+            .filter(|k| matches!(k, TreeKey::Char(_)))
+            .count();
+        assert_eq!(pane.len(), letters, "one row per letter: {keys:?}");
+    }
+
+    #[test]
+    fn a_user_rebound_h_leaves_the_arrow_on_its_own_row() {
+        let toml_str = r#"
+            [p]
+            h = "PaneClose"
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let mut tree = KeybindingTree::default();
+        tree.merge(&KeybindingTree::from_toml(&value).unwrap());
+
+        let pane = tree.children_at(&tree_path("p")).unwrap();
+        let find = |key: &str| pane.iter().find(|(k, _)| k == key).map(|(_, l)| l.clone());
+        assert_eq!(find("h").as_deref(), Some("PaneClose"));
+        assert_eq!(find("\u{2190}").as_deref(), Some("focus left"));
+        assert_eq!(
+            leaf_actions(&tree, &[TreeKey::Char('p'), arrow(Arrow::Left, false)]),
+            vec!["PaneFocusLeft".to_string(), "EnterNormal".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_arrow_folds_into_its_own_letter_before_an_earlier_twin() {
+        let toml_str = r#"
+            [q]
+            a = "PaneFocusLeft"
+            h = "PaneFocusLeft"
+            Left = "PaneFocusLeft"
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let tree = KeybindingTree::from_toml(&value).unwrap();
+        let keys: Vec<String> = tree
+            .children_at(&tree_path("q"))
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, ["a", "h/\u{2190}"]);
+    }
+
+    #[test]
+    fn toml_accepts_arrow_keys_in_groups_and_can_unbind_them() {
+        let toml_str = r#"
+            leader = "Ctrl-b"
+            Left = "TabPrev"
+            Shift-Left = "PaneMoveLeft"
+            [p]
+            Up = "PaneClose"
+            "Shift-Down" = "PaneNew"
+            [p.R]
+            Right = ""
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let user = KeybindingTree::from_toml(&value).unwrap();
+        assert_eq!(
+            leaf_actions(&user, &[arrow(Arrow::Left, false)]),
+            vec!["TabPrev".to_string()]
+        );
+        assert!(
+            user.lookup(&[arrow(Arrow::Left, true)]).is_none(),
+            "a root Shift+arrow is a Normal-mode shortcut, not a tree key"
+        );
+        assert!(!user.root.keys().any(|k| k.to_string() == "leader"));
+
+        let mut tree = KeybindingTree::default();
+        tree.merge(&user);
+        assert_eq!(
+            leaf_actions(&tree, &[TreeKey::Char('p'), arrow(Arrow::Up, false)]),
+            vec!["PaneClose".to_string()]
+        );
+        assert_eq!(
+            leaf_actions(&tree, &[TreeKey::Char('p'), arrow(Arrow::Down, true)]),
+            vec!["PaneNew".to_string()]
+        );
+        let mut resize_right = tree_path("pR");
+        resize_right.push(arrow(Arrow::Right, false));
+        assert!(tree.lookup(&resize_right).is_none());
+        assert!(tree.lookup(&tree_path("pRl")).is_some());
+        // Merging a group the user re-declared keeps it sticky.
+        assert!(matches!(
+            tree.lookup(&tree_path("pR")),
+            Some(KeyNode::Group { sticky: true, .. })
+        ));
+    }
+
+    #[test]
+    fn a_binding_hint_names_the_letter_not_the_arrow() {
+        let tree = KeybindingTree::default();
+        assert_eq!(tree.path_for("PaneFocusLeft"), Some(tree_path("ph")));
+        let shortcuts = ShortcutBindings::default();
+        assert_eq!(
+            shortcuts.notation_for("PaneFocusLeft").as_deref(),
+            Some("Alt-h")
+        );
+        assert_eq!(
+            shortcuts.notation_for("PaneMoveRight").as_deref(),
+            Some("Alt-L")
+        );
+    }
+
+    #[test]
+    fn default_shortcuts_bind_alt_arrows_to_focus_and_alt_shift_arrows_to_move() {
+        let shortcuts = ShortcutBindings::default();
+        let run = |code, modifiers| match shortcuts.lookup(&KeyEvent::new(code, modifiers)) {
+            Some(InterceptAction::Command(cmds)) => cmds.clone(),
+            other => panic!("{code:?} {modifiers:?}: {other:?}"),
+        };
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        for (code, focus, mv) in [
+            (KeyCode::Left, "PaneFocusLeft", "PaneMoveLeft"),
+            (KeyCode::Down, "PaneFocusDown", "PaneMoveDown"),
+            (KeyCode::Up, "PaneFocusUp", "PaneMoveUp"),
+            (KeyCode::Right, "PaneFocusRight", "PaneMoveRight"),
+        ] {
+            assert_eq!(run(code, KeyModifiers::ALT), vec![focus.to_string()]);
+            assert_eq!(run(code, alt_shift), vec![mv.to_string()]);
+        }
+        assert!(shortcuts
+            .lookup(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .is_none());
+    }
+
+    #[test]
+    fn the_alt_section_folds_arrows_into_their_letters() {
+        let entries = ShortcutBindings::default().entries();
+        let get = |n: &str| entries.iter().find(|(k, _)| k == n).map(|(_, l)| l.clone());
+        assert_eq!(get("Alt-h/\u{2190}").as_deref(), Some("focus left"));
+        assert_eq!(get("Alt-L/\u{21e7}\u{2192}").as_deref(), Some("move right"));
+        assert!(
+            !entries
+                .iter()
+                .any(|(k, _)| k.contains("Left") || k.contains("Right")),
+            "{entries:?}"
+        );
+        let arrows = ShortcutBindings::default()
+            .bindings
+            .keys()
+            .filter(|k| Arrow::from_code(k.code).is_some())
+            .count();
+        assert_eq!(arrows, 8);
+        assert_eq!(
+            entries.len(),
+            ShortcutBindings::default().bindings.len() - arrows
+        );
+    }
+
+    #[test]
+    fn stacked_modifiers_parse_and_round_trip() {
+        let ev = parse_key_notation("Alt-Shift-Left").unwrap();
+        assert_eq!(ev.code, KeyCode::Left);
+        assert_eq!(ev.modifiers, KeyModifiers::ALT | KeyModifiers::SHIFT);
+        assert_eq!(
+            format_key_notation(&NormalizedKeyEvent::from(ev)),
+            "Alt-Shift-Left"
+        );
+        let ev = parse_key_notation("Ctrl-Alt-x").unwrap();
+        assert_eq!(ev.modifiers, KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let ev = parse_key_notation("Shift-Tab").unwrap();
+        assert_eq!(ev.code, KeyCode::BackTab);
+        assert_eq!(
+            parse_key_notation("Alt--").unwrap().code,
+            KeyCode::Char('-')
+        );
+        assert!(parse_key_notation("Alt-").is_none());
+    }
+
+    #[test]
+    fn a_user_can_unbind_the_alt_shift_arrow_defaults() {
+        let value: toml::Value = toml::from_str(r#""Alt-Shift-Left" = """#).unwrap();
+        let mut shortcuts = ShortcutBindings::default();
+        shortcuts.merge(&ShortcutBindings::from_toml(&value).unwrap());
+        assert!(shortcuts
+            .lookup(&KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            ))
+            .is_none());
+        assert!(shortcuts
+            .lookup(&KeyEvent::new(KeyCode::Left, KeyModifiers::ALT))
+            .is_some());
     }
 }

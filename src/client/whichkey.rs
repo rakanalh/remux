@@ -115,8 +115,8 @@ fn kept_cols(text_cols: usize, width: usize) -> usize {
 
 /// Whether a cell that keeps `kept` columns still shows the whole key, which
 /// is drawn after the cell's one leading space.
-fn key_survives(kept: usize, key: char) -> bool {
-    kept > key.width().unwrap_or(1)
+fn key_survives(kept: usize, key: &str) -> bool {
+    kept > key.width()
 }
 
 /// `text` fitted to exactly `width` columns: padded when it fits, otherwise cut
@@ -133,11 +133,11 @@ fn fit_cell(text: &str, width: usize) -> String {
     out
 }
 
-fn box_entry_text(key: char, label: &str) -> String {
+fn box_entry_text(key: &str, label: &str) -> String {
     format!(" {key} {label}")
 }
 
-fn full_width_entry_text(key: char, label: &str) -> String {
+fn full_width_entry_text(key: &str, label: &str) -> String {
     format!(" {key} \u{2192} {label}")
 }
 
@@ -152,8 +152,9 @@ pub struct WhichKeyPopup {
     pub visible: bool,
     /// The label for the current keybinding group (e.g., "Tab").
     pub group_label: String,
-    /// The key-label pairs to display (e.g., `('n', "new")`).
-    pub entries: Vec<(char, String)>,
+    /// The key-label pairs to display (e.g., `("n", "new")`, or
+    /// `("h/\u{2190}", "focus left")` for a key and its arrow alias).
+    pub entries: Vec<(String, String)>,
     /// Global Alt shortcuts to display as a secondary section, as
     /// `(notation, label)` pairs (e.g., `("Alt-h", "focus left")`). Only
     /// populated on the root/main which-key page.
@@ -186,7 +187,7 @@ impl WhichKeyPopup {
     pub fn show(
         &mut self,
         label: String,
-        entries: Vec<(char, String)>,
+        entries: Vec<(String, String)>,
         shortcuts: Vec<(String, String)>,
     ) {
         self.visible = true;
@@ -247,7 +248,7 @@ impl WhichKeyPopup {
         let texts: Vec<String> = self
             .entries
             .iter()
-            .map(|(k, l)| box_entry_text(*k, l))
+            .map(|(k, l)| box_entry_text(k, l))
             .chain(self.shortcuts.iter().map(|(n, l)| shortcut_text(n, l)))
             .collect();
         let natural = natural_width(texts.iter().map(String::as_str), BOX_MIN_COL);
@@ -318,13 +319,13 @@ impl WhichKeyPopup {
         // Entry rows.
         for row in 0..entry_rows {
             let y = start_y + 1 + row as u16;
-            let cells: Vec<Option<&(char, String)>> = (0..columns.count)
+            let cells: Vec<Option<&(String, String)>> = (0..columns.count)
                 .map(|c| self.entries.get(row * columns.count + c))
                 .collect();
 
             let mut row_text = BOX_VERTICAL.to_string();
             for entry in &cells {
-                let text = entry.map_or_else(String::new, |(k, l)| box_entry_text(*k, l));
+                let text = entry.map_or_else(String::new, |(k, l)| box_entry_text(k, l));
                 row_text.push_str(&fit_cell(&text, columns.width));
             }
             row_text.push(BOX_VERTICAL);
@@ -339,8 +340,8 @@ impl WhichKeyPopup {
             // Separate draw commands for the key chars, for highlight color.
             for (c, entry) in cells.iter().enumerate() {
                 if let Some((key, label)) = entry {
-                    let text_cols = box_entry_text(*key, label).width();
-                    if key_survives(kept_cols(text_cols, columns.width), *key) {
+                    let text_cols = box_entry_text(key, label).width();
+                    if key_survives(kept_cols(text_cols, columns.width), key) {
                         commands.push(DrawCommand {
                             x: start_x + 2 + c as u16 * col_width,
                             y,
@@ -464,7 +465,7 @@ impl WhichKeyPopup {
         let texts: Vec<String> = self
             .entries
             .iter()
-            .map(|(k, l)| full_width_entry_text(*k, l))
+            .map(|(k, l)| full_width_entry_text(k, l))
             .chain(self.shortcuts.iter().map(|(n, l)| shortcut_text(n, l)))
             .collect();
         let natural = natural_width(texts.iter().map(String::as_str), FULL_WIDTH_MIN_CELL);
@@ -578,7 +579,7 @@ impl WhichKeyPopup {
             // Never draw past the right edge: cap the cell to the remaining
             // content width (matters on very narrow screens).
             let width = columns.width.min(avail_at(x));
-            let entry_str = full_width_entry_text(*key, label);
+            let entry_str = full_width_entry_text(key, label);
             let kept = kept_cols(entry_str.width(), width);
             commands.push(DrawCommand {
                 x,
@@ -590,7 +591,7 @@ impl WhichKeyPopup {
 
             // Highlight the key char (drawn after the leading space), unless
             // truncation cut it off.
-            if key_survives(kept, *key) {
+            if key_survives(kept, key) {
                 commands.push(DrawCommand {
                     x: x + 1,
                     y,
@@ -722,7 +723,10 @@ mod tests {
         let mut popup = WhichKeyPopup::new();
         popup.show(
             "Tab".to_string(),
-            vec![('n', "new".to_string()), ('c', "close".to_string())],
+            vec![
+                ("n".to_string(), "new".to_string()),
+                ("c".to_string(), "close".to_string()),
+            ],
             vec![("Alt-h".to_string(), "focus left".to_string())],
         );
 
@@ -751,9 +755,9 @@ mod tests {
         popup.show(
             "Tab".to_string(),
             vec![
-                ('n', "new".to_string()),
-                ('c', "close".to_string()),
-                ('r', "rename".to_string()),
+                ("n".to_string(), "new".to_string()),
+                ("c".to_string(), "close".to_string()),
+                ("r".to_string(), "rename".to_string()),
             ],
             Vec::new(),
         );
@@ -768,7 +772,10 @@ mod tests {
         let mut popup = WhichKeyPopup::new();
         popup.show(
             "Tab".to_string(),
-            vec![('n', "new".to_string()), ('c', "close".to_string())],
+            vec![
+                ("n".to_string(), "new".to_string()),
+                ("c".to_string(), "close".to_string()),
+            ],
             Vec::new(),
         );
 
@@ -850,11 +857,11 @@ mod tests {
         popup.show(
             "Tab".to_string(),
             vec![
-                ('n', "new".to_string()),
-                ('c', "close".to_string()),
-                ('r', "rename".to_string()),
-                ('p', "prev".to_string()),
-                ('x', "next".to_string()),
+                ("n".to_string(), "new".to_string()),
+                ("c".to_string(), "close".to_string()),
+                ("r".to_string(), "rename".to_string()),
+                ("p".to_string(), "prev".to_string()),
+                ("x".to_string(), "next".to_string()),
             ],
             Vec::new(),
         );
@@ -866,11 +873,11 @@ mod tests {
     fn sample_popup_with_shortcuts() -> WhichKeyPopup {
         let mut popup = WhichKeyPopup::new();
         let entries = vec![
-            ('n', "new".to_string()),
-            ('c', "close".to_string()),
-            ('r', "rename".to_string()),
-            ('p', "prev".to_string()),
-            ('x', "next".to_string()),
+            ("n".to_string(), "new".to_string()),
+            ("c".to_string(), "close".to_string()),
+            ("r".to_string(), "rename".to_string()),
+            ("p".to_string(), "prev".to_string()),
+            ("x".to_string(), "next".to_string()),
         ];
         let shortcuts = vec![
             ("Alt-h".to_string(), "focus left".to_string()),
@@ -938,7 +945,10 @@ mod tests {
     /// Build a popup with many shortcuts to force the truncation path.
     fn sample_popup_many_shortcuts() -> WhichKeyPopup {
         let mut popup = WhichKeyPopup::new();
-        let entries = vec![('n', "new".to_string()), ('c', "close".to_string())];
+        let entries = vec![
+            ("n".to_string(), "new".to_string()),
+            ("c".to_string(), "close".to_string()),
+        ];
         let shortcuts: Vec<(String, String)> = (0..30)
             .map(|i| (format!("Alt-{i}"), format!("action {i}")))
             .collect();
@@ -1037,9 +1047,9 @@ mod tests {
     fn root_popup() -> WhichKeyPopup {
         let mut popup = WhichKeyPopup::new();
         let entries = vec![
-            (':', "command palette".to_string()),
-            ('a', "send prefix".to_string()),
-            ('\u{2423}', "layout next".to_string()),
+            (":".to_string(), "command palette".to_string()),
+            ("a".to_string(), "send prefix".to_string()),
+            ("\u{2423}".to_string(), "layout next".to_string()),
         ];
         let shortcuts = vec![
             ("Alt-L".to_string(), "move right".to_string()),

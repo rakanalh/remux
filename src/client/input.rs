@@ -7,7 +7,7 @@ use crate::client::command_palette::CommandPaletteState;
 use crate::client::registry::ConnId;
 use crate::config::keybindings::{
     resolve_action, InterceptAction, KeyNode, KeybindingTree, SessionManagerBindings,
-    ShortcutBindings,
+    ShortcutBindings, TreeKey,
 };
 use crate::protocol::{Action, ClientAction, RemuxCommand};
 use crate::server::compositor::{
@@ -355,7 +355,7 @@ pub enum InputAction {
     /// sub-group pages.
     ShowWhichKey {
         label: String,
-        entries: Vec<(char, String)>,
+        entries: Vec<(String, String)>,
         shortcuts: Vec<(String, String)>,
     },
     /// Execute a command AND keep/show the which-key popup for a (sticky)
@@ -364,7 +364,7 @@ pub enum InputAction {
     ExecuteAndShowWhichKey {
         command: RemuxCommand,
         label: String,
-        entries: Vec<(char, String)>,
+        entries: Vec<(String, String)>,
         shortcuts: Vec<(String, String)>,
     },
     /// Hide the which-key popup.
@@ -539,7 +539,7 @@ pub enum SidebarIntent {
 /// sequence in Normal mode.
 #[derive(Debug, Clone)]
 pub struct KeybindingState {
-    current_path: Vec<char>,
+    current_path: Vec<TreeKey>,
 }
 
 impl KeybindingState {
@@ -557,17 +557,17 @@ impl KeybindingState {
         self.current_path.is_empty()
     }
 
-    pub fn push(&mut self, key: char) {
+    pub fn push(&mut self, key: TreeKey) {
         self.current_path.push(key);
     }
 
-    pub fn path(&self) -> &[char] {
+    pub fn path(&self) -> &[TreeKey] {
         &self.current_path
     }
 
     /// Initialize the state at a given tree path (for entering Command mode
     /// at a non-root group via modifier shortcuts).
-    pub fn set_path(&mut self, path: &[char]) {
+    pub fn set_path(&mut self, path: &[TreeKey]) {
         self.current_path = path.to_vec();
     }
 }
@@ -1959,7 +1959,7 @@ impl InputHandler {
         let leader = crate::config::keybindings::format_key_notation(
             &crate::config::keybindings::NormalizedKeyEvent::from(&self.leader_key),
         );
-        let keys: Vec<String> = path.iter().map(char::to_string).collect();
+        let keys: Vec<String> = path.iter().map(TreeKey::to_string).collect();
         Some(format!("{leader} {}", keys.join(" ")))
     }
 
@@ -2324,16 +2324,9 @@ impl InputHandler {
             return InputAction::ModeChanged(Mode::Normal);
         }
 
-        // We only handle character keys in command mode.
-        let ch = match key.code {
-            KeyCode::Char(c)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                c
-            }
-            _ => {
+        let tree_key = match TreeKey::from_key_event(&key) {
+            Some(tree_key) => tree_key,
+            None => {
                 // Check if this is the leader key at root (leader-leader normal mode).
                 if self.keybinding_state.is_at_root() && self.is_leader_key(&key) {
                     // Look up leader-leader binding in tree.
@@ -2342,7 +2335,7 @@ impl InputHandler {
                     if let KeyCode::Char(c) = key.code {
                         // Let it go through normal tree lookup path with modifiers stripped
                         // But leader-leader is handled via the tree binding
-                        self.keybinding_state.push(c);
+                        self.keybinding_state.push(TreeKey::Char(c));
                         let path = self.keybinding_state.path().to_vec();
                         return self.resolve_tree_path(&path);
                     }
@@ -2351,21 +2344,21 @@ impl InputHandler {
             }
         };
 
-        self.keybinding_state.push(ch);
+        self.keybinding_state.push(tree_key);
         let path = self.keybinding_state.path().to_vec();
 
         self.resolve_tree_path(&path)
     }
 
     /// Resolve a keybinding tree path and return the appropriate action.
-    fn resolve_tree_path(&mut self, path: &[char]) -> InputAction {
+    fn resolve_tree_path(&mut self, path: &[TreeKey]) -> InputAction {
         match self.keybinding_tree.lookup(path) {
             Some(KeyNode::Leaf { action, .. }) => {
                 let actions = action.clone();
                 // If the parent group is sticky, stay in the menu after
                 // executing: drop the state back to the parent group path so
                 // the next key resolves against the same submenu again.
-                let parent: Vec<char> = path[..path.len().saturating_sub(1)].to_vec();
+                let parent: Vec<TreeKey> = path[..path.len().saturating_sub(1)].to_vec();
                 let parent_sticky = matches!(
                     self.keybinding_tree.lookup(&parent),
                     Some(KeyNode::Group { sticky: true, .. })
@@ -4015,6 +4008,7 @@ fn escape_seq(alt: bool, suffix: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::keybindings::tree_path;
     use crossterm::event::KeyEventKind;
 
     fn make_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
@@ -4366,7 +4360,7 @@ mod tests {
         // Manually add leader-leader binding (Ctrl-a = 'a' with ctrl).
         // In the default tree, we need to insert the leader-leader binding.
         handler.keybinding_tree.root.insert(
-            'a',
+            TreeKey::Char('a'),
             crate::config::keybindings::KeyNode::Leaf {
                 label: "send leader".to_string(),
                 action: vec!["SendKey Ctrl-a".to_string(), "EnterNormal".to_string()],
@@ -5273,9 +5267,9 @@ mod tests {
         match action {
             InputAction::ShowWhichKey { label, entries, .. } => {
                 assert_eq!(label, "Pane");
-                let keys: Vec<char> = entries.iter().map(|(k, _)| *k).collect();
-                assert!(keys.contains(&'n'));
-                assert!(keys.contains(&'h'));
+                let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+                assert!(keys.contains(&"n"));
+                assert!(keys.contains(&"h/\u{2190}"));
             }
             other => panic!("expected ShowWhichKey for Pane, got {other:?}"),
         }
@@ -5371,15 +5365,15 @@ mod tests {
             } => {
                 assert_eq!(command, RemuxCommand::ResizeRight(5));
                 assert_eq!(label, "Resize");
-                let keys: Vec<char> = entries.iter().map(|(k, _)| *k).collect();
-                assert!(keys.contains(&'h'));
-                assert!(keys.contains(&'l'));
+                let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+                assert!(keys.contains(&"h/\u{2190}"));
+                assert!(keys.contains(&"l/\u{2192}"));
             }
             other => panic!("expected ExecuteAndShowWhichKey, got {other:?}"),
         }
         // The state dropped back to the parent group path ['p','R'] and we're
         // still in Command mode.
-        assert_eq!(handler.keybinding_state.path(), ['p', 'R']);
+        assert_eq!(handler.keybinding_state.path(), tree_path("pR"));
         assert_eq!(handler.mode, Mode::Command);
 
         // A second 'l' resolves to the resize leaf again (still sticky).
@@ -5390,7 +5384,7 @@ mod tests {
             }
             other => panic!("expected ExecuteAndShowWhichKey on second resize, got {other:?}"),
         }
-        assert_eq!(handler.keybinding_state.path(), ['p', 'R']);
+        assert_eq!(handler.keybinding_state.path(), tree_path("pR"));
         assert_eq!(handler.mode, Mode::Command);
     }
 
@@ -5415,7 +5409,7 @@ mod tests {
         handler.handle_key(char_key('R'));
         // Perform one resize; the menu stays open at ['p','R'].
         handler.handle_key(char_key('l'));
-        assert_eq!(handler.keybinding_state.path(), ['p', 'R']);
+        assert_eq!(handler.keybinding_state.path(), tree_path("pR"));
 
         // ESC exits the sticky menu back to Normal and resets the state.
         let action = handler.handle_key(esc_key());
@@ -5432,7 +5426,7 @@ mod tests {
 
         // Default tree has no 'q' binding at root, and the default leader is
         // Ctrl-a.
-        assert!(handler.keybinding_tree.lookup(&['q']).is_none());
+        assert!(handler.keybinding_tree.lookup(&tree_path("q")).is_none());
         let ctrl_a = ctrl_key('a');
         assert!(matches!(
             handler.handle_key(ctrl_a),
@@ -5445,7 +5439,7 @@ mod tests {
         // Build a distinct tree that binds 'q' at root and a new leader (Ctrl-b).
         let mut root = std::collections::HashMap::new();
         root.insert(
-            'q',
+            TreeKey::Char('q'),
             KeyNode::Leaf {
                 label: "new tab".to_string(),
                 action: vec!["TabNew".to_string(), "EnterNormal".to_string()],
@@ -5462,7 +5456,7 @@ mod tests {
         );
 
         // The tree actually changed: 'q' now resolves at root.
-        assert!(handler.keybinding_tree.lookup(&['q']).is_some());
+        assert!(handler.keybinding_tree.lookup(&tree_path("q")).is_some());
 
         // The old leader (Ctrl-a) no longer enters Command mode; it is a normal
         // keystroke forwarded to the PTY.
@@ -5482,7 +5476,7 @@ mod tests {
 
         // Simulate an in-progress Command-mode chord.
         handler.mode = Mode::Command;
-        handler.keybinding_state.push('t');
+        handler.keybinding_state.push(TreeKey::Char('t'));
         assert!(!handler.keybinding_state.is_at_root());
 
         handler.reload_keybindings(
@@ -7278,6 +7272,131 @@ mod tests {
             InputAction::AgentSwitchClose
         );
         assert!(handler.agent_switch.is_none());
+    }
+
+    fn press_after_prefix(handler: &mut InputHandler, keys: &[KeyEvent]) -> InputAction {
+        handler.handle_key(ctrl_key('a'));
+        let mut last = InputAction::None;
+        for key in keys {
+            last = handler.handle_key(*key);
+        }
+        last
+    }
+
+    #[test]
+    fn an_arrow_after_the_prefix_does_what_its_letter_does() {
+        let arrows = [
+            ('h', KeyCode::Left),
+            ('j', KeyCode::Down),
+            ('k', KeyCode::Up),
+            ('l', KeyCode::Right),
+        ];
+        for (letter, code) in arrows {
+            for (shifted, modifiers) in [
+                (letter, KeyModifiers::NONE),
+                (letter.to_ascii_uppercase(), KeyModifiers::SHIFT),
+            ] {
+                let mut by_letter = InputHandler::with_defaults();
+                let expected =
+                    press_after_prefix(&mut by_letter, &[char_key('p'), char_key(shifted)]);
+                let mut by_arrow = InputHandler::with_defaults();
+                let got =
+                    press_after_prefix(&mut by_arrow, &[char_key('p'), make_key(code, modifiers)]);
+                assert_eq!(got, expected, "p {shifted} vs {code:?} {modifiers:?}");
+                assert_ne!(
+                    got,
+                    InputAction::ModeChanged(Mode::Normal),
+                    "p {shifted} did nothing"
+                );
+                assert_eq!(by_arrow.mode, by_letter.mode);
+            }
+        }
+    }
+
+    #[test]
+    fn arrows_keep_the_sticky_resize_menu_open() {
+        let mut handler = InputHandler::with_defaults();
+        let first = press_after_prefix(
+            &mut handler,
+            &[
+                char_key('p'),
+                char_key('R'),
+                make_key(KeyCode::Left, KeyModifiers::NONE),
+            ],
+        );
+        match first {
+            InputAction::ExecuteAndShowWhichKey {
+                command, entries, ..
+            } => {
+                assert_eq!(command, RemuxCommand::ResizeLeft(5));
+                let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+                assert!(keys.contains(&"h/\u{2190}"), "{keys:?}");
+            }
+            other => panic!("expected ExecuteAndShowWhichKey, got {other:?}"),
+        }
+        assert_eq!(handler.mode, Mode::Command);
+        for (code, want) in [
+            (KeyCode::Down, RemuxCommand::ResizeDown(5)),
+            (KeyCode::Up, RemuxCommand::ResizeUp(5)),
+            (KeyCode::Right, RemuxCommand::ResizeRight(5)),
+        ] {
+            match handler.handle_key(make_key(code, KeyModifiers::NONE)) {
+                InputAction::ExecuteAndShowWhichKey { command, .. } => assert_eq!(command, want),
+                other => panic!("{code:?}: expected a sticky resize, got {other:?}"),
+            }
+        }
+        assert_eq!(handler.keybinding_state.path(), tree_path("pR"));
+        assert_eq!(
+            handler.handle_key(esc_key()),
+            InputAction::ModeChanged(Mode::Normal)
+        );
+    }
+
+    #[test]
+    fn an_unbound_arrow_at_the_root_ends_the_chord() {
+        let mut handler = InputHandler::with_defaults();
+        let action =
+            press_after_prefix(&mut handler, &[make_key(KeyCode::Left, KeyModifiers::NONE)]);
+        assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn alt_arrows_focus_and_alt_shift_arrows_move_in_normal_mode() {
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        for (code, focus, mv) in [
+            (
+                KeyCode::Left,
+                RemuxCommand::PaneFocusLeft,
+                RemuxCommand::PaneMoveLeft,
+            ),
+            (
+                KeyCode::Down,
+                RemuxCommand::PaneFocusDown,
+                RemuxCommand::PaneMoveDown,
+            ),
+            (
+                KeyCode::Up,
+                RemuxCommand::PaneFocusUp,
+                RemuxCommand::PaneMoveUp,
+            ),
+            (
+                KeyCode::Right,
+                RemuxCommand::PaneFocusRight,
+                RemuxCommand::PaneMoveRight,
+            ),
+        ] {
+            let mut handler = InputHandler::with_defaults();
+            assert_eq!(
+                handler.handle_key(make_key(code, KeyModifiers::ALT)),
+                InputAction::Execute(focus)
+            );
+            assert_eq!(
+                handler.handle_key(make_key(code, alt_shift)),
+                InputAction::Execute(mv)
+            );
+            assert_eq!(handler.mode, Mode::Normal);
+        }
     }
 }
 
