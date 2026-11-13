@@ -28,7 +28,14 @@ CASES = [
     ("plain Right", b"\x1b[C",    "^[[C"),
 ]
 
-t = Tui(RUNDIR).start()
+# Alt+Up is a default shortcut (focus up), so it never reaches the pane unless
+# it is unbound. Unbinding it keeps this the round trip of the folded Alt form.
+CONFIG = """
+[keybindings.command]
+"Alt-Up" = ""
+"""
+
+t = Tui(RUNDIR, config=CONFIG).start()
 t.send(f"stty raw -echo; {CAT}\r", t=1.0)
 
 results = []

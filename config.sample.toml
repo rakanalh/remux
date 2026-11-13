@@ -431,11 +431,13 @@
 # "Alt-j" = "PaneFocusDown"
 # "Alt-k" = "PaneFocusUp"
 # "Alt-l" = "PaneFocusRight"
+# "Alt-Left" = "PaneFocusLeft"     # and Alt-Down / Alt-Up / Alt-Right
 # Move panes directionally (Alt-Shift-h/j/k/l):
 # "Alt-H" = "PaneMoveLeft"
 # "Alt-J" = "PaneMoveDown"
 # "Alt-K" = "PaneMoveUp"
 # "Alt-L" = "PaneMoveRight"
+# "Alt-Shift-Left" = "PaneMoveLeft" # and Alt-Shift-Down / -Up / -Right
 # Tab navigation and direct jumps:
 # "Alt-," = "TabPrev"
 # "Alt-." = "TabNext"
@@ -525,6 +527,11 @@
 # j = "ResizeDown 5"
 # k = "ResizeUp 5"
 # l = "ResizeRight 5"
+# Arrow keys are bound beside h/j/k/l here and in the other directional groups
+# (p, p S, p U, t m), written by name. Shift+arrows stand in for H/J/K/L, but
+# only inside a group: at the root, "Shift-Left" is a Normal-mode shortcut.
+# Left = "ResizeLeft 5"
+# Right = ""        # removes the default arrow binding
 
 # --- Tab (t) ---
 # [keybindings.command.t]
@@ -586,8 +593,8 @@
 # old Buffer group, freed by the search-mode refactor.
 #
 # NOTE ON `b b`: cycling lives on `b`, not on Tab. The command-mode tree is
-# keyed by single characters and only plain character keys reach it, so Tab
-# (and any other named key) cannot be bound inside a group.
+# keyed by single characters and the arrow keys only, so Tab (and any other
+# named key) cannot be bound inside a group.
 # [keybindings.command.b]
 # _label = "Sidebar"
 # h = "SidebarToggleLeft"

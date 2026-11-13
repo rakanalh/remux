@@ -5,7 +5,7 @@ server reorders anything, and only the rendered status bar shows the result.
 
 What it covers:
 
-  1  which-key under `Prefix t m` lists `h left` and `l right`
+  1  which-key under `Prefix t m` lists `h/← left` and `l/→ right`
   2  on the LAST tab, `t m l` changes nothing (right edge). The old `m` leaf
      sent `TabMove 0`, which moved the active tab to the FIRST position
   3  `t m h` twice walks the tab to the front, and it stays active each step
@@ -87,8 +87,8 @@ def main():
         print("[1] which-key lists the sub-group")
         t.prefix(b"tm", 0.6)
         rows = t.rows_text()
-        check(any(re.search(r"\bh left\b", r) for r in rows), "`Prefix t m` shows `h left`")
-        check(any(re.search(r"\bl right\b", r) for r in rows), "`Prefix t m` shows `l right`")
+        check(any(re.search(r"\bh/← left\b", r) for r in rows), "`Prefix t m` shows `h/← left`")
+        check(any(re.search(r"\bl/→ right\b", r) for r in rows), "`Prefix t m` shows `l/→ right`")
         t.send(ESC, 0.5)
         expect(t, NAMES, "charlie", "Esc out of `t m`")
 
