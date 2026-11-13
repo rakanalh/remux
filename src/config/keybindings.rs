@@ -108,12 +108,6 @@ impl TreeKey {
     }
 }
 
-impl From<char> for TreeKey {
-    fn from(c: char) -> Self {
-        TreeKey::Char(c)
-    }
-}
-
 /// The config spelling, the inverse of [`TreeKey::parse`].
 impl std::fmt::Display for TreeKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -233,6 +227,21 @@ fn with_arrow_aliases(children: Vec<(char, KeyNode)>) -> HashMap<TreeKey, KeyNod
         map.insert(TreeKey::Char(c), node);
     }
     map
+}
+
+/// The vim direction key for an arrow, the inverse of [`arrow_alias`].
+fn arrow_letter(arrow: Arrow, shift: bool) -> char {
+    let letter = match arrow {
+        Arrow::Left => 'h',
+        Arrow::Down => 'j',
+        Arrow::Up => 'k',
+        Arrow::Right => 'l',
+    };
+    if shift {
+        letter.to_ascii_uppercase()
+    } else {
+        letter
+    }
 }
 
 /// The arrow that means the same direction as a vim direction key.
@@ -572,12 +581,22 @@ impl KeybindingTree {
 
         let mut result: Vec<(TreeKey, String, String)> = Vec::new();
         for (&key, node) in sorted {
-            if let (TreeKey::Arrow { .. }, KeyNode::Leaf { action, .. }) = (key, node) {
-                let twin = result.iter_mut().find(|(k, _, _)| {
+            if let (TreeKey::Arrow { arrow, shift }, KeyNode::Leaf { action, .. }) = (key, node) {
+                let same_chain = |k: &TreeKey| {
                     matches!(k, TreeKey::Char(_))
                         && matches!(children.get(k), Some(KeyNode::Leaf { action: a, .. }) if a == action)
-                });
-                if let Some((_, shown, _)) = twin {
+                };
+                // The arrow's own letter wins over another letter that happens
+                // to run the same chain, so Left folds into `h`.
+                let own = TreeKey::Char(arrow_letter(arrow, shift));
+                let twin = match result
+                    .iter()
+                    .position(|(k, _, _)| *k == own && same_chain(k))
+                {
+                    Some(i) => Some(i),
+                    None => result.iter().position(|(k, _, _)| same_chain(k)),
+                };
+                if let Some((_, shown, _)) = twin.map(|i| &mut result[i]) {
                     shown.push('/');
                     shown.push_str(&key.label());
                     continue;
@@ -953,12 +972,21 @@ impl ShortcutBindings {
         for (key, action) in sorted {
             if let Some(arrow) = Arrow::from_code(key.code) {
                 let chord = key.modifiers - KeyModifiers::SHIFT;
-                let twin = result.iter_mut().find(|(k, _, _)| {
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                let same_action = |k: &NormalizedKeyEvent| {
                     matches!(k.code, KeyCode::Char(_))
                         && k.modifiers == chord
                         && self.bindings.get(k) == Some(action)
-                });
-                if let Some((_, notation, _)) = twin {
+                };
+                let own = KeyCode::Char(arrow_letter(arrow, shift));
+                let twin = match result
+                    .iter()
+                    .position(|(k, _, _)| k.code == own && same_action(k))
+                {
+                    Some(i) => Some(i),
+                    None => result.iter().position(|(k, _, _)| same_action(k)),
+                };
+                if let Some((_, notation, _)) = twin.map(|i| &mut result[i]) {
                     notation.push('/');
                     notation.push_str(&arrow_glyph(
                         arrow,
@@ -3880,6 +3908,25 @@ mod tests {
             leaf_actions(&tree, &[TreeKey::Char('p'), arrow(Arrow::Left, false)]),
             vec!["PaneFocusLeft".to_string(), "EnterNormal".to_string()]
         );
+    }
+
+    #[test]
+    fn an_arrow_folds_into_its_own_letter_before_an_earlier_twin() {
+        let toml_str = r#"
+            [q]
+            a = "PaneFocusLeft"
+            h = "PaneFocusLeft"
+            Left = "PaneFocusLeft"
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let tree = KeybindingTree::from_toml(&value).unwrap();
+        let keys: Vec<String> = tree
+            .children_at(&tree_path("q"))
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, ["a", "h/\u{2190}"]);
     }
 
     #[test]
