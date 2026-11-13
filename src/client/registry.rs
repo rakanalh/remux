@@ -15,7 +15,6 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWrite;
-use tokio::process::Child;
 use tokio::sync::mpsc;
 
 use crate::client::terminal::{Look, RemuxClient};
@@ -109,7 +108,7 @@ struct RemoteEntry {
     /// [`crate::protocol::build_version`] to detect version skew.
     server_version: Option<String>,
     /// Keeps the ssh child alive; dropping it triggers `kill_on_drop`.
-    _child: Option<Child>,
+    _child: Option<crate::client::terminal::SshProcess>,
     /// Whether this entry originates from the `[remotes]` config map (vs. an
     /// ad-hoc remote added at runtime via `RemoteConnect`/`add_remote`). Only
     /// config-derived entries are eligible for removal by [`update_remotes`]

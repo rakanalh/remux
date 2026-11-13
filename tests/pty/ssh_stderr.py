@@ -43,9 +43,17 @@ Checks, and why each one cannot pass vacuously:
     stderr and not /dev/tty. The echo is escaped, so the DECRST pair is still
     absent from the outer terminal.
   9 a line the far side writes after the client took the terminal (a
-    background child of the shim, 4s in) is logged and never echoed. Both
-    the end of the handshake and the terminal being taken stop the echo, so
-    each was removed alone to show the other still holds this.
+    background child of the shim, 4s in) is never echoed, and, being after
+    the handshake, is not logged on its own: it is counted and kept in the
+    tail that is logged when the connection ends (the relay is under
+    `timeout 9`). Both the end of the handshake and the terminal being taken
+    stop the echo, so each was removed alone to show the other still holds it.
+ 10 the log directories are 0700 and the logs 0600, including a client.log
+    that existed at 0644 before the client started.
+ 11 after `slow`'s dial fails, a child of the shim that outlived it (a
+    ProxyCommand) writes to stderr at 13s and gets EPIPE: the drain was
+    stopped, so nothing holds the read end, and the line is never logged.
+ 12 `attach-remote` has no deadline, so its echo is capped, with a note.
 
 Run from the repo root (debug build):
     python3 tests/pty/ssh_stderr.py [-v]
@@ -70,6 +78,7 @@ DECRST = b"\x1b[?1000l\x1b[?1006l"
 FILLER_LINES = 500
 RESOLVE = "ssh: Could not resolve hostname badhost: Name or service not known"
 SLOW = "proxy: still waiting for the jump host"
+ORPHAN = f"{RUN}/orphan"
 
 fails = []
 
@@ -121,7 +130,11 @@ def write_shim():
             "#!/bin/sh\n"
             'case "$*" in\n'
             f"  *badhost*) echo '{RESOLVE}' >&2; exit 255 ;;\n"
-            f"  *slowhost*) echo '{SLOW}' >&2; sleep 20 & exec sleep 20 ;;\n"
+            f"  *slowhost*) echo '{SLOW}' >&2\n"
+            "    ( trap '' PIPE; sleep 13\n"
+            f"      if printf 'ORPHAN writes late\\n' >&2; then echo wrote > {ORPHAN}\n"
+            f"      else echo epipe > {ORPHAN}; fi ) &\n"
+            "    exec sleep 20 ;;\n"
             "esac\n"
             "printf 'LEAK\\033[?1000l\\033[?1006l\\n' >&2\n"
             "printf 'motd: welcome to the fake remote\\n' >&2\n"
@@ -136,7 +149,9 @@ def write_shim():
             f"export XDG_RUNTIME_DIR={RUN}/run2\n"
             f"export XDG_STATE_HOME={RUN}/state2\n"
             f"export XDG_DATA_HOME={RUN}/data2\n"
-            f"echo $$ >> {relay_pids()}\n" f"exec {BIN} relay\n"
+            f"echo $$ >> {relay_pids()}\n"
+            f'case "$*" in *autohost*) exec timeout 9 {BIN} relay ;; esac\n'
+            f"exec {BIN} relay\n"
         )
     os.chmod(shim, 0o755)
 
@@ -275,7 +290,19 @@ def main():
         servers.append(start_server(SOCK2, env_remote()))
         seed_remote_session()
         servers.append(start_server(SOCK1, env_local(f"{RUN}/cfg-none")))
+        # A client.log left 0644 by an older build must be narrowed too.
+        old_log = f"{RUN}/state/remux/client.log"
+        open(old_log, "a").close()
+        os.chmod(old_log, 0o644)
         c = Client(f"{RUN}/cfg")
+        for path, want in ((f"{RUN}/state2/remux", 0o700),
+                           (f"{RUN}/state2/remux/server.log", 0o600),
+                           (f"{RUN}/state/remux", 0o700),
+                           (f"{RUN}/state/remux/server.log", 0o600),
+                           (old_log, 0o600)):
+            mode = os.stat(path).st_mode & 0o777
+            check(f"10 {path.removeprefix(RUN + '/')} is {want:o}", mode == want,
+                  f"{mode:o}")
 
         # -- the good remote, dialled in raw mode ----------------------------
         sm_open(c)
@@ -334,14 +361,23 @@ def main():
             c.dump("after connecting slow")
         check("7 the slow remote's row reads failed", "(failed:" in row.text, row.text)
         check("7 the row names the line ssh wrote before it hung",
-              f"ssh stderr: {SLOW}" in row.text, row.text)
+              f"timed out after 10s; stderr: {SLOW[:10]}" in row.text, row.text)
         failed = [l for l in client_log().splitlines()
                   if b"remote 'slow' failed" in l]
         check("7 the failure line holds the tail and the timeout",
-              any(f"ssh stderr: {SLOW}: connection timed out after 10s".encode() in l
+              any(f"connection timed out after 10s; stderr: {SLOW}".encode() in l
                   for l in failed), failed)
         check("7 a stderr held open did not hold the failure up",
               took < 13.0, f"{took:.1f}s from Enter to failed")
+        deadline = time.time() + 10.0
+        while time.time() < deadline and not os.path.exists(ORPHAN):
+            c.pump(0.5)
+        time.sleep(0.2)
+        orphan = open(ORPHAN).read().strip() if os.path.exists(ORPHAN) else None
+        check("11 the drain let go of the pipe after the failed dial",
+              orphan == "epipe", orphan)
+        check("11 the orphan's late line was not read",
+              b"ORPHAN writes late" not in client_log())
         check("client alive", c.alive())
 
         # -- attach-remote dials BEFORE raw mode -----------------------------
@@ -359,7 +395,7 @@ def main():
         check("6 attach-remote fails non-zero", a.exitstatus not in (0, None),
               a.exitstatus)
         check("6 attach-remote's error names the ssh error",
-              b"ssh stderr: " + RESOLVE.encode() in out, out[-400:])
+              b"ssh exited 255; stderr: " + RESOLVE.encode() in out, out[-400:])
 
         # -- the pre-raw dials echo, escaped ---------------------------------
         a = pexpect.spawn(BIN, ["attach-remote", "whatever", "rbox"],
@@ -375,22 +411,33 @@ def main():
             except pexpect.EOF:
                 break
         a.terminate(force=True)
+        echoed = sum(1 for l in out.splitlines() if b"filler " in l)
+        check("12 attach-remote's echo is capped", 0 < echoed < FILLER_LINES,
+              f"{echoed} filler lines echoed")
+        check("12 the cap says where the rest went",
+              b"remux: further ssh output is in client.log" in out)
         check("8 attach-remote echoed the normal line",
               b"motd: welcome to the fake remote" in out)
         check("8 attach-remote echoed the marker escaped",
               b"LEAK\\x1b[?1000l\\x1b[?1006l" in out)
         check("8 attach-remote never wrote the DECRST pair raw", DECRST not in out)
 
-        log_before = client_log().count(b"LATE\\x1b[?1000l after raw mode")
         auto = Client(f"{RUN}/cfg-auto")
-        auto.pump(6.0)
+        # The relay of `autohost` ends at 9s, which ends the connection and
+        # closes ssh's stderr, so its summary is written.
+        auto.pump(11.0)
         out = bytes(auto.raw)
         auto.kill()
+        log = client_log()
         check("8 auto_connect echoed the marker escaped",
               b"LEAK\\x1b[?1000l\\x1b[?1006l" in out)
         check("8 auto_connect never wrote the DECRST pair raw", DECRST not in out)
-        check("9 a line written after raw mode reached client.log",
-              client_log().count(b"LATE\\x1b[?1000l after raw mode") > log_before)
+        check("9 a line written after the handshake is not logged on its own",
+              b"ssh mini: LATE" not in log)
+        summary = [l for l in log.splitlines()
+                   if b"ssh mini: stderr closed:" in l and b"1 after it" in l]
+        check("9 it is counted, and in the tail, when the connection ends",
+              any(b"LATE\\x1b[?1000l after raw mode" in l for l in summary), summary)
         check("9 that line was not echoed onto the terminal", b"LATE" not in out)
     except Exception:
         traceback.print_exc()

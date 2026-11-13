@@ -94,7 +94,7 @@ pub struct RemuxClient {
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     /// Keeps the ssh child process alive for remote connections. `None` for
     /// local (Unix socket) connections.
-    _child: Option<Child>,
+    _child: Option<SshProcess>,
     /// The `remux_version` the server reported in its `Welcome` during the
     /// handshake. Used to detect version skew against this binary's own
     /// [`crate::protocol::build_version`].
@@ -198,10 +198,12 @@ impl RemuxClient {
                 .await
                 .with_context(|| format!("handshake with remote server via {}", remote.ssh))
         };
+        let mut timed_out = false;
         let dialed = match deadline {
             Some(deadline) => tokio::time::timeout(deadline, dial)
                 .await
                 .unwrap_or_else(|_| {
+                    timed_out = true;
                     Err(anyhow::anyhow!(
                         "connection timed out after {}s",
                         deadline.as_secs()
@@ -209,25 +211,23 @@ impl RemuxClient {
                 }),
             None => dial.await,
         };
-        stderr.stop_echo();
         let server_version = match dialed {
             Ok(version) => version,
             Err(e) => {
-                let _ = child.start_kill();
-                let tail = stderr.tail(std::time::Duration::from_millis(500)).await;
-                return Err(if tail.is_empty() {
-                    e
-                } else {
-                    e.context(format!("ssh stderr: {tail}"))
-                });
+                stderr.stop_echo();
+                return Err(dial_failed(label, e, timed_out, &mut child, &mut stderr).await);
             }
         };
+        stderr.connected();
 
         log::debug!("terminal: connect_ssh success {label}");
         Ok(Self {
             reader,
             writer,
-            _child: Some(child),
+            _child: Some(SshProcess {
+                _child: child,
+                _stderr: stderr,
+            }),
             server_version,
             captured_views: None,
         })
@@ -315,11 +315,61 @@ impl RemuxClient {
     ) -> (
         Box<dyn AsyncRead + Unpin + Send>,
         Box<dyn AsyncWrite + Unpin + Send>,
-        Option<Child>,
+        Option<SshProcess>,
     ) {
         (self.reader, self.writer, self._child)
     }
 }
+
+/// An ssh connection's process and its stderr drain, which live and die
+/// together. Dropping it kills ssh (`kill_on_drop`) and then stops the drain.
+pub struct SshProcess {
+    _child: Child,
+    _stderr: crate::client::ssh_stderr::SshStderr,
+}
+
+/// The error for a dial that failed with `cause`. When ssh itself exited with
+/// a failure, that is the cause the user needs, and the handshake's own error
+/// (end of file) is only its consequence. The cause comes before ssh's last
+/// lines, bounded, because the error is cut to fit a row.
+async fn dial_failed(
+    label: &str,
+    cause: anyhow::Error,
+    timed_out: bool,
+    child: &mut Child,
+    stderr: &mut crate::client::ssh_stderr::SshStderr,
+) -> anyhow::Error {
+    let wait = std::time::Duration::from_millis(500);
+    let exited = if timed_out {
+        None
+    } else {
+        tokio::time::timeout(wait, child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    };
+    let _ = child.start_kill();
+    let tail = stderr.tail(wait).await;
+    let cause = match exited {
+        Some(status) if !status.success() => {
+            log::debug!("terminal: connect_ssh {label}: {cause:#}");
+            match status.code() {
+                Some(code) => anyhow::anyhow!("ssh exited {code}"),
+                None => anyhow::anyhow!("ssh exited: {status}"),
+            }
+        }
+        _ => cause,
+    };
+    if tail.is_empty() {
+        return cause;
+    }
+    let tail = crate::client::cli_common::escape_bounded(&tail, DIAL_TAIL_MAX);
+    anyhow::anyhow!("{cause:#}; stderr: {tail}")
+}
+
+/// Characters of ssh's last lines in a dial's error, so that the error's cause
+/// stays inside the 300 characters a failed remote's row keeps.
+const DIAL_TAIL_MAX: usize = 150;
 
 /// The client settings every server it views draws with, whichever machine
 /// that server is on.
