@@ -20,8 +20,22 @@ use crate::server::daemon::{read_message, socket_path, write_message};
 // Terminal setup / restore
 // ---------------------------------------------------------------------------
 
+/// Set the first time the client takes the terminal, and never cleared.
+/// Clearing it when an editor borrows the terminal would let a dial made in
+/// that time print over the editor.
+static TERMINAL_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the client has put the terminal into raw mode at any time. Until
+/// it has, the terminal is still the user's shell's, and text written to it
+/// is read as text.
+pub fn terminal_taken() -> bool {
+    TERMINAL_TAKEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Put the terminal into raw mode and switch to the alternate screen.
 pub fn setup_terminal() -> Result<()> {
+    // Before raw mode, so that no ssh line is echoed while it changes.
+    TERMINAL_TAKEN.store(true, std::sync::atomic::Ordering::SeqCst);
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
     enable_terminal_modes().context("setting up alternate screen")
 }
@@ -80,7 +94,7 @@ pub struct RemuxClient {
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     /// Keeps the ssh child process alive for remote connections. `None` for
     /// local (Unix socket) connections.
-    _child: Option<Child>,
+    _child: Option<SshProcess>,
     /// The `remux_version` the server reported in its `Welcome` during the
     /// handshake. Used to detect version skew against this binary's own
     /// [`crate::protocol::build_version`].
@@ -136,60 +150,84 @@ impl RemuxClient {
     /// Connect to a remote server over SSH by spawning `remux relay` on the
     /// remote host and pumping the wire protocol through its stdio.
     ///
-    /// `dest` is any SSH destination (`user@host`, or a `~/.ssh/config` alias);
-    /// `remux_path` is where the `remux` binary lives on the remote. Optional
-    /// `port`/`identity` map to `ssh -p`/`-i`; `extra_args` are inserted before
-    /// the destination so `~/.ssh/config`-style options can be passed.
+    /// `label` names the remote in the log. A failed dial, or one that has
+    /// not finished within `deadline`, is an error that starts with the last
+    /// lines ssh wrote to stderr. Until the handshake is done, and only while
+    /// the client has not yet taken the terminal ([`terminal_taken`]), those
+    /// lines are also printed, escaped, to this process's stderr.
     pub async fn connect_ssh(
-        dest: &str,
-        port: Option<u16>,
-        identity: Option<&str>,
-        extra_args: &[String],
-        remux_path: &str,
+        label: &str,
+        remote: &crate::config::RemoteConfig,
+        deadline: Option<std::time::Duration>,
     ) -> Result<Self> {
         log::debug!(
-            "terminal: connect_ssh dest={dest} port={port:?} identity={identity:?} \
-             extra_args={extra_args:?} remux_path={remux_path}"
+            "terminal: connect_ssh {label} dest={} port={:?} identity={:?} \
+             extra_args={:?} remux_path={}",
+            remote.ssh,
+            remote.port,
+            remote.identity,
+            remote.extra_args,
+            remote.remux_path
         );
-        // stderr is inherited so ssh host-key / password prompts are visible;
-        // this runs before the terminal enters raw mode.
-        let remote = crate::config::RemoteConfig {
-            ssh: dest.to_string(),
-            port,
-            identity: identity.map(str::to_string),
-            remux_path: remux_path.to_string(),
-            extra_args: extra_args.to_vec(),
-            ..crate::config::RemoteConfig::default()
-        };
+        // stderr is never inherited, because the client is in raw mode for
+        // most of the connection and escape codes from the far side would
+        // change the terminal's modes. ssh writes its password, passphrase and
+        // host-key prompts to /dev/tty, so they still reach the user. It
+        // writes keyboard-interactive instructions (a 2FA menu) and the sshd
+        // banner to stderr, which is why a dial made before raw mode echoes.
         let mut cmd = remote.ssh_command(false);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd
             .spawn()
-            .with_context(|| format!("spawning ssh to {dest}"))?;
+            .with_context(|| format!("spawning ssh to {}", remote.ssh))?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .context("ssh child produced no stdout pipe")?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("ssh child produced no stdin pipe")?;
+        let (Some(stdout), Some(stdin), Some(stderr)) =
+            (child.stdout.take(), child.stdin.take(), child.stderr.take())
+        else {
+            anyhow::bail!("ssh child has no stdio pipes");
+        };
+        let mut stderr = crate::client::ssh_stderr::SshStderr::spawn(label, stderr);
 
         let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(stdout);
         let mut writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(stdin);
-        let server_version = handshake(&mut reader, &mut writer)
-            .await
-            .with_context(|| format!("handshake with remote server via {dest}"))?;
+        let dial = async {
+            handshake(&mut reader, &mut writer)
+                .await
+                .with_context(|| format!("handshake with remote server via {}", remote.ssh))
+        };
+        let mut timed_out = false;
+        let dialed = match deadline {
+            Some(deadline) => tokio::time::timeout(deadline, dial)
+                .await
+                .unwrap_or_else(|_| {
+                    timed_out = true;
+                    Err(anyhow::anyhow!(
+                        "connection timed out after {}s",
+                        deadline.as_secs()
+                    ))
+                }),
+            None => dial.await,
+        };
+        let server_version = match dialed {
+            Ok(version) => version,
+            Err(e) => {
+                stderr.stop_echo();
+                return Err(dial_failed(label, e, timed_out, &mut child, &mut stderr).await);
+            }
+        };
+        stderr.connected();
 
-        log::debug!("terminal: connect_ssh success dest={dest}");
+        log::debug!("terminal: connect_ssh success {label}");
         Ok(Self {
             reader,
             writer,
-            _child: Some(child),
+            _child: Some(SshProcess {
+                _child: child,
+                _stderr: stderr,
+            }),
             server_version,
             captured_views: None,
         })
@@ -277,11 +315,63 @@ impl RemuxClient {
     ) -> (
         Box<dyn AsyncRead + Unpin + Send>,
         Box<dyn AsyncWrite + Unpin + Send>,
-        Option<Child>,
+        Option<SshProcess>,
     ) {
         (self.reader, self.writer, self._child)
     }
 }
+
+/// An ssh connection's process and its stderr drain, which live and die
+/// together. Dropping it kills ssh (`kill_on_drop`) and then stops the drain.
+pub struct SshProcess {
+    _child: Child,
+    _stderr: crate::client::ssh_stderr::SshStderr,
+}
+
+/// The error for a dial that failed with `cause`. When ssh itself exited with
+/// a failure, that is the cause the user needs, and the handshake's own error
+/// (end of file) is only its consequence. The cause comes before ssh's last
+/// lines, bounded, because the error is cut to fit a row.
+async fn dial_failed(
+    label: &str,
+    cause: anyhow::Error,
+    timed_out: bool,
+    child: &mut Child,
+    stderr: &mut crate::client::ssh_stderr::SshStderr,
+) -> anyhow::Error {
+    let wait = std::time::Duration::from_millis(500);
+    let exited = if timed_out {
+        None
+    } else {
+        tokio::time::timeout(wait, child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    };
+    let _ = child.start_kill();
+    let tail = stderr.tail(wait, DIAL_TAIL_MAX).await;
+    let cause = match exited {
+        Some(status) if !status.success() => {
+            log::debug!(
+                "terminal: connect_ssh {label}: {}",
+                crate::client::cli_common::escape_bounded(&format!("{cause:#}"), 300)
+            );
+            match status.code() {
+                Some(code) => anyhow::anyhow!("ssh exited {code}"),
+                None => anyhow::anyhow!("ssh exited: {status}"),
+            }
+        }
+        _ => cause,
+    };
+    if tail.is_empty() {
+        return cause;
+    }
+    anyhow::anyhow!("{cause:#}; stderr: {tail}")
+}
+
+/// Characters of ssh's last lines in a dial's error, so that the error's cause
+/// stays inside the 300 characters a failed remote's row keeps.
+const DIAL_TAIL_MAX: usize = 150;
 
 /// The client settings every server it views draws with, whichever machine
 /// that server is on.

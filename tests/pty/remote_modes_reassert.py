@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""A remote's ssh stderr cannot leave the client without mouse capture.
+"""The client sends its input modes again when a remote connects or drops.
 
-The client inherits ssh's stderr onto its own terminal, so whatever the remote
-side prints there reaches the outer terminal directly. A login banner, a
-ProxyCommand or a terminal reset can switch off mouse tracking (1000) and SGR
-mouse (1006), and after that no click reaches the client. The client therefore
-sends its input modes again when a remote connects and when one drops.
+A login banner, a ProxyCommand or a terminal reset can switch off mouse
+tracking (1000) and SGR mouse (1006), and after that no click reaches the
+client. ssh's own stderr can no longer do it, because the client drains it
+into client.log (`tests/pty/ssh_stderr.py`), but anything else that reaches the
+outer terminal still can, so the client sends its input modes again when a
+remote connects and when one drops.
 
 The fake `ssh` shim writes `CSI ? 1000 l` and `CSI ? 1006 l` to stderr before it
-starts the relay, and again after the relay exits. Each write carries a marker,
-so the harness can find it in the client's output stream and assert that
-`CSI ? 1000 h` and `CSI ? 1006 h` come AFTER it. That order is what decides the
-outer terminal's final mode state.
+starts the relay, and again after the relay exits. Each write carries a marker.
+The harness checks that neither reaches the client's output stream, that both
+reach client.log escaped (which is what proves the shim ran at each point), and
+that `CSI ? 1000 h` and `CSI ? 1006 h` are sent after the connect and after the
+drop.
 
 The connect is made with a `Prefix c` -> `RemoteConnect` binding once the
 client is running.
@@ -87,12 +89,12 @@ def write_shim():
     with open(shim, "w") as f:
         f.write(
             "#!/bin/sh\n"
-            "printf 'LEAKCONNECT\\033[?1000l\\033[?1006l' >&2\n"
+            "printf 'LEAKCONNECT\\033[?1000l\\033[?1006l\\n' >&2\n"
             f"export XDG_RUNTIME_DIR={REMOTE}/run\n"
             f"export XDG_STATE_HOME={REMOTE}/state\n"
             f"export XDG_DATA_HOME={REMOTE}/data\n"
             f"sh -c 'echo $$ >> {relay_pids()}; exec {BIN} relay'\n"
-            "printf 'LEAKDROP\\033[?1000l\\033[?1006l' >&2\n"
+            "printf 'LEAKDROP\\033[?1000l\\033[?1006l\\n' >&2\n"
         )
     os.chmod(shim, 0o755)
 
@@ -122,15 +124,26 @@ def wait_for(t, needle, timeout=8.0):
     return False
 
 
-def check_reasserted(t, label, leak):
+def escaped(leak):
+    return leak.replace(b"\x1b", b"\\x1b")
+
+
+def wait_for_log(t, needle, timeout=8.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if needle in t.log("client"):
+            return True
+        t.pump(0.2)
+    return False
+
+
+def check_reasserted(t, label, leak, at):
     raw = bytes(t.raw)
-    at = raw.rfind(leak)
-    check(f"{label}: the shim's leak reached the terminal", at >= 0, raw[-200:])
-    if at < 0:
-        return
-    after = raw[at + len(leak):]
+    check(f"{label}: the shim's leak never reached the terminal", leak not in raw,
+          raw[raw.find(leak) - 40:][:200])
+    after = raw[at:]
     for name, seq in MODES:
-        check(f"{label}: {name} is re-sent after the leak", seq in after, after[:200])
+        check(f"{label}: {name} is re-sent after the {label}", seq in after, after[:200])
 
 
 def main():
@@ -142,16 +155,22 @@ def main():
         t.pump(1.0)
         check("setup: no remote dialled before the binding", CONNECT_LEAK not in bytes(t.raw))
 
+        at = len(t.raw)
         t.prefix(b"c", 0.5)
-        check("connect: the shim was run", wait_for(t, CONNECT_LEAK))
+        check("connect: the shim was run",
+              wait_for_log(t, escaped(CONNECT_LEAK).decode()))
         check("connect: the session manager lists the remote", wait_for(t, b"mini"))
         t.pump(1.5)
-        check_reasserted(t, "connect", CONNECT_LEAK)
+        check_reasserted(t, "connect", CONNECT_LEAK, at)
 
+        at = len(t.raw)
         kill_relays(within=ROOT)
-        check("drop: the shim reported the dropped relay", wait_for(t, DROP_LEAK))
+        # Written after the handshake, so it is logged in the summary that
+        # follows ssh's stderr closing, not on its own line.
+        check("drop: the shim reported the dropped relay",
+              wait_for_log(t, escaped(DROP_LEAK).decode()))
         t.pump(1.5)
-        check_reasserted(t, "drop", DROP_LEAK)
+        check_reasserted(t, "drop", DROP_LEAK, at)
 
         check("client alive", t.alive())
         for which in ("client", "server"):

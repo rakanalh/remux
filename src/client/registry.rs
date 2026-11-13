@@ -15,7 +15,6 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWrite;
-use tokio::process::Child;
 use tokio::sync::mpsc;
 
 use crate::client::terminal::{Look, RemuxClient};
@@ -109,7 +108,7 @@ struct RemoteEntry {
     /// [`crate::protocol::build_version`] to detect version skew.
     server_version: Option<String>,
     /// Keeps the ssh child alive; dropping it triggers `kill_on_drop`.
-    _child: Option<Child>,
+    _child: Option<crate::client::terminal::SshProcess>,
     /// Whether this entry originates from the `[remotes]` config map (vs. an
     /// ad-hoc remote added at runtime via `RemoteConnect`/`add_remote`). Only
     /// config-derived entries are eligible for removal by [`update_remotes`]
@@ -135,6 +134,8 @@ fn remote_error(msg: &str) -> String {
 }
 
 const REMOTE_ERROR_MAX: usize = 300;
+
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Owns every open connection and the shared incoming-message channel.
 pub struct ConnectionManager {
@@ -399,17 +400,10 @@ impl ConnectionManager {
         self.set_state(name, RemoteState::Connecting);
         log::info!("registry: connecting to remote '{name}' ({})", config.ssh);
 
-        let connect = RemuxClient::connect_ssh(
-            &config.ssh,
-            config.port,
-            config.identity.as_deref(),
-            &config.extra_args,
-            &config.remux_path,
-        );
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), connect).await;
+        let result = RemuxClient::connect_ssh(name, &config, Some(DIAL_TIMEOUT)).await;
 
         match result {
-            Ok(Ok(mut client)) => {
+            Ok(mut client) => {
                 let look = self.look();
                 if let Err(e) = client.announce(&look, name).await {
                     log::warn!("registry: telling remote '{name}' its look failed: {e:#}");
@@ -417,17 +411,11 @@ impl ConnectionManager {
                 self.install_remote(name, client);
                 Ok(())
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 let msg = remote_error(&format!("{e:#}"));
                 log::warn!("registry: remote '{name}' failed: {msg}");
                 self.fail_remote(name, msg.clone());
                 Err(e)
-            }
-            Err(_) => {
-                let msg = "connection timed out".to_string();
-                log::warn!("registry: remote '{name}' timed out");
-                self.fail_remote(name, msg.clone());
-                anyhow::bail!("connecting to remote '{name}': {msg}")
             }
         }
     }
@@ -487,28 +475,19 @@ impl ConnectionManager {
         let name = name.to_string();
         let look = std::sync::Arc::clone(&self.look);
         tokio::spawn(async move {
-            let connect = RemuxClient::connect_ssh(
-                &config.ssh,
-                config.port,
-                config.identity.as_deref(),
-                &config.extra_args,
-                &config.remux_path,
-            );
-            let result =
-                match tokio::time::timeout(std::time::Duration::from_secs(10), connect).await {
-                    Ok(Ok(mut client)) => {
-                        let look = look
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .clone();
-                        if let Err(e) = client.announce(&look, &name).await {
-                            log::warn!("registry: telling remote '{name}' its look failed: {e:#}");
-                        }
-                        Ok(Box::new(client))
+            let result = match RemuxClient::connect_ssh(&name, &config, Some(DIAL_TIMEOUT)).await {
+                Ok(mut client) => {
+                    let look = look
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Err(e) = client.announce(&look, &name).await {
+                        log::warn!("registry: telling remote '{name}' its look failed: {e:#}");
                     }
-                    Ok(Err(e)) => Err(format!("{e:#}")),
-                    Err(_) => Err("connection timed out".to_string()),
-                };
+                    Ok(Box::new(client))
+                }
+                Err(e) => Err(format!("{e:#}")),
+            };
             let _ = tx.send(Incoming::RemoteDialed(name, result));
         });
         true

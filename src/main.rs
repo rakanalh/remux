@@ -320,15 +320,43 @@ async fn run_cli_spawn(
     Ok(())
 }
 
-/// The log file at `path`, created with its directory.
+/// The log file at `path`, created with its directory, readable by its owner
+/// alone. It holds what the far side of an ssh connection wrote, which can be
+/// a sign-in URL from a ProxyCommand. `mode` applies only to a file this call
+/// creates, so an existing directory and file are narrowed as well. A
+/// failure to narrow either is ignored, because no log at all costs more than
+/// a log in the old mode; [`warn_if_log_is_shared`] reports it.
 fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .mode(0o600)
+        .open(path)?;
+    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    Ok(file)
+}
+
+/// Warn, in the log itself, when the log at `path` can still be read by
+/// other users because [`open_log`] could not narrow it.
+fn warn_if_log_is_shared(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            log::warn!(
+                "log: {} is mode {mode:o}, readable beyond its owner; it holds ssh output",
+                path.display()
+            );
+        }
+    }
 }
 
 /// Route panics into the role's log file, in addition to stderr.
@@ -396,11 +424,14 @@ async fn main() -> Result<()> {
         _ => "client",
     };
     match open_log(&log_path) {
-        Ok(log_file) => env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Debug)
-            .format_timestamp_millis()
-            .target(env_logger::Target::Pipe(Box::new(log_file)))
-            .init(),
+        Ok(log_file) => {
+            env_logger::Builder::new()
+                .filter_level(log::LevelFilter::Debug)
+                .format_timestamp_millis()
+                .target(env_logger::Target::Pipe(Box::new(log_file)))
+                .init();
+            warn_if_log_is_shared(&log_path);
+        }
         // The server and the relay run for days, and the server's log is the
         // only record of attribution, refused peers and link events, so
         // neither runs without its log.
@@ -591,7 +622,12 @@ async fn main() -> Result<()> {
             );
             // The server we want is the remote one; the relay starts it there,
             // so we deliberately do NOT call ensure_server_running() locally.
-            let mut client = RemuxClient::connect_ssh(&dest, None, None, &[], &remux_path).await?;
+            let remote = RemoteConfig {
+                ssh: dest.clone(),
+                remux_path,
+                ..Default::default()
+            };
+            let mut client = RemuxClient::connect_ssh(&dest, &remote, None).await?;
             let config = Config::load()?;
             client.announce(&Look::from_config(&config), &dest).await?;
 
@@ -3505,8 +3541,10 @@ async fn unsubscribe_view_cells(
     Ok(())
 }
 
-/// Send mouse capture and bracketed paste again after a remote's ssh child,
-/// which writes its stderr to the client's terminal, may have turned them off.
+/// Send mouse capture and bracketed paste again when a remote connects or
+/// drops. ssh's stderr is drained into the log, but a connect can still
+/// overlap something else that writes to the terminal (a ProxyCommand that
+/// opens `/dev/tty`, ssh's own prompts), and that may have turned them off.
 ///
 /// The alternate screen is not sent here because entering it clears the
 /// screen and no repaint follows. A `Redraw` sends the full set.
