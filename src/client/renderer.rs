@@ -229,6 +229,8 @@ pub struct Renderer {
     /// Row count of the last frame [`Renderer::render_full`] was given, so a
     /// diff can tell which of its changes land on that frame's last row.
     frame_rows: usize,
+    /// Column count of that frame, for the same reason as `frame_rows`.
+    frame_cols: usize,
     /// The last row of the most recent server frame, kept up to date by diffs
     /// while [`Renderer::status_row_owned`] withholds it from the screen. A
     /// server too old to describe its status bar leaves the client this row as
@@ -251,6 +253,7 @@ impl Renderer {
             popup: None,
             status_row_owned: false,
             frame_rows: 0,
+            frame_cols: 0,
             frame_status_row: Vec::new(),
         }
     }
@@ -270,6 +273,12 @@ impl Renderer {
     /// Row count of the last server frame, or 0 before the first one.
     pub fn frame_rows(&self) -> u16 {
         u16::try_from(self.frame_rows).unwrap_or(u16::MAX)
+    }
+
+    /// `(cols, rows)` of the last server frame, or `None` before the first one.
+    pub fn frame_size(&self) -> Option<(u16, u16)> {
+        let cols = u16::try_from(self.frame_cols).unwrap_or(u16::MAX);
+        (self.frame_rows > 0 && cols > 0).then(|| (cols, self.frame_rows()))
     }
 
     /// The server frame's last row as it stands after the latest frame and
@@ -661,6 +670,7 @@ impl Renderer {
         cursor_style: u8,
     ) -> Result<()> {
         self.frame_rows = cells.len();
+        self.frame_cols = cells.first().map_or(0, Vec::len);
         let cells = match cells.split_last() {
             Some((status, body)) if self.status_row_owned => {
                 self.frame_status_row = status.clone();
@@ -1483,9 +1493,9 @@ impl Renderer {
         let saved_cursor = self.last_cursor;
         // The front buffer's last row is whatever is on the terminal's last
         // row, which is exactly what must be put back, not a server bar row to
-        // withhold. `frame_rows` is restored too, because the diffs that follow
+        // withhold. `frame_rows` and `frame_cols` are restored too, because the diffs that follow
         // still describe the last server frame.
-        let saved_status = (self.status_row_owned, self.frame_rows);
+        let saved_status = (self.status_row_owned, self.frame_rows, self.frame_cols);
         // The front buffer never holds the popup box, and what it holds under
         // the box is stale, so the mask stays up for the replay. The replay then
         // emits the whole box in its own bracket.
@@ -1507,7 +1517,7 @@ impl Renderer {
         self.content_cols = saved.2;
         self.content_rows = saved.3;
         self.last_cursor = saved_cursor;
-        (self.status_row_owned, self.frame_rows) = saved_status;
+        (self.status_row_owned, self.frame_rows, self.frame_cols) = saved_status;
         res
     }
 
