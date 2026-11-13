@@ -472,6 +472,10 @@ impl Screen {
                 self.grid.pop();
                 need -= 1;
             }
+            // Rows below the cursor that hold anything are kept, so when there
+            // are more of them than the new height leaves room for, the rows
+            // pushed off the top include the cursor's own row. That is the
+            // price of never removing text, and the old resize did the same.
             for row in self.grid.drain(..need) {
                 self.scrollback.push_back(row);
             }
@@ -589,6 +593,9 @@ impl Screen {
                 scrollback.pop_front();
                 self.lines_evicted += 1;
             }
+            // These rows may come back when the primary screen grows again,
+            // as rows `resize_height` moves off the top do.
+            self.resize_scrolled = (self.resize_scrolled + overflow).min(scrollback.len());
         } else {
             saved.drain(..overflow);
         }
@@ -902,11 +909,20 @@ impl Screen {
         let mut cursor_logical = 0usize;
         let mut cursor_off = 0usize;
         // Where the old screen's top row sits in its logical line, so step 6
-        // can find that row again after re-splitting.
+        // can find that row again after re-splitting. Likewise the first row
+        // after the last clear: the scrollback before it was cleared from view
+        // and must stay out of it.
         let mut top_logical = 0usize;
         let mut top_off = 0usize;
+        let boundary = sb_len - self.resize_scrolled.min(sb_len);
+        let mut boundary_logical = 0usize;
+        let mut boundary_off = 0usize;
 
         for (idx, row) in stream.iter().enumerate() {
+            if idx == boundary {
+                boundary_logical = logicals.len();
+                boundary_off = current.len();
+            }
             if idx == sb_len {
                 top_logical = logicals.len();
                 top_off = current.len();
@@ -950,11 +966,18 @@ impl Screen {
         let mut new_lines: Vec<Row> = Vec::new();
         let mut cursor_target: Option<(usize, usize)> = None;
         let mut old_top = 0usize;
+        let mut new_boundary = 0usize;
         for (li, logical) in logicals.iter().enumerate() {
+            let row_of = |off: usize| {
+                let (_, pos) =
+                    Self::split_logical(logical, cols, Some(off.min(logical.len())), &tails[li]);
+                new_lines.len() + pos.map_or(0, |(r, _)| r)
+            };
             if li == top_logical {
-                let at = Some(top_off.min(logical.len()));
-                let (_, pos) = Self::split_logical(logical, cols, at, &tails[li]);
-                old_top = new_lines.len() + pos.map_or(0, |(r, _)| r);
+                old_top = row_of(top_off);
+            }
+            if li == boundary_logical {
+                new_boundary = row_of(boundary_off);
             }
             let at = if li == cursor_logical {
                 Some(cursor_off)
@@ -979,11 +1002,15 @@ impl Screen {
         let rows_us = rows as usize;
         let total = new_lines.len();
         let keep_distance = (total + dropped.len()).saturating_sub(rows_us);
+        //    - Either way the grid never starts above the last clear, so the
+        //      history cleared from view stays out of it. That cannot hide the
+        //      cursor: the clear's row is at or above the old top row.
         let grid_start = if keep_distance <= old_top {
             keep_distance
         } else {
             old_top.max(total.saturating_sub(rows_us))
-        };
+        }
+        .max(new_boundary);
         let mut grid = new_lines.split_off(grid_start);
         let mut scrollback: VecDeque<Row> = VecDeque::from(new_lines);
         let mut dropped = dropped.into_iter();
@@ -1001,6 +1028,9 @@ impl Screen {
             scrollback.pop_front();
             self.lines_evicted += 1;
         }
+        // The scrollback rows after the clear are the ones a taller screen may
+        // pull back; re-splitting changed how many rows they take.
+        self.resize_scrolled = (grid_start - new_boundary).min(scrollback.len());
 
         self.cols = cols;
         self.rows = rows;
@@ -3899,13 +3929,148 @@ mod tests {
     /// Six lines of history on a 4-row screen, then `clear` (ED 2) and a prompt
     /// at the top: the state a shell leaves after the `clear` command.
     fn cleared_with_history() -> Screen {
+        cleared_with_history_by(b"\x1b[2J\x1b[H")
+    }
+
+    /// `cleared_with_history` with the clear given as bytes, ED 2 or ED 0 from
+    /// home.
+    fn cleared_with_history_by(clear: &[u8]) -> Screen {
         let mut s = Screen::new(20, 4, 100);
         for i in 0..6 {
             s.process_output(format!("hist{i}\r\n").as_bytes());
         }
-        s.process_output(b"\x1b[2J\x1b[H$ ");
+        s.process_output(clear);
+        s.process_output(b"$ ");
         assert!(!s.scrollback.is_empty(), "the history is in the scrollback");
         s
+    }
+
+    /// Ten lines of history `H0`..`H9` on a 20x6 screen, then ED 2 and home.
+    fn cleared_after_ten_lines() -> Screen {
+        let mut s = Screen::new(20, 6, 100);
+        for i in 0..10 {
+            s.process_output(format!("H{i}\r\n").as_bytes());
+        }
+        s.process_output(b"\x1b[2J\x1b[H");
+        s
+    }
+
+    fn shows_cleared_history(s: &Screen) -> bool {
+        screen_text(s).iter().any(|row| row.starts_with('H'))
+    }
+
+    #[test]
+    fn widening_wrapped_text_after_clear_does_not_pull_the_cleared_history_in() {
+        let mut s = cleared_after_ten_lines();
+        let a = "A".repeat(30);
+        let b = "B".repeat(30);
+        s.process_output(format!("{a}\r\n{b}\r\n$ ").as_bytes());
+        s.resize(40, 6);
+        assert_eq!(screen_text(&s), [a.as_str(), b.as_str(), "$", "", "", ""]);
+        assert_eq!(s.cursor_y, 2);
+    }
+
+    #[test]
+    fn output_that_scrolled_after_clear_comes_back_but_the_cleared_history_does_not() {
+        let mut s = cleared_after_ten_lines();
+        // Four 30-character lines take eight rows on a six-row screen, so some
+        // of the text printed after the clear scrolls into the scrollback.
+        for i in 0..4 {
+            s.process_output(format!("L{i}{}\r\n", "x".repeat(28)).as_bytes());
+        }
+        s.process_output(b"$ ");
+        s.resize(40, 6);
+        assert!(!shows_cleared_history(&s), "widened: {:?}", screen_text(&s));
+        s.resize(40, 16);
+        assert!(!shows_cleared_history(&s), "grown: {:?}", screen_text(&s));
+        let text = screen_text(&s);
+        for i in 0..4 {
+            let want = format!("L{i}{}", "x".repeat(28));
+            assert!(
+                text.contains(&want),
+                "{want:?} comes back into view: {text:?}"
+            );
+        }
+        assert_eq!(
+            text[0],
+            format!("L0{}", "x".repeat(28)),
+            "the text starts at the top"
+        );
+    }
+
+    #[test]
+    fn growing_pulls_back_the_lines_that_scrolled_off() {
+        let mut s = Screen::new(20, 4, 100);
+        for i in 0..10 {
+            s.process_output(format!("x{i}\r\n").as_bytes());
+        }
+        s.resize(20, 8);
+        assert_eq!(
+            row_text(&s, 0).trim_end(),
+            "x3",
+            "the 4th-newest history line"
+        );
+        assert_eq!(s.cursor_y, 7);
+    }
+
+    #[test]
+    fn rows_a_shrink_pushes_off_come_back_when_the_screen_grows() {
+        let mut s = Screen::new(20, 4, 100);
+        s.process_output(b"\x1b[2J\x1b[Hr0\r\nr1\r\nr2\r\nr3");
+        s.resize(20, 2);
+        s.resize(20, 4);
+        assert_eq!(screen_text(&s), ["r0", "r1", "r2", "r3"]);
+        assert_eq!(s.cursor_y, 3);
+    }
+
+    #[test]
+    fn ed_0_from_home_counts_as_a_clear() {
+        let mut s = cleared_with_history_by(b"\x1b[H\x1b[J");
+        s.resize(20, 8);
+        assert_eq!(
+            s.cursor_y, 0,
+            "growing does not pull the cleared history back"
+        );
+        assert_eq!(row_text(&s, 0).trim_end(), "$");
+    }
+
+    #[test]
+    fn a_clear_on_the_alternate_screen_leaves_the_history_pullable() {
+        let mut s = Screen::new(20, 4, 100);
+        for i in 0..10 {
+            s.process_output(format!("x{i}\r\n").as_bytes());
+        }
+        s.process_output(b"\x1b[?1049h\x1b[2J\x1b[?1049l");
+        s.resize(20, 8);
+        assert_eq!(row_text(&s, 0).trim_end(), "x3", "the history comes back");
+    }
+
+    #[test]
+    fn a_height_only_resize_after_clear_keeps_the_cleared_history_out() {
+        let mut s = cleared_after_ten_lines();
+        let a = "A".repeat(30);
+        s.process_output(format!("{a}\r\n$ ").as_bytes());
+        s.resize(20, 10);
+        assert!(!shows_cleared_history(&s), "grown: {:?}", screen_text(&s));
+        s.resize(20, 3);
+        s.resize(20, 6);
+        assert!(
+            !shows_cleared_history(&s),
+            "shrunk and grown: {:?}",
+            screen_text(&s)
+        );
+        assert_eq!(row_text(&s, 0).trim_end(), &a[..20]);
+    }
+
+    #[test]
+    fn rows_spilled_while_the_alternate_screen_is_up_come_back() {
+        let mut s = Screen::new(20, 6, 100);
+        s.process_output(b"\x1b[2J\x1b[Hp0\r\np1\r\np2\r\np3\r\n$ ");
+        s.process_output(b"\x1b[?1049h");
+        s.resize(20, 3);
+        s.process_output(b"\x1b[?1049l");
+        s.resize(20, 6);
+        assert_eq!(screen_text(&s)[..5], ["p0", "p1", "p2", "p3", "$"]);
     }
 
     #[test]

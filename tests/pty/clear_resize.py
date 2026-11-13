@@ -12,10 +12,14 @@ What it covers:
      numbered lines is on screen
   2  after the zoom, and again after the unzoom, the prompt is still on the
      pane's top row and no numbered line has come back into view above it
-  3  the client stays alive and neither log holds a panic
+  3  after a second clear, three lines too long for the pane (so they wrap in
+     it and fit when zoomed) and the prompt: after the zoom and the unzoom the
+     first long line is on the top row, all three are on screen, and no
+     numbered line has come back into view above them
+  4  the client stays alive and neither log holds a panic
 
-The numbered lines are printed as `N:<n>` by printf, so the typed command line
-never matches what the check looks for.
+The numbered lines are printed as `N:<n>` and the long ones as `W<n>:000...`
+by printf, so the typed command line never matches what the check looks for.
 
 Run from the repo root: python3 tests/pty/clear_resize.py [-v]
 """
@@ -28,6 +32,7 @@ from rundirs import run_dir  # noqa: E402
 COLS, ROWS = 120, 30
 VERBOSE = "-v" in sys.argv
 NUMBERED = re.compile(r"N:\d+")
+LONG = re.compile(r"W(\d):0")
 
 fails = []
 
@@ -53,6 +58,15 @@ def verify(t, label):
     check(not shown, f"{label}: no numbered line is on screen ({shown[:3]})")
 
 
+def verify_long(t, label):
+    pane = left_pane(t)
+    check(bool(LONG.match(pane[0])), f"{label}: the first long line is on the top row ({pane[0].rstrip()[:20]!r})")
+    starts = {m.group(1) for r in pane for m in [LONG.match(r)] if m}
+    check(starts == {"1", "2", "3"}, f"{label}: all three long lines are on screen ({sorted(starts)})")
+    shown = [r.strip() for r in pane if NUMBERED.search(r)]
+    check(not shown, f"{label}: no numbered line is on screen ({shown[:3]})")
+
+
 def main():
     rundir = run_dir("rmxclrz")
     t = Tui(rundir, cols=COLS, rows=ROWS, extra_env={"XDG_CACHE_HOME": f"{rundir}/cache"})
@@ -67,13 +81,19 @@ def main():
         verify(t, "2 zoomed")
         t.prefix(b"z", 1.2)
         verify(t, "2 unzoomed")
+        t.send("printf '\\033[H\\033[2J'; for n in 1 2 3; do printf 'W%s:%080d\\n' $n 0; done\r", 1.0)
+        verify_long(t, "3 after the clear")
+        t.prefix(b"z", 1.2)
+        verify_long(t, "3 zoomed")
+        t.prefix(b"z", 1.2)
+        verify_long(t, "3 unzoomed")
         if fails:
             t.dump("at failure")
-        check(t.alive(), "3 the client is alive")
+        check(t.alive(), "4 the client is alive")
     finally:
         t.kill()
     for which in ("client", "server"):
-        check("panicked at" not in t.log(which), f"3 no panic in {which}.log")
+        check("panicked at" not in t.log(which), f"4 no panic in {which}.log")
     print(f"{'FAIL' if fails else 'PASS'}  clear_resize: {len(fails)} failure(s)")
     return 1 if fails else 0
 
