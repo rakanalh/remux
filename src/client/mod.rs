@@ -14,6 +14,7 @@ pub mod renderer;
 pub mod session_manager;
 pub mod sidebar;
 pub mod sidebar_state;
+pub mod ssh_stderr;
 pub mod terminal;
 pub mod tree_model;
 pub mod view;

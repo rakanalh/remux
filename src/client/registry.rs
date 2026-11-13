@@ -136,6 +136,8 @@ fn remote_error(msg: &str) -> String {
 
 const REMOTE_ERROR_MAX: usize = 300;
 
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Owns every open connection and the shared incoming-message channel.
 pub struct ConnectionManager {
     /// Per-connection writer, keyed by connection id.
@@ -386,6 +388,17 @@ impl ConnectionManager {
     /// On success spawns a reader task and marks the remote `Connected`; on
     /// failure or timeout marks it `Failed(msg)` and returns the error.
     pub async fn connect_remote(&mut self, name: &str) -> Result<()> {
+        self.dial_remote(name, false).await
+    }
+
+    /// [`connect_remote`](Self::connect_remote) for a dial made before the
+    /// terminal enters raw mode, which also prints ssh's escaped stderr until
+    /// the handshake is done (see [`RemuxClient::connect_ssh`]).
+    pub async fn connect_remote_before_raw(&mut self, name: &str) -> Result<()> {
+        self.dial_remote(name, true).await
+    }
+
+    async fn dial_remote(&mut self, name: &str, echo: bool) -> Result<()> {
         let config = match self.remotes.get(name) {
             Some(entry) => {
                 if entry.state == RemoteState::Connected {
@@ -399,17 +412,10 @@ impl ConnectionManager {
         self.set_state(name, RemoteState::Connecting);
         log::info!("registry: connecting to remote '{name}' ({})", config.ssh);
 
-        let connect = RemuxClient::connect_ssh(
-            &config.ssh,
-            config.port,
-            config.identity.as_deref(),
-            &config.extra_args,
-            &config.remux_path,
-        );
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), connect).await;
+        let result = RemuxClient::connect_ssh(name, &config, Some(DIAL_TIMEOUT), echo).await;
 
         match result {
-            Ok(Ok(mut client)) => {
+            Ok(mut client) => {
                 let look = self.look();
                 if let Err(e) = client.announce(&look, name).await {
                     log::warn!("registry: telling remote '{name}' its look failed: {e:#}");
@@ -417,17 +423,11 @@ impl ConnectionManager {
                 self.install_remote(name, client);
                 Ok(())
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 let msg = remote_error(&format!("{e:#}"));
                 log::warn!("registry: remote '{name}' failed: {msg}");
                 self.fail_remote(name, msg.clone());
                 Err(e)
-            }
-            Err(_) => {
-                let msg = "connection timed out".to_string();
-                log::warn!("registry: remote '{name}' timed out");
-                self.fail_remote(name, msg.clone());
-                anyhow::bail!("connecting to remote '{name}': {msg}")
             }
         }
     }
@@ -487,16 +487,9 @@ impl ConnectionManager {
         let name = name.to_string();
         let look = std::sync::Arc::clone(&self.look);
         tokio::spawn(async move {
-            let connect = RemuxClient::connect_ssh(
-                &config.ssh,
-                config.port,
-                config.identity.as_deref(),
-                &config.extra_args,
-                &config.remux_path,
-            );
             let result =
-                match tokio::time::timeout(std::time::Duration::from_secs(10), connect).await {
-                    Ok(Ok(mut client)) => {
+                match RemuxClient::connect_ssh(&name, &config, Some(DIAL_TIMEOUT), false).await {
+                    Ok(mut client) => {
                         let look = look
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -506,8 +499,7 @@ impl ConnectionManager {
                         }
                         Ok(Box::new(client))
                     }
-                    Ok(Err(e)) => Err(format!("{e:#}")),
-                    Err(_) => Err("connection timed out".to_string()),
+                    Err(e) => Err(format!("{e:#}")),
                 };
             let _ = tx.send(Incoming::RemoteDialed(name, result));
         });

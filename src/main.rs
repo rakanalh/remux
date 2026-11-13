@@ -591,7 +591,12 @@ async fn main() -> Result<()> {
             );
             // The server we want is the remote one; the relay starts it there,
             // so we deliberately do NOT call ensure_server_running() locally.
-            let mut client = RemuxClient::connect_ssh(&dest, None, None, &[], &remux_path).await?;
+            let remote = RemoteConfig {
+                ssh: dest.clone(),
+                remux_path,
+                ..Default::default()
+            };
+            let mut client = RemuxClient::connect_ssh(&dest, &remote, None, true).await?;
             let config = Config::load()?;
             client.announce(&Look::from_config(&config), &dest).await?;
 
@@ -1041,7 +1046,7 @@ async fn connect_auto_remotes(mgr: &mut ConnectionManager, config: &Config) {
 
     for name in names {
         log::info!("auto-connecting remote '{name}'");
-        match mgr.connect_remote(name).await {
+        match mgr.connect_remote_before_raw(name).await {
             Ok(()) => log::info!("auto-connect to remote '{name}' succeeded"),
             Err(e) => {
                 log::warn!("auto-connect to remote '{name}' failed: {e}");

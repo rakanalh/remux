@@ -136,56 +136,81 @@ impl RemuxClient {
     /// Connect to a remote server over SSH by spawning `remux relay` on the
     /// remote host and pumping the wire protocol through its stdio.
     ///
-    /// `dest` is any SSH destination (`user@host`, or a `~/.ssh/config` alias);
-    /// `remux_path` is where the `remux` binary lives on the remote. Optional
-    /// `port`/`identity` map to `ssh -p`/`-i`; `extra_args` are inserted before
-    /// the destination so `~/.ssh/config`-style options can be passed.
+    /// `label` names the remote in the log. A failed dial, or one that has
+    /// not finished within `deadline`, is an error that starts with the last
+    /// lines ssh wrote to stderr. `echo` also prints those lines to this
+    /// process's stderr until the handshake is done; it is for a dial made
+    /// before the terminal enters raw mode.
     pub async fn connect_ssh(
-        dest: &str,
-        port: Option<u16>,
-        identity: Option<&str>,
-        extra_args: &[String],
-        remux_path: &str,
+        label: &str,
+        remote: &crate::config::RemoteConfig,
+        deadline: Option<std::time::Duration>,
+        echo: bool,
     ) -> Result<Self> {
         log::debug!(
-            "terminal: connect_ssh dest={dest} port={port:?} identity={identity:?} \
-             extra_args={extra_args:?} remux_path={remux_path}"
+            "terminal: connect_ssh {label} dest={} port={:?} identity={:?} \
+             extra_args={:?} remux_path={}",
+            remote.ssh,
+            remote.port,
+            remote.identity,
+            remote.extra_args,
+            remote.remux_path
         );
-        // stderr is inherited so ssh host-key / password prompts are visible;
-        // this runs before the terminal enters raw mode.
-        let remote = crate::config::RemoteConfig {
-            ssh: dest.to_string(),
-            port,
-            identity: identity.map(str::to_string),
-            remux_path: remux_path.to_string(),
-            extra_args: extra_args.to_vec(),
-            ..crate::config::RemoteConfig::default()
-        };
+        // stderr is never inherited, because the client is in raw mode for
+        // most of the connection and escape codes from the far side would
+        // change the terminal's modes. ssh writes its password, passphrase and
+        // host-key prompts to /dev/tty, so they still reach the user. It
+        // writes keyboard-interactive instructions (a 2FA menu) and the sshd
+        // banner to stderr, which is what `echo` is for.
         let mut cmd = remote.ssh_command(false);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd
             .spawn()
-            .with_context(|| format!("spawning ssh to {dest}"))?;
+            .with_context(|| format!("spawning ssh to {}", remote.ssh))?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .context("ssh child produced no stdout pipe")?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("ssh child produced no stdin pipe")?;
+        let (Some(stdout), Some(stdin), Some(stderr)) =
+            (child.stdout.take(), child.stdin.take(), child.stderr.take())
+        else {
+            anyhow::bail!("ssh child has no stdio pipes");
+        };
+        let mut stderr = crate::client::ssh_stderr::SshStderr::spawn(label, stderr, echo);
 
         let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(stdout);
         let mut writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(stdin);
-        let server_version = handshake(&mut reader, &mut writer)
-            .await
-            .with_context(|| format!("handshake with remote server via {dest}"))?;
+        let dial = async {
+            handshake(&mut reader, &mut writer)
+                .await
+                .with_context(|| format!("handshake with remote server via {}", remote.ssh))
+        };
+        let dialed = match deadline {
+            Some(deadline) => tokio::time::timeout(deadline, dial)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "connection timed out after {}s",
+                        deadline.as_secs()
+                    ))
+                }),
+            None => dial.await,
+        };
+        stderr.stop_echo();
+        let server_version = match dialed {
+            Ok(version) => version,
+            Err(e) => {
+                let _ = child.start_kill();
+                let tail = stderr.tail(std::time::Duration::from_millis(500)).await;
+                return Err(if tail.is_empty() {
+                    e
+                } else {
+                    e.context(format!("ssh stderr: {tail}"))
+                });
+            }
+        };
 
-        log::debug!("terminal: connect_ssh success dest={dest}");
+        log::debug!("terminal: connect_ssh success {label}");
         Ok(Self {
             reader,
             writer,
