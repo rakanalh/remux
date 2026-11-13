@@ -33,8 +33,8 @@ What each scenario covers:
   4  the client stays alive and neither log holds a panic
 
 A key counts as drawn once the Neovim pane has changed and then reads the same
-twice in a row. A pane that never settles fails loudly rather than being read
-mid-redraw.
+twice in a row. A pane that never changes (a lost key) or never settles fails
+loudly rather than being read mid-redraw.
 
 On Linux, Neovim emits ECH only in a window narrower than the screen, so only
 the `:vsplit` scenarios (`single`, `split`, `remote-split`) go red when the
@@ -232,15 +232,19 @@ def pane_region(t, x0):
 def press(t, key, x0, label):
     """Send `key`, then wait until the Neovim pane has been redrawn.
 
-    The pane must change (a key at the top or bottom of the file may change
-    nothing, so that wait gives up after `CHANGE_WAIT`) and then read the same
-    twice in a row. A pane that is still changing after `SETTLE_TIMEOUT` is a
-    failure, not something to read.
+    Every key the harness sends moves the cursor, and the ruler on Neovim's
+    status line inside the pane shows the move, so the pane must change within
+    `CHANGE_WAIT` and then read the same twice in a row. A pane that never
+    changes means the key was lost, and one still changing after
+    `SETTLE_TIMEOUT` is not something to read: both are failures.
     """
     before = pane_region(t, x0)
     t.send(key, 0)
     deadline = time.time() + CHANGE_WAIT
-    while time.time() < deadline and pane_region(t, x0) == before:
+    while pane_region(t, x0) == before:
+        if time.time() > deadline:
+            check(False, f"{label}: the Neovim pane changed within {CHANGE_WAIT}s")
+            return False
         t.pump(POLL)
     last = pane_region(t, x0)
     deadline = time.time() + SETTLE_TIMEOUT
