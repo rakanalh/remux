@@ -89,6 +89,10 @@ This is expected. The [files panel](/remux/sidebars/#files) follows the director
 - `<server>: no detection` means that server's platform cannot detect agents. Linux and macOS are supported.
 - A pane stuck on "needs input", or one that never turns red: `server.log` says why each pane was classified as it was. Adjust the pattern and restart. See [Agents](/remux/agents/#blocked-prompt-patterns).
 
+## Alt shortcuts do nothing on a Mac
+
+Your terminal is sending Option as a key for typing special characters, so Remux never sees an Alt. Set it to send Option as Meta (Esc+): [macOS: make Option work as Alt](/remux/install/#macos-make-option-work-as-alt) has the setting for each terminal.
+
 ## Starting Remux inside a Remux pane
 
 Remux refuses to start a client inside one of its own panes. Detach first or use another terminal, or set `REMUX_ALLOW_NESTED=1` if you really want a nested client.

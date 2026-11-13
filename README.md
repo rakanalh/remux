@@ -453,6 +453,8 @@ Remux is modal:
 
 Both the leader tree and the Alt shortcuts are fully configurable and **hot-reload live**. The which-key popup lists both the current tree level and the global Alt shortcuts.
 
+**On macOS**, Alt is the Option key, and most terminals must be set to send Option as Meta (Esc+) before the Alt shortcuts reach Remux: in Terminal.app, **Settings → Profiles → Keyboard → Use Option as Meta key**; in iTerm2, **Settings → Profiles → Keys → Left/Right Option key → Esc+**. Settings for Ghostty, Alacritty, WezTerm and Kitty: [https://rakanalh.github.io/remux/install/#macos-make-option-work-as-alt](https://rakanalh.github.io/remux/install/#macos-make-option-work-as-alt).
+
 Full details: [https://rakanalh.github.io/remux/keybindings/](https://rakanalh.github.io/remux/keybindings/) · The keys by task: [https://rakanalh.github.io/remux/keyboard/](https://rakanalh.github.io/remux/keyboard/)
 
 ### Leader tree (default, leader = `Ctrl-a`)
