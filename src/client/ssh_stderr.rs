@@ -99,15 +99,12 @@ pub struct SshStderr {
 impl SshStderr {
     /// Start draining `stderr` on its own task, which runs until ssh closes
     /// the stream. It must always read, because ssh blocks once the pipe is
-    /// full. With `echo`, each escaped line also goes to this process's
-    /// stderr until [`stop_echo`](Self::stop_echo).
-    pub fn spawn(
-        label: &str,
-        mut stderr: impl AsyncRead + Unpin + Send + 'static,
-        echo: bool,
-    ) -> Self {
+    /// full. Each escaped line also goes to this process's stderr until
+    /// [`stop_echo`](Self::stop_echo), or until the client takes the terminal,
+    /// whichever comes first.
+    pub fn spawn(label: &str, mut stderr: impl AsyncRead + Unpin + Send + 'static) -> Self {
         let tail = Arc::new(Mutex::new(VecDeque::new()));
-        let echo = Arc::new(AtomicBool::new(echo));
+        let echo = Arc::new(AtomicBool::new(true));
         let (done_tx, done) = oneshot::channel();
         let label = label.to_string();
         let task_tail = Arc::clone(&tail);
@@ -117,7 +114,7 @@ impl SshStderr {
             let mut budget = Budget::default();
             let mut chunk = [0u8; 4096];
             let mut emit = |line: String| {
-                if task_echo.load(Ordering::Relaxed) {
+                if task_echo.load(Ordering::Relaxed) && !crate::client::terminal::terminal_taken() {
                     let _ = writeln!(std::io::stderr(), "{line}");
                 }
                 match budget.take() {
@@ -237,7 +234,7 @@ mod tests {
     async fn the_tail_keeps_the_last_lines_after_the_stream_closes() {
         let input: &'static [u8] =
             b"one\ntwo\nPermission denied (publickey).\nssh: \x1b]0;x\x07end\n";
-        let mut drain = SshStderr::spawn("t", input, false);
+        let mut drain = SshStderr::spawn("t", input);
         assert_eq!(
             drain.tail(Duration::from_secs(5)).await,
             "two | Permission denied (publickey). | ssh: \\x1b]0;x\\x07end"
@@ -250,7 +247,7 @@ mod tests {
         tokio::io::AsyncWriteExt::write_all(&mut held, b"held open\n")
             .await
             .unwrap();
-        let mut drain = SshStderr::spawn("t", read, false);
+        let mut drain = SshStderr::spawn("t", read);
         let started = std::time::Instant::now();
         let tail = drain.tail(Duration::from_millis(200)).await;
         assert!(started.elapsed() < Duration::from_secs(2));

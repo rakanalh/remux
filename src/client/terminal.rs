@@ -20,8 +20,22 @@ use crate::server::daemon::{read_message, socket_path, write_message};
 // Terminal setup / restore
 // ---------------------------------------------------------------------------
 
+/// Set the first time the client takes the terminal, and never cleared.
+/// Clearing it when an editor borrows the terminal would let a dial made in
+/// that time print over the editor.
+static TERMINAL_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the client has put the terminal into raw mode at any time. Until
+/// it has, the terminal is still the user's shell's, and text written to it
+/// is read as text.
+pub fn terminal_taken() -> bool {
+    TERMINAL_TAKEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Put the terminal into raw mode and switch to the alternate screen.
 pub fn setup_terminal() -> Result<()> {
+    // Before raw mode, so that no ssh line is echoed while it changes.
+    TERMINAL_TAKEN.store(true, std::sync::atomic::Ordering::SeqCst);
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
     enable_terminal_modes().context("setting up alternate screen")
 }
@@ -138,14 +152,13 @@ impl RemuxClient {
     ///
     /// `label` names the remote in the log. A failed dial, or one that has
     /// not finished within `deadline`, is an error that starts with the last
-    /// lines ssh wrote to stderr. `echo` also prints those lines to this
-    /// process's stderr until the handshake is done; it is for a dial made
-    /// before the terminal enters raw mode.
+    /// lines ssh wrote to stderr. Until the handshake is done, and only while
+    /// the client has not yet taken the terminal ([`terminal_taken`]), those
+    /// lines are also printed, escaped, to this process's stderr.
     pub async fn connect_ssh(
         label: &str,
         remote: &crate::config::RemoteConfig,
         deadline: Option<std::time::Duration>,
-        echo: bool,
     ) -> Result<Self> {
         log::debug!(
             "terminal: connect_ssh {label} dest={} port={:?} identity={:?} \
@@ -161,7 +174,7 @@ impl RemuxClient {
         // change the terminal's modes. ssh writes its password, passphrase and
         // host-key prompts to /dev/tty, so they still reach the user. It
         // writes keyboard-interactive instructions (a 2FA menu) and the sshd
-        // banner to stderr, which is what `echo` is for.
+        // banner to stderr, which is why a dial made before raw mode echoes.
         let mut cmd = remote.ssh_command(false);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -176,7 +189,7 @@ impl RemuxClient {
         else {
             anyhow::bail!("ssh child has no stdio pipes");
         };
-        let mut stderr = crate::client::ssh_stderr::SshStderr::spawn(label, stderr, echo);
+        let mut stderr = crate::client::ssh_stderr::SshStderr::spawn(label, stderr);
 
         let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(stdout);
         let mut writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(stdin);

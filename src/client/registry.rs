@@ -388,17 +388,6 @@ impl ConnectionManager {
     /// On success spawns a reader task and marks the remote `Connected`; on
     /// failure or timeout marks it `Failed(msg)` and returns the error.
     pub async fn connect_remote(&mut self, name: &str) -> Result<()> {
-        self.dial_remote(name, false).await
-    }
-
-    /// [`connect_remote`](Self::connect_remote) for a dial made before the
-    /// terminal enters raw mode, which also prints ssh's escaped stderr until
-    /// the handshake is done (see [`RemuxClient::connect_ssh`]).
-    pub async fn connect_remote_before_raw(&mut self, name: &str) -> Result<()> {
-        self.dial_remote(name, true).await
-    }
-
-    async fn dial_remote(&mut self, name: &str, echo: bool) -> Result<()> {
         let config = match self.remotes.get(name) {
             Some(entry) => {
                 if entry.state == RemoteState::Connected {
@@ -412,7 +401,7 @@ impl ConnectionManager {
         self.set_state(name, RemoteState::Connecting);
         log::info!("registry: connecting to remote '{name}' ({})", config.ssh);
 
-        let result = RemuxClient::connect_ssh(name, &config, Some(DIAL_TIMEOUT), echo).await;
+        let result = RemuxClient::connect_ssh(name, &config, Some(DIAL_TIMEOUT)).await;
 
         match result {
             Ok(mut client) => {
@@ -487,20 +476,19 @@ impl ConnectionManager {
         let name = name.to_string();
         let look = std::sync::Arc::clone(&self.look);
         tokio::spawn(async move {
-            let result =
-                match RemuxClient::connect_ssh(&name, &config, Some(DIAL_TIMEOUT), false).await {
-                    Ok(mut client) => {
-                        let look = look
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .clone();
-                        if let Err(e) = client.announce(&look, &name).await {
-                            log::warn!("registry: telling remote '{name}' its look failed: {e:#}");
-                        }
-                        Ok(Box::new(client))
+            let result = match RemuxClient::connect_ssh(&name, &config, Some(DIAL_TIMEOUT)).await {
+                Ok(mut client) => {
+                    let look = look
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Err(e) = client.announce(&look, &name).await {
+                        log::warn!("registry: telling remote '{name}' its look failed: {e:#}");
                     }
-                    Err(e) => Err(format!("{e:#}")),
-                };
+                    Ok(Box::new(client))
+                }
+                Err(e) => Err(format!("{e:#}")),
+            };
             let _ = tx.send(Incoming::RemoteDialed(name, result));
         });
         true

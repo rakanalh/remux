@@ -596,7 +596,7 @@ async fn main() -> Result<()> {
                 remux_path,
                 ..Default::default()
             };
-            let mut client = RemuxClient::connect_ssh(&dest, &remote, None, true).await?;
+            let mut client = RemuxClient::connect_ssh(&dest, &remote, None).await?;
             let config = Config::load()?;
             client.announce(&Look::from_config(&config), &dest).await?;
 
@@ -1046,7 +1046,7 @@ async fn connect_auto_remotes(mgr: &mut ConnectionManager, config: &Config) {
 
     for name in names {
         log::info!("auto-connecting remote '{name}'");
-        match mgr.connect_remote_before_raw(name).await {
+        match mgr.connect_remote(name).await {
             Ok(()) => log::info!("auto-connect to remote '{name}' succeeded"),
             Err(e) => {
                 log::warn!("auto-connect to remote '{name}' failed: {e}");

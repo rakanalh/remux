@@ -42,6 +42,10 @@ Checks, and why each one cannot pass vacuously:
     echo the escaped lines, because a 2FA menu and the sshd banner reach ssh's
     stderr and not /dev/tty. The echo is escaped, so the DECRST pair is still
     absent from the outer terminal.
+  9 a line the far side writes after the client took the terminal (a
+    background child of the shim, 4s in) is logged and never echoed. Both
+    the end of the handshake and the terminal being taken stop the echo, so
+    each was removed alone to show the other still holds this.
 
 Run from the repo root (debug build):
     python3 tests/pty/ssh_stderr.py [-v]
@@ -121,7 +125,9 @@ def write_shim():
             "esac\n"
             "printf 'LEAK\\033[?1000l\\033[?1006l\\n' >&2\n"
             "printf 'motd: welcome to the fake remote\\n' >&2\n"
+            "( sleep 4; printf 'LATE\\033[?1000l after raw mode\\n' >&2 ) &\n"
             "i=0\n"
+            'case "$*" in *autohost*) i=' f"{FILLER_LINES}" ' ;; esac\n'
             f"while [ $i -lt {FILLER_LINES} ]; do\n"
             "  printf 'filler %04d xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
             "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' $i >&2\n"
@@ -145,8 +151,9 @@ def setup_dirs():
                  '[remotes.mini]\nssh = "whatever"\nremux_path = "remux"\n\n'
                  '[remotes.bad]\nssh = "badhost"\nremux_path = "remux"\n\n'
                  '[remotes.slow]\nssh = "slowhost"\nremux_path = "remux"\n')
+    # `autohost` skips the filler, so the late line is inside the log budget.
     write_config(f"{RUN}/cfg-auto",
-                 '[remotes.mini]\nssh = "whatever"\nremux_path = "remux"\n'
+                 '[remotes.mini]\nssh = "autohost"\nremux_path = "remux"\n'
                  'auto_connect = true\n')
     write_config(f"{RUN}/cfg-none", "")
 
@@ -374,13 +381,17 @@ def main():
               b"LEAK\\x1b[?1000l\\x1b[?1006l" in out)
         check("8 attach-remote never wrote the DECRST pair raw", DECRST not in out)
 
+        log_before = client_log().count(b"LATE\\x1b[?1000l after raw mode")
         auto = Client(f"{RUN}/cfg-auto")
-        auto.pump(3.0)
+        auto.pump(6.0)
         out = bytes(auto.raw)
         auto.kill()
         check("8 auto_connect echoed the marker escaped",
               b"LEAK\\x1b[?1000l\\x1b[?1006l" in out)
         check("8 auto_connect never wrote the DECRST pair raw", DECRST not in out)
+        check("9 a line written after raw mode reached client.log",
+              client_log().count(b"LATE\\x1b[?1000l after raw mode") > log_before)
+        check("9 that line was not echoed onto the terminal", b"LATE" not in out)
     except Exception:
         traceback.print_exc()
         fails.append("exception")
