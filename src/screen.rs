@@ -175,6 +175,12 @@ pub struct Screen {
     /// pointing at the same content line even as older lines are dropped. See
     /// [`Screen::abs_of_row`] / [`Screen::row_of_abs`].
     pub lines_evicted: usize,
+    /// How many of the newest scrollback lines a taller screen may pull back
+    /// into view: the lines that scrolled or were resized off the top since the
+    /// screen was last cleared. tmux keeps the same count (`hscrolled`), which
+    /// is what stops a resize after `clear` from bringing the cleared history
+    /// back above the prompt.
+    resize_scrolled: usize,
     /// Top of the scroll region (0-based, inclusive).
     pub scroll_top: u16,
     /// Bottom of the scroll region (0-based, inclusive).
@@ -274,6 +280,7 @@ impl Screen {
             scrollback: VecDeque::new(),
             scrollback_limit,
             lines_evicted: 0,
+            resize_scrolled: 0,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             parser: vte::Parser::new(),
@@ -413,7 +420,11 @@ impl Screen {
         if self.alt_screen_active {
             self.resize_clamp(cols, rows);
         } else {
-            self.reflow(cols, rows);
+            // Height first, then width, the order tmux's screen_resize uses.
+            self.resize_height(rows);
+            if cols != self.cols {
+                self.reflow(cols, rows);
+            }
         }
 
         self.scroll_top = 0;
@@ -426,6 +437,65 @@ impl Screen {
         if self.cursor_y >= rows {
             self.cursor_y = rows.saturating_sub(1);
         }
+    }
+
+    /// The whole screen was cleared, so none of the scrollback belongs above
+    /// what is on it any more: a taller screen must not pull it back into view.
+    /// tmux resets `hscrolled` on the same clears. The alternate screen's
+    /// clears leave the primary screen's count alone.
+    fn history_cleared_from_view(&mut self) {
+        if !self.alt_screen_active {
+            self.resize_scrolled = 0;
+        }
+    }
+
+    /// Change the primary screen's height at its current width, as tmux does.
+    ///
+    /// Shrinking removes the blank rows below the cursor first and only then
+    /// moves rows off the top into the scrollback, so a prompt at the top of a
+    /// cleared screen stays there. Rows that hold anything are never removed.
+    /// Growing pulls back at most `resize_scrolled` lines from the scrollback,
+    /// so history cleared from view stays out of it, and adds blank rows at the
+    /// bottom for the rest.
+    fn resize_height(&mut self, rows: u16) {
+        let old = self.grid.len();
+        let new = rows as usize;
+        if new < old {
+            let mut need = old - new;
+            while need > 0
+                && self.grid.len() > self.cursor_y as usize + 1
+                && self
+                    .grid
+                    .last()
+                    .is_some_and(|row| row.cells.iter().all(Self::is_padding))
+            {
+                self.grid.pop();
+                need -= 1;
+            }
+            for row in self.grid.drain(..need) {
+                self.scrollback.push_back(row);
+            }
+            self.resize_scrolled += need;
+            self.cursor_y = (self.cursor_y as usize).saturating_sub(need) as u16;
+            while self.scrollback.len() > self.scrollback_limit {
+                self.scrollback.pop_front();
+                self.lines_evicted += 1;
+            }
+            self.resize_scrolled = self.resize_scrolled.min(self.scrollback.len());
+        } else if new > old {
+            let pull = (new - old)
+                .min(self.resize_scrolled)
+                .min(self.scrollback.len());
+            for _ in 0..pull {
+                if let Some(row) = self.scrollback.pop_back() {
+                    self.grid.insert(0, row);
+                }
+            }
+            self.resize_scrolled -= pull;
+            self.cursor_y += pull as u16;
+            self.grid.resize(new, Row::new(self.cols));
+        }
+        self.rows = rows;
     }
 
     /// Non-reflowing resize: copy the top-left `min(rows) x min(cols)` block
@@ -831,8 +901,16 @@ impl Screen {
         let mut current: Vec<Cell> = Vec::new();
         let mut cursor_logical = 0usize;
         let mut cursor_off = 0usize;
+        // Where the old screen's top row sits in its logical line, so step 6
+        // can find that row again after re-splitting.
+        let mut top_logical = 0usize;
+        let mut top_off = 0usize;
 
         for (idx, row) in stream.iter().enumerate() {
+            if idx == sb_len {
+                top_logical = logicals.len();
+                top_off = current.len();
+            }
             if idx == cursor_abs {
                 cursor_logical = logicals.len();
                 cursor_off = current.len() + cursor_x_eff;
@@ -871,7 +949,13 @@ impl Screen {
         // 5. Re-split every logical line at the new width.
         let mut new_lines: Vec<Row> = Vec::new();
         let mut cursor_target: Option<(usize, usize)> = None;
+        let mut old_top = 0usize;
         for (li, logical) in logicals.iter().enumerate() {
+            if li == top_logical {
+                let at = Some(top_off.min(logical.len()));
+                let (_, pos) = Self::split_logical(logical, cols, at, &tails[li]);
+                old_top = new_lines.len() + pos.map_or(0, |(r, _)| r);
+            }
             let at = if li == cursor_logical {
                 Some(cursor_off)
             } else {
@@ -884,12 +968,22 @@ impl Screen {
             new_lines.extend(chunks);
         }
 
-        // 6. Re-derive the split: the last `rows` lines are the visible grid,
-        //    everything before them is scrollback (oldest dropped past the
-        //    limit). A short buffer is padded at the bottom.
+        // 6. Re-derive the split between scrollback and grid. The blank rows
+        //    that were below the cursor stay below it, as in tmux, so a prompt
+        //    on a cleared screen keeps its place instead of the scrollback being
+        //    pulled down above it.
+        //    - Text that now takes fewer rows pulls the scrollback into view
+        //      above it, keeping the cursor's distance from the bottom.
+        //    - Text that now takes more rows uses up the blank rows first, and
+        //      only then pushes the top of the screen into the scrollback.
         let rows_us = rows as usize;
         let total = new_lines.len();
-        let grid_start = total.saturating_sub(rows_us);
+        let keep_distance = (total + dropped.len()).saturating_sub(rows_us);
+        let grid_start = if keep_distance <= old_top {
+            keep_distance
+        } else {
+            old_top.max(total.saturating_sub(rows_us))
+        };
         let mut grid = new_lines.split_off(grid_start);
         let mut scrollback: VecDeque<Row> = VecDeque::from(new_lines);
         let mut dropped = dropped.into_iter();
@@ -948,10 +1042,12 @@ impl Screen {
         if top == 0 && !self.alt_screen_active {
             let evicted = self.grid[0].clone();
             self.scrollback.push_back(evicted);
+            self.resize_scrolled += 1;
             while self.scrollback.len() > self.scrollback_limit {
                 self.scrollback.pop_front();
                 self.lines_evicted += 1;
             }
+            self.resize_scrolled = self.resize_scrolled.min(self.scrollback.len());
         }
 
         // Shift lines up within the region. The rows keep their `wrapped`
@@ -1409,6 +1505,9 @@ impl vte::Perform for Screen {
                         // Erase from cursor to end of display.
                         let row = self.cursor_y as usize;
                         let col = self.cursor_x as usize;
+                        if row == 0 && col == 0 {
+                            self.history_cleared_from_view();
+                        }
                         if row < self.grid.len() {
                             self.erase_cells(row, col, self.grid[row].len());
                             // Erased text cannot continue anywhere: drop the
@@ -1435,6 +1534,7 @@ impl vte::Perform for Screen {
                     2 => {
                         // Erase entire display.
                         self.grid = vec![self.blank_row(); self.rows as usize];
+                        self.history_cleared_from_view();
                     }
                     3 => {
                         // xterm ED 3: erase the saved lines (scrollback).
@@ -1451,6 +1551,7 @@ impl vte::Perform for Screen {
                         // `saved_scrollback` -- alone: a full-screen app's
                         // redraw must not throw away the user's shell history.
                         self.scrollback.clear();
+                        self.history_cleared_from_view();
                     }
                     _ => {}
                 }
@@ -3787,6 +3888,135 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    fn screen_text(s: &Screen) -> Vec<String> {
+        (0..s.grid.len())
+            .map(|r| row_text(s, r).trim_end().to_string())
+            .collect()
+    }
+
+    /// Six lines of history on a 4-row screen, then `clear` (ED 2) and a prompt
+    /// at the top: the state a shell leaves after the `clear` command.
+    fn cleared_with_history() -> Screen {
+        let mut s = Screen::new(20, 4, 100);
+        for i in 0..6 {
+            s.process_output(format!("hist{i}\r\n").as_bytes());
+        }
+        s.process_output(b"\x1b[2J\x1b[H$ ");
+        assert!(!s.scrollback.is_empty(), "the history is in the scrollback");
+        s
+    }
+
+    #[test]
+    fn a_width_change_after_clear_keeps_the_prompt_at_the_top() {
+        let mut s = cleared_with_history();
+        let history = s.scrollback.len();
+        s.resize(15, 4);
+        assert_eq!(
+            screen_text(&s),
+            ["$", "", "", ""],
+            "no history comes back into view"
+        );
+        assert_eq!(
+            (s.cursor_x, s.cursor_y),
+            (2, 0),
+            "the cursor stays on the prompt row"
+        );
+        assert_eq!(
+            s.scrollback.len(),
+            history,
+            "the history stays where it was"
+        );
+    }
+
+    #[test]
+    fn a_height_change_after_clear_keeps_the_prompt_at_the_top() {
+        let mut s = cleared_with_history();
+        s.resize(20, 8);
+        assert_eq!(s.cursor_y, 0, "growing does not pull cleared history back");
+        assert_eq!(row_text(&s, 0).trim_end(), "$");
+        s.resize(20, 3);
+        assert_eq!(
+            s.cursor_y, 0,
+            "shrinking eats the blank rows below the cursor"
+        );
+        assert_eq!(screen_text(&s), ["$", "", ""]);
+    }
+
+    #[test]
+    fn a_prompt_mid_screen_after_clear_keeps_its_row_through_resizes() {
+        let mut s = Screen::new(20, 6, 100);
+        for i in 0..10 {
+            s.process_output(format!("old output {i}\r\n").as_bytes());
+        }
+        s.process_output(b"\x1b[H\x1b[2J$ echo hi\r\nhi\r\n$ ");
+        let history = s.scrollback.len();
+        for (cols, when) in [(12, "narrower"), (30, "wider"), (20, "back")] {
+            s.resize(cols, 6);
+            assert_eq!(s.cursor_y, 2, "{when}: the cursor keeps its row");
+            assert_eq!(
+                screen_text(&s)[..3],
+                ["$ echo hi", "hi", "$"],
+                "{when}: the screen above the cursor is unchanged"
+            );
+            assert_eq!(
+                s.scrollback.len(),
+                history,
+                "{when}: nothing moves to or from history"
+            );
+        }
+    }
+
+    #[test]
+    fn coloured_rows_below_the_cursor_come_back_with_scrollback_present() {
+        let mut s = cleared_with_history();
+        // Blue from col 12 on row 2, below the prompt.
+        s.process_output(b"\x1b[3;13H\x1b[44m\x1b[K\x1b[0m\x1b[1;3H");
+        s.resize(15, 4);
+        assert_eq!(s.cursor_y, 0);
+        assert_eq!(s.grid[2][5].attrs.bg, Color::Default, "row 2 col 5");
+        assert_eq!(s.grid[2][12].attrs.bg, Color::Indexed(4), "row 2 col 12");
+        assert_eq!(s.grid[2][14].attrs.bg, Color::Indexed(4), "row 2 new edge");
+    }
+
+    #[test]
+    fn repeated_resizes_after_clear_are_stable() {
+        let mut s = cleared_with_history();
+        let history = s.scrollback.len();
+        for _ in 0..5 {
+            for (cols, rows) in [(15, 4), (20, 6), (12, 3), (20, 4)] {
+                s.resize(cols, rows);
+                assert_eq!(s.cursor_y, 0, "{cols}x{rows}: the prompt stays at the top");
+                assert_eq!(row_text(&s, 0).trim_end(), "$", "{cols}x{rows}");
+            }
+        }
+        assert_eq!(
+            s.scrollback.len(),
+            history,
+            "the history neither grows nor shrinks"
+        );
+    }
+
+    #[test]
+    fn a_full_screen_of_output_still_scrolls_into_history_when_narrowed() {
+        let mut s = Screen::new(20, 4, 100);
+        for i in 0..4 {
+            s.process_output(format!("line {i} 1234567890").as_bytes());
+            if i < 3 {
+                s.process_output(b"\r\n");
+            }
+        }
+        assert!(s.scrollback.is_empty());
+        s.resize(10, 4);
+        // Every 16-character line now takes two rows, so the first two lines
+        // move into the scrollback and the cursor stays on the last row.
+        assert_eq!(s.scrollback.len(), 4);
+        assert_eq!(s.cursor_y, 3);
+        assert_eq!(
+            screen_text(&s),
+            ["line 2 123", "4567890", "line 3 123", "4567890"]
+        );
     }
 
     #[test]
