@@ -1482,6 +1482,9 @@ impl vte::Perform for Screen {
             }
             // ICH - Insert Characters
             '@' => {
+                // As in xterm, the shifted row no longer ends in the character
+                // that left the wrap pending.
+                self.pending_wrap = false;
                 let n = Self::csi_param(params, 0, 1) as usize;
                 let row = self.cursor_y as usize;
                 let col = self.cursor_x as usize;
@@ -1495,14 +1498,13 @@ impl vte::Perform for Screen {
                     self.break_wide_at(row, col);
                     self.break_wide_at(row, len - n);
                     let line = &mut self.grid[row];
-                    for _ in 0..n {
-                        line.insert(col, Cell::default());
-                    }
+                    line.splice(col..col, std::iter::repeat_n(Cell::default(), n));
                     line.truncate(len);
                 }
             }
             // DCH - Delete Characters
             'P' => {
+                self.pending_wrap = false;
                 let n = Self::csi_param(params, 0, 1) as usize;
                 let row = self.cursor_y as usize;
                 let col = self.cursor_x as usize;
@@ -3173,6 +3175,61 @@ mod tests {
         s.process_output(b"\x1b[1;2H\x1b[2P");
         assert_no_split_glyph(&s, 0, "DCH ending inside a glyph");
         assert_eq!(row_text(&s, 0).trim_end(), "a c");
+    }
+
+    #[test]
+    fn ich_and_dch_clamp_a_count_past_the_row_end() {
+        // A count far past the row must be clamped to the columns left, or
+        // `len - n` underflows (ICH) and the drain range runs off the row (DCH):
+        // pane output is untrusted, so either would take the server down.
+        for (op, seq) in [
+            ("ICH", b"\x1b[1;8H\x1b[500@"),
+            ("DCH", b"\x1b[1;8H\x1b[500P"),
+        ] {
+            let mut s = Screen::new(10, 2, 100);
+            s.process_output(b"0123456789");
+            s.process_output(seq);
+            assert_eq!(row_text(&s, 0), "0123456   ", "{op}");
+            assert_eq!(s.grid[0].len(), 10, "{op} keeps the row length");
+        }
+        // With a wide glyph at cols 7-8 both breaks run with the clamped count.
+        for (op, seq) in [
+            ("ICH", b"\x1b[1;9H\x1b[500@"),
+            ("DCH", b"\x1b[1;9H\x1b[500P"),
+        ] {
+            let mut s = Screen::new(10, 2, 100);
+            s.process_output("0123456中9".as_bytes());
+            s.process_output(seq);
+            assert_no_split_glyph(&s, 0, op);
+            assert_eq!(row_text(&s, 0), "0123456   ", "{op}");
+            assert_eq!(s.grid[0].len(), 10, "{op} keeps the row length");
+        }
+    }
+
+    #[test]
+    fn ich_with_a_zero_count_inserts_one_cell() {
+        let mut s = Screen::new(10, 2, 100);
+        s.process_output(b"abc\x1b[1;2H\x1b[0@");
+        assert_eq!(row_text(&s, 0).trim_end(), "a bc");
+    }
+
+    #[test]
+    fn dch_with_a_zero_count_deletes_one_cell() {
+        let mut s = Screen::new(10, 2, 100);
+        s.process_output(b"abc\x1b[1;2H\x1b[0P");
+        assert_eq!(row_text(&s, 0).trim_end(), "ac");
+    }
+
+    #[test]
+    fn ich_and_dch_cancel_a_pending_wrap() {
+        for (op, seq) in [("ICH", b"\x1b[@X"), ("DCH", b"\x1b[PX")] {
+            let mut s = Screen::new(10, 3, 100);
+            s.process_output(b"0123456789");
+            assert!(s.pending_wrap, "{op}: a full row leaves the wrap pending");
+            s.process_output(seq);
+            assert_eq!(s.grid[0][9].c, 'X', "{op}: X lands in the last column");
+            assert_eq!(row_text(&s, 1).trim_end(), "", "{op}: nothing wrapped");
+        }
     }
 
     #[test]
