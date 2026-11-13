@@ -119,6 +119,8 @@ Shortcuts are the `"<Modifier>-<key>"` entries under `[keybindings.command]`. Th
 - A shortcut stays in Normal mode. It does not need `EnterNormal`.
 - A shortcut on your leader key replaces the leader.
 
+<!-- os-keys: off -->
+
 ## Key notation
 
 Used by `leader`, shortcut keys and `SendKey`.
@@ -132,6 +134,7 @@ Used by `leader`, shortcut keys and `SendKey`.
 - Modifiers are `Ctrl-`, `Alt-` and `Shift-`. Only **one** is allowed. `Ctrl-Alt-x` does not parse.
 - For Alt with Shift, write the uppercase character: `Alt-H` is `Alt+Shift+h`.
 - Names are case-sensitive: `Ctrl-a`, not `ctrl-a` or `C-a`.
+- On macOS, `Alt-` is the Option key, and the config still spells it `Alt-`. See [macOS setup](/remux/install/#macos-make-option-work-as-alt).
 
 ## SendKey
 
@@ -143,6 +146,8 @@ a = "SendKey Ctrl-a; EnterNormal"
 ```
 
 Only characters are sent. `Ctrl-<letter>` sends the control character; `Alt` and `Shift` are dropped, so `SendKey Alt-x` sends a plain `x`. Named keys such as `Enter` or `Esc` send nothing.
+
+<!-- os-keys: on -->
 
 ## Default bindings
 
@@ -253,7 +258,11 @@ A right click opens a context menu at the pointer. Its rows depend on what you c
 | A row of the agents panel | `Go to pane`, `Zoom` (zooms that pane and never releases a zoom), `Close pane` |
 | A row of the files panel | A file: `Open in split`, `Copy path`. A directory: `Copy path`. |
 
+<!-- os-keys: off -->
+
 Every row runs an action that already exists, so the menu adds no behaviour of its own. Each row shows its current binding from your config: a modifier shortcut such as `Alt-z` when one runs the action, otherwise the leader and the key path, such as `Ctrl-a p x`. A row with no binding shows none.
+
+<!-- os-keys: on -->
 
 The menu opens at the pointer and is moved to stay on screen. It draws over everything, sidebars and the popup terminal included. Move the highlight with the mouse, `j`/`k` or the arrow keys, run a row with a left click or `Enter`, and close the menu with `Esc` or `q`. A left or right click outside the menu closes it, and the click then acts as if the menu had not been there. Only one menu is open at a time, and it does not close the popup terminal.
 

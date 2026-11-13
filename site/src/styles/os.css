@@ -1,0 +1,17 @@
+.os-mac {
+	display: none;
+}
+
+:root[data-os='mac'] .os-mac {
+	display: inline;
+	white-space: nowrap;
+}
+
+:root[data-os='mac'] .os-linux {
+	display: none;
+}
+
+:root[data-os='mac'] .os-icon-linux,
+:root:not([data-os='mac']) .os-icon-mac {
+	display: none;
+}

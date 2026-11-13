@@ -37,6 +37,29 @@ remux --version
 
 It prints the crate version, for example `remux 0.1.0`.
 
+## macOS: make Option work as Alt
+
+A Mac keyboard has no Alt key. Remux's `Alt` shortcuts use the Option key (⌥) instead, but most macOS terminals send Option as a key for typing special characters (Option-b types `∫`), so those shortcuts never reach Remux. Set your terminal to send Option as Meta, an Esc prefix, which is what Remux reads as Alt:
+
+| Terminal | Setting |
+|---|---|
+| Terminal.app | **Terminal → Settings → Profiles → Keyboard**, select your profile and turn on **Use Option as Meta key**. |
+| iTerm2 | **Settings → Profiles → Keys → General**, set **Left Option key** (and **Right Option key** if you want both) to **Esc+** (the iTerm2 manual calls it “+Esc”). iTerm2 advises against **Meta**. |
+| Ghostty | `macos-option-as-alt = true` in the config, or `left` / `right` for one Option key. U.S. layouts already default to `true`. |
+| Alacritty | `option_as_alt = "Both"` (or `"OnlyLeft"` / `"OnlyRight"`) in the `[window]` table. The default is `"None"`. |
+| WezTerm | The left Option key already acts as Alt. To use the right one too, set `config.send_composed_key_when_right_alt_is_pressed = false`. |
+| Kitty | `macos_option_as_alt both` (or `left` / `right`) in `kitty.conf`. The default is `no`. Kitty applies it on restart, not on a config reload. |
+
+Setting only the left Option key keeps the right one for typing accented and special characters.
+
+<!-- os-keys: off -->
+
+The docs show every key for your keyboard: use the **Linux / macOS** menu at the top of the page. On macOS, `Alt-h` is shown as ⌥h and `Alt-H` as ⌥⇧H. Your config file still spells the modifier `Alt-` on every platform.
+
+<!-- os-keys: on -->
+
+Cmd-K (clear) and the terminal's own reset commands are handled by the terminal and never reach Remux.
+
 ## Add a config file
 
 Remux works without a config file. To start customising, copy the fully commented sample from the repository. Every option in it is commented out at its default value, so copying it verbatim changes nothing until you uncomment a line:
@@ -69,4 +92,5 @@ If you use [remotes](/remux/remotes/), build the **same commit** on every machin
 ## Next steps
 
 - [Quick start](/remux/quick-start/): open a session, split panes and detach.
+- [macOS setup](#macos-make-option-work-as-alt): make the Option key work for the `Alt` shortcuts.
 - [Concepts](/remux/concepts/): how servers, sessions, tabs and panes fit together.

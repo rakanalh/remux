@@ -5,6 +5,10 @@ description: Start a server, open a session, split panes and detach in five minu
 
 This walkthrough takes you from a fresh install to a session you can detach from and come back to. It assumes the default key map, where the prefix is `Ctrl-a`.
 
+:::tip[On a Mac]
+The `Alt` shortcuts use the Option key, and most macOS terminals need a setting before Option reaches Remux. See [macOS: make Option work as Alt](/remux/install/#macos-make-option-work-as-alt).
+:::
+
 ## Start Remux
 
 ```sh

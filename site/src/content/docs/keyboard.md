@@ -30,7 +30,7 @@ To send a literal `Ctrl-a` to the program in the pane, press `Ctrl-a a`.
 
 ## Alt shortcuts
 
-These work directly in Normal mode, with no prefix.
+These work directly in Normal mode, with no prefix. On a Mac they use the Option key, which your terminal must send as Alt: see [macOS setup](/remux/install/#macos-make-option-work-as-alt).
 
 | Action | Keys |
 |---|---|

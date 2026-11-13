@@ -1,0 +1,116 @@
+---
+import { Icon } from '@astrojs/starlight/components';
+---
+
+<remux-os-select hidden>
+	<label>
+		<span class="sr-only">Show key bindings for</span>
+		<Icon name="linux" class="icon label-icon os-icon-linux" />
+		<Icon name="apple" class="icon label-icon os-icon-mac" />
+		<select autocomplete="off">
+			<option value="linux">Linux</option>
+			<option value="mac">macOS</option>
+		</select>
+		<Icon name="down-caret" class="icon caret" />
+	</label>
+</remux-os-select>
+
+<script>
+	type Os = 'linux' | 'mac';
+
+	const storageKey = 'remux-os';
+
+	const parseOs = (value: unknown): Os | null =>
+		value === 'linux' || value === 'mac' ? value : null;
+
+	function storeOs(os: Os): void {
+		try {
+			localStorage.setItem(storageKey, os);
+		} catch {
+			// Storage can be blocked; the choice then lasts for this page only.
+		}
+	}
+
+	const currentOs = (): Os => parseOs(document.documentElement.dataset.os) ?? 'linux';
+
+	class RemuxOsSelect extends HTMLElement {
+		connectedCallback(): void {
+			const select = this.querySelector('select');
+			if (!select) return;
+			select.value = currentOs();
+			select.addEventListener('change', () => {
+				const os = parseOs(select.value) ?? 'linux';
+				document.documentElement.dataset.os = os;
+				storeOs(os);
+				for (const other of document.querySelectorAll('remux-os-select select')) {
+					if (other instanceof HTMLSelectElement) other.value = os;
+				}
+			});
+			this.hidden = false;
+		}
+	}
+	customElements.define('remux-os-select', RemuxOsSelect);
+</script>
+
+<style>
+	remux-os-select {
+		margin-inline-end: 1rem;
+	}
+
+	label {
+		--sl-label-icon-size: 0.875rem;
+		--sl-caret-size: 1.25rem;
+		--sl-inline-padding: 0.5rem;
+		position: relative;
+		display: flex;
+		align-items: center;
+		gap: 0.25rem;
+		color: var(--sl-color-gray-2);
+	}
+
+	label:hover {
+		color: var(--sl-color-white);
+	}
+
+	.icon {
+		position: absolute;
+		top: 50%;
+		transform: translateY(-50%);
+		pointer-events: none;
+	}
+
+	.label-icon {
+		font-size: var(--sl-label-icon-size);
+		inset-inline-start: 0;
+	}
+
+	.caret {
+		font-size: var(--sl-caret-size);
+		inset-inline-end: 0;
+	}
+
+	select {
+		border: 0;
+		padding-block: 0.625rem;
+		padding-inline: calc(var(--sl-label-icon-size) + var(--sl-inline-padding) + 0.25rem)
+			calc(var(--sl-caret-size) + var(--sl-inline-padding) + 0.25rem);
+		margin-inline: calc(var(--sl-inline-padding) * -1);
+		width: calc(7em + var(--sl-inline-padding) * 2);
+		background-color: transparent;
+		text-overflow: ellipsis;
+		color: inherit;
+		cursor: pointer;
+		appearance: none;
+	}
+
+	option {
+		background-color: var(--sl-color-bg-nav);
+		color: var(--sl-color-gray-1);
+	}
+
+	@media (min-width: 50rem) {
+		select {
+			font-size: var(--sl-text-sm);
+		}
+	}
+</style>
