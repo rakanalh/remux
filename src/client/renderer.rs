@@ -1970,8 +1970,8 @@ impl Renderer {
     }
 
     /// Clear the command palette overlay by re-rendering the front buffer.
-    pub fn clear_command_palette_overlay(&mut self, cols: u16, rows: u16) -> Result<()> {
-        self.clear_overlay(cols, rows)
+    pub fn clear_command_palette_overlay(&mut self) -> Result<()> {
+        self.clear_overlay()
     }
 
     /// Render a search prompt overlay at the bottom of the screen (above the
@@ -2128,8 +2128,7 @@ impl Renderer {
     /// Delegates to `repaint_all`: `render_full` writes at the content origin,
     /// so using it here would re-blit the full-terminal buffer offset by the
     /// origin and erase the sidebars.
-    pub fn clear_overlay(&mut self, cols: u16, rows: u16) -> Result<()> {
-        let _ = (cols, rows); // suppress unused warnings
+    pub fn clear_overlay(&mut self) -> Result<()> {
         self.repaint_all()
     }
 
@@ -2961,7 +2960,7 @@ mod origin_tests {
         let mut r = Renderer::new(10, 2);
         r.render_full(&grid("AAAAAAAAAA", 2), 3, 1, true, 0)
             .unwrap();
-        r.clear_overlay(10, 2).unwrap();
+        r.clear_overlay().unwrap();
 
         let mut out: Vec<u8> = Vec::new();
         r.paint_panel_into(

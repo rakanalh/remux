@@ -1860,7 +1860,7 @@ async fn apply_sidebar_intent(ctx: SidebarApply<'_>, intent: SidebarIntent) -> R
     let tore_down_popup = whichkey.visible;
     if tore_down_popup {
         whichkey.hide();
-        renderer.clear_overlay(tc, tr)?;
+        renderer.clear_overlay()?;
     }
     // FOCUS intents are refused while a view is live.
     // A panel CAN hold the keyboard there -- a
@@ -2382,8 +2382,7 @@ fn repaint_overlays(
     focused_pane_rect: Option<&crate::protocol::PaneRect>,
     cursor: (u16, u16, bool),
 ) -> Result<()> {
-    let (c, r) = crossterm::terminal::size()?;
-    renderer.clear_overlay(c, r)?;
+    renderer.clear_overlay()?;
     relay_overlays(
         renderer,
         input,
@@ -2392,8 +2391,6 @@ fn repaint_overlays(
         which_key_position,
         viewport_top,
         focused_pane_rect,
-        c,
-        r,
     )?;
     renderer.restore_cursor(cursor.0, cursor.1, cursor.2)?;
     renderer.flush()?;
@@ -3077,10 +3074,11 @@ fn paint_search_overlay(
 /// arm) can reuse the exact same overlay layering. The caller paints the base
 /// frame and flushes; this only lays the overlays between those two steps.
 ///
-/// Note the deliberate asymmetry preserved from the original arms: the
-/// which-key popup is drawn at the loop's cached `cols`/`rows` while every other
-/// overlay re-queries `terminal::size()`. Kept verbatim to avoid changing
-/// behavior during the extraction.
+/// The which-key popup is laid out against `Renderer::size`, the size the front
+/// buffer under it was allocated for. The keypress arms that open it use the
+/// same size. A popup re-laid at any other size lands somewhere else on the
+/// screen, and the copy the keypress drew stays there until something repaints
+/// the whole screen.
 #[allow(clippy::too_many_arguments)]
 fn relay_overlays(
     renderer: &mut Renderer,
@@ -3090,8 +3088,6 @@ fn relay_overlays(
     which_key_position: &crate::config::WhichKeyPosition,
     viewport_top: usize,
     focused_pane_rect: Option<&crate::protocol::PaneRect>,
-    cols: u16,
-    rows: u16,
 ) -> Result<()> {
     // Re-render visual overlay on top if in visual mode
     if let Some(ref vs) = input.visual_state {
@@ -3161,6 +3157,7 @@ fn relay_overlays(
     }
     // Re-render popup on top if visible
     else if whichkey.visible {
+        let (cols, rows) = renderer.size();
         let commands = whichkey.render(cols, rows, theme, which_key_position.clone());
         renderer.render_whichkey_overlay(&commands)?;
     }
@@ -3297,8 +3294,6 @@ fn paint_view(
         which_key_position,
         viewport_top,
         focused_pane_rect,
-        c,
-        r,
     )?;
     renderer.flush()?;
     Ok(())
@@ -3671,8 +3666,7 @@ async fn handle_connection_drop(
     if input.tab_picker.as_ref().is_some_and(|tp| tp.conn() == src) {
         input.tab_picker = None;
         input.mode = Mode::Normal;
-        let (tc, tr) = renderer.size();
-        renderer.clear_overlay(tc, tr)?;
+        renderer.clear_overlay()?;
     }
     if input
         .layout_switch
@@ -3681,8 +3675,7 @@ async fn handle_connection_drop(
     {
         input.layout_switch = None;
         input.mode = Mode::Normal;
-        let (tc, tr) = renderer.size();
-        renderer.clear_overlay(tc, tr)?;
+        renderer.clear_overlay()?;
     }
     // Panels scope their state by connection: tell them
     // before anything else here can `continue` or return.
@@ -3793,7 +3786,7 @@ async fn handle_connection_drop(
                     sm.set_foreground(mgr.foreground().clone());
                     sm.set_roster(mgr.server_roster());
                     let (c, r) = crossterm::terminal::size()?;
-                    renderer.clear_overlay(c, r)?;
+                    renderer.clear_overlay()?;
                     let draw_cmds = sm.render(c, r, theme);
                     renderer.render_whichkey_overlay(&draw_cmds)?;
                     renderer.flush()?;
@@ -3810,7 +3803,7 @@ async fn handle_connection_drop(
             sm.set_foreground(mgr.foreground().clone());
             sm.set_roster(mgr.server_roster());
             let (c, r) = crossterm::terminal::size()?;
-            renderer.clear_overlay(c, r)?;
+            renderer.clear_overlay()?;
             let draw_cmds = sm.render(c, r, theme);
             renderer.render_whichkey_overlay(&draw_cmds)?;
             renderer.flush()?;
@@ -4020,8 +4013,6 @@ async fn handle_view_command(
     status_bar: &crate::config::StatusBarPosition,
     viewport_top: usize,
     focused_pane_rect: Option<&crate::protocol::PaneRect>,
-    cols: u16,
-    rows: u16,
 ) -> Result<bool> {
     use crate::server::layout::FocusDirection;
 
@@ -4030,7 +4021,7 @@ async fn handle_view_command(
         () => {
             if whichkey.visible {
                 whichkey.hide();
-                renderer.clear_overlay(cols, rows)?;
+                renderer.clear_overlay()?;
             }
         };
     }
@@ -4068,6 +4059,7 @@ async fn handle_view_command(
         // Resolved against the rect the view is PAINTED into, not the raw
         // terminal: with a sidebar open the two differ, and a neighbour
         // computed from the wrong width is the wrong cell.
+        let (cols, rows) = renderer.size();
         let content = chrome.content_rect(cols, rows);
         let area = crate::server::layout::Rect {
             x: 0,
@@ -4194,7 +4186,7 @@ async fn handle_view_command(
                 chrome.focus,
                 crate::client::chrome::ChromeFocus::Sidebar { .. }
             ) {
-                // `Renderer::size`, not the `cols`/`rows` passed in, because
+                // `Renderer::size`, not `terminal::size()`, because
                 // `subscribe_view_cells` lays the cells out against the front
                 // buffer and the two disagree inside the SIGWINCH window.
                 let (tc, tr) = renderer.size();
@@ -4359,7 +4351,7 @@ async fn handle_view_command(
         _ => {
             if whichkey.visible {
                 whichkey.hide();
-                renderer.clear_overlay(cols, rows)?;
+                renderer.clear_overlay()?;
                 repaint!();
             }
             Ok(true)
@@ -4467,9 +4459,11 @@ async fn run_client_loop(
         shortcut_bindings,
         session_manager_bindings,
     );
-    let (cols, rows) = crossterm::terminal::size()?;
-    log::debug!("run_client_loop: terminal size={}x{}", cols, rows);
-    let mut renderer = Renderer::new(cols, rows);
+    let mut renderer = {
+        let (cols, rows) = crossterm::terminal::size()?;
+        log::debug!("run_client_loop: terminal size={}x{}", cols, rows);
+        Renderer::new(cols, rows)
+    };
     let mut whichkey = WhichKeyPopup::new();
     let mut theme = config.theme();
     // `CompositorTheme` (CellColor) mirror of the client `Theme`, used to draw
@@ -5139,8 +5133,7 @@ async fn run_client_loop(
 
                         // If rename popup was dismissed, clear overlay
                         if was_renaming && input.rename_overlay.is_none() && !matches!(action, InputAction::RenameUpdate(_)) {
-                            let (c, r) = crossterm::terminal::size()?;
-                            renderer.clear_overlay(c, r)?;
+                            renderer.clear_overlay()?;
                             renderer.flush()?;
                         }
                         // If the palette was dismissed by this key, tear its
@@ -5151,8 +5144,7 @@ async fn run_client_loop(
                         // clearing per-arm would leave the palette painted over
                         // whichever arm was forgotten.
                         if was_in_palette && input.command_palette.is_none() {
-                            let (c, r) = crossterm::terminal::size()?;
-                            renderer.clear_command_palette_overlay(c, r)?;
+                            renderer.clear_command_palette_overlay()?;
                             renderer.flush()?;
                         }
                         match action {
@@ -5236,8 +5228,6 @@ async fn run_client_loop(
                                         &config.appearance.status_bar_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
-                                        cols,
-                                        rows,
                                     )
                                     .await?
                                     {
@@ -5247,7 +5237,7 @@ async fn run_client_loop(
                                 // Hide which-key popup when executing a command
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 renderer.flush()?;
                                 if matches!(cmd, RemuxCommand::SessionDetach) {
@@ -5339,7 +5329,7 @@ async fn run_client_loop(
                                 // Hide which-key popup when executing commands
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                     renderer.flush()?;
                                 }
                                 for mut cmd in cmds {
@@ -5377,8 +5367,6 @@ async fn run_client_loop(
                                             &config.appearance.status_bar_position,
                                             viewport_top,
                                             focused_pane_rect.as_ref(),
-                                            cols,
-                                            rows,
                                         )
                                         .await?
                                         {
@@ -5529,8 +5517,7 @@ async fn run_client_loop(
                                 // ScrollReset, so nothing else would repaint the
                                 // highlights away.
                                 if mode == Mode::Normal {
-                                    let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 // When entering Visual mode, scope to the
                                 // focused pane's bounds instead of the full
@@ -5643,7 +5630,7 @@ async fn run_client_loop(
                                 // Hide which-key when mode changes
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 // Returning to Normal from a visual/search
                                 // overlay: clear_overlay above hid the hardware
@@ -5688,7 +5675,7 @@ async fn run_client_loop(
                                 // Hide which-key when rename overlay activates
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 // Show the rename popup with empty text
                                 let target_str = match input.rename_overlay.as_ref().map(|o| &o.target) {
@@ -5716,9 +5703,9 @@ async fn run_client_loop(
                                 entries,
                                 shortcuts,
                             } => {
-                                let (c, r) = crossterm::terminal::size()?;
                                 whichkey.show(label, entries, shortcuts);
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
+                                let (c, r) = renderer.size();
                                 let commands = whichkey.render(c, r, &theme, which_key_position.clone());
                                 renderer.render_whichkey_overlay(&commands)?;
                                 renderer.flush()?;
@@ -5737,7 +5724,6 @@ async fn run_client_loop(
                                 // -- otherwise a resize would be forwarded to the
                                 // masked foreground server (resizing the wrong
                                 // panes) instead of the view's cells.
-                                let (c, r) = crossterm::terminal::size()?;
                                 // See the `Execute` arm: keep the client-local view
                                 // border style in step with the server's.
                                 if matches!(command, RemuxCommand::ToggleStyle) {
@@ -5762,8 +5748,6 @@ async fn run_client_loop(
                                         &config.appearance.status_bar_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
-                                        cols,
-                                        rows,
                                     )
                                     .await?;
                                 }
@@ -5834,14 +5818,15 @@ async fn run_client_loop(
                                 // keep resizing (re-shown over the repainted view
                                 // when a view consumed the command).
                                 whichkey.show(label, entries, shortcuts);
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
+                                let (c, r) = renderer.size();
                                 let commands = whichkey.render(c, r, &theme, which_key_position.clone());
                                 renderer.render_whichkey_overlay(&commands)?;
                                 renderer.flush()?;
                             }
                             InputAction::HideWhichKey => {
                                 whichkey.hide();
-                                renderer.clear_overlay(cols, rows)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                             }
                             InputAction::EditInEditor => {
@@ -5903,7 +5888,7 @@ async fn run_client_loop(
                                     })
                                     .await?;
                                 // Re-render to clear selection highlighting.
-                                renderer.clear_overlay(cols, rows)?;
+                                renderer.clear_overlay()?;
                                 // clear_overlay hides the hardware cursor; no
                                 // server frame necessarily follows the yank, so
                                 // put the real cursor back at its last position.
@@ -6036,7 +6021,7 @@ async fn run_client_loop(
                                 // Hide which-key when opening palette.
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 // Render the palette overlay.
                                 if let Some(ref palette) = input.command_palette {
@@ -6057,7 +6042,7 @@ async fn run_client_loop(
                                 // Re-render the palette overlay with updated state.
                                 if let Some(ref palette) = input.command_palette {
                                     let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_command_palette_overlay(c, r)?;
+                                    renderer.clear_command_palette_overlay()?;
                                     let draw_cmds = palette.render(c, r, &theme);
                                     renderer.render_command_palette_overlay(&draw_cmds)?;
                                 }
@@ -6067,8 +6052,7 @@ async fn run_client_loop(
                                 // Already handled via Execute action path.
                             }
                             InputAction::CommandPaletteClose => {
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_command_palette_overlay(c, r)?;
+                                renderer.clear_command_palette_overlay()?;
                                 renderer.flush()?;
                                 // Notify server of mode change.
                                 let mode_str = match input.mode {
@@ -6113,8 +6097,7 @@ async fn run_client_loop(
                                 // Send mode changed to NORMAL.
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                 // Clear overlay.
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 // clear_overlay hides the hardware cursor. This
                                 // search->Normal exit does not flow through the
                                 // ModeChanged(Normal) handler and, when
@@ -6179,7 +6162,7 @@ async fn run_client_loop(
                                 // Hide which-key when opening session manager.
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 // Seed the freshly-opened manager with the server
                                 // roster and current foreground.
@@ -6204,7 +6187,7 @@ async fn run_client_loop(
                                 // Hide which-key when opening the session manager.
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 // (This command usually arrives from the palette;
                                 // its overlay was torn down above.)
@@ -6228,7 +6211,7 @@ async fn run_client_loop(
                                     sm.set_roster(mgr.server_roster());
                                     sm.set_views(session_manager_views(&views));
                                     let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     let draw_cmds = sm.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                     renderer.flush()?;
@@ -6257,7 +6240,7 @@ async fn run_client_loop(
                                 if let Some(sm) = input.session_manager.as_mut() {
                                     sm.set_roster(mgr.server_roster());
                                     let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     let draw_cmds = sm.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                     renderer.flush()?;
@@ -6267,7 +6250,7 @@ async fn run_client_loop(
                                 log::debug!("input: RemoteDisconnect name={name}");
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 // The same body the session manager's `d y`
                                 // reaches, so the command cannot drift from the
@@ -6304,8 +6287,7 @@ async fn run_client_loop(
                                 }
                             }
                             InputAction::SessionManagerClose => {
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                                 // Notify server of mode change.
                                 mgr
@@ -6318,7 +6300,7 @@ async fn run_client_loop(
                                 // Re-render the session manager overlay.
                                 if let Some(ref sm) = input.session_manager {
                                     let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     let draw_cmds = sm.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                 }
@@ -6361,7 +6343,7 @@ async fn run_client_loop(
                                             sm.set_foreground(mgr.foreground().clone());
                                             sm.set_roster(mgr.server_roster());
                                             let (c, r) = crossterm::terminal::size()?;
-                                            renderer.clear_overlay(c, r)?;
+                                            renderer.clear_overlay()?;
                                             let draw_cmds = sm.render(c, r, &theme);
                                             renderer.render_whichkey_overlay(&draw_cmds)?;
                                             renderer.flush()?;
@@ -6401,8 +6383,7 @@ async fn run_client_loop(
                                     SessionManagerAction::SwitchSession { server, session } => {
                                         input.session_manager = None;
                                         input.mode = Mode::Normal;
-                                        let (c, r) = crossterm::terminal::size()?;
-                                        renderer.clear_overlay(c, r)?;
+                                        renderer.clear_overlay()?;
                                         renderer.flush()?;
                                         // Same jump path as the sidebar panel; see
                                         // `switch_to_target`.
@@ -6425,8 +6406,7 @@ async fn run_client_loop(
                                     SessionManagerAction::SwitchTab { server, session, tab_index } => {
                                         input.session_manager = None;
                                         input.mode = Mode::Normal;
-                                        let (c, r) = crossterm::terminal::size()?;
-                                        renderer.clear_overlay(c, r)?;
+                                        renderer.clear_overlay()?;
                                         renderer.flush()?;
                                         // Same jump path as the sidebar panel; see
                                         // `switch_to_target`.
@@ -6449,8 +6429,7 @@ async fn run_client_loop(
                                     SessionManagerAction::SwitchPane { server, session, tab_index, pane_id } => {
                                         input.session_manager = None;
                                         input.mode = Mode::Normal;
-                                        let (c, r) = crossterm::terminal::size()?;
-                                        renderer.clear_overlay(c, r)?;
+                                        renderer.clear_overlay()?;
                                         renderer.flush()?;
                                         // The jump itself is shared with the sidebar's
                                         // `PluginAction::JumpTo`; see `switch_to_target`.
@@ -6610,8 +6589,7 @@ async fn run_client_loop(
                                         // Closed exactly as a session jump closes it.
                                         input.session_manager = None;
                                         input.mode = Mode::Normal;
-                                        let (c, r) = crossterm::terminal::size()?;
-                                        renderer.clear_overlay(c, r)?;
+                                        renderer.clear_overlay()?;
                                         mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                         use crate::client::view::{resolve_view_entry, ViewEntry};
                                         let entry = resolve_view_entry(views.iter().map(|v| v.id), active_view, id);
@@ -6690,7 +6668,7 @@ async fn run_client_loop(
                                         input.view_picker = Some(crate::client::input::ViewPickerOverlay::new(names));
                                         if let Some(ref vp) = input.view_picker {
                                             let (c, r) = crossterm::terminal::size()?;
-                                            renderer.clear_overlay(c, r)?;
+                                            renderer.clear_overlay()?;
                                             let draw_cmds = vp.render(c, r, &theme);
                                             renderer.render_whichkey_overlay(&draw_cmds)?;
                                             renderer.flush()?;
@@ -6702,8 +6680,7 @@ async fn run_client_loop(
                                             .unwrap_or(false);
                                         input.session_manager = None;
                                         input.mode = Mode::Normal;
-                                        let (c, r) = crossterm::terminal::size()?;
-                                        renderer.clear_overlay(c, r)?;
+                                        renderer.clear_overlay()?;
                                         renderer.flush()?;
                                         if !has_sessions {
                                             break;
@@ -6717,7 +6694,7 @@ async fn run_client_loop(
                                 // Hide which-key popup
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 // Request session tree to get folder list
                                 mgr.send_foreground(ClientMessage::ListSessionTree).await?;
@@ -6734,15 +6711,14 @@ async fn run_client_loop(
                             InputAction::FolderSelectUpdate => {
                                 if let Some(ref fs) = input.folder_select {
                                     let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     let draw_cmds = fs.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                 }
                                 renderer.flush()?;
                             }
                             InputAction::FolderSelectConfirm { ref session, ref folder } => {
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                                 // Send the move command
                                 mgr.send_foreground(ClientMessage::Command(RemuxCommand::FolderMoveSession {
@@ -6752,15 +6728,14 @@ async fn run_client_loop(
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::FolderSelectClose => {
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::SessionSwitchOpen => {
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 // Query every connected server (local + remotes)
                                 // so the switcher aggregates all their sessions.
@@ -6795,7 +6770,7 @@ async fn run_client_loop(
                                         focused_pane_rect.as_ref(),
                                     )?;
                                 } else if let Some(ref ss) = input.session_switch {
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     let draw_cmds = ss.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                     renderer.flush()?;
@@ -6822,7 +6797,7 @@ async fn run_client_loop(
                                     )?;
                                 } else {
                                     if let Some(ref ss) = input.session_switch {
-                                        renderer.clear_overlay(c, r)?;
+                                        renderer.clear_overlay()?;
                                         let draw_cmds = ss.render(c, r, &theme);
                                         renderer.render_whichkey_overlay(&draw_cmds)?;
                                     }
@@ -6832,8 +6807,7 @@ async fn run_client_loop(
                             InputAction::SessionSwitchConfirm { server, session } => {
                                 input.session_switch = None;
                                 input.mode = Mode::Normal;
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                                 // Hand off to the target server (no-op when it is
                                 // already foreground) and attach. Re-attaching to
@@ -6871,10 +6845,9 @@ async fn run_client_loop(
                                 input.mode = Mode::Normal;
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                                 if attach_check.as_ref().is_some_and(AttachCheck::owes_attach) {
                                     log::debug!("Alt+o: dropped, an attach is still being settled");
@@ -6903,7 +6876,7 @@ async fn run_client_loop(
                             InputAction::AgentSwitchOpen => {
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 // Seeded from the lists already held, which are
                                 // current for every connection subscribed right
@@ -6935,7 +6908,7 @@ async fn run_client_loop(
                                         focused_pane_rect.as_ref(),
                                     )?;
                                 } else if let Some(ref sw) = input.agent_switch {
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     let draw_cmds = sw.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                     renderer.flush()?;
@@ -6959,7 +6932,7 @@ async fn run_client_loop(
                                         focused_pane_rect.as_ref(),
                                     )?;
                                 } else if let Some(ref sw) = input.agent_switch {
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     let draw_cmds = sw.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                     renderer.flush()?;
@@ -6968,8 +6941,7 @@ async fn run_client_loop(
                             InputAction::AgentSwitchConfirm(target) => {
                                 input.agent_switch = None;
                                 input.mode = Mode::Normal;
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                                 // The agents panel's jump, and the session
                                 // manager's: see `switch_to_target`.
@@ -6988,8 +6960,7 @@ async fn run_client_loop(
                                 ).await?;
                             }
                             InputAction::AgentSwitchClose => {
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                                 input.agent_switch = None;
                                 input.mode = Mode::Normal;
@@ -6998,7 +6969,7 @@ async fn run_client_loop(
                             InputAction::TabPickerOpen => {
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 if let Some(av) = active_view {
                                     // A view's cells alias panes of any session
@@ -7032,7 +7003,7 @@ async fn run_client_loop(
                                     move_follow.picker_opened();
                                     let picker = TabPickerOverlay::new(conn);
                                     let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     renderer.render_whichkey_overlay(&picker.render(c, r, &theme))?;
                                     renderer.flush()?;
                                     input.tab_picker = Some(picker);
@@ -7042,14 +7013,13 @@ async fn run_client_loop(
                             InputAction::TabPickerUpdate => {
                                 if let Some(ref tp) = input.tab_picker {
                                     let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     renderer.render_whichkey_overlay(&tp.render(c, r, &theme))?;
                                     renderer.flush()?;
                                 }
                             }
                             InputAction::TabPickerConfirm { ref conn, ref session, tab_id, ref current } => {
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                                 let cmd = ClientMessage::Command(RemuxCommand::PaneMoveToTabTarget {
                                     tab_id,
@@ -7072,15 +7042,14 @@ async fn run_client_loop(
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::TabPickerClose => {
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::LayoutSwitchOpen => {
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 // Views live on the local server, whatever
                                 // the foreground connection is.
@@ -7092,7 +7061,7 @@ async fn run_client_loop(
                                 mgr.send(&conn, request).await?;
                                 if let Some(ref ls) = input.layout_switch {
                                     let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     renderer.render_whichkey_overlay(&ls.render(c, r, &theme))?;
                                     renderer.flush()?;
                                 }
@@ -7101,14 +7070,13 @@ async fn run_client_loop(
                             InputAction::LayoutSwitchUpdate => {
                                 if let Some(ref ls) = input.layout_switch {
                                     let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     renderer.render_whichkey_overlay(&ls.render(c, r, &theme))?;
                                     renderer.flush()?;
                                 }
                             }
                             InputAction::LayoutSwitchConfirm { ref conn, target, ref name } => {
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                                 if let Err(e) = mgr.send(conn, target.set_request(name.clone())).await {
                                     log::info!("layout switcher: {target:?} switch not sent to {conn:?}: {e}");
@@ -7133,14 +7101,12 @@ async fn run_client_loop(
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::LayoutSwitchClose => {
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::SessionSwitchClose => {
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.flush()?;
                                 input.session_switch = None;
                                 input.mode = Mode::Normal;
@@ -7197,7 +7163,6 @@ async fn run_client_loop(
                                 // and reset mode to Normal. Resolve the switcher
                                 // index against the (possibly-since-rebuilt) cache and
                                 // enter that view by id.
-                                let (c, r) = crossterm::terminal::size()?;
                                 if index < views.len() {
                                     enter_view(
                                         mgr,
@@ -7222,14 +7187,14 @@ async fn run_client_loop(
                                 } else {
                                     // Stale index (view removed under us): just
                                     // clear the switcher popup.
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     renderer.flush()?;
                                 }
                             }
                             InputAction::ViewAddPaneOpen => {
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 // Resolve the current focused pane asynchronously
                                 // (the client doesn't track it): ask the foreground
@@ -7244,7 +7209,7 @@ async fn run_client_loop(
                                 input.view_picker = Some(crate::client::input::ViewPickerOverlay::new(names));
                                 if let Some(ref vp) = input.view_picker {
                                     let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     let draw_cmds = vp.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                     renderer.flush()?;
@@ -7253,7 +7218,7 @@ async fn run_client_loop(
                             InputAction::ViewPickerUpdate => {
                                 if let Some(ref vp) = input.view_picker {
                                     let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     let draw_cmds = vp.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                     renderer.flush()?;
@@ -7262,7 +7227,6 @@ async fn run_client_loop(
                             InputAction::ViewPickerClose => {
                                 pending_view_add = false;
                                 pending_panes.clear();
-                                let (c, r) = crossterm::terminal::size()?;
                                 if let Some(av) = active_view {
                                     paint_view(
                                         &mut renderer,
@@ -7278,12 +7242,11 @@ async fn run_client_loop(
                                         focused_pane_rect.as_ref(),
                                     )?;
                                 } else {
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     renderer.flush()?;
                                 }
                             }
                             InputAction::ViewPickerConfirm { view } => {
-                                let (c, r) = crossterm::terminal::size()?;
                                 pending_view_add = false;
                                 let panes = std::mem::take(&mut pending_panes);
                                 if panes.is_empty() {
@@ -7306,7 +7269,7 @@ async fn run_client_loop(
                                             focused_pane_rect.as_ref(),
                                         )?;
                                     } else {
-                                        renderer.clear_overlay(c, r)?;
+                                        renderer.clear_overlay()?;
                                         renderer.flush()?;
                                     }
                                 } else {
@@ -7362,7 +7325,7 @@ async fn run_client_loop(
                                                     focused_pane_rect.as_ref(),
                                                 )?;
                                             } else {
-                                                renderer.clear_overlay(c, r)?;
+                                                renderer.clear_overlay()?;
                                                 renderer.flush()?;
                                             }
                                         }
@@ -7376,7 +7339,7 @@ async fn run_client_loop(
                                                 ClientMessage::ViewCreate { name },
                                             )
                                             .await?;
-                                            renderer.clear_overlay(c, r)?;
+                                            renderer.clear_overlay()?;
                                             renderer.flush()?;
                                         }
                                     }
@@ -7405,8 +7368,6 @@ async fn run_client_loop(
                                         &config.appearance.status_bar_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
-                                        cols,
-                                        rows,
                                     )
                                     .await?;
                                 }
@@ -7434,7 +7395,7 @@ async fn run_client_loop(
                             InputAction::ViewLayoutNext => {
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 if let Some(av) = active_view {
                                     // Cycle the SHARED layout: intent the local server;
@@ -7466,7 +7427,7 @@ async fn run_client_loop(
                                 // screen back to the foreground session via Resize.
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 if let Some(av) = active_view {
                                     unsubscribe_view_cells(mgr, &views[av]).await?;
@@ -7505,7 +7466,7 @@ async fn run_client_loop(
                                 // displaying it does the same.
                                 if whichkey.visible {
                                     whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 if let Some(av) = active_view {
                                     let id = views[av].id;
@@ -8709,8 +8670,6 @@ async fn run_client_loop(
                                 &which_key_position,
                                 viewport_top,
                                 focused_pane_rect.as_ref(),
-                                cols,
-                                rows,
                             )?;
                             renderer.flush()?;
                         }
@@ -8763,8 +8722,6 @@ async fn run_client_loop(
                                 &which_key_position,
                                 viewport_top,
                                 focused_pane_rect.as_ref(),
-                                cols,
-                                rows,
                             )?;
                             renderer.flush()?;
                         }
@@ -8803,8 +8760,6 @@ async fn run_client_loop(
                                 &which_key_position,
                                 viewport_top,
                                 focused_pane_rect.as_ref(),
-                                cols,
-                                rows,
                             )?;
                             renderer.flush()?;
                         }
@@ -8841,8 +8796,7 @@ async fn run_client_loop(
                                 if let Some(target) = target {
                                     if !manager_open {
                                         input.mode = Mode::Normal;
-                                        let (c, r) = crossterm::terminal::size()?;
-                                        renderer.clear_overlay(c, r)?;
+                                        renderer.clear_overlay()?;
                                         renderer.flush()?;
                                     }
                                     // Standard switch dance (mirrors the session-manager
@@ -9227,7 +9181,7 @@ async fn run_client_loop(
                                 // buffer: a shorter list would leave the old
                                 // popup's last rows on screen.
                                 if switcher_open {
-                                    renderer.clear_overlay(tc, tr)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref())?;
                                 relay_overlays(
@@ -9238,8 +9192,6 @@ async fn run_client_loop(
                                     &which_key_position,
                                     viewport_top,
                                     focused_pane_rect.as_ref(),
-                                    tc,
-                                    tr,
                                 )?;
                             }
                             renderer.flush()?;
@@ -9291,8 +9243,6 @@ async fn run_client_loop(
                                 &which_key_position,
                                 viewport_top,
                                 focused_pane_rect.as_ref(),
-                                tc,
-                                tr,
                             )?;
                         }
                         renderer.flush()?;
@@ -9417,8 +9367,6 @@ async fn run_client_loop(
                                     &which_key_position,
                                     viewport_top,
                                     focused_pane_rect.as_ref(),
-                                    tc,
-                                    tr,
                                 )?;
                             }
                         }
@@ -9450,7 +9398,7 @@ async fn run_client_loop(
                                 sw.set_current(current);
                                 if active_view.is_none() {
                                     let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                     let draw_cmds = sw.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                     renderer.flush()?;
@@ -9460,7 +9408,7 @@ async fn run_client_loop(
                         if let Some(picker) = input.tab_picker.as_mut() {
                             if let Some(verdict) = picker.apply_tree_from(&src, &folders, &unfiled) {
                                 let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 match verdict {
                                     TabPickerTree::Offer => {
                                         renderer.render_whichkey_overlay(&picker.render(c, r, &theme))?;
@@ -9517,7 +9465,7 @@ async fn run_client_loop(
                                 )?;
                             } else if let Some(ref ss) = input.session_switch {
                                 let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 let draw_cmds = ss.render(c, r, &theme);
                                 renderer.render_whichkey_overlay(&draw_cmds)?;
                             }
@@ -9547,7 +9495,7 @@ async fn run_client_loop(
                             // Render the popup
                             if let Some(ref fs) = input.folder_select {
                                 let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 let draw_cmds = fs.render(c, r, &theme);
                                 renderer.render_whichkey_overlay(&draw_cmds)?;
                             }
@@ -9591,7 +9539,7 @@ async fn run_client_loop(
                                 }
                             }
                             let (c, r) = crossterm::terminal::size()?;
-                            renderer.clear_overlay(c, r)?;
+                            renderer.clear_overlay()?;
                             let draw_cmds = sm.render(c, r, &theme);
                             renderer.render_whichkey_overlay(&draw_cmds)?;
                         }
@@ -9756,7 +9704,7 @@ async fn run_client_loop(
                         if let Some(ls) = input.layout_switch.as_mut() {
                             if ls.apply_from(&src, request, layouts, current, popup_open) {
                                 let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 renderer.render_whichkey_overlay(&ls.render(c, r, &theme))?;
                                 renderer.flush()?;
                             }
@@ -9956,8 +9904,7 @@ async fn run_client_loop(
                                 log::debug!("layout switcher: closed, its view was deleted");
                                 input.layout_switch = None;
                                 input.mode = Mode::Normal;
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
+                                renderer.clear_overlay()?;
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
 
@@ -10091,8 +10038,6 @@ async fn run_client_loop(
                                     &which_key_position,
                                     viewport_top,
                                     focused_pane_rect.as_ref(),
-                                    tc,
-                                    tr,
                                 )?;
                                 renderer.flush()?;
                             }
@@ -10119,7 +10064,7 @@ async fn run_client_loop(
                                         focused_pane_rect.as_ref(),
                                     )?;
                                 } else {
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 if let Some(ref ss) = input.session_switch {
                                     let draw_cmds = ss.render(c, r, &theme);
@@ -10153,7 +10098,7 @@ async fn run_client_loop(
                                         focused_pane_rect.as_ref(),
                                     )?;
                                 } else {
-                                    renderer.clear_overlay(c, r)?;
+                                    renderer.clear_overlay()?;
                                 }
                                 if let Some(ref sm) = input.session_manager {
                                     let draw_cmds = sm.render(c, r, &theme);
@@ -10399,7 +10344,7 @@ async fn run_client_loop(
                     if input.session_manager.is_some() {
                         if let Some(sm) = input.session_manager.as_ref() {
                             let (c, r) = crossterm::terminal::size()?;
-                            renderer.clear_overlay(c, r)?;
+                            renderer.clear_overlay()?;
                             let draw_cmds = sm.render(c, r, &theme);
                             renderer.render_whichkey_overlay(&draw_cmds)?;
                             renderer.flush()?;
