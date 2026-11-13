@@ -58,9 +58,10 @@ pub struct Cell {
     /// case of a non-linked cell.
     pub hyperlink: Option<String>,
     /// Filled by an erase or a scroll rather than written. Such a blank may
-    /// carry the current background (back-colour erase), and reflow must still
-    /// trim it as padding: counting a coloured erase as text would make every
-    /// erased row as long as the old width and wrap it when the pane narrows.
+    /// carry the current background (back-colour erase). Reflow treats it as
+    /// padding when it decides where a line ends, then puts it back: counting
+    /// a coloured erase as text would make every erased row as long as the old
+    /// width and wrap it when the pane narrows.
     pub erased: bool,
 }
 
@@ -90,7 +91,8 @@ impl Default for Cell {
 /// [`Screen::reflow`] rejoins consecutive rows into one logical line while
 /// `wrapped` is true, so a stale flag would splice two *unrelated* lines
 /// together. Every path that blanks, inserts, deletes or scrolls a row must
-/// therefore clear it (see `Row::new`, which is the single blank-row factory).
+/// therefore clear it (`Row::new` makes a default blank row, `Screen::blank_row`
+/// one in the current background).
 ///
 /// `Deref`/`DerefMut` to the cell vector keep the (many) `row[c]`, `row.len()`,
 /// `row.iter()` call sites reading exactly as they did when a row was a plain
@@ -632,16 +634,33 @@ impl Screen {
 
     // -- Reflow -------------------------------------------------------------
 
-    /// Whether a cell is mere padding, i.e. indistinguishable from an empty
-    /// cell once rendered.
+    /// Whether a cell is padding rather than text, for deciding where a logical
+    /// line ends.
     ///
     /// Only such cells may be trimmed off the end of a logical line. A space
     /// with a non-default background or under reverse video is *real content*
     /// (colored prompts, `ls` output, status bars) and has to survive reflow.
+    ///
+    /// An erased blank counts as padding whatever its background, because it
+    /// says where nothing was written, not what was. Reflow uses that to decide
+    /// where a line ends and whether it wraps, and then puts the trimmed tail
+    /// back on the line's last row so its colour survives (see `pad_template`).
+    /// A continuation cell is never padding: it belongs to the glyph before it.
     fn is_padding(cell: &Cell) -> bool {
         cell.c == ' '
+            && cell.width == 1
             && cell.combining.is_empty()
             && (cell.erased || (cell.attrs.bg == Color::Default && !cell.attrs.reverse))
+    }
+
+    /// The cell that continues a trimmed tail past its own end: its last cell
+    /// when that came from an erase, so a line erased in colour to the edge
+    /// stays coloured to the new edge, and a default blank otherwise.
+    fn pad_template(tail: &[Cell]) -> Cell {
+        match tail.last() {
+            Some(cell) if cell.erased => cell.clone(),
+            _ => Cell::default(),
+        }
     }
 
     /// The cell every erase, insert, delete and scroll fills with. It takes the
@@ -687,10 +706,15 @@ impl Screen {
     /// `cursor_at` is an index into `cells` (or `cells.len()` for "just past the
     /// end of the line"). The matching `(row, col)` within the produced rows is
     /// returned so the caller can put the cursor back on the same character.
+    ///
+    /// `tail` is the padding reflow trimmed off the line. It goes back on the
+    /// last row as far as it fits, never onto a row of its own, and the row is
+    /// then filled out with `pad_template(tail)`.
     fn split_logical(
         cells: &[Cell],
         cols: u16,
         cursor_at: Option<usize>,
+        tail: &[Cell],
     ) -> (Vec<Row>, Option<(usize, usize)>) {
         let width = cols as usize;
         let mut out: Vec<Row> = Vec::new();
@@ -756,7 +780,13 @@ impl Screen {
         if cursor_at == Some(cells.len()) {
             cursor_pos = Some((out.len(), used));
         }
-        out.push(Self::finish_row(row, cols, false));
+        let room = width.saturating_sub(used);
+        row.extend(tail.iter().take(room).cloned());
+        row.resize(width, Self::pad_template(tail));
+        out.push(Row {
+            cells: row,
+            wrapped: false,
+        });
 
         (out, cursor_pos)
     }
@@ -782,11 +812,16 @@ impl Screen {
         //    information, and keeping them means every shrink shoves real
         //    content off into the scrollback -- so a zoom/unzoom cycle would
         //    permanently inflate it with blanks.
+        //    A dropped row that an erase coloured comes back in step 6 with the
+        //    same background, as the padding rows at the bottom of the grid.
         let mut end = stream.len();
         while end > cursor_abs + 1 && stream[end - 1].cells.iter().all(Self::is_padding) {
             end -= 1;
         }
-        stream.truncate(end);
+        let dropped_pads: Vec<Cell> = stream
+            .drain(end..)
+            .map(|row| Self::pad_template(&row.cells))
+            .collect();
 
         // 3. Join rows into logical lines: a row starts a new one unless the row
         //    before it is flagged `wrapped`. The cursor's *logical* coordinates
@@ -819,15 +854,19 @@ impl Screen {
         // 4. Trim the padding off the end of each logical line. The cursor's own
         //    line is never trimmed past the cursor: it usually sits just after
         //    the text (shell prompt), and clipping there would drag it left.
+        //    The trimmed padding is kept as the line's tail for step 5.
+        let mut tails: Vec<Vec<Cell>> = Vec::with_capacity(logicals.len());
         for (li, logical) in logicals.iter_mut().enumerate() {
             let keep = if li == cursor_logical {
                 cursor_off.min(logical.len())
             } else {
                 0
             };
-            while logical.len() > keep && logical.last().map(Self::is_padding).unwrap_or(false) {
-                logical.pop();
+            let mut cut = logical.len();
+            while cut > keep && Self::is_padding(&logical[cut - 1]) {
+                cut -= 1;
             }
+            tails.push(logical.split_off(cut));
         }
         cursor_off = cursor_off.min(logicals[cursor_logical].len());
 
@@ -840,7 +879,7 @@ impl Screen {
             } else {
                 None
             };
-            let (chunks, pos) = Self::split_logical(logical, cols, at);
+            let (chunks, pos) = Self::split_logical(logical, cols, at, &tails[li]);
             if let Some((r, c)) = pos {
                 cursor_target = Some((new_lines.len() + r, c));
             }
@@ -855,8 +894,13 @@ impl Screen {
         let grid_start = total.saturating_sub(rows_us);
         let mut grid = new_lines.split_off(grid_start);
         let mut scrollback: VecDeque<Row> = VecDeque::from(new_lines);
+        let mut pads = dropped_pads.into_iter();
         while grid.len() < rows_us {
-            grid.push(Row::new(cols));
+            let pad = pads.next().unwrap_or_default();
+            grid.push(Row {
+                cells: vec![pad; cols as usize],
+                wrapped: false,
+            });
         }
         while scrollback.len() > self.scrollback_limit {
             scrollback.pop_front();
@@ -1613,6 +1657,8 @@ impl vte::Perform for Screen {
                                     self.saved_hyperlink = self.current_hyperlink.clone();
                                     self.saved_scroll_top = self.scroll_top;
                                     self.saved_scroll_bottom = self.scroll_bottom;
+                                    // As in tmux, the alternate screen starts
+                                    // in the default background, not the BCE one.
                                     self.grid = Self::make_grid(self.cols, self.rows);
                                     self.cursor_x = 0;
                                     self.cursor_y = 0;
@@ -1627,6 +1673,8 @@ impl vte::Perform for Screen {
                                 self.saved_scrollback = Some(std::mem::take(&mut self.scrollback));
                                 self.saved_scroll_top = self.scroll_top;
                                 self.saved_scroll_bottom = self.scroll_bottom;
+                                // As in tmux, the alternate screen starts in the
+                                // default background, not the BCE one.
                                 self.grid = Self::make_grid(self.cols, self.rows);
                                 self.cursor_x = 0;
                                 self.cursor_y = 0;
@@ -3424,11 +3472,56 @@ mod tests {
     #[test]
     fn an_erase_with_the_default_background_leaves_a_default_blank() {
         let mut s = Screen::new(10, 2, 100);
-        s.process_output(b"0123456789\x1b[1;4H\x1b[K");
+        // Bold, underline and reverse are set but the background is default,
+        // so the erased cells must carry none of them.
+        s.process_output(b"0123456789\x1b[1;4;7m\x1b[1;4H\x1b[K");
         for x in 3..10 {
-            assert_eq!(s.grid[0][x].attrs, CellAttrs::default());
-            assert_eq!(s.grid[0][x].c, ' ');
+            let cell = &s.grid[0][x];
+            assert_eq!(cell.attrs, CellAttrs::default(), "col {x}");
+            assert_eq!(cell.c, ' ', "col {x}");
+            assert!(cell.erased, "col {x} comes from an erase");
         }
+    }
+
+    #[test]
+    fn reflow_keeps_a_coloured_erase_through_narrowing_and_widening() {
+        let mut s = Screen::new(20, 3, 100);
+        s.process_output(b"ab\x1b[44m\x1b[K\x1b[0m\r\ncd");
+
+        for (cols, when) in [
+            (15, "after narrowing to 15"),
+            (20, "after widening back to 20"),
+        ] {
+            s.resize(cols, 3);
+            assert_eq!(s.grid[0][5].attrs.bg, Color::Indexed(4), "col 5 {when}");
+            assert_eq!(
+                s.grid[0][cols as usize - 1].attrs.bg,
+                Color::Indexed(4),
+                "the last column {when}"
+            );
+            assert!(!s.grid[0].wrapped, "row 0 does not wrap {when}");
+            assert_eq!(row_text(&s, 0).trim_end(), "ab", "{when}");
+            assert_eq!(row_text(&s, 1).trim_end(), "cd", "{when}");
+        }
+    }
+
+    #[test]
+    fn reflow_keeps_the_colour_of_erased_rows_below_the_cursor() {
+        let mut s = Screen::new(20, 4, 100);
+        // ED 0 in blue below the cursor's row, then the cursor goes home.
+        s.process_output(b"ab\r\n\x1b[44m\x1b[J\x1b[0m\x1b[H");
+
+        s.resize(15, 4);
+
+        for r in 1..4 {
+            assert_eq!(s.grid[r][0].attrs.bg, Color::Indexed(4), "row {r} col 0");
+            assert_eq!(
+                s.grid[r][14].attrs.bg,
+                Color::Indexed(4),
+                "row {r} last col"
+            );
+        }
+        assert_eq!(row_text(&s, 0).trim_end(), "ab");
     }
 
     #[test]

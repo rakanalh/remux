@@ -24,7 +24,8 @@ What it covers:
   4  the client stays alive and neither log holds a panic
 
 A key counts as drawn once the Neovim pane has changed and then reads the same
-twice in a row. A pane that never settles is a failure. Every process the
+twice in a row. A pane that never changes (a lost key) or never settles is a
+failure. Every process the
 harness starts gets its HOME and XDG directories, cache included, inside the
 run dir. Skipped (exit 0, with a SKIP line) when `nvim` is not on PATH.
 
@@ -73,11 +74,18 @@ def pane_region(t):
 
 
 def press(t, key, label):
-    """Send `key`, then wait until the pane has changed and reads the same twice."""
+    """Send `key`, then wait until the pane has changed and reads the same twice.
+
+    Every key the harness sends moves the cursor, so a pane that never changes
+    means the key was lost, and that is a failure.
+    """
     before = pane_region(t)
     t.send(key, 0)
     deadline = time.time() + CHANGE_WAIT
-    while time.time() < deadline and pane_region(t) == before:
+    while pane_region(t) == before:
+        if time.time() > deadline:
+            check(False, f"{label}: the pane changed within {CHANGE_WAIT}s")
+            return
         t.pump(POLL)
     last = pane_region(t)
     deadline = time.time() + SETTLE_TIMEOUT
