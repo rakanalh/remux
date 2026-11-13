@@ -1020,6 +1020,19 @@ impl Screen {
         }
     }
 
+    /// When `x` is the continuation of a wide glyph, blank the whole glyph, so
+    /// that an insert or delete splitting it there moves no lone half.
+    fn break_wide_at(&mut self, row: usize, x: usize) {
+        if self
+            .grid
+            .get(row)
+            .and_then(|line| line.get(x))
+            .is_some_and(|c| c.width == 0)
+        {
+            self.erase_cells(row, x, x + 1);
+        }
+    }
+
     /// Perform a DECAWM autowrap: mark the row the cursor is leaving as
     /// continuing onto the next one, then move to column 0 of that next row
     /// (scrolling the region when we were sitting on its last line).
@@ -1546,35 +1559,44 @@ impl vte::Perform for Screen {
             }
             // ICH - Insert Characters
             '@' => {
+                // As in xterm, the shifted row no longer ends in the character
+                // that left the wrap pending.
+                self.pending_wrap = false;
                 let n = Self::csi_param(params, 0, 1) as usize;
                 let row = self.cursor_y as usize;
                 let col = self.cursor_x as usize;
-                if row < self.grid.len() {
+                if row < self.grid.len() && col < self.grid[row].len() {
+                    let len = self.grid[row].len();
+                    let n = n.min(len - col);
+                    // As tmux does: break a wide glyph the cursor sits inside,
+                    // and the one the first dropped cell belongs to, so the
+                    // shift neither moves a lone half nor drops a continuation
+                    // off the row behind a lead left in the last column.
+                    self.break_wide_at(row, col);
+                    self.break_wide_at(row, len - n);
                     let blank = self.blank();
-                    let cols = self.cols as usize;
                     let line = &mut self.grid[row];
-                    for _ in 0..n {
-                        if col < line.len() {
-                            line.insert(col, blank.clone());
-                            line.truncate(cols);
-                        }
-                    }
+                    line.splice(col..col, std::iter::repeat_n(blank, n));
+                    line.truncate(len);
                 }
             }
             // DCH - Delete Characters
             'P' => {
+                self.pending_wrap = false;
                 let n = Self::csi_param(params, 0, 1) as usize;
                 let row = self.cursor_y as usize;
                 let col = self.cursor_x as usize;
-                if row < self.grid.len() {
+                if row < self.grid.len() && col < self.grid[row].len() {
+                    let len = self.grid[row].len();
+                    let n = n.min(len - col);
+                    // Break the glyph the cursor sits inside, and the one whose
+                    // continuation the deletion would pull to the cursor.
+                    self.break_wide_at(row, col);
+                    self.break_wide_at(row, col + n);
                     let blank = self.blank();
                     let line = &mut self.grid[row];
-                    for _ in 0..n {
-                        if col < line.len() {
-                            line.remove(col);
-                            line.push(blank.clone());
-                        }
-                    }
+                    line.drain(col..col + n);
+                    line.resize(len, blank);
                 }
             }
             // SU - Scroll Up
@@ -3170,6 +3192,141 @@ mod tests {
             !s.grid[0].wrapped,
             "an erase that reaches the row end ends the line"
         );
+    }
+
+    /// Every wide lead on row `r` is followed by its continuation, and every
+    /// continuation follows a lead: the client never paints a width-0 cell, so
+    /// a lone half leaves that column showing whatever was drawn there before.
+    fn assert_no_split_glyph(s: &Screen, r: usize, op: &str) {
+        let line = &s.grid[r];
+        for x in 0..line.len() {
+            match line[x].width {
+                2 => assert!(
+                    line.get(x + 1).is_some_and(|c| c.width == 0),
+                    "{op}: the lead at col {x} has no continuation"
+                ),
+                0 => assert!(
+                    x > 0 && line[x - 1].width == 2,
+                    "{op}: the continuation at col {x} has no lead"
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn ich_at_a_continuation_blanks_the_glyph_it_splits() {
+        let mut s = Screen::new(10, 2, 100);
+        s.process_output("a中b".as_bytes());
+        s.process_output(b"\x1b[1;3H\x1b[@");
+        assert_no_split_glyph(&s, 0, "ICH at a continuation");
+        assert_eq!(row_text(&s, 0).trim_end(), "a   b");
+    }
+
+    #[test]
+    fn dch_at_a_continuation_blanks_the_glyph_it_splits() {
+        let mut s = Screen::new(10, 2, 100);
+        s.process_output("a中b".as_bytes());
+        s.process_output(b"\x1b[1;3H\x1b[P");
+        assert_no_split_glyph(&s, 0, "DCH at a continuation");
+        assert_eq!(row_text(&s, 0).trim_end(), "a b");
+    }
+
+    #[test]
+    fn ich_that_pushes_a_lead_into_the_last_column_blanks_it() {
+        let mut s = Screen::new(6, 2, 100);
+        // 中 sits at cols 3-4. Two inserted cells would leave its lead in the
+        // last column and push its continuation off the row.
+        s.process_output("abc中d".as_bytes());
+        s.process_output(b"\x1b[1;1H\x1b[2@");
+        assert_no_split_glyph(&s, 0, "ICH pushing a lead to the margin");
+        assert_eq!(row_text(&s, 0), "  abc ");
+    }
+
+    #[test]
+    fn dch_that_pulls_a_continuation_to_the_cursor_blanks_it() {
+        let mut s = Screen::new(10, 2, 100);
+        // Deleting 中's lead alone would pull its continuation to col 1.
+        s.process_output("a中b".as_bytes());
+        s.process_output(b"\x1b[1;2H\x1b[P");
+        assert_no_split_glyph(&s, 0, "DCH pulling a continuation");
+        assert_eq!(row_text(&s, 0).trim_end(), "a b");
+
+        // The same with a span that ends inside the glyph.
+        let mut s = Screen::new(10, 2, 100);
+        s.process_output("ab中c".as_bytes());
+        s.process_output(b"\x1b[1;2H\x1b[2P");
+        assert_no_split_glyph(&s, 0, "DCH ending inside a glyph");
+        assert_eq!(row_text(&s, 0).trim_end(), "a c");
+    }
+
+    #[test]
+    fn ich_and_dch_clamp_a_count_past_the_row_end() {
+        // A count far past the row must be clamped to the columns left, or
+        // `len - n` underflows (ICH) and the drain range runs off the row (DCH):
+        // pane output is untrusted, so either would take the server down.
+        for (op, seq) in [
+            ("ICH", b"\x1b[1;8H\x1b[500@"),
+            ("DCH", b"\x1b[1;8H\x1b[500P"),
+        ] {
+            let mut s = Screen::new(10, 2, 100);
+            s.process_output(b"0123456789");
+            s.process_output(seq);
+            assert_eq!(row_text(&s, 0), "0123456   ", "{op}");
+            assert_eq!(s.grid[0].len(), 10, "{op} keeps the row length");
+        }
+        // With a wide glyph at cols 7-8 both breaks run with the clamped count.
+        for (op, seq) in [
+            ("ICH", b"\x1b[1;9H\x1b[500@"),
+            ("DCH", b"\x1b[1;9H\x1b[500P"),
+        ] {
+            let mut s = Screen::new(10, 2, 100);
+            s.process_output("0123456中9".as_bytes());
+            s.process_output(seq);
+            assert_no_split_glyph(&s, 0, op);
+            assert_eq!(row_text(&s, 0), "0123456   ", "{op}");
+            assert_eq!(s.grid[0].len(), 10, "{op} keeps the row length");
+        }
+    }
+
+    #[test]
+    fn ich_with_a_zero_count_inserts_one_cell() {
+        let mut s = Screen::new(10, 2, 100);
+        s.process_output(b"abc\x1b[1;2H\x1b[0@");
+        assert_eq!(row_text(&s, 0).trim_end(), "a bc");
+    }
+
+    #[test]
+    fn dch_with_a_zero_count_deletes_one_cell() {
+        let mut s = Screen::new(10, 2, 100);
+        s.process_output(b"abc\x1b[1;2H\x1b[0P");
+        assert_eq!(row_text(&s, 0).trim_end(), "ac");
+    }
+
+    #[test]
+    fn ich_and_dch_cancel_a_pending_wrap() {
+        for (op, seq) in [("ICH", b"\x1b[@X"), ("DCH", b"\x1b[PX")] {
+            let mut s = Screen::new(10, 3, 100);
+            s.process_output(b"0123456789");
+            assert!(s.pending_wrap, "{op}: a full row leaves the wrap pending");
+            s.process_output(seq);
+            assert_eq!(s.grid[0][9].c, 'X', "{op}: X lands in the last column");
+            assert_eq!(row_text(&s, 1).trim_end(), "", "{op}: nothing wrapped");
+        }
+    }
+
+    #[test]
+    fn ich_and_dch_move_whole_wide_glyphs_unchanged() {
+        let mut s = Screen::new(10, 2, 100);
+        s.process_output("a中b".as_bytes());
+        s.process_output(b"\x1b[1;1H\x1b[2@");
+        assert_no_split_glyph(&s, 0, "ICH before a glyph");
+        assert_eq!((s.grid[0][3].c, s.grid[0][3].width), ('中', 2));
+        s.process_output(b"\x1b[1;1H\x1b[2P");
+        assert_no_split_glyph(&s, 0, "DCH before a glyph");
+        assert_eq!((s.grid[0][1].c, s.grid[0][1].width), ('中', 2));
+        // A continuation cell holds a space, so row_text shows one after 中.
+        assert_eq!(row_text(&s, 0).trim_end(), "a中 b");
     }
 
     #[test]
