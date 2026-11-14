@@ -408,17 +408,17 @@ pub fn status_bar_rect(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16)
 /// frame, at the SAME column: both bars are laid out from column 0 by the same
 /// code, so the server's tab hit regions line up with what the user clicked.
 ///
-/// The server's bar row is the last row of the frame the client was sent,
-/// `frame_rows - 1`, and NOT the content rect's last row. The two differ when
-/// a smaller client shares the session, because the server then composites
-/// every frame at the smallest attached size. A `frame_rows` of 0 means no
-/// frame has arrived yet, and the content rect's last row stands in for it.
-/// The row is still clamped into the content rect, because the last frame can
-/// be TALLER than it for a moment: after the terminal shrinks and before the
-/// next frame, and after a View closes, whose composite set `frame_rows`.
+/// `frame` is the `(cols, rows)` of the last server frame. The server's bar
+/// row is that frame's last row, and NOT the content rect's last row. The two
+/// differ when a smaller client shares the session, because the server then
+/// composites every frame at the smallest attached size. `None` means no frame
+/// has arrived yet, and the content rect's last row stands in for it. The row
+/// is still clamped into the content rect, because the last frame can be
+/// TALLER than it for a moment, after the terminal shrinks and before the next
+/// frame.
 pub fn content_point(
     content: Rect,
-    frame_rows: u16,
+    frame: Option<(u16, u16)>,
     term_cols: u16,
     term_rows: u16,
     col: u16,
@@ -427,10 +427,7 @@ pub fn content_point(
     let last_x = content.width.saturating_sub(1);
     let last_y = content.height.saturating_sub(1);
     if status_bar_owned(content, term_cols, term_rows) && row + 1 == term_rows {
-        let bar_y = match frame_rows {
-            0 => last_y,
-            n => (n - 1).min(last_y),
-        };
+        let bar_y = frame.map_or(last_y, |(_, rows)| rows.saturating_sub(1).min(last_y));
         return (col.min(last_x), bar_y);
     }
     (
@@ -444,20 +441,18 @@ pub fn content_point(
 /// server's only as wide as the frame it sent, which is the content rect or,
 /// with a smaller client on the session, narrower. Nothing on the server
 /// answers a press there; [`content_point`] would clamp it onto the server
-/// bar's last column instead. A `frame_cols` of 0 means no frame has arrived
-/// yet, and the content rect's width stands in for it.
+/// bar's last column instead. `frame` is the `(cols, rows)` of the last server
+/// frame; `None` means no frame has arrived yet, and the content rect's width
+/// stands in for it.
 pub fn past_the_server_bar(
     content: Rect,
-    frame_cols: u16,
+    frame: Option<(u16, u16)>,
     term_cols: u16,
     term_rows: u16,
     col: u16,
     row: u16,
 ) -> bool {
-    let server_bar_width = match frame_cols {
-        0 => content.width,
-        n => n.min(content.width),
-    };
+    let server_bar_width = frame.map_or(content.width, |(cols, _)| cols.min(content.width));
     status_bar_owned(content, term_cols, term_rows)
         && row + 1 == term_rows
         && col >= server_bar_width
@@ -1785,16 +1780,49 @@ mod tests {
         let content = content_rect(&sbs, 100, 30);
         // Column 5 is under the left sidebar in every row but the last. On the
         // bar it is column 5 of the server's bar row, NOT content column 0.
-        assert_eq!(content_point(content, 24, 100, 30, 5, 29), (5, 23));
+        assert_eq!(
+            content_point(content, Some((80, 24)), 100, 30, 5, 29),
+            (5, 23)
+        );
         // Past the server bar's width it clamps rather than leaving the row,
         // which is right for a drag and wrong for a press.
-        assert_eq!(content_point(content, 24, 100, 30, 99, 29), (79, 23));
-        assert!(past_the_server_bar(content, 80, 100, 30, 80, 29));
-        assert!(!past_the_server_bar(content, 80, 100, 30, 79, 29));
-        assert!(!past_the_server_bar(content, 80, 100, 30, 90, 28));
+        assert_eq!(
+            content_point(content, Some((80, 24)), 100, 30, 99, 29),
+            (79, 23)
+        );
+        assert!(past_the_server_bar(
+            content,
+            Some((80, 30)),
+            100,
+            30,
+            80,
+            29
+        ));
+        assert!(!past_the_server_bar(
+            content,
+            Some((80, 30)),
+            100,
+            30,
+            79,
+            29
+        ));
+        assert!(!past_the_server_bar(
+            content,
+            Some((80, 30)),
+            100,
+            30,
+            90,
+            28
+        ));
         // Elsewhere the mapping is the plain clamped translation.
-        assert_eq!(content_point(content, 24, 100, 30, 25, 3), (5, 3));
-        assert_eq!(content_point(content, 24, 100, 30, 5, 3), (0, 3));
+        assert_eq!(
+            content_point(content, Some((80, 24)), 100, 30, 25, 3),
+            (5, 3)
+        );
+        assert_eq!(
+            content_point(content, Some((80, 24)), 100, 30, 5, 3),
+            (0, 3)
+        );
     }
 
     #[test]
@@ -1804,7 +1832,7 @@ mod tests {
         // The last frame is 40 rows: the terminal has just shrunk, or a View
         // that was composited at the old size has just closed.
         assert_eq!(
-            content_point(content, 40, 100, 30, 5, 29),
+            content_point(content, Some((80, 40)), 100, 30, 5, 29),
             (5, content.height - 1)
         );
     }
@@ -1815,14 +1843,42 @@ mod tests {
         let content = content_rect(&sbs, 100, 30);
         assert_eq!(content.width, 80);
         // A 50-column frame from a smaller client on the session.
-        assert!(past_the_server_bar(content, 50, 100, 30, 50, 29));
-        assert!(!past_the_server_bar(content, 50, 100, 30, 49, 29));
+        assert!(past_the_server_bar(
+            content,
+            Some((50, 30)),
+            100,
+            30,
+            50,
+            29
+        ));
+        assert!(!past_the_server_bar(
+            content,
+            Some((50, 30)),
+            100,
+            30,
+            49,
+            29
+        ));
         // Before the first frame, and with a frame wider than the content,
         // the content rect's width is the limit.
-        assert!(!past_the_server_bar(content, 0, 100, 30, 79, 29));
-        assert!(past_the_server_bar(content, 0, 100, 30, 80, 29));
-        assert!(!past_the_server_bar(content, 120, 100, 30, 79, 29));
-        assert!(past_the_server_bar(content, 120, 100, 30, 80, 29));
+        assert!(!past_the_server_bar(content, None, 100, 30, 79, 29));
+        assert!(past_the_server_bar(content, None, 100, 30, 80, 29));
+        assert!(!past_the_server_bar(
+            content,
+            Some((120, 30)),
+            100,
+            30,
+            79,
+            29
+        ));
+        assert!(past_the_server_bar(
+            content,
+            Some((120, 30)),
+            100,
+            30,
+            80,
+            29
+        ));
     }
 
     #[test]
@@ -1831,19 +1887,38 @@ mod tests {
         let content = content_rect(&sbs, 100, 30);
         assert_eq!(content.height, 30);
         // A smaller client on the session makes the server send 18-row frames.
-        assert_eq!(content_point(content, 18, 100, 30, 5, 29), (5, 17));
+        assert_eq!(
+            content_point(content, Some((80, 18)), 100, 30, 5, 29),
+            (5, 17)
+        );
         // Before the first frame the content rect's last row is used.
-        assert_eq!(content_point(content, 0, 100, 30, 5, 29), (5, 29));
+        assert_eq!(content_point(content, None, 100, 30, 5, 29), (5, 29));
         // Rows other than the bar are not affected by the frame's size.
-        assert_eq!(content_point(content, 18, 100, 30, 25, 3), (5, 3));
+        assert_eq!(
+            content_point(content, Some((80, 18)), 100, 30, 25, 3),
+            (5, 3)
+        );
     }
 
     #[test]
     fn with_no_sidebar_a_click_maps_exactly_as_before() {
         let content = content_rect(&[], 100, 30);
-        assert_eq!(content_point(content, 30, 100, 30, 7, 29), (7, 29));
-        assert_eq!(content_point(content, 30, 100, 30, 99, 0), (99, 0));
-        assert!(!past_the_server_bar(content, 100, 100, 30, 99, 29));
+        assert_eq!(
+            content_point(content, Some((80, 30)), 100, 30, 7, 29),
+            (7, 29)
+        );
+        assert_eq!(
+            content_point(content, Some((80, 30)), 100, 30, 99, 0),
+            (99, 0)
+        );
+        assert!(!past_the_server_bar(
+            content,
+            Some((100, 30)),
+            100,
+            30,
+            99,
+            29
+        ));
     }
 
     fn strip_of(edge: SidebarEdge) -> SidebarGeom {
