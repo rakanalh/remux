@@ -5388,8 +5388,8 @@ struct PaneData {
     /// dedup did nothing.** `Verdict::why` embeds the elapsed milliseconds, so
     /// two consecutive samples of a pane that had not moved compared UNEQUAL and
     /// both logged -- per agent pane, at up to ten samples a second, into a log
-    /// that is never rotated and (`main.rs` pins the logger at `Debug`) can
-    /// never be turned down. A user reported 586 MB in about a day.
+    /// that (`main.rs` pins the logger at `Debug`) can never be turned down, and
+    /// whose rotation then discards every other line within minutes. A user reported 586 MB in about a day.
     /// [`crate::server::agents::Reason`] is the same reason with that number
     /// taken out.
     agent_verdict: Option<(AgentState, crate::server::agents::Reason)>,
@@ -6553,8 +6553,8 @@ impl RemuxServer {
 /// The `files` panel re-lists itself **every 2 seconds while it is placed, for
 /// ever** (see `sidebar/files.rs`), so through the catch-all this was a
 /// timer-driven line writing roughly 43k entries a day per placed panel into a
-/// log that is never rotated and that `main.rs` pins at `Debug` with no
-/// `RUST_LOG` to turn down. That is the same unbounded shape as the agents
+/// log that `main.rs` pins at `Debug` with no `RUST_LOG` to turn down, where
+/// each line rotates an older, useful one out. That is the same unbounded shape as the agents
 /// classification line and the compositor's per-frame lines, and it is fixed
 /// the same way: on CHANGE, not on sample.
 ///
@@ -6608,10 +6608,9 @@ async fn handle_client_message(
     // Log a summary of every incoming client message.
     //
     // **Anything the user TYPED is summarised, never printed.** `server.log` is
-    // plaintext, unrotated and never pruned -- one user's reached 586 MB in
-    // about a day -- and `main.rs` pins the logger at `Debug` with no
-    // `RUST_LOG`, so nothing a user can set turns any of this off. Whatever
-    // lands here stays on disk indefinitely.
+    // plaintext and kept on disk through its rotations, and `main.rs` pins the
+    // logger at `Debug` with no `RUST_LOG`, so nothing a user can set turns any
+    // of this off. Whatever lands here stays on disk until it is rotated out.
     //
     // The three arms below carry content; the catch-all `{other:?}` Debug-prints
     // whole structs, so a variant carrying typed bytes MUST have an arm here or

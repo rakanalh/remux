@@ -583,7 +583,7 @@ mod tests {
     use super::*;
 
     /// **`client.log` must not contain what the user typed.** It is plaintext,
-    /// unrotated and never pruned, and `main.rs` pins the logger at `Debug`
+    /// kept on disk through its rotations, and `main.rs` pins the logger at `Debug`
     /// with no `RUST_LOG`, so nothing a user can set turns it off.
     ///
     /// Tested here rather than in a harness because `InputToPane` is only ever

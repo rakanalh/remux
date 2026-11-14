@@ -22,8 +22,9 @@ const LINE_BYTES_MAX: usize = 1024;
 /// Characters of one line as it is logged and shown, escapes included.
 const LINE_CHARS_MAX: usize = 200;
 
-/// Lines logged per connection. `client.log` is never rotated, and a
-/// connection can live for days under an rc that prints on every login.
+/// Lines logged per connection. A connection can live for days under an rc
+/// that prints on every login, and every line it logs pushes older diagnostics
+/// out of the rotated `client.log`.
 const LOG_LINES_MAX: usize = 100;
 
 /// Lines kept for a failed dial's error.

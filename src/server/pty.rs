@@ -1166,7 +1166,7 @@ pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedRecei
 
         // Once per task, not once per occurrence. The fallback fires on a timer, so
         // an unconditional warning would write a line per pane per second for the
-        // life of the server, and `server.log` is never rotated.
+        // life of the server and rotate useful lines out of `server.log`.
         let mut warned_fallback = false;
 
         loop {
