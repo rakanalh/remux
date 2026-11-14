@@ -83,8 +83,15 @@ def install_agent_standin(bin_dir, name, script_body):
 
 
 class Tui:
-    def __init__(self, rundir, cols=120, rows=40, config=None, extra_env=None):
+    def __init__(self, rundir, cols=120, rows=40, config=None, extra_env=None,
+                 own_server=False):
         self.rundir = rundir
+        # Start the server from the harness, before the client, instead of
+        # letting the client auto-spawn it. The harness then holds its process
+        # and may stop and continue it (`pause_server`), which the rundirs
+        # rule allows only for a process the harness started itself.
+        self.own_server = own_server
+        self.server = None
         # Merged over the isolated environment, e.g. a `PATH` with stand-in
         # programs on it. Panes inherit it through the auto-spawned server.
         self.extra_env = extra_env or {}
@@ -152,6 +159,19 @@ class Tui:
         # of them -- so a test that wants to assert on the YANKED text has to
         # read it out of the byte stream itself. See `yanks()`.
         self.raw = bytearray()
+        if self.own_server:
+            self.server = subprocess.Popen(
+                [BIN, "server"], env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            sock = f"{self.rundir}/run/remux.sock"
+            for _ in range(200):
+                if os.path.exists(sock):
+                    break
+                time.sleep(0.05)
+            else:
+                raise SystemExit(f"own server never made {sock}")
+            time.sleep(0.3)
         self.child = pexpect.spawn(
             BIN, [], env=env, dimensions=(self.rows, self.cols), encoding=None,
         )
@@ -214,6 +234,16 @@ class Tui:
     def alive(self):
         return self.child.isalive()
 
+    def pause_server(self):
+        """SIGSTOP the server this harness started (`own_server=True`). Every
+        caller must reach `resume_server` on every path; `kill` does too."""
+        assert self.server is not None, "pause_server needs own_server=True"
+        self.server.send_signal(signal.SIGSTOP)
+
+    def resume_server(self):
+        if self.server is not None and self.server.poll() is None:
+            self.server.send_signal(signal.SIGCONT)
+
     def kill(self):
         """Close the client and stop the server it auto-spawned.
 
@@ -228,6 +258,9 @@ class Tui:
             self.child.terminate(force=True)
         except Exception:
             pass
+        # A stopped server holds a SIGTERM until it is continued, so the
+        # `remux stop` below would wait on it for nothing.
+        self.resume_server()
         env, self.env = self.env, None
         if env is None:
             return
@@ -235,6 +268,12 @@ class Tui:
             stop_runtime(env["XDG_RUNTIME_DIR"])
         except Exception:
             pass
+        if self.server is not None:
+            try:
+                self.server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.server.kill()
+                self.server.wait()
 
     def log(self, which="client"):
         p = f"{self.rundir}/state/remux/{which}.log"

@@ -21,6 +21,13 @@ bottom-most pane never touches the edge, and the key leaks to the server as a
      status bar at column 80, past the server's 70-column bar, sends no
      `MouseClick`; a click on the first tab's label sends one, and it hits
      that tab
+  7  right sidebar, smaller peer, right pane focused: a View is entered, the
+     SERVER IS STOPPED, the View is closed and Alt+l is pressed. Closing the
+     View is client-side and its Attach waits in the socket, so no server
+     frame arrives before the key: the edge test can only use the size the
+     client recorded from the server before the View, never the View's own
+     composite. The placeholder must show `focused` while the server is still
+     stopped, and once it is continued no `PaneFocus` may reach its log
 
 The placeholder panel draws `focused` while it holds the keyboard. A marker
 typed after the key, assembled by the shell (`printf '%s:%s' K n`), must then
@@ -39,7 +46,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import PROTOCOL_VERSION, Tui  # noqa: E402
+from pty_harness import PROTOCOL_VERSION, Tui, sm_compose_view  # noqa: E402
 from rundirs import run_dir  # noqa: E402
 
 VERBOSE = "-v" in sys.argv
@@ -138,9 +145,10 @@ def press(t, key, word, label, want_sidebar):
     return s
 
 
-def run(name, edge, size, peer_size, body):
+def run(name, edge, size, peer_size, body, own_server=False):
     print(f"--- {name}")
-    t = Tui(run_dir("rmx-sesp"), cols=COLS, rows=ROWS, config=config(edge, size))
+    t = Tui(run_dir("rmx-sesp"), cols=COLS, rows=ROWS, config=config(edge, size),
+            own_server=own_server)
     peer = None
     try:
         t.start()
@@ -211,6 +219,31 @@ def bar_clicks(t):
     check(len(inside) == 1 and "target=Tab(0)" in inside[0], "that click hits the first tab", inside)
 
 
+def view_exit_while_server_stopped(t):
+    two_panes(t)
+    sm_compose_view(t, panes=(0, 1), settle=2.0)
+    t.pump(1.0)
+    if "View 1" not in t.rows_text()[-1]:
+        t.dump("not in a view")
+        check(False, "a View is on screen (every check below would be vacuous)")
+        return
+    before = focus_commands(t)
+    t.pause_server()
+    try:
+        t.prefix(b"wq", 1.0)
+        left = "View 1" not in t.rows_text()[-1]
+        t.send(ALT["l"], 1.0)
+        focused = sidebar_focused(t)
+        s = screen(t)
+    finally:
+        t.resume_server()
+    t.pump(1.5)
+    check(left, "the View closes with the server stopped", s)
+    check(focused, "Alt+l right after the View closes focuses the sidebar", s)
+    leaked = focus_commands(t) - before
+    check(leaked == 0, f"no PaneFocus reached the server once it continued ({leaked} log lines)")
+
+
 def main():
     run("1 right sidebar, no peer", "right", 24, None, from_right_pane)
     run("2 right sidebar, smaller peer", "right", 24, (70, 24), from_right_pane)
@@ -219,6 +252,8 @@ def main():
     run("4 bottom sidebar, smaller peer", "bottom", 8, (70, 20), from_only_pane_down)
     run("5 left sidebar, smaller peer", "left", 24, (70, 24), from_left_pane_left)
     run("6 client bar past a narrower frame", "right", 24, PEER, bar_clicks)
+    run("7 leaving a View with the server stopped", "right", 24, PEER,
+        view_exit_while_server_stopped, own_server=True)
     print(f"\n{'FAILED' if failures else 'OK'}: {len(failures)} failure(s)")
     sys.exit(1 if failures else 0)
 
