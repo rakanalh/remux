@@ -30,8 +30,10 @@ pub const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 pub const KEEP: usize = 3;
 
 /// Overrides [`ROTATE_BYTES`], so that a harness can force a rotation with a
-/// few kilobytes of log.
-const ROTATE_BYTES_ENV: &str = "REMUX_LOG_ROTATE_BYTES";
+/// few kilobytes of log. It is a test hook, not a setting: panes inherit the
+/// server's environment, so every remux process started inside them would
+/// rotate at the harness's limit too.
+const ROTATE_BYTES_ENV: &str = "REMUX_TEST_LOG_ROTATE_BYTES";
 
 /// How long a failed rename or reopen waits before the next attempt. Without
 /// it a log on a read-only directory would retry, and report, on every record.
@@ -93,6 +95,7 @@ pub struct RotatingLog {
     limit: u64,
     keep: usize,
     retry_at: Option<Instant>,
+    first: bool,
 }
 
 impl RotatingLog {
@@ -103,12 +106,16 @@ impl RotatingLog {
             limit,
             keep,
             retry_at: None,
+            first: true,
         })
     }
 
     /// Make the open file the one at the path, and rotate it when it is full.
-    /// Called before each record, so a record is never split across files.
+    /// Called before each record. A record is never split across files
+    /// because env_logger's `Pipe` target hands each record to one `write_all`,
+    /// which [`Write::write`] below passes on whole.
     fn prepare(&mut self) {
+        let first = std::mem::replace(&mut self.first, false);
         if self.retry_at.is_some_and(|at| Instant::now() < at) {
             return;
         }
@@ -121,7 +128,7 @@ impl RotatingLog {
             return;
         }
         if ours.len() >= self.limit {
-            self.rotate();
+            self.rotate(first);
         }
     }
 
@@ -132,7 +139,8 @@ impl RotatingLog {
             .is_ok_and(|at_path| at_path.dev() == ours.dev() && at_path.ino() == ours.ino())
     }
 
-    fn rotate(&mut self) {
+    /// `at_startup` is true only for the first record this process writes.
+    fn rotate(&mut self, at_startup: bool) {
         if !try_lock(&self.file) {
             // Another process is rotating this file. Its rename makes
             // `path_is` false on a later record, which reopens.
@@ -149,10 +157,12 @@ impl RotatingLog {
                 return;
             }
         };
-        // A file this far past the limit was not written under rotation, so
-        // it predates it. Kept as `.1` it would stay on disk through `KEEP`
-        // more rotations, so it is deleted instead.
-        let oversized = ours.len() > self.limit.saturating_mul(2);
+        // A file this far past the limit when this process first writes was
+        // not written under rotation, so it predates it. Kept as `.1` it would
+        // stay on disk through `KEEP` more rotations, so it is deleted instead.
+        // Later in the run the same size can be another writer's log that grew
+        // during a backoff or under a larger limit, and that log is kept.
+        let oversized = at_startup && ours.len() > self.limit.saturating_mul(2);
         let moved = if oversized {
             std::fs::remove_file(&self.path)
         } else {
@@ -350,6 +360,39 @@ mod tests {
         write_lines(&mut a, 1);
         assert!(numbered(&path, 1).exists());
         assert!(!numbered(&path, 2).exists(), "the chain was shifted twice");
+    }
+
+    #[test]
+    fn a_writer_that_checked_before_another_rotated_does_not_shift_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.log");
+        let mut a = RotatingLog::open(&path, 512, 3).unwrap();
+        let mut b = RotatingLog::open(&path, 512, 3).unwrap();
+        write_lines(&mut a, 9);
+        assert!(numbered(&path, 1).exists());
+        // `b` saw the shared file full before `a` rotated it, and reaches the
+        // lock only now.
+        b.rotate(false);
+        assert!(!numbered(&path, 2).exists(), "the chain was shifted twice");
+        b.write_all(b"FROM-B\n").unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("FROM-B"));
+    }
+
+    #[test]
+    fn an_oversized_log_later_in_the_run_is_rotated_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.log");
+        let mut log = RotatingLog::open(&path, 1024, 3).unwrap();
+        log.write_all(b"FIRST\n").unwrap();
+        let mut other = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        other.write_all(&vec![b'x'; 10_000]).unwrap();
+        log.write_all(b"NEXT\n").unwrap();
+        let rotated = std::fs::read_to_string(numbered(&path, 1)).unwrap();
+        assert!(rotated.starts_with("FIRST\n"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "NEXT\n");
     }
 
     #[test]

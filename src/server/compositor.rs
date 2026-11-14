@@ -217,9 +217,9 @@ pub fn composite(
     // `debug!` -- and `main.rs` pins the logger at `Debug` with no `RUST_LOG` to
     // turn it down, and every line rotates an older one out of the log. Frames
     // are driven by pane output, so a single pane scrolling a build log wrote
-    // lines for as long as the build ran. Everything both lines reported is pure derived geometry
-    // recomputed from the arguments, so it told a reader nothing the inputs did
-    // not already say.
+    // lines for as long as the build ran. Everything both lines reported is
+    // pure derived geometry recomputed from the arguments, so it told a reader
+    // nothing the inputs did not already say.
     let mut buffer = vec![vec![RenderCell::default(); total_cols as usize]; total_rows as usize];
     let mut hit_regions = HitRegions::default();
 

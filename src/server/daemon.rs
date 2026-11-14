@@ -5388,8 +5388,9 @@ struct PaneData {
     /// dedup did nothing.** `Verdict::why` embeds the elapsed milliseconds, so
     /// two consecutive samples of a pane that had not moved compared UNEQUAL and
     /// both logged -- per agent pane, at up to ten samples a second, into a log
-    /// that (`main.rs` pins the logger at `Debug`) can never be turned down, and
-    /// whose rotation then discards every other line within minutes. A user reported 586 MB in about a day.
+    /// that (`main.rs` pins the logger at `Debug`) can never be turned down. A
+    /// user reported 586 MB in about a day, a rate at which rotation discards
+    /// every other line after a couple of hours.
     /// [`crate::server::agents::Reason`] is the same reason with that number
     /// taken out.
     agent_verdict: Option<(AgentState, crate::server::agents::Reason)>,

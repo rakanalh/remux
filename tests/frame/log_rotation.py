@@ -2,7 +2,7 @@
 """`server.log` and `client.log` rotate by size while the process runs.
 
 `main.rs` pins the logger at Debug, so a log grows for as long as its process
-lives. `REMUX_LOG_ROTATE_BYTES` lowers the limit so a few hundred protocol
+lives. `REMUX_TEST_LOG_ROTATE_BYTES` lowers the limit so a few hundred protocol
 messages fill it.
 
   1  a running server rotates server.log: `.1` to `.3` exist, `.4` does not
@@ -10,8 +10,11 @@ messages fill it.
   3  every file starts on a whole record, so no record was split
   4  logging continues after rotation: a session created afterwards is named
      in the live file and in no rotated one
-  5  thirty concurrent `remux ls` processes share client.log: `.4` never
-     appears, every file is 0600 and bounded, and every line is whole
+  2b every rotated file was at least the limit: a writer that shifted the
+     chain a second time for one full file would rotate a small one
+  5  25 rounds of thirty concurrent `remux ls` processes share
+     client.log: `.4` never appears, every file is 0600 and bounded, every
+     line is whole, and no round leaves a rotated file below the limit
   6  a server.log over twice the limit at startup (a log from before
      rotation) is dropped, so the directory is bounded again
 
@@ -31,6 +34,7 @@ from rundirs import run_dir  # noqa: E402
 RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-logrot")
 LIMIT = 20_000
 CLIENT_LIMIT = 2_000
+CLIENT_ROUNDS = 25
 # A record can land after the size check of the write before it, and other
 # processes can append between a check and the write it guards.
 SLACK = 4_096
@@ -66,7 +70,7 @@ def whole_records(path):
 
 
 def main():
-    os.environ["REMUX_LOG_ROTATE_BYTES"] = str(LIMIT)
+    os.environ["REMUX_TEST_LOG_ROTATE_BYTES"] = str(LIMIT)
     srv = Server(f"{RUNDIR}/srv")
     srv.start()
     logdir = f"{RUNDIR}/srv/state/remux"
@@ -94,9 +98,13 @@ def main():
                                   for size, mode in files.values()),
               f"2 server log files 0600 and bounded "
               f"({ {k: (s, oct(m)) for k, (s, m) in files.items()} })")
+        check(all(size >= LIMIT for k, (size, _) in files.items() if k != "server.log"),
+              f"2b every rotated server log file was full when it rotated "
+              f"({ {k: s for k, (s, _) in files.items()} })")
         # -- 3 -----------------------------------------------------------------
         starts = {k: whole_records(f"{logdir}/{k}")[0] for k in files}
-        check(len(starts) > 1 and all(starts.values()), f"3 every server log file starts on a record ({starts})")
+        check(len(starts) > 1 and all(starts.values()),
+              f"3 every server log file starts on a record ({starts})")
         # -- 4 -----------------------------------------------------------------
         live = read(f"{logdir}/server.log")
         rotated = [k for k in files if k != "server.log"]
@@ -105,17 +113,23 @@ def main():
               "4 a session created after rotation is logged in the live server.log only")
 
         # -- 5 -----------------------------------------------------------------
-        env = dict(srv.env, REMUX_LOG_ROTATE_BYTES=str(CLIENT_LIMIT))
+        env = dict(srv.env, REMUX_TEST_LOG_ROTATE_BYTES=str(CLIENT_LIMIT))
         env.pop("REMUX_SESSION", None)
         env.pop("REMUX_PANE", None)
-        procs = [subprocess.Popen([BIN, "ls"], env=env, stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                 for _ in range(30)]
         errs = []
-        for p in procs:
-            _, err = p.communicate(timeout=30)
-            errs.append((p.returncode, err.decode(errors="replace")))
-        cfiles = files_of(logdir, "client.log")
+        # A second shift for one full file leaves a short rotated file that
+        # later rotations push out of `.3`, so each round is inspected.
+        short = []
+        for _ in range(CLIENT_ROUNDS):
+            procs = [subprocess.Popen([BIN, "ls"], env=env, stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                     for _ in range(30)]
+            for p in procs:
+                _, err = p.communicate(timeout=30)
+                errs.append((p.returncode, err.decode(errors="replace")))
+            cfiles = files_of(logdir, "client.log")
+            short += [(k, size) for k, (size, _) in cfiles.items()
+                      if k != "client.log" and size < CLIENT_LIMIT]
         bad_lines = []
         for k in cfiles:
             first_ok, lines = whole_records(f"{logdir}/{k}")
@@ -129,7 +143,11 @@ def main():
                   for size, mode in cfiles.values()),
               f"5c client log files 0600 and bounded "
               f"({ {k: (s, oct(m)) for k, (s, m) in cfiles.items()} })")
-        check(len(cfiles) > 1 and not bad_lines, f"5d every client.log line is a whole record ({bad_lines[:3]})")
+        check(not short,
+              f"5e every rotated client log file was full when it rotated, so no writer "
+              f"shifted the chain twice ({short[:4]})")
+        check(len(cfiles) > 1 and not bad_lines,
+              f"5d every client.log line is a whole record ({bad_lines[:3]})")
 
         # -- 6 -----------------------------------------------------------------
         srv.stop()
