@@ -7,11 +7,11 @@ messages fill it.
 
   1  a running server rotates server.log: `.1` to `.3` exist, `.4` does not
   2  every server log file is 0600 and at most the limit plus one record
+  2b every rotated file was at least the limit: a writer that shifted the
+     chain a second time for one full file would rotate a small one
   3  every file starts on a whole record, so no record was split
   4  logging continues after rotation: a session created afterwards is named
      in the live file and in no rotated one
-  2b every rotated file was at least the limit: a writer that shifted the
-     chain a second time for one full file would rotate a small one
   5  25 rounds of thirty concurrent `remux ls` processes share
      client.log: `.4` never appears, every file is 0600 and bounded, every
      line is whole, and no round leaves a rotated file below the limit
@@ -34,6 +34,8 @@ from rundirs import run_dir  # noqa: E402
 RUNDIR = os.environ.get("RMX_RUNDIR") or run_dir("rmx-logrot")
 LIMIT = 20_000
 CLIENT_LIMIT = 2_000
+# More than the log a CreateSession writes in one burst.
+HEADROOM = 8_000
 CLIENT_ROUNDS = 25
 # A record can land after the size check of the write before it, and other
 # processes can append between a check and the write it guards.
@@ -85,6 +87,15 @@ def main():
             c.send({"Input": {"data": list(b"x")}})
             if i % 100 == 0:
                 c.drain(0.05)
+        # The marker's CreateSession is followed by a burst of lines that also
+        # name the session. With the live file near the limit, a rotation
+        # inside that burst puts the name in `.1` as well, so the marker is
+        # sent only once the live file has room for the whole burst.
+        for _ in range(400):
+            c.drain(0.1)
+            if os.path.getsize(f"{logdir}/server.log") <= LIMIT - HEADROOM:
+                break
+            c.send({"Input": {"data": list(b"x")}})
         c.send({"CreateSession": {"name": "after-rotation-marker", "folder": None}})
         c.drain(1.0)
 
