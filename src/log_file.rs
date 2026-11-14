@@ -228,10 +228,14 @@ fn shift(path: &Path, keep: usize) -> io::Result<()> {
     std::fs::rename(path, numbered(path, 1))
 }
 
+/// False only when another process holds the lock. A filesystem that does not
+/// support `flock` (some network mounts) answers with another error, and is
+/// rotated unlocked: refusing there would leave the log to grow without bound.
 fn try_lock(file: &File) -> bool {
     // SAFETY: `flock` takes a descriptor and flags and touches no memory; the
     // descriptor is valid for as long as `file` is borrowed.
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
+    locked || io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock
 }
 
 fn unlock(file: &File) {
