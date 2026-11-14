@@ -5296,7 +5296,7 @@ async fn run_client_loop(
                                         // The popup layer owns the rect while it
                                         // is up, and it is not a pane's edge.
                                         focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()),
-                                        renderer.frame_size(),
+                                        renderer.server_frame(),
                                         tc,
                                         tr,
                                         &config.appearance.status_bar_position,
@@ -5424,7 +5424,8 @@ async fn run_client_loop(
                                         if crate::client::chrome::intercept_focus(
                                             &mut chrome,
                                             dir,
-                                            focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()), renderer.frame_size(),
+                                            focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()),
+                                            renderer.server_frame(),
                                             tc,
                                             tr,
                                             &config.appearance.status_bar_position,
@@ -5807,7 +5808,8 @@ async fn run_client_loop(
                                         if crate::client::chrome::intercept_focus(
                                             &mut chrome,
                                             dir,
-                                            focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()), renderer.frame_size(),
+                                            focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()),
+                                            renderer.server_frame(),
                                             tc,
                                             tr,
                                             &config.appearance.status_bar_position,
@@ -8259,7 +8261,7 @@ async fn run_client_loop(
                         let (cx, cy) = popup_local.unwrap_or_else(|| {
                             crate::client::chrome::content_point(
                                 content,
-                                renderer.frame_rows(),
+                                renderer.server_frame(),
                                 tc,
                                 tr,
                                 mouse.column,
@@ -8273,7 +8275,7 @@ async fn run_client_loop(
                                 if popup_local.is_none()
                                     && crate::client::chrome::past_the_server_bar(
                                     content,
-                                    renderer.frame_size().map_or(0, |(cols, _)| cols),
+                                    renderer.server_frame(),
                                     tc,
                                     tr,
                                     mouse.column,
@@ -8413,7 +8415,7 @@ async fn run_client_loop(
                                 if popup_local.is_some()
                                     || !crate::client::chrome::past_the_server_bar(
                                         content,
-                                        renderer.frame_size().map_or(0, |(cols, _)| cols),
+                                        renderer.server_frame(),
                                         tc,
                                         tr,
                                         mouse.column,
@@ -8692,6 +8694,7 @@ async fn run_client_loop(
                         // A View owns the screen while active: keep all the
                         // bookkeeping above (so state is fresh when the view
                         // closes) but skip painting the server's frame.
+                        renderer.note_server_frame(&cells);
                         if active_view.is_none() {
                             renderer.render_full(&cells, cursor_x, cursor_y, cursor_visible, cursor_style)?;
                             // Panels write INTO the front buffer, so this

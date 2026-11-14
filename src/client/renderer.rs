@@ -229,8 +229,12 @@ pub struct Renderer {
     /// Row count of the last frame [`Renderer::render_full`] was given, so a
     /// diff can tell which of its changes land on that frame's last row.
     frame_rows: usize,
-    /// Column count of that frame, for the same reason as `frame_rows`.
-    frame_cols: usize,
+    /// `(cols, rows)` of the last server `FullRender`, recorded through
+    /// [`Renderer::note_server_frame`] whether or not it was painted. Geometry
+    /// that maps between this screen and the server's coordinates must read
+    /// this and never `frame_rows`: a View composites through `render_full`
+    /// too, so `frame_rows` can describe the View rather than the server.
+    server_frame: Option<(u16, u16)>,
     /// The last row of the most recent server frame, kept up to date by diffs
     /// while [`Renderer::status_row_owned`] withholds it from the screen. A
     /// server too old to describe its status bar leaves the client this row as
@@ -253,7 +257,7 @@ impl Renderer {
             popup: None,
             status_row_owned: false,
             frame_rows: 0,
-            frame_cols: 0,
+            server_frame: None,
             frame_status_row: Vec::new(),
         }
     }
@@ -270,15 +274,18 @@ impl Renderer {
         self.status_row_owned = owned;
     }
 
-    /// Row count of the last server frame, or 0 before the first one.
-    pub fn frame_rows(&self) -> u16 {
-        u16::try_from(self.frame_rows).unwrap_or(u16::MAX)
+    /// Record the size of a server `FullRender`. Called for every one, also
+    /// while a View owns the screen and the frame is not painted, so that the
+    /// size is right the moment the View closes, before the next frame.
+    pub fn note_server_frame(&mut self, cells: &[Vec<RenderCell>]) {
+        let rows = u16::try_from(cells.len()).unwrap_or(u16::MAX);
+        let cols = u16::try_from(cells.first().map_or(0, Vec::len)).unwrap_or(u16::MAX);
+        self.server_frame = (rows > 0 && cols > 0).then_some((cols, rows));
     }
 
     /// `(cols, rows)` of the last server frame, or `None` before the first one.
-    pub fn frame_size(&self) -> Option<(u16, u16)> {
-        let cols = u16::try_from(self.frame_cols).unwrap_or(u16::MAX);
-        (self.frame_rows > 0 && cols > 0).then(|| (cols, self.frame_rows()))
+    pub fn server_frame(&self) -> Option<(u16, u16)> {
+        self.server_frame
     }
 
     /// The server frame's last row as it stands after the latest frame and
@@ -670,7 +677,6 @@ impl Renderer {
         cursor_style: u8,
     ) -> Result<()> {
         self.frame_rows = cells.len();
-        self.frame_cols = cells.first().map_or(0, Vec::len);
         let cells = match cells.split_last() {
             Some((status, body)) if self.status_row_owned => {
                 self.frame_status_row = status.clone();
@@ -1493,9 +1499,9 @@ impl Renderer {
         let saved_cursor = self.last_cursor;
         // The front buffer's last row is whatever is on the terminal's last
         // row, which is exactly what must be put back, not a server bar row to
-        // withhold. `frame_rows` and `frame_cols` are restored too, because the diffs that follow
+        // withhold. `frame_rows` is restored too, because the diffs that follow
         // still describe the last server frame.
-        let saved_status = (self.status_row_owned, self.frame_rows, self.frame_cols);
+        let saved_status = (self.status_row_owned, self.frame_rows);
         // The front buffer never holds the popup box, and what it holds under
         // the box is stale, so the mask stays up for the replay. The replay then
         // emits the whole box in its own bracket.
@@ -1517,7 +1523,7 @@ impl Renderer {
         self.content_cols = saved.2;
         self.content_rows = saved.3;
         self.last_cursor = saved_cursor;
-        (self.status_row_owned, self.frame_rows, self.frame_cols) = saved_status;
+        (self.status_row_owned, self.frame_rows) = saved_status;
         res
     }
 
@@ -2407,6 +2413,23 @@ mod origin_tests {
         (0..rows)
             .map(|_| text.chars().map(cell).collect::<Vec<_>>())
             .collect()
+    }
+
+    #[test]
+    fn a_view_composite_does_not_replace_the_server_frame_size() {
+        let mut r = Renderer::new(20, 8);
+        assert_eq!(r.server_frame(), None);
+        let server = grid("0123456789", 4);
+        r.note_server_frame(&server);
+        r.render_full(&server, 0, 0, false, 0).unwrap();
+        assert_eq!(r.server_frame(), Some((10, 4)));
+        // A View paints its own composite through `render_full`, sized to the
+        // content rect, and the server's frames are then recorded unpainted.
+        r.render_full(&grid(&"v".repeat(20), 8), 0, 0, false, 0)
+            .unwrap();
+        assert_eq!(r.server_frame(), Some((10, 4)));
+        r.note_server_frame(&grid("01234567", 3));
+        assert_eq!(r.server_frame(), Some((8, 3)));
     }
 
     /// A 20x6 terminal with a left sidebar 5 wide: the content rect is 15x6,
