@@ -839,9 +839,7 @@ impl Renderer {
                     // not after the last cell of the row.
                     self.blank_span(out, sy, painted, content_right, !need_move)?;
                 } else {
-                    for sx in painted..content_right {
-                        self.front[sy][sx] = RenderCell::default();
-                    }
+                    self.front[sy][painted..content_right].fill(RenderCell::default());
                     queue!(out, Print(" ".repeat(content_right - painted)))?;
                 }
             }
@@ -863,9 +861,7 @@ impl Renderer {
                 }
                 queue!(out, MoveTo(self.origin_x, sy as u16))?;
                 queue!(out, Print(" ".repeat(content_right - ox)))?;
-                for sx in ox..content_right {
-                    self.front[sy][sx] = RenderCell::default();
-                }
+                self.front[sy][ox..content_right].fill(RenderCell::default());
             }
         }
 

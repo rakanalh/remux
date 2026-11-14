@@ -3809,13 +3809,10 @@ mod tests {
 
         s.resize(15, 4);
 
-        for r in 1..4 {
-            assert_eq!(s.grid[r][0].attrs.bg, Color::Indexed(4), "row {r} col 0");
-            assert_eq!(
-                s.grid[r][14].attrs.bg,
-                Color::Indexed(4),
-                "row {r} last col"
-            );
+        assert_eq!(s.grid.len(), 4);
+        for (r, row) in s.grid.iter().enumerate().take(4).skip(1) {
+            assert_eq!(row[0].attrs.bg, Color::Indexed(4), "row {r} col 0");
+            assert_eq!(row[14].attrs.bg, Color::Indexed(4), "row {r} last col");
         }
         assert_eq!(row_text(&s, 0).trim_end(), "ab");
     }
