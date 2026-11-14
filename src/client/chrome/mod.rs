@@ -1167,10 +1167,20 @@ const BORDER_INSET: u16 = 1;
 ///
 /// Nothing inside a sidebar ever falls through to the server: a direction with
 /// nowhere to go is a swallowed no-op, never a leaked `PaneFocus*`.
+///
+/// `frame` is the `(cols, rows)` of the server frame `pane_rect` arrived with.
+/// When it is given, the right and bottom edges are measured against that frame
+/// instead of `pane_area`. The two differ when a smaller client shares the
+/// session: the server then composites at the smallest attached size, so the
+/// rightmost pane ends at the FRAME's right edge, short of this client's pane
+/// area, and the edge test against `pane_area` never fires for it. `None`
+/// keeps `pane_area`, which is right for a rect that is not from a server
+/// frame, such as a View cell.
 pub fn intercept_focus(
     chrome: &mut Chrome,
     dir: FocusDirection,
     pane_rect: Option<&crate::protocol::PaneRect>,
+    frame: Option<(u16, u16)>,
     term_cols: u16,
     term_rows: u16,
     status_bar: &StatusBarPosition,
@@ -1247,6 +1257,13 @@ pub fn intercept_focus(
             // Compare in content-relative space.
             let content = chrome.content_rect(term_cols, term_rows);
             let pa_rel_y = pa.y.saturating_sub(content.y);
+            // The server spends the frame's last row on its status bar, as it
+            // does the content rect's, so the frame's pane area is one row
+            // shorter than the frame.
+            let (pa_width, pa_height) = match frame {
+                Some((cols, rows)) => (cols, rows.saturating_sub(1)),
+                None => (pa.width, pa.height),
+            };
             // The server reports the pane's INTERIOR (see the `focused_pane_rect`
             // construction in `build_composite`: the pane rect inset by the
             // border), so an edge pane's interior sits BORDER_INSET cells inside
@@ -1254,9 +1271,9 @@ pub fn intercept_focus(
             // how this silently never fires with borders on -- the default.
             let at_edge = match dir {
                 Left => rect.x <= BORDER_INSET,
-                Right => rect.x + rect.width + BORDER_INSET >= pa.width,
+                Right => rect.x + rect.width + BORDER_INSET >= pa_width,
                 Up => rect.y <= pa_rel_y + BORDER_INSET,
-                Down => rect.y + rect.height + BORDER_INSET >= pa_rel_y + pa.height,
+                Down => rect.y + rect.height + BORDER_INSET >= pa_rel_y + pa_height,
             };
             // In Monocle or under zoom the rect touches every edge, so the edge
             // test alone would take every direction into the sidebar while the
@@ -1655,6 +1672,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Down,
             Some(&pane),
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -1685,6 +1703,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Left,
             Some(&pane),
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -1715,6 +1734,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Left,
             Some(&right_half),
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -1732,6 +1752,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Right,
             Some(&left_half),
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -1743,6 +1764,7 @@ mod focus_tests {
             c,
             FocusDirection::Left,
             Some(pane),
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -1796,6 +1818,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Down,
             None,
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -1803,6 +1826,7 @@ mod focus_tests {
         assert!(intercept_focus(
             &mut c,
             FocusDirection::Right,
+            None,
             None,
             100,
             30,
@@ -1843,6 +1867,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Left,
             Some(&pane),
+            None,
             18,
             30,
             &StatusBarPosition::Bottom
@@ -1908,6 +1933,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Down,
             None,
+            None,
             100,
             10,
             &StatusBarPosition::Bottom
@@ -1924,6 +1950,7 @@ mod focus_tests {
         assert!(intercept_focus(
             &mut c,
             FocusDirection::Up,
+            None,
             None,
             100,
             10,
@@ -1953,6 +1980,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Left,
             Some(&pane),
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -1988,6 +2016,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Left,
             Some(&full_area_pane(neighbors)),
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -2002,11 +2031,72 @@ mod focus_tests {
                 x: 0,
                 ..full_area_pane(neighbors)
             }),
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
         ));
         assert_eq!(c.focus, ChromeFocus::Content);
+    }
+
+    #[test]
+    fn the_edge_of_a_smaller_frame_enters_the_sidebar_on_that_edge() {
+        // A smaller client on the session makes the server send 50x20 frames,
+        // short of this client's content rect on the right and at the bottom.
+        let frame = Some((50, 20));
+        let right_edge = PaneRect {
+            x: 26,
+            y: 1,
+            width: 23,
+            height: 17,
+            ..Default::default()
+        };
+        for (edge, size, dir) in [
+            (SidebarEdge::Right, 30, FocusDirection::Right),
+            (SidebarEdge::Bottom, 6, FocusDirection::Down),
+        ] {
+            let mut c = chrome_with(edge, size);
+            assert!(
+                !intercept_focus(
+                    &mut c,
+                    dir.clone(),
+                    Some(&right_edge),
+                    None,
+                    100,
+                    30,
+                    &StatusBarPosition::Bottom
+                ),
+                "{edge:?}: measured against the pane area, the frame's edge is not an edge"
+            );
+            assert!(
+                intercept_focus(
+                    &mut c,
+                    dir,
+                    Some(&right_edge),
+                    frame,
+                    100,
+                    30,
+                    &StatusBarPosition::Bottom
+                ),
+                "{edge:?}: measured against the frame, it is"
+            );
+            assert!(matches!(c.focus, ChromeFocus::Sidebar { .. }), "{edge:?}");
+        }
+        // A pane short of the frame's right edge stays a pane move.
+        let mut c = chrome_with(SidebarEdge::Right, 30);
+        let inner = PaneRect {
+            width: 20,
+            ..right_edge
+        };
+        assert!(!intercept_focus(
+            &mut c,
+            FocusDirection::Right,
+            Some(&inner),
+            frame,
+            100,
+            30,
+            &StatusBarPosition::Bottom
+        ));
     }
 
     #[test]
@@ -2020,6 +2110,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Left,
             Some(&full_area_pane(neighbors)),
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -2047,6 +2138,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Left,
             Some(&pane),
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -2068,6 +2160,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Left,
             Some(&pane),
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -2080,6 +2173,7 @@ mod focus_tests {
         assert!(!intercept_focus(
             &mut c,
             FocusDirection::Left,
+            None,
             None,
             100,
             30,
@@ -2115,7 +2209,15 @@ mod focus_tests {
         for sb in [StatusBarPosition::Top, StatusBarPosition::Bottom] {
             let mut c = chrome_with(SidebarEdge::Bottom, 5);
             assert!(
-                intercept_focus(&mut c, FocusDirection::Down, Some(&at_edge), 100, 30, &sb),
+                intercept_focus(
+                    &mut c,
+                    FocusDirection::Down,
+                    Some(&at_edge),
+                    None,
+                    100,
+                    30,
+                    &sb
+                ),
                 "a full-height pane is at the bottom edge under {sb:?}"
             );
         }
@@ -2132,7 +2234,7 @@ mod focus_tests {
         for sb in [StatusBarPosition::Top, StatusBarPosition::Bottom] {
             let mut c = chrome_with(SidebarEdge::Bottom, 5);
             assert!(
-                !intercept_focus(&mut c, FocusDirection::Down, Some(&mid), 100, 30, &sb),
+                !intercept_focus(&mut c, FocusDirection::Down, Some(&mid), None, 100, 30, &sb),
                 "a mid-screen pane must not be captured under {sb:?}"
             );
         }
@@ -2148,6 +2250,7 @@ mod focus_tests {
         assert!(intercept_focus(
             &mut c,
             FocusDirection::Right,
+            None,
             None,
             100,
             30,
@@ -2189,6 +2292,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Down,
             None,
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -2214,6 +2318,7 @@ mod focus_tests {
             &mut c,
             FocusDirection::Down,
             None,
+            None,
             100,
             30,
             &StatusBarPosition::Bottom
@@ -2237,6 +2342,7 @@ mod focus_tests {
         assert!(intercept_focus(
             &mut c,
             FocusDirection::Left,
+            None,
             None,
             100,
             30,

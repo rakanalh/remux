@@ -4115,6 +4115,7 @@ async fn handle_view_command(
             chrome,
             dir.clone(),
             None,
+            None,
             cols,
             rows,
             status_bar,
@@ -4178,6 +4179,7 @@ async fn handle_view_command(
                 chrome,
                 dir,
                 rect.as_ref(),
+                None,
                 cols,
                 rows,
                 status_bar,
@@ -5294,6 +5296,7 @@ async fn run_client_loop(
                                         // The popup layer owns the rect while it
                                         // is up, and it is not a pane's edge.
                                         focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()),
+                                        renderer.frame_size(),
                                         tc,
                                         tr,
                                         &config.appearance.status_bar_position,
@@ -5421,7 +5424,7 @@ async fn run_client_loop(
                                         if crate::client::chrome::intercept_focus(
                                             &mut chrome,
                                             dir,
-                                            focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()),
+                                            focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()), renderer.frame_size(),
                                             tc,
                                             tr,
                                             &config.appearance.status_bar_position,
@@ -5804,7 +5807,7 @@ async fn run_client_loop(
                                         if crate::client::chrome::intercept_focus(
                                             &mut chrome,
                                             dir,
-                                            focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()),
+                                            focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()), renderer.frame_size(),
                                             tc,
                                             tr,
                                             &config.appearance.status_bar_position,
@@ -8270,6 +8273,7 @@ async fn run_client_loop(
                                 if popup_local.is_none()
                                     && crate::client::chrome::past_the_server_bar(
                                     content,
+                                    renderer.frame_size().map_or(0, |(cols, _)| cols),
                                     tc,
                                     tr,
                                     mouse.column,
@@ -8409,6 +8413,7 @@ async fn run_client_loop(
                                 if popup_local.is_some()
                                     || !crate::client::chrome::past_the_server_bar(
                                         content,
+                                        renderer.frame_size().map_or(0, |(cols, _)| cols),
                                         tc,
                                         tr,
                                         mouse.column,
