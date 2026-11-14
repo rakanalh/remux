@@ -14,6 +14,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # rustc warnings (check, test, clippy) are errors.
+  RUSTFLAGS: -D warnings
+  # Cargo's own warnings too, such as an unused dependency in Cargo.toml,
+  # which RUSTFLAGS cannot reach because rustc never emits them.
+  CARGO_BUILD_WARNINGS: deny
 
 jobs:
   check:
@@ -43,7 +48,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   fmt:
     name: Format
