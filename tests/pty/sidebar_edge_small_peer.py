@@ -17,6 +17,10 @@ bottom-most pane never touches the edge, and the key leaks to the server as a
   4  bottom sidebar, smaller peer: Alt+j from the only pane enters it
   5  left sidebar, smaller peer: Alt+h from the left pane enters it (control:
      the left edge is at column 0 of every frame)
+  6  right sidebar, smaller 70-column peer: a left click on the client-drawn
+     status bar at column 80, past the server's 70-column bar, sends no
+     `MouseClick`; a click on the first tab's label sends one, and it hits
+     that tab
 
 The placeholder panel draws `focused` while it holds the keyboard. A marker
 typed after the key, assembled by the shell (`printf '%s:%s' K n`), must then
@@ -28,6 +32,7 @@ Run from the repo root:
 """
 import json
 import os
+import re
 import socket
 import struct
 import sys
@@ -40,6 +45,7 @@ from rundirs import run_dir  # noqa: E402
 VERBOSE = "-v" in sys.argv
 ALT = {"h": b"\x1bh", "j": b"\x1bj", "l": b"\x1bl"}
 COLS, ROWS = 120, 36
+PEER = (70, 24)
 
 failures = []
 
@@ -91,6 +97,23 @@ def screen(t):
 
 def sidebar_focused(t):
     return "focused" in screen(t)
+
+
+def columns(text, needle):
+    """Every column `needle` starts at, on any row. Two panes share each row,
+    so a scan that stops at a row's first match would read the wrong pane."""
+    return sorted({m.start() for row in text.splitlines()
+                   for m in re.finditer(re.escape(needle), row)})
+
+
+def presses(t):
+    return [line for line in t.log("server").splitlines()
+            if "server: MouseClick" in line and "release=false" in line]
+
+
+def sgr_click(t, col, row):
+    t.send(f"\x1b[<0;{col + 1};{row + 1}M".encode(), 0.2)
+    t.send(f"\x1b[<0;{col + 1};{row + 1}m".encode(), 0.8)
 
 
 def focus_commands(t):
@@ -152,10 +175,10 @@ def from_left_pane(t):
     two_panes(t)
     t.send(ALT["h"], 1.0)
     s = press(t, "l", "moved", "Alt+l from the left pane", False)
-    row = next((r for r in s.splitlines() if "K:moved" in r), "")
-    two_at = next((r for r in s.splitlines() if "P:two" in r), "")
-    check(row and two_at and row.index("K:moved") == two_at.index("P:two"),
-          "Alt+l from the left pane: the marker lands in the right pane", s)
+    moved = columns(s, "K:moved")
+    two = columns(s, "P:two")
+    check(len(moved) == 1 and len(two) == 1 and moved == two,
+          f"Alt+l from the left pane: the marker lands in the right pane ({moved} vs {two})", s)
 
 
 def from_only_pane_down(t):
@@ -168,6 +191,26 @@ def from_left_pane_left(t):
     press(t, "h", "left", "Alt+h from the left pane", True)
 
 
+def bar_clicks(t):
+    """The client draws the bar across the terminal; the server's bar is only
+    the 70 columns of the frame the peer's size gives it."""
+    t.prefix(b"tn", 1.0)
+    bar = t.rows_text()[-1]
+    if VERBOSE:
+        print(f"       bar: {bar!r}")
+    first = bar.find("Tab 1")
+    check(0 <= first < PEER[0], f"the first tab label starts inside column {PEER[0]} ({first})", bar)
+    before = len(presses(t))
+    sgr_click(t, PEER[0] + 10, ROWS - 1)
+    outside = presses(t)[before:]
+    check(not outside, f"a click on the client bar at column {PEER[0] + 10} sends no MouseClick", outside)
+    before = len(presses(t))
+    sgr_click(t, first + 1, ROWS - 1)
+    inside = presses(t)[before:]
+    check(len(inside) == 1, f"a click on the first tab label sends one MouseClick ({len(inside)})", inside)
+    check(len(inside) == 1 and "target=Tab(0)" in inside[0], "that click hits the first tab", inside)
+
+
 def main():
     run("1 right sidebar, no peer", "right", 24, None, from_right_pane)
     run("2 right sidebar, smaller peer", "right", 24, (70, 24), from_right_pane)
@@ -175,6 +218,7 @@ def main():
         from_left_pane)
     run("4 bottom sidebar, smaller peer", "bottom", 8, (70, 20), from_only_pane_down)
     run("5 left sidebar, smaller peer", "left", 24, (70, 24), from_left_pane_left)
+    run("6 client bar past a narrower frame", "right", 24, PEER, bar_clicks)
     print(f"\n{'FAILED' if failures else 'OK'}: {len(failures)} failure(s)")
     sys.exit(1 if failures else 0)
 
