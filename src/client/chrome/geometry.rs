@@ -1829,8 +1829,8 @@ mod tests {
     fn a_frame_taller_than_the_content_still_maps_the_bar_into_the_content() {
         let sbs = [sb(SidebarEdge::Left, 20, &[1])];
         let content = content_rect(&sbs, 100, 30);
-        // The last frame is 40 rows: the terminal has just shrunk, or a View
-        // that was composited at the old size has just closed.
+        // The last frame is 40 rows because the terminal has just shrunk and
+        // the next server frame has not arrived yet.
         assert_eq!(
             content_point(content, Some((80, 40)), 100, 30, 5, 29),
             (5, content.height - 1)

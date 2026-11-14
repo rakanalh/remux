@@ -8654,8 +8654,9 @@ async fn run_client_loop(
                         last_cursor_visible = cursor_visible;
                         server_status = status;
                         // A View owns the screen while active: keep all the
-                        // bookkeeping above (so state is fresh when the view
-                        // closes) but skip painting the server's frame.
+                        // bookkeeping, the frame's size included, so state is
+                        // fresh when the view closes, but skip painting the
+                        // server's frame.
                         renderer.note_server_frame(&cells);
                         if active_view.is_none() {
                             renderer.render_full(&cells, cursor_x, cursor_y, cursor_visible, cursor_style)?;
