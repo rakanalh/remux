@@ -481,7 +481,7 @@ Wherever `h` / `j` / `k` / `l` pick a direction to focus, move, stack, unstack o
 | `}` | Next tab *(→ Normal)* |
 | `{` | Previous tab *(→ Normal)* |
 | `:` | Open the command palette |
-| `r` | Redraw the screen, e.g. after the terminal's own clear (Cmd+K) wiped it |
+| `r` | Redraw the screen, e.g. after the terminal's own clear wiped it |
 | `a` | Send the literal prefix key (`Ctrl-a`) to the app *(→ Normal)* |
 
 #### Pane (`p`)
@@ -495,6 +495,7 @@ Wherever `h` / `j` / `k` / `l` pick a direction to focus, move, stack, unstack o
 | `h` / `j` / `k` / `l` | Focus left / down / up / right *(→ Normal)* |
 | `H` / `J` / `K` / `L` | Move (swap) pane left / down / up / right; in a stack, `H` / `L` move it along the stack, then out of it at the end, and `J` / `K` take it out below / above *(→ Normal)* |
 | `z` | Toggle zoom *(→ Normal)* |
+| `c` | Clear the pane and drop its scrollback *(→ Normal)* |
 | `o` | Toggle the popup terminal *(→ Normal)* |
 | `m` | Make the focused pane the master (Master layout) *(→ Normal)* |
 | `r` | Rename pane |
@@ -609,6 +610,8 @@ There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h
 | `Alt-p` | Toggle the popup terminal |
 | `Alt-Space` | Cycle layout |
 | `Alt-m` | Make the focused pane the master (Master layout) |
+| `Cmd-k` | Clear the focused pane and drop its scrollback (`PaneClearScrollback`) |
+| `Cmd-l` | Send `Ctrl-l` to the focused pane and keep its scrollback (`PaneClear`) |
 
 #### Popup keys
 
@@ -715,6 +718,8 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `PaneMoveDown` | — | Swap the focused pane with the pane below. In a stack of several panes, take it out of the stack into a new slot below. |
 | `PaneRename` | — | Rename the focused pane (prompts for the name). |
 | `PaneMoveToTab` | — | Pick a tab of any session on this server (or a session's `+ new tab`) and move the focused pane there. |
+| `PaneClear` | — | Send `Ctrl-l` to the focused pane, or a View's focused cell, and keep its scrollback. Default key `Cmd-l`. |
+| `PaneClearScrollback` | — | Clear the focused pane, or a View's focused cell, drop its scrollback and send `Ctrl-l` so the shell redraws its prompt. On the alternate screen only the scrollback is dropped. Default keys `Cmd-k` and `Ctrl-a p c`. The Cmd keys need a terminal set up to send them: [https://rakanalh.github.io/remux/install/#macos-make-cmdk--cmdl-reach-remux](https://rakanalh.github.io/remux/install/#macos-make-cmdk--cmdl-reach-remux). |
 | `PaneToggleZoom` | — | Toggle zoom for the focused pane, or a View's focused cell, as `[zoom] mode` says: fullscreen (the default) or a float over the layout. Releases a zoom of either kind. |
 | `PaneToggleZoomFullscreen` | — | Toggle a fullscreen zoom for the focused pane whatever `[zoom] mode` says. It has no default key. Refused in Monocle; releases a zoom of either kind. |
 | `PaneToggleZoomFloat` | — | Toggle a float zoom for the focused pane whatever `[zoom] mode` says. It has no default key. Releases a zoom of either kind. |

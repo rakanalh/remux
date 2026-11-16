@@ -49,6 +49,15 @@ These work directly in Normal mode, with no prefix. On a Mac they use the Option
 | Cycle the layout | `Alt-Space` |
 | Make the focused pane the master (Master layout) | `Alt-m` |
 
+### Cmd shortcuts (macOS)
+
+These reach Remux only from a terminal set up to send them: see [Cmd+K / Cmd+L](/remux/install/#macos-make-cmdk--cmdl-reach-remux). Terminal.app cannot, so use `Prefix p c` there.
+
+| Action | Keys |
+|---|---|
+| Clear the focused pane and drop its scrollback | `Cmd-k` |
+| Clear the focused pane and keep its scrollback (sends `Ctrl-l`) | `Cmd-l` |
+
 ## Prefix key tree
 
 Keys below follow `Ctrl-a`. For the action name behind each key, which is what you write in the config to rebind it, see [Default bindings](/remux/keybindings/#default-bindings).
@@ -69,6 +78,7 @@ Keys below follow `Ctrl-a`. For the action name behind each key, which is what y
 | Next / previous tab | `}` / `{` |
 | Toggle border style (Zellij / tmux) | `g` |
 | Command palette | `:` |
+| Redraw the screen, after the terminal cleared it | `r` |
 | Send a literal `Ctrl-a` | `a` |
 
 ### Panes: `p`
@@ -81,6 +91,7 @@ Keys below follow `Ctrl-a`. For the action name behind each key, which is what y
 | Focus left / down / up / right | `p h` / `p j` / `p k` / `p l` |
 | Move the pane left / down / up / right | `p H` / `p J` / `p K` / `p L` |
 | Zoom | `p z` |
+| Clear the pane and drop its scrollback | `p c` |
 | Toggle the popup terminal | `p o` |
 | Make the pane the master | `p m` |
 | Rename the pane | `p r` |
