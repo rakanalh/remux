@@ -58,7 +58,27 @@ The docs show every key for your keyboard: use the **Linux / macOS** menu at the
 
 <!-- os-keys: on -->
 
-Cmd-K (clear) and the terminal's own reset commands are handled by the terminal and never reach Remux.
+## macOS: make Cmd+K / Cmd+L reach Remux
+
+Most macOS terminals handle Cmd+K themselves: they clear their own screen and do not tell the program running in them. Remux cannot detect that, so its view of the screen goes blank until something repaints it. Set your terminal to send Cmd+K and Cmd+L to Remux instead, as `ESC [107;9u` and `ESC [108;9u` (the kitty keyboard protocol's form of `k` and `l` with Super). Remux then runs:
+
+| Key | Command | Does |
+|---|---|---|
+| Cmd+K | `PaneClearScrollback` | Clears the focused pane and drops its scrollback. At a shell prompt it also sends `Ctrl-l` so the shell redraws the prompt. A running command, such as ssh, is sent nothing and keeps the line the cursor is on, moved to the top |
+| Cmd+L | `PaneClear` | Sends `Ctrl-l` to the focused pane, so the shell clears the screen, and keeps the scrollback. A running command gets the `Ctrl-l` as input, as in a plain terminal |
+
+| Terminal | Setting |
+|---|---|
+| Ghostty | `keybind = cmd+k=text:\x1b[107;9u` and `keybind = cmd+l=text:\x1b[108;9u` in the config. |
+| WezTerm | Add to `config.keys`: `{ key = 'k', mods = 'SUPER', action = wezterm.action.SendString '\x1b[107;9u' }` and the same with `'l'` and `'\x1b[108;9u'`. |
+| Alacritty | In the config: `[[keyboard.bindings]]` with `key = "K"`, `mods = "Command"`, `chars = "\u001b[107;9u"`, and a second binding with `key = "L"` and `chars = "\u001b[108;9u"`. |
+| Kitty | `map cmd+k send_text all \x1b[107;9u` and `map cmd+l send_text all \x1b[108;9u` in `kitty.conf`. These replace kitty's own Cmd+K and Cmd+L clears. Use `send_text`, not `send_key`, which sends nothing for Cmd to a program in legacy keyboard mode. `kitten show-key` shows what the key sends. |
+| iTerm2 | **Settings → Profiles → Keys → Key Mappings**, add Cmd+K with the action **Send Hex Codes** and `0x1b 0x5b 0x31 0x30 0x37 0x3b 0x39 0x75`, and Cmd+L with `0x1b 0x5b 0x31 0x30 0x38 0x3b 0x39 0x75`. |
+| Terminal.app | Cannot send these keys. Use `Prefix p c` for `PaneClearScrollback`, and run `PaneClear` from the command palette (`Prefix :`) to keep the scrollback. A typed `Ctrl-l` drops the scrollback too. |
+
+If the terminal has already cleared its screen, `Prefix r` (`Redraw`) repaints it from what Remux last drew.
+
+The keys are ordinary shortcuts, `"Cmd-k"` and `"Cmd-l"` under `[keybindings.command]`, so you can rebind or unbind them. `Super-` is the same modifier as `Cmd-`.
 
 ## Add a config file
 
@@ -92,5 +112,5 @@ If you use [remotes](/remux/remotes/), build the **same commit** on every machin
 ## Next steps
 
 - [Quick start](/remux/quick-start/): open a session, split panes and detach.
-- [macOS setup](#macos-make-option-work-as-alt): make the Option key work for the Alt shortcuts.
+- [macOS setup](#macos-make-option-work-as-alt): make the Option key work for the Alt shortcuts, and [Cmd+K / Cmd+L](#macos-make-cmdk--cmdl-reach-remux) reach Remux.
 - [Concepts](/remux/concepts/): how servers, sessions, tabs and panes fit together.

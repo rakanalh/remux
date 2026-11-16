@@ -137,10 +137,11 @@ Used by `leader`, shortcut keys and `SendKey`.
 | Form | Examples |
 |---|---|
 | A single character | `a`, `H`, `,`, `1` |
-| Modifiers + a key | `Ctrl-a`, `Alt-h`, `Alt-Space`, `Shift-Tab`, `Alt-Shift-Left`, `Ctrl-Alt-x` |
+| Modifiers + a key | `Ctrl-a`, `Alt-h`, `Alt-Space`, `Shift-Tab`, `Alt-Shift-Left`, `Ctrl-Alt-x`, `Cmd-k` |
 | A named key | `Enter`, `Esc`, `Tab`, `BackTab`, `Space`, `Backspace`, `Up`, `Down`, `Left`, `Right`, `F1`–`F12` |
 
-- Modifiers are `Ctrl-`, `Alt-` and `Shift-`. They stack in any order: `Alt-Shift-Left` and `Shift-Alt-Left` are the same key.
+- Modifiers are `Ctrl-`, `Alt-`, `Shift-` and `Cmd-` (or `Super-`, the same modifier). They stack in any order: `Alt-Shift-Left` and `Shift-Alt-Left` are the same key.
+- A `Cmd-` key reaches Remux only from a terminal that sends it in the kitty keyboard protocol's `CSI u` form, `ESC [107;9u` for `Cmd-k`. See [Cmd+K / Cmd+L](/remux/install/#macos-make-cmdk--cmdl-reach-remux).
 - For Alt with Shift on a character, write the uppercase character: `Alt-H` is `Alt+Shift+h`. On a named key such as an arrow, write `Shift-`: `Alt-Shift-Left`.
 - Names are case-sensitive: `Ctrl-a`, not `ctrl-a` or `C-a`.
 - On macOS, `Alt-` is the Option key, and the config still spells it `Alt-`. See [macOS setup](/remux/install/#macos-make-option-work-as-alt).
@@ -173,6 +174,7 @@ Only characters are sent. `Ctrl-<letter>` sends the control character; `Alt` and
 | `Prefix v` | `EnterVisualMode` | |
 | `Prefix :` | `CommandPaletteOpen` | |
 | `Prefix a` | `SendKey Ctrl-a` | Send the leader to the pane |
+| `Prefix r` | `Redraw` | Repaint the screen after the terminal cleared it |
 | `Prefix }` / `Prefix {` | `TabNext` / `TabPrev` | |
 | **Pane**: `Prefix p …` | | |
 | `n` | `PaneNew` | |
@@ -182,6 +184,7 @@ Only characters are sent. `Ctrl-<letter>` sends the control character; `Alt` and
 | `h` `j` `k` `l` | `PaneFocusLeft/Down/Up/Right` | The arrows too |
 | `H` `J` `K` `L` | `PaneMoveLeft/Down/Up/Right` | Shift+arrows too |
 | `z` | `PaneToggleZoom` | Same as `Prefix z` |
+| `c` | `PaneClearScrollback` | Same as `Cmd-k` |
 | `o` | `PopupToggle` | Popup terminal |
 | `m` | `SetMaster` | |
 | `r` | `PaneRename` | Prompts for a name |
@@ -243,6 +246,8 @@ The `SidebarFocus*` actions have no default key. `Alt-h/j/k/l` move into and out
 | `Alt-p` | `PopupToggle` |
 | `Alt-m` | `SetMaster` |
 | `Alt-Space` | `LayoutNext` |
+| `Cmd-k` | `PaneClearScrollback` |
+| `Cmd-l` | `PaneClear` |
 
 ### Popup keys
 
@@ -349,6 +354,8 @@ Every action you can bind or run from the command palette. The names are PascalC
 | `PaneToggleZoom` | Zoom or unzoom the focused pane, as `[zoom] mode` says (fullscreen by default, or a float over the layout). Releases a zoom of either kind |
 | `PaneToggleZoomFullscreen` | Zoom the focused pane to fill the tab whatever `[zoom] mode` says, or release a zoom of either kind. Refused in Monocle. No default key |
 | `PaneToggleZoomFloat` | Zoom the focused pane as a float whatever `[zoom] mode` says, or release a zoom of either kind. No default key |
+| `PaneClear` | Send `Ctrl-l` to the focused pane, so the shell clears the screen. The scrollback stays. Like a `Ctrl-l` typed in a plain terminal, it goes to whatever program is running there, which reads it as input. `Cmd-l` by default |
+| `PaneClearScrollback` | Clear the focused pane and drop its scrollback. When the shell is at its prompt it is also sent `Ctrl-l`, so it redraws the prompt. A running command, such as ssh, is sent nothing, and the line the cursor is on stays, moved to the top, as a native terminal's Cmd+K leaves it. On the alternate screen (a full-screen program) only the scrollback is dropped and nothing is sent. Works on a View's focused cell, on any machine. `Cmd-k` and `Prefix p c` by default |
 | `PaneRename` | Rename the focused pane (prompts) |
 | `PaneMoveToTab` | Move the focused pane to another tab or a new one, in any session on this server (opens a picker) |
 | `PopupToggle [float\|left\|right\|top\|bottom] [size]` | Show or hide the active tab's popup terminal. A hidden popup opens at the named position, or at `popup_position` with none, sized by `size` in percent (`80` or `80x60` for a float, one number for a drawer's axis) or by `popup_width_pct` / `popup_height_pct` with none; a visible one closes, whatever the key names |

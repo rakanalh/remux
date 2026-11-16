@@ -231,7 +231,11 @@ pub enum ConnDescriptor {
 /// 24 -> 25: [`RemuxCommand::TabMoveToSession`]. A 24 server cannot decode the
 /// command and drops the connection, so the bump turns that into a refused
 /// handshake for the upgraded client.
-pub const PROTOCOL_VERSION: u32 = 25;
+///
+/// 25 -> 26: [`RemuxCommand::PaneClear`], [`RemuxCommand::PaneClearScrollback`]
+/// and [`ClientMessage::ClearPaneScrollback`]. A 25 server cannot decode any of
+/// them and drops the connection.
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -585,6 +589,9 @@ pub enum ClientMessage {
     /// explicitly -- this is what a focused View cell uses to type into the
     /// real pane it aliases, wherever that pane actually lives.
     InputToPane { pane_id: PaneId, data: Vec<u8> },
+    /// [`RemuxCommand::PaneClearScrollback`] for a pane named by identity,
+    /// which is how a View cell clears the pane it aliases.
+    ClearPaneScrollback { pane_id: PaneId },
     /// List the contents of `path` **on this server's filesystem**.
     ///
     /// The `files` sidebar panel's one question. It goes over the wire rather
@@ -2455,6 +2462,18 @@ pub enum RemuxCommand {
     /// Zoom the focused pane as a centred float over the layout whatever
     /// `[zoom] mode` says, or release a zoom of either mode.
     PaneToggleZoomFloat,
+    /// Write `^L` to the pane that takes input and keep its scrollback. The
+    /// `^L` goes to whatever runs in the pane's foreground, as a Ctrl+L typed
+    /// in a plain terminal would, so a job reads it as input. This is not
+    /// `SendKey Ctrl-l`: a client sends that as `Input`, and the server drops
+    /// the scrollback when `Input` carries a `^L`.
+    PaneClear,
+    /// Blank the pane that takes input and drop its scrollback. When the shell
+    /// is in the pane's foreground it is also sent `^L`, so that it redraws its
+    /// prompt. A foreground job is sent nothing and keeps the cursor's row,
+    /// moved to the top. See `Screen::clear_screen_and_history`, which also
+    /// covers the alternate screen.
+    PaneClearScrollback,
     /// Show/hide the active tab's popup terminal, drawn over the layout. One
     /// popup per tab, shared by every attached client; the pane is spawned
     /// lazily on the tab's first toggle and its shell keeps running while
@@ -2683,6 +2702,8 @@ impl RemuxCommand {
             | RemuxCommand::PaneToggleZoom
             | RemuxCommand::PaneToggleZoomFullscreen
             | RemuxCommand::PaneToggleZoomFloat
+            | RemuxCommand::PaneClear
+            | RemuxCommand::PaneClearScrollback
             | RemuxCommand::PopupToggle(_)
             | RemuxCommand::ResizeLeft(_)
             | RemuxCommand::ResizeRight(_)
@@ -2998,6 +3019,8 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("PaneToggleZoom"),
             ActionSpec::server("PaneToggleZoomFullscreen"),
             ActionSpec::server("PaneToggleZoomFloat"),
+            ActionSpec::server("PaneClear").label("clear pane"),
+            ActionSpec::server("PaneClearScrollback").label("clear pane and scrollback"),
             ActionSpec::server("PopupToggle").arg("[float|left|right|top|bottom] [size]", "right"),
             ActionSpec::server("ResizeLeft").arg("<amount>", "5"),
             ActionSpec::server("ResizeRight").arg("<amount>", "5"),
@@ -4676,6 +4699,8 @@ mod tests {
             RemuxCommand::PaneToggleZoom => Some("PaneToggleZoom"),
             RemuxCommand::PaneToggleZoomFullscreen => Some("PaneToggleZoomFullscreen"),
             RemuxCommand::PaneToggleZoomFloat => Some("PaneToggleZoomFloat"),
+            RemuxCommand::PaneClear => Some("PaneClear"),
+            RemuxCommand::PaneClearScrollback => Some("PaneClearScrollback"),
             RemuxCommand::PopupToggle(_) => Some("PopupToggle"),
             RemuxCommand::ResizeLeft(_) => Some("ResizeLeft"),
             RemuxCommand::ResizeRight(_) => Some("ResizeRight"),
@@ -4759,11 +4784,11 @@ mod tests {
     }
 
     /// A peer on 23 drops the `mode` of a `ViewToggleZoom` without an error,
-    /// and a peer on 24 cannot decode `TabMoveToSession`, so the handshake has
-    /// to refuse both pairings.
+    /// a peer on 24 cannot decode `TabMoveToSession`, and a peer on 25 cannot
+    /// decode the pane clears, so the handshake has to refuse each pairing.
     #[test]
-    fn protocol_version_is_25_for_the_tab_move() {
-        assert_eq!(PROTOCOL_VERSION, 25);
+    fn protocol_version_is_26_for_the_pane_clears() {
+        assert_eq!(PROTOCOL_VERSION, 26);
     }
 
     #[test]

@@ -441,6 +441,52 @@ impl Screen {
         }
     }
 
+    /// Drop this screen's history and, on the primary screen, blank the grid.
+    /// Returns whether the primary screen was cleared, which is when the
+    /// caller may write `^L` so the shell redraws its prompt.
+    ///
+    /// With `keep_cursor_row` the cursor's row moves to the top row with the
+    /// cursor on it at the same column, which is what a native terminal's
+    /// Cmd+K leaves. The caller asks for it when it will send no `^L`, since
+    /// the program in the foreground then redraws nothing, and a blank pane
+    /// would hide the line it is editing (an ssh session's prompt, for
+    /// example). Without it the cursor goes home on a blank grid.
+    ///
+    /// On the alternate screen the history to drop is the primary screen's,
+    /// parked in `saved_scrollback`, and the grid is left as it is: it belongs
+    /// to a full-screen application, and an application that does not repaint
+    /// would otherwise be left blank. The caller sends that application
+    /// nothing, because `^L` is input to it and not always a redraw.
+    pub fn clear_screen_and_history(&mut self, keep_cursor_row: bool) -> bool {
+        // The dropped lines count as evicted, so the absolute ids of the rows
+        // that remain do not move under a selection anchor that holds one.
+        if self.alt_screen_active {
+            if let Some(saved) = self.saved_scrollback.as_mut() {
+                self.lines_evicted += saved.len();
+                saved.clear();
+            }
+            return false;
+        }
+        let mut grid = vec![self.blank_row(); self.rows as usize];
+        if keep_cursor_row {
+            if let (Some(top), Some(row)) =
+                (grid.first_mut(), self.grid.get(self.cursor_y as usize))
+            {
+                *top = row.clone();
+                top.wrapped = false;
+            }
+        } else {
+            self.cursor_x = 0;
+            self.pending_wrap = false;
+        }
+        self.grid = grid;
+        self.cursor_y = 0;
+        self.lines_evicted += self.scrollback.len();
+        self.scrollback.clear();
+        self.history_cleared_from_view();
+        true
+    }
+
     /// The whole screen was cleared, so none of the scrollback belongs above
     /// what is on it any more: a taller screen must not pull it back into view.
     /// tmux resets `hscrolled` on the same clears. The alternate screen's
@@ -3249,6 +3295,90 @@ mod tests {
     /// Row `r` of the grid as a plain string.
     fn row_text(s: &Screen, r: usize) -> String {
         s.grid[r].iter().map(|c| c.c).collect()
+    }
+
+    #[test]
+    fn clear_screen_and_history_blanks_the_grid_and_drops_the_scrollback() {
+        let mut s = Screen::new(10, 3, 100);
+        for i in 0..20 {
+            s.process_output(format!("line{i}\r\n").as_bytes());
+        }
+        s.process_output(b"$ ");
+        assert!(!s.scrollback.is_empty());
+
+        assert!(s.clear_screen_and_history(false));
+
+        assert!(s.scrollback.is_empty());
+        assert_eq!(s.total_lines(), 3);
+        for r in 0..3 {
+            assert_eq!(row_text(&s, r).trim_end(), "", "row {r}");
+        }
+        assert_eq!((s.cursor_x, s.cursor_y), (0, 0));
+        // A taller screen must not pull the dropped lines back.
+        s.resize(10, 6);
+        assert!(s.scrollback.is_empty());
+        for r in 0..6 {
+            assert_eq!(row_text(&s, r).trim_end(), "", "row {r} after resize");
+        }
+    }
+
+    #[test]
+    fn clear_screen_and_history_can_keep_the_cursor_row_on_top() {
+        let mut s = Screen::new(10, 4, 100);
+        for i in 0..20 {
+            s.process_output(format!("line{i}\r\n").as_bytes());
+        }
+        s.process_output(b"$ ec");
+        let row = s.cursor_y as usize;
+        assert_eq!(row_text(&s, row).trim_end(), "$ ec");
+
+        assert!(s.clear_screen_and_history(true));
+
+        assert!(s.scrollback.is_empty());
+        assert_eq!(row_text(&s, 0).trim_end(), "$ ec");
+        for r in 1..4 {
+            assert_eq!(row_text(&s, r).trim_end(), "", "row {r}");
+        }
+        assert_eq!((s.cursor_x, s.cursor_y), (4, 0));
+        s.process_output(b"ho");
+        assert_eq!(row_text(&s, 0).trim_end(), "$ echo");
+    }
+
+    #[test]
+    fn clear_screen_and_history_keeps_absolute_row_ids_monotonic() {
+        let mut s = Screen::new(10, 3, 100);
+        for i in 0..20 {
+            s.process_output(format!("line{i}\r\n").as_bytes());
+        }
+        let top_before = s.abs_of_row(0, 0);
+        assert!(s.clear_screen_and_history(false));
+        assert_eq!(s.abs_of_row(0, 0), top_before, "primary screen");
+
+        for i in 0..20 {
+            s.process_output(format!("line{i}\r\n").as_bytes());
+        }
+        let top_before_alt = s.abs_of_row(0, 0);
+        s.process_output(b"\x1b[?1049h");
+        assert!(!s.clear_screen_and_history(false));
+        s.process_output(b"\x1b[?1049l");
+        assert!(s.scrollback.is_empty());
+        assert_eq!(s.abs_of_row(0, 0), top_before_alt, "alternate screen");
+    }
+
+    #[test]
+    fn clear_screen_and_history_on_the_alt_screen_drops_the_parked_history() {
+        let mut s = Screen::new(10, 3, 100);
+        for i in 0..20 {
+            s.process_output(format!("line{i}\r\n").as_bytes());
+        }
+        s.process_output(b"\x1b[?1049hAPP");
+
+        assert!(!s.clear_screen_and_history(false));
+        assert_eq!(row_text(&s, 0).trim_end(), "APP", "the app's grid is kept");
+
+        s.process_output(b"\x1b[?1049l");
+        assert!(!s.alt_screen_active);
+        assert!(s.scrollback.is_empty(), "{:?}", s.scrollback.len());
     }
 
     #[test]

@@ -5091,6 +5091,38 @@ mod tests {
         assert_eq!(handler.mode, Mode::Normal);
     }
 
+    /// The key event crossterm decodes `ESC [107;9u` and `ESC [108;9u` into:
+    /// the codepoint as the character and modifier 9 as `SUPER` alone.
+    fn csi_u_super(c: char) -> KeyEvent {
+        make_key(KeyCode::Char(c), KeyModifiers::SUPER)
+    }
+
+    #[test]
+    fn cmd_k_and_cmd_l_run_the_clears() {
+        let mut handler = InputHandler::with_defaults();
+        assert_eq!(
+            handler.handle_key(csi_u_super('k')),
+            InputAction::Execute(RemuxCommand::PaneClearScrollback)
+        );
+        assert_eq!(
+            handler.handle_key(csi_u_super('l')),
+            InputAction::Execute(RemuxCommand::PaneClear)
+        );
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn prefix_p_c_clears_the_pane_and_its_scrollback() {
+        let mut handler = InputHandler::with_defaults();
+        handler.handle_key(make_key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        handler.handle_key(make_key(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Char('c'), KeyModifiers::NONE)),
+            InputAction::Execute(RemuxCommand::PaneClearScrollback)
+        );
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
     #[test]
     fn normal_alt_keys_unbound_pass_to_pty() {
         let mut handler = InputHandler::with_defaults();

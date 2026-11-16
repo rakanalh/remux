@@ -2366,6 +2366,49 @@ async fn run_menu_action(
     Ok(())
 }
 
+/// Repaint the whole screen from the front buffer and re-send the terminal
+/// modes, for a screen the outer terminal cleared without telling remux.
+///
+/// The front buffer holds what the client last painted, chrome and View cells
+/// included, so replaying it restores the screen with no server round trip,
+/// even while scrolled back.
+#[allow(clippy::too_many_arguments)]
+fn redraw_screen(
+    renderer: &mut Renderer,
+    input: &InputHandler,
+    whichkey: &mut WhichKeyPopup,
+    theme: &crate::config::theme::Theme,
+    which_key_position: &crate::config::WhichKeyPosition,
+    viewport_top: usize,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
+    cursor: (u16, u16, bool),
+) -> Result<()> {
+    if whichkey.visible {
+        whichkey.hide();
+    }
+    crate::client::terminal::enable_terminal_modes()?;
+    repaint_overlays(
+        renderer,
+        input,
+        whichkey,
+        theme,
+        which_key_position,
+        viewport_top,
+        focused_pane_rect,
+        cursor,
+    )
+}
+
+/// A pane clear runs where the terminal's own clear key used to, and some
+/// terminals both clear their screen and send the key, so the client repaints
+/// everything it owns instead of trusting its diff baseline.
+fn redraws_after(cmd: &RemuxCommand) -> bool {
+    matches!(
+        cmd,
+        RemuxCommand::PaneClear | RemuxCommand::PaneClearScrollback
+    )
+}
+
 /// Repaint the screen under the context menu and lay the overlays back on, the
 /// menu last. Used when the highlight moves or the menu closes, since both
 /// leave cells of the old frame on screen.
@@ -3925,6 +3968,22 @@ async fn send_to_focused_cell(
     data: Vec<u8>,
     label: &str,
 ) -> bool {
+    send_to_focused_cell_with(mgr, view, label, |pane_id| ClientMessage::InputToPane {
+        pane_id,
+        data,
+    })
+    .await
+}
+
+/// [`send_to_focused_cell`] for any message addressed to the focused cell's
+/// pane, under the same rules for which cells take it and what a failed send
+/// does.
+async fn send_to_focused_cell_with(
+    mgr: &mut ConnectionManager,
+    view: &mut crate::client::view::ClientView,
+    label: &str,
+    message: impl FnOnce(crate::protocol::PaneId) -> ClientMessage,
+) -> bool {
     let focused = view.focused;
     let target = view
         .cells
@@ -3935,12 +3994,9 @@ async fn send_to_focused_cell(
         Some(t) => t,
         None => return false,
     };
-    if let Err(e) = mgr
-        .send(&conn, ClientMessage::InputToPane { pane_id, data })
-        .await
-    {
+    if let Err(e) = mgr.send(&conn, message(pane_id)).await {
         log::warn!(
-            "view: {label} InputToPane to {:?} pane {} failed: {e}; marking cell disconnected",
+            "view: {label} to {:?} pane {} failed: {e}; marking cell disconnected",
             conn,
             pane_id
         );
@@ -3992,6 +4048,10 @@ async fn send_to_focused_cell(
 ///   path runs and the client exits.
 /// - `SendKey(bytes)` -> route the raw bytes to the focused cell's pane by
 ///   identity (best-effort), never to the foreground (per-terminal, unchanged).
+/// - `PaneClear` -> `^L` to the focused cell's pane as `InputToPane`, which
+///   keeps the scrollback; `PaneClearScrollback` -> `ClearPaneScrollback` for
+///   that pane. Both go to the cell's own connection, and both repaint the
+///   whole screen.
 /// - `Resize{Left,Right,Up,Down}` while a PANEL holds the keyboard -> swallowed.
 ///   `handle_chrome_resize` moves the content rect without re-subscribing the
 ///   view's cells, and it runs after this.
@@ -4345,6 +4405,26 @@ async fn handle_view_command(
             if send_to_focused_cell(mgr, &mut views[av], bytes.clone(), "SendKey").await {
                 repaint!();
             }
+            Ok(true)
+        }
+        // Routed by the cell's own connection and pane id, so a cell aliasing
+        // a remote pane clears that pane on its own server.
+        RemuxCommand::PaneClear | RemuxCommand::PaneClearScrollback => {
+            hide_whichkey!();
+            if matches!(cmd, RemuxCommand::PaneClear) {
+                send_to_focused_cell(mgr, &mut views[av], vec![0x0c], "PaneClear").await;
+            } else {
+                send_to_focused_cell_with(mgr, &mut views[av], "PaneClearScrollback", |pane_id| {
+                    ClientMessage::ClearPaneScrollback { pane_id }
+                })
+                .await;
+            }
+            // `paint_view` alone is not a full repaint: with a sidebar up the
+            // client owns the status bar, and `Chrome::paint_status_bar` skips
+            // a row the front buffer already holds. The replay puts it back.
+            crate::client::terminal::enable_terminal_modes()?;
+            renderer.repaint_all()?;
+            repaint!();
             Ok(true)
         }
         // Every other structural / server command is a NO-OP while in a view:
@@ -5292,11 +5372,24 @@ async fn run_client_loop(
                                 {
                                     continue;
                                 }
+                                let redraw = redraws_after(&cmd);
                                 // Handle SendKey: forward raw bytes to PTY.
                                 if let RemuxCommand::SendKey(ref bytes) = cmd {
                                     mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
                                 } else if !prepare_popup_toggle(&mut cmd, mgr, &mut popup, &chrome, &renderer, &current_attached, active_view.is_some()).await? {
                                     mgr.send_foreground(ClientMessage::Command(cmd)).await?;
+                                }
+                                if redraw {
+                                    redraw_screen(
+                                        &mut renderer,
+                                        &input,
+                                        &mut whichkey,
+                                        &theme,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                        (last_cursor_x, last_cursor_y, last_cursor_visible),
+                                    )?;
                                 }
                                 // Notify server of current mode if it changed.
                                 let mode_str = match input.mode {
@@ -5419,10 +5512,23 @@ async fn run_client_loop(
                                     {
                                         continue;
                                     }
+                                    let redraw = redraws_after(&cmd);
                                     if let RemuxCommand::SendKey(ref bytes) = cmd {
                                         mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
                                     } else if !prepare_popup_toggle(&mut cmd, mgr, &mut popup, &chrome, &renderer, &current_attached, active_view.is_some()).await? {
                                         mgr.send_foreground(ClientMessage::Command(cmd)).await?;
+                                    }
+                                    if redraw {
+                                        redraw_screen(
+                                            &mut renderer,
+                                            &input,
+                                            &mut whichkey,
+                                            &theme,
+                                            &which_key_position,
+                                            viewport_top,
+                                            focused_pane_rect.as_ref(),
+                                            (last_cursor_x, last_cursor_y, last_cursor_visible),
+                                        )?;
                                     }
                                 }
                                 // Notify server of current mode.
@@ -5721,6 +5827,7 @@ async fn run_client_loop(
                                 shortcuts,
                             } => {
                                 log::debug!("input: ExecuteAndShowWhichKey cmd={:?}", command);
+                                let redraw = redraws_after(&command);
                                 // Sticky-group leaves (e.g. the `p R h/j/k/l`
                                 // resize group) arrive here, NOT via `Execute`.
                                 // While a view is active they must be intercepted
@@ -5818,6 +5925,13 @@ async fn run_client_loop(
                                     if !prepare_popup_toggle(&mut command, mgr, &mut popup, &chrome, &renderer, &current_attached, active_view.is_some()).await? {
                                         mgr.send_foreground(ClientMessage::Command(command)).await?;
                                     }
+                                }
+                                // The `clear_overlay` below already replays the
+                                // front buffer, which is the rest of what
+                                // `redraw_screen` does; it is not called here
+                                // because it closes the which-key popup.
+                                if redraw {
+                                    crate::client::terminal::enable_terminal_modes()?;
                                 }
                                 // Keep the which-key popup open so the user can
                                 // keep resizing (re-shown over the repainted view
@@ -7378,18 +7492,10 @@ async fn run_client_loop(
                                 }
                             }
                             InputAction::Redraw => {
-                                if whichkey.visible {
-                                    whichkey.hide();
-                                }
-                                crate::client::terminal::enable_terminal_modes()?;
-                                // The front buffer holds what the client last
-                                // painted, chrome and View cells included, so
-                                // replaying it restores the screen with no
-                                // server round trip, even while scrolled back.
-                                repaint_overlays(
+                                redraw_screen(
                                     &mut renderer,
                                     &input,
-                                    &whichkey,
+                                    &mut whichkey,
                                     &theme,
                                     &which_key_position,
                                     viewport_top,
