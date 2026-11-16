@@ -72,7 +72,7 @@ Most macOS terminals handle Cmd+K themselves: they clear their own screen and do
 | Ghostty | `keybind = cmd+k=text:\x1b[107;9u` and `keybind = cmd+l=text:\x1b[108;9u` in the config. |
 | WezTerm | Add to `config.keys`: `{ key = 'k', mods = 'SUPER', action = wezterm.action.SendString '\x1b[107;9u' }` and the same with `'l'` and `'\x1b[108;9u'`. |
 | Alacritty | In the config: `[[keyboard.bindings]]` with `key = "K"`, `mods = "Command"`, `chars = "\u001b[107;9u"`, and a second binding with `key = "L"` and `chars = "\u001b[108;9u"`. |
-| Kitty | `map cmd+k send_text all \x1b[107;9u` and `map cmd+l send_text all \x1b[108;9u` in `kitty.conf`. |
+| Kitty | `map cmd+k send_text all \x1b[107;9u` and `map cmd+l send_text all \x1b[108;9u` in `kitty.conf`. These replace kitty's own Cmd+K and Cmd+L clears. Use `send_text`, not `send_key`, which sends nothing for Cmd to a program in legacy keyboard mode. `kitten show-key` shows what the key sends. |
 | iTerm2 | **Settings → Profiles → Keys → Key Mappings**, add Cmd+K with the action **Send Hex Codes** and `0x1b 0x5b 0x31 0x30 0x37 0x3b 0x39 0x75`, and Cmd+L with `0x1b 0x5b 0x31 0x30 0x38 0x3b 0x39 0x75`. |
 | Terminal.app | Cannot send these keys. Use `Prefix p c` for `PaneClearScrollback`, and run `PaneClear` from the command palette (`Prefix :`) to keep the scrollback. A typed `Ctrl-l` drops the scrollback too. |
 
