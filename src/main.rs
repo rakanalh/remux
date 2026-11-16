@@ -4419,9 +4419,11 @@ async fn handle_view_command(
                 })
                 .await;
             }
-            // `paint_view` writes every cell of the view and its chrome, so it
-            // is the full repaint here; only the modes need re-sending.
+            // `paint_view` alone is not a full repaint: with a sidebar up the
+            // client owns the status bar, and `Chrome::paint_status_bar` skips
+            // a row the front buffer already holds. The replay puts it back.
             crate::client::terminal::enable_terminal_modes()?;
+            renderer.repaint_all()?;
             repaint!();
             Ok(true)
         }

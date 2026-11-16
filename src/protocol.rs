@@ -2470,8 +2470,9 @@ pub enum RemuxCommand {
     PaneClear,
     /// Blank the pane that takes input and drop its scrollback. When the shell
     /// is in the pane's foreground it is also sent `^L`, so that it redraws its
-    /// prompt; a foreground job is sent nothing. See
-    /// `Screen::clear_screen_and_history` for the alternate screen.
+    /// prompt. A foreground job is sent nothing and keeps the cursor's row,
+    /// moved to the top. See `Screen::clear_screen_and_history`, which also
+    /// covers the alternate screen.
     PaneClearScrollback,
     /// Show/hide the active tab's popup terminal, drawn over the layout. One
     /// popup per tab, shared by every attached client; the pane is spawned

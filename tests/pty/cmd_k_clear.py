@@ -21,6 +21,8 @@ the markers are printed by `printf`, so no typed command can satisfy a check.
      `^L` reached it) and the wheel still reaches `BBB:` history
   5  `Prefix p c`, the fallback for Terminal.app, clears as Cmd+K does
   6  the client is alive and neither log has a panic
+  9  case 7 with a left sidebar, where the client owns the status bar: the
+     bar and the sidebar are repainted too
   8  a clear bound in the sticky `p R` group clears the same way and re-sends
      the terminal modes
   7  inside a View of both panes, Cmd+K clears the focused cell's pane through
@@ -56,6 +58,20 @@ FAILURES = []
 # `p R` is a sticky group: its leaves run through the client's
 # ExecuteAndShowWhichKey arm, not Execute, so a clear bound there takes the
 # other repaint path.
+SIDEBAR_W = 24
+# With a sidebar up the client owns the status bar, and its painter skips a row
+# the front buffer already holds, so only a front-buffer replay restores the
+# bar after the terminal cleared its screen.
+SIDEBAR_CONFIG = f"""
+[[sidebar]]
+edge = "left"
+size = {SIDEBAR_W}
+visible = true
+
+  [[sidebar.panel]]
+  plugin = "placeholder"
+  weight = 1
+"""
 STICKY_CONFIG = """
 [keybindings.command.p.R]
 c = "PaneClearScrollback"
@@ -160,8 +176,8 @@ def history_under_wheel(t, prefix, origin):
     return bool(seen) and (not before or min(seen) < min(before))
 
 
-def test_view():
-    t = ShadowTui(run_dir("rmx-cmdkv"), cols=COLS, rows=ROWS,
+def test_view(label, rundir, config=None):
+    t = ShadowTui(run_dir(rundir), cols=COLS, rows=ROWS, config=config,
                   extra_env={"PS1": "P$((6*7))> "}).start()
     try:
         two_filled_panes(t)
@@ -169,7 +185,7 @@ def test_view():
         sm_compose_view(t, panes=(0, 1), settle=2.0)
         t.pump(1.0)
         in_view = "View 1" in t.rows_text()[-1]
-        check("7 setup: entered a view of both panes", in_view, t.rows_text()[-1])
+        check(f"{label} setup: entered a view of both panes", in_view, t.rows_text()[-1])
         if not in_view:
             return
         before = {p: marks(t, p, t.control) for p in ("AAA", "BBB")}
@@ -180,37 +196,40 @@ def test_view():
         t.screen.reset()
         mark = len(t.raw)
         t.send(CMD_K, 1.5)
-        check_modes("7 view", bytes(t.raw[mark:]))
+        check_modes(label, bytes(t.raw[mark:]))
         after = {p: marks(t, p, t.control) for p in ("AAA", "BBB")}
         cleared = [p for p in ("AAA", "BBB") if before[p] and not after[p]]
         kept = [p for p in ("AAA", "BBB") if after[p] == before[p] and before[p]]
-        check("7 view: Cmd+K cleared exactly one cell and left the other",
+        check(f"{label}: Cmd+K cleared exactly one cell and left the other",
               len(cleared) == 1 and len(kept) == 1, (before, after))
         if kept:
-            check("7 view: the other cell's lines are repainted",
+            check(f"{label}: the other cell's lines are repainted",
                   marks(t, kept[0]) == before[kept[0]],
                   (sorted(marks(t, kept[0]))[:4], sorted(before[kept[0]])[:4]))
-        check("7 view: the status bar is repainted",
+        check(f"{label}: the status bar is repainted",
               t.rows_text()[-1].strip() == status, repr(t.rows_text()[-1].strip()[:60]))
+        if config is not None:
+            check(f"{label}: the sidebar is repainted", t.has("placeholder"),
+                  [r[:SIDEBAR_W] for r in t.rows_text()[:4]])
         # The cells sit side by side, so the only prompt in the top rows is the
         # one the cleared cell's shell redrew; the other's is at its bottom.
-        check("7 view: the shell redrew the prompt at the cleared cell's top",
+        check(f"{label}: the shell redrew the prompt at the cleared cell's top",
               any(PROMPT in r for r in t.control.display[:4]), t.control.display[:4])
         t.prefix(b"wq", 1.5)
-        check("7 view: left the view", "View 1" not in t.rows_text()[-1], t.rows_text()[-1])
+        check(f"{label}: left the view", "View 1" not in t.rows_text()[-1], t.rows_text()[-1])
         if len(cleared) == 1:
             origins = {"AAA": left, "BBB": right}
             gone, other = cleared[0], kept[0] if kept else None
-            check(f"7 view: the cleared pane ({gone}) has no history after the view",
+            check(f"{label}: the cleared pane ({gone}) has no history after the view",
                   not history_under_wheel(t, gone, origins[gone]))
             if other:
-                check(f"7 view: the other pane ({other}) keeps its history",
+                check(f"{label}: the other pane ({other}) keeps its history",
                       history_under_wheel(t, other, origins[other]))
-        check("7 view: the client is alive", t.alive())
+        check(f"{label}: the client is alive", t.alive())
     finally:
         t.kill()
     for which in ("client", "server"):
-        check(f"7 view: no panic in the {which} log", "panicked at" not in t.log(which))
+        check(f"{label}: no panic in the {which} log", "panicked at" not in t.log(which))
 
 
 def main():
@@ -269,7 +288,8 @@ def main():
         t.kill()
     for which in ("client", "server"):
         check(f"6 no panic in the {which} log", "panicked at" not in t.log(which))
-    test_view()
+    test_view("7 view", "rmx-cmdkv")
+    test_view("9 view with a sidebar", "rmx-cmdkvs", SIDEBAR_CONFIG)
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}\nlogs: {RUNDIR}/state/remux/")
         sys.exit(1)

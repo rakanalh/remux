@@ -5585,6 +5585,15 @@ impl PaneData {
         }
     }
 
+    /// Whether the PTY's foreground process group is the pane's own leader,
+    /// the shell, rather than a job the shell started. The shell leads its
+    /// own process group, so its pid is that group's id. With job control off
+    /// (`set +m`) a job stays in the shell's group, so it counts as the shell.
+    fn shell_is_foreground(&self) -> bool {
+        let (foreground, _) = pty::foreground_of(std::os::fd::AsFd::as_fd(&self.pty.master_fd));
+        foreground == Some(self.pty.child_pid.as_raw())
+    }
+
     /// [`Self::send_input`] for keys a person pressed, which arms the typing
     /// guard. Every human key path writes through this, and nothing else
     /// does: a submit's own writes arming it would hold the next submit
@@ -5599,14 +5608,6 @@ impl PaneData {
     /// the key's Enter would make run it. A paste the agent is inside (it
     /// read the opener, and not yet the closer) is closed first, so the key
     /// is never taken as part of it. Only the first key does this.
-    /// Whether the PTY's foreground process group is the pane's own leader,
-    /// the shell, rather than a job the shell started. The shell leads its
-    /// own process group, so its pid is that group's id.
-    fn shell_is_foreground(&self) -> bool {
-        let (foreground, _) = pty::foreground_of(std::os::fd::AsFd::as_fd(&self.pty.master_fd));
-        foreground == Some(self.pty.child_pid.as_raw())
-    }
-
     fn send_human_input(&mut self, data: &[u8]) {
         self.last_human_input = Some(std::time::Instant::now());
         let typing = self
@@ -8312,14 +8313,16 @@ async fn clear_pane_scrollback(
             log::info!("server: ClearPaneScrollback pane_id={pane_id} refused: pane is gone");
             return;
         };
-        let primary = pane.screen.clear_screen_and_history();
         // Only the shell is sent `^L`. A job in the foreground reads it as
         // input: `cat > file` writes it into the file, and a job that has not
         // read it yet leaves it queued for the shell, which then clears the
-        // job's last output off the screen when the prompt returns. Written
+        // job's last output off the screen when the prompt returns. A job is
+        // left its cursor row instead, because nothing will redraw it. Written
         // under the same lock as the clear, so no output from the pane can
         // land between the two and survive on the blank grid.
-        let shell_foreground = primary && pane.shell_is_foreground();
+        let shell = pane.shell_is_foreground();
+        let primary = pane.screen.clear_screen_and_history(!shell);
+        let shell_foreground = primary && shell;
         if shell_foreground {
             pane.send_human_input(&[CLEAR_SCREEN_KEY]);
         }

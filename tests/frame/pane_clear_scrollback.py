@@ -31,6 +31,10 @@ What it covers:
      was typed, with no `^L` in it
   8  `PaneClearScrollback` on the alternate screen under `cat -v`: no `^L`
      reaches it, so none is echoed
+  9  `PaneClearScrollback` while `cat` holds a half-typed line: the line moves
+     to the pane's top row with the cursor still on it, the history is gone,
+     and no `^L` is echoed. `cat` redraws nothing, so a blank pane would hide
+     the line
 
 Run from the repo root:  python3 tests/frame/pane_clear_scrollback.py
 """
@@ -233,6 +237,33 @@ def main():
         time.sleep(0.3)
         c.send({"Input": {"data": list(b"printf '\\033[?1049l'\n")}})
         time.sleep(0.5)
+
+        # 9: a foreground job holding a half-typed line.
+        fill(c, grid)
+        c.send({"Input": {"data": list(b"cat\n")}})
+        time.sleep(0.5)
+        c.send({"Input": {"data": list(b"partial")}})
+        time.sleep(0.4)
+        pump(c, grid)
+        c.send({"Command": "PaneClearScrollback"})
+        time.sleep(0.8)
+        pump(c, grid)
+        check("9 job line: the half-typed line is on the pane's top row",
+              grid.pane_top().rstrip(" │") == "partial", repr(grid.pane_top()[:40]))
+        check("9 job line: the rest of the pane is blank",
+              all(not r[1:-1].strip() for r in grid.rows()[2:ROWS - 2]),
+              [r for r in grid.rows()[2:ROWS - 2] if r[1:-1].strip()][:3])
+        check("9 job line: no ^L reached the job", not grid.has("^L"), grid.rows()[:3])
+        c.send({"Input": {"data": list(b"X")}})
+        time.sleep(0.4)
+        pump(c, grid)
+        check("9 job line: the cursor is still at the end of that line",
+              grid.pane_top().rstrip(" │") == "partialX", repr(grid.pane_top()[:40]))
+        c.send({"Input": {"data": [0x03]}})
+        time.sleep(0.3)
+        pump(c, grid)
+        seen, top = scrolled_hist(c, grid)
+        check("9 job line: the history is gone", not seen and top == 0, (seen[:4], top))
         c.close()
     except (ConnectionError, OSError, AssertionError) as e:
         check("the connection survives the run", False, repr(e))

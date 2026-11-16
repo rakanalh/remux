@@ -741,8 +741,10 @@
 #                                     A running command reads the ^L as input
 #   PaneClearScrollback             — Clear the focused pane and drop its scrollback. At a
 #                                     shell prompt it also sends ^L so the shell redraws
-#                                     the prompt; a running command is sent nothing. On
-#                                     the alternate screen only the scrollback is dropped
+#                                     the prompt; a running command (ssh, say) is sent
+#                                     nothing and keeps the cursor's line, moved to the
+#                                     top. On the alternate screen only the scrollback
+#                                     is dropped
 #   PaneRename                      — Rename the focused pane (prompts)
 #   PaneMoveToTab                   — Move the focused pane to another tab (opens a picker)
 #   PopupToggle [position [size]]   — Toggle the popup terminal. A hidden popup opens
