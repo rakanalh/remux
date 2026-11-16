@@ -4419,7 +4419,9 @@ async fn handle_view_command(
                 })
                 .await;
             }
-            renderer.repaint_all()?;
+            // `paint_view` writes every cell of the view and its chrome, so it
+            // is the full repaint here; only the modes need re-sending.
+            crate::client::terminal::enable_terminal_modes()?;
             repaint!();
             Ok(true)
         }
@@ -5823,6 +5825,7 @@ async fn run_client_loop(
                                 shortcuts,
                             } => {
                                 log::debug!("input: ExecuteAndShowWhichKey cmd={:?}", command);
+                                let redraw = redraws_after(&command);
                                 // Sticky-group leaves (e.g. the `p R h/j/k/l`
                                 // resize group) arrive here, NOT via `Execute`.
                                 // While a view is active they must be intercepted
@@ -5920,6 +5923,13 @@ async fn run_client_loop(
                                     if !prepare_popup_toggle(&mut command, mgr, &mut popup, &chrome, &renderer, &current_attached, active_view.is_some()).await? {
                                         mgr.send_foreground(ClientMessage::Command(command)).await?;
                                     }
+                                }
+                                // The `clear_overlay` below already replays the
+                                // front buffer, which is the rest of what
+                                // `redraw_screen` does; it is not called here
+                                // because it closes the which-key popup.
+                                if redraw {
+                                    crate::client::terminal::enable_terminal_modes()?;
                                 }
                                 // Keep the which-key popup open so the user can
                                 // keep resizing (re-shown over the repainted view

@@ -21,10 +21,14 @@ the markers are printed by `printf`, so no typed command can satisfy a check.
      `^L` reached it) and the wheel still reaches `BBB:` history
   5  `Prefix p c`, the fallback for Terminal.app, clears as Cmd+K does
   6  the client is alive and neither log has a panic
+  8  a clear bound in the sticky `p R` group clears the same way and re-sends
+     the terminal modes
   7  inside a View of both panes, Cmd+K clears the focused cell's pane through
      `ClearPaneScrollback`: its markers are gone and the shell redrew `P42> `,
      the other cell keeps its lines, and after leaving the view the wheel finds
-     no history in the cleared pane and history in the other
+     no history in the cleared pane and history in the other. The pyte screen
+     is reset just before, so the other cell and the status bar are back only
+     if the client repainted them
 
 Run from the repo root (pyte and pexpect are needed):
     uv run --no-config --no-project --with pyte --with pexpect \\
@@ -49,6 +53,13 @@ CMD_K = b"\x1b[107;9u"
 CMD_L = b"\x1b[108;9u"
 ALT_H, ALT_L = b"\x1bh", b"\x1bl"
 FAILURES = []
+# `p R` is a sticky group: its leaves run through the client's
+# ExecuteAndShowWhichKey arm, not Execute, so a clear bound there takes the
+# other repaint path.
+STICKY_CONFIG = """
+[keybindings.command.p.R]
+c = "PaneClearScrollback"
+"""
 
 
 def check(name, cond, detail=""):
@@ -99,6 +110,16 @@ def pane_origin(t, prefix):
     rows = [y for y, r in enumerate(t.rows_text()) if pat.search(r)]
     assert cols and rows, f"no {prefix}: markers on screen"
     return cols[0], rows[0]
+
+
+MODES = (("mouse tracking", b"\x1b[?1000h"),
+         ("SGR mouse", b"\x1b[?1006h"),
+         ("bracketed paste", b"\x1b[?2004h"))
+
+
+def check_modes(label, emitted):
+    for name, seq in MODES:
+        check(f"{label}: the clear re-sends {name}", seq in emitted, emitted[:80])
 
 
 def top_row(t, origin, screen=None):
@@ -152,12 +173,25 @@ def test_view():
         if not in_view:
             return
         before = {p: marks(t, p, t.control) for p in ("AAA", "BBB")}
+        status = t.rows_text()[-1].strip()
+        # As in case 2: the reset stands for a terminal that cleared its own
+        # screen, and only the client's repaint can bring back the cell that
+        # was not cleared, because its pane prints nothing.
+        t.screen.reset()
+        mark = len(t.raw)
         t.send(CMD_K, 1.5)
+        check_modes("7 view", bytes(t.raw[mark:]))
         after = {p: marks(t, p, t.control) for p in ("AAA", "BBB")}
         cleared = [p for p in ("AAA", "BBB") if before[p] and not after[p]]
         kept = [p for p in ("AAA", "BBB") if after[p] == before[p] and before[p]]
         check("7 view: Cmd+K cleared exactly one cell and left the other",
               len(cleared) == 1 and len(kept) == 1, (before, after))
+        if kept:
+            check("7 view: the other cell's lines are repainted",
+                  marks(t, kept[0]) == before[kept[0]],
+                  (sorted(marks(t, kept[0]))[:4], sorted(before[kept[0]])[:4]))
+        check("7 view: the status bar is repainted",
+              t.rows_text()[-1].strip() == status, repr(t.rows_text()[-1].strip()[:60]))
         # The cells sit side by side, so the only prompt in the top rows is the
         # one the cleared cell's shell redrew; the other's is at its bottom.
         check("7 view: the shell redrew the prompt at the cleared cell's top",
@@ -180,7 +214,8 @@ def test_view():
 
 
 def main():
-    t = ShadowTui(RUNDIR, cols=COLS, rows=ROWS, extra_env={"PS1": "P$((6*7))> "}).start()
+    t = ShadowTui(RUNDIR, cols=COLS, rows=ROWS, config=STICKY_CONFIG,
+                  extra_env={"PS1": "P$((6*7))> "}).start()
     try:
         two_filled_panes(t)
         right = pane_origin(t, "BBB")
@@ -194,7 +229,9 @@ def main():
         # Checked before any wheel: a scroll repaints the whole frame, which
         # would restore the reset screen whether or not Cmd+K did.
         t.screen.reset()
+        mark = len(t.raw)
         t.send(CMD_K, 1.5)
+        check_modes("2 Cmd+K", bytes(t.raw[mark:]))
         check("2 Cmd+K: the left pane's lines are repainted",
               marks(t, "AAA") == left_live, (sorted(marks(t, "AAA"))[:4], sorted(left_live)[:4]))
         check("2 Cmd+K: the status bar is repainted",
@@ -219,6 +256,13 @@ def main():
         fill(t, "BBB")
         t.prefix(b"pc", 1.5)
         check_cleared(t, "5 Prefix p c", right)
+
+        fill(t, "BBB")
+        mark = len(t.raw)
+        t.prefix(b"pRc", 1.5)
+        check_modes("8 sticky group", bytes(t.raw[mark:]))
+        check_cleared(t, "8 sticky group", right)
+        t.send(b"\x1b", 0.6)
 
         check("6 the client is alive", t.alive())
     finally:

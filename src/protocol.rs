@@ -2462,13 +2462,16 @@ pub enum RemuxCommand {
     /// Zoom the focused pane as a centred float over the layout whatever
     /// `[zoom] mode` says, or release a zoom of either mode.
     PaneToggleZoomFloat,
-    /// Write `^L` to the pane that takes input and keep its scrollback. This
-    /// is not `SendKey Ctrl-l`: a client sends that as `Input`, and the server
-    /// drops the scrollback when `Input` carries a `^L`.
+    /// Write `^L` to the pane that takes input and keep its scrollback. The
+    /// `^L` goes to whatever runs in the pane's foreground, as a Ctrl+L typed
+    /// in a plain terminal would, so a job reads it as input. This is not
+    /// `SendKey Ctrl-l`: a client sends that as `Input`, and the server drops
+    /// the scrollback when `Input` carries a `^L`.
     PaneClear,
-    /// Blank the pane that takes input, drop its scrollback, and write `^L` so
-    /// the shell redraws its prompt. See `Screen::clear_screen_and_history` for
-    /// the alternate screen.
+    /// Blank the pane that takes input and drop its scrollback. When the shell
+    /// is in the pane's foreground it is also sent `^L`, so that it redraws its
+    /// prompt; a foreground job is sent nothing. See
+    /// `Screen::clear_screen_and_history` for the alternate screen.
     PaneClearScrollback,
     /// Show/hide the active tab's popup terminal, drawn over the layout. One
     /// popup per tab, shared by every attached client; the pane is spawned

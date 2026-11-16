@@ -2,9 +2,10 @@
 """`PaneClearScrollback`, `ClearPaneScrollback` and `PaneClear` (frame harness).
 
 Cmd+K is `PaneClearScrollback`: the server blanks the pane that takes input,
-drops its scrollback and writes `^L`, so the shell redraws its prompt. A View
-cell sends `ClearPaneScrollback { pane_id }` for the same thing. Cmd+L is
-`PaneClear`: only the `^L`, and the scrollback stays.
+drops its scrollback and, when the shell is in the foreground, writes `^L` so
+the shell redraws its prompt. A View cell sends `ClearPaneScrollback
+{ pane_id }` for the same thing. Cmd+L is `PaneClear`: only the `^L`, and the
+scrollback stays.
 
 The history is `HIST_<n>` lines printed by `seq`, and the prompt is `P42> `,
 which bash builds from `$((6*7))`. Neither string is in a typed command, so a
@@ -23,6 +24,13 @@ What it covers:
   4  `PaneClear`: the shell redrew `P42> ` on the top row and the history is
      still reachable by scrolling up
   5  no panic in the server log
+  6  `PaneClearScrollback` while `sleep` runs: the job is sent no `^L`, so the
+     `DONE:ok` it prints afterwards stays on screen (a queued `^L` would make the
+     shell clear it when the prompt returns), and the history is still dropped
+  7  `PaneClearScrollback` while `cat > file` reads: the file holds exactly what
+     was typed, with no `^L` in it
+  8  `PaneClearScrollback` on the alternate screen under `cat -v`: no `^L`
+     reaches it, so none is echoed
 
 Run from the repo root:  python3 tests/frame/pane_clear_scrollback.py
 """
@@ -87,6 +95,9 @@ class Grid:
     def pane_top(self):
         """The pane's first content row: inside the top border and the left one."""
         return "".join(self.g[1][1:])
+
+    def has(self, needle):
+        return needle in self.text()
 
     def hist(self):
         return sorted({int(m.group(1)) for m in re.finditer(r"HIST_(\d+)", self.text())})
@@ -182,6 +193,46 @@ def main():
         seen, top = scrolled_hist(c, grid)
         check("4 PaneClear: the history is still reachable", bool(seen) and top > 0,
               (seen[:4], top))
+        # 6: a running job. The marker is assembled by printf, after the clear.
+        fill(c, grid)
+        c.send({"Input": {"data": list(b"sleep 2; printf 'DONE:%s\\n' ok\n")}})
+        time.sleep(0.6)
+        c.send({"Command": "PaneClearScrollback"})
+        time.sleep(3.0)
+        pump(c, grid, 1.0)
+        check("6 job: the job's output after the clear stays on screen",
+              grid.has("DONE:ok"), grid.rows()[:4])
+        seen, top = scrolled_hist(c, grid)
+        check("6 job: the history is still dropped", not seen and top == 0, (seen[:4], top))
+
+        # 7: a job reading the terminal.
+        out = f"{RUNDIR}/cat.out"
+        c.send({"Input": {"data": list(f"cat > {out}\n".encode())}})
+        time.sleep(0.6)
+        c.send({"Input": {"data": list(b"abc\n")}})
+        time.sleep(0.4)
+        c.send({"Command": "PaneClearScrollback"})
+        time.sleep(0.6)
+        c.send({"Input": {"data": [0x04]}})
+        time.sleep(0.8)
+        pump(c, grid)
+        got = open(out, "rb").read() if os.path.exists(out) else None
+        check("7 cat > file: the file holds only what was typed", got == b"abc\n", got)
+
+        # 8: the alternate screen. The tty echoes a ^L that `cat -v` is sent
+        # as `^L`, whatever cat does with it.
+        c.send({"Input": {"data": list(b"printf '\\033[?1049h'; cat -v\n")}})
+        time.sleep(0.8)
+        pump(c, grid)
+        c.send({"Command": "PaneClearScrollback"})
+        time.sleep(0.8)
+        pump(c, grid)
+        check("8 alt screen: no ^L reaches the application", not grid.has("^L"),
+              grid.rows()[:4])
+        c.send({"Input": {"data": [0x03]}})
+        time.sleep(0.3)
+        c.send({"Input": {"data": list(b"printf '\\033[?1049l'\n")}})
+        time.sleep(0.5)
         c.close()
     except (ConnectionError, OSError, AssertionError) as e:
         check("the connection survives the run", False, repr(e))

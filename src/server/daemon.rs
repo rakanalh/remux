@@ -5599,6 +5599,14 @@ impl PaneData {
     /// the key's Enter would make run it. A paste the agent is inside (it
     /// read the opener, and not yet the closer) is closed first, so the key
     /// is never taken as part of it. Only the first key does this.
+    /// Whether the PTY's foreground process group is the pane's own leader,
+    /// the shell, rather than a job the shell started. The shell leads its
+    /// own process group, so its pid is that group's id.
+    fn shell_is_foreground(&self) -> bool {
+        let (foreground, _) = pty::foreground_of(std::os::fd::AsFd::as_fd(&self.pty.master_fd));
+        foreground == Some(self.pty.child_pid.as_raw())
+    }
+
     fn send_human_input(&mut self, data: &[u8]) {
         self.last_human_input = Some(std::time::Instant::now());
         let typing = self
@@ -8268,7 +8276,7 @@ async fn handle_input(
         // must be unaffected. The shell repaints itself, so no render/broadcast
         // is needed; handle_scroll_delta re-clamps any stale client offsets
         // against the now-smaller total line count.
-        if data.contains(&0x0C) && !pane_data.screen.alt_screen_active {
+        if data.contains(&CLEAR_SCREEN_KEY) && !pane_data.screen.alt_screen_active {
             pane_data.screen.scrollback.clear();
         }
     }
@@ -8305,13 +8313,18 @@ async fn clear_pane_scrollback(
             return;
         };
         let primary = pane.screen.clear_screen_and_history();
-        // Written under the same lock as the clear, so no output from the
-        // pane can land between the two and survive on the blank grid.
-        if primary {
+        // Only the shell is sent `^L`. A job in the foreground reads it as
+        // input: `cat > file` writes it into the file, and a job that has not
+        // read it yet leaves it queued for the shell, which then clears the
+        // job's last output off the screen when the prompt returns. Written
+        // under the same lock as the clear, so no output from the pane can
+        // land between the two and survive on the blank grid.
+        let shell_foreground = primary && pane.shell_is_foreground();
+        if shell_foreground {
             pane.send_human_input(&[CLEAR_SCREEN_KEY]);
         }
         log::info!(
-            "server: cleared pane_id={pane_id} and its scrollback (alternate screen: {})",
+            "server: cleared pane_id={pane_id} and its scrollback (alternate screen: {}, ^L sent: {shell_foreground})",
             !primary
         );
     }
@@ -8329,6 +8342,16 @@ async fn clear_pane_scrollback(
             }
             if c.mouse_selection.as_ref().map(|m| m.pane_id) == Some(pane_id) {
                 c.mouse_selection = None;
+            }
+            if c.drag.as_ref().map(|d| d.pane_id) == Some(pane_id) {
+                c.drag = None;
+                c.autoscroll_repeat = None;
+            }
+            if c.pane_drag.as_ref().map(|d| d.pane_id) == Some(pane_id) {
+                c.pane_drag = None;
+            }
+            if c.pane_autoscroll_repeat.map(|r| r.0) == Some(pane_id) {
+                c.pane_autoscroll_repeat = None;
             }
         }
     }
@@ -22348,6 +22371,101 @@ mod popup_tests {
         for id in [CLIENT, 2] {
             let cls = rig.clients.lock().await;
             assert!(cls[&id].session_scroll.is_empty(), "client {id}");
+        }
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn clear_scrollback_drops_every_view_state_of_that_pane_and_no_other() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let left = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        let right = rig.split(dir.path()).await;
+        let drag = |pane_id| DragSession {
+            pane_id,
+            anchor_col: 1,
+            anchor_abs: 2,
+            end_abs: 3,
+            end_col: 4,
+        };
+        let selection = |pane_id| MouseSelection {
+            pane_id,
+            start: (0, 0),
+            end: (3, 0),
+        };
+        {
+            let mut cls = rig.clients.lock().await;
+            let c = cls.get_mut(&CLIENT).unwrap();
+            for pane in [left, right] {
+                c.pane_scroll.insert(pane, 4);
+                c.pane_selection.insert(pane, selection(pane));
+            }
+            c.mouse_selection = Some(selection(right));
+            c.drag = Some(drag(right));
+            c.autoscroll_repeat = Some((1, 2, 3, 4, false));
+            c.pane_drag = Some(drag(right));
+            c.pane_autoscroll_repeat = Some((right, 1, 2, 3, 4));
+        }
+
+        rig.command(RemuxCommand::PaneClearScrollback).await;
+
+        {
+            let cls = rig.clients.lock().await;
+            let c = &cls[&CLIENT];
+            assert_eq!(c.pane_scroll.keys().collect::<Vec<_>>(), vec![&left]);
+            assert_eq!(c.pane_selection.keys().collect::<Vec<_>>(), vec![&left]);
+            assert!(c.mouse_selection.is_none());
+            assert!(c.drag.is_none());
+            assert!(c.autoscroll_repeat.is_none());
+            assert!(c.pane_drag.is_none());
+            assert!(c.pane_autoscroll_repeat.is_none());
+        }
+
+        // The same state on the OTHER pane survives a clear of this one.
+        {
+            let mut cls = rig.clients.lock().await;
+            let c = cls.get_mut(&CLIENT).unwrap();
+            c.mouse_selection = Some(selection(left));
+            c.drag = Some(drag(left));
+            c.autoscroll_repeat = Some((1, 2, 3, 4, false));
+            c.pane_drag = Some(drag(left));
+            c.pane_autoscroll_repeat = Some((left, 1, 2, 3, 4));
+        }
+        rig.command(RemuxCommand::PaneClearScrollback).await;
+        {
+            let cls = rig.clients.lock().await;
+            let c = &cls[&CLIENT];
+            assert!(c.mouse_selection.is_some());
+            assert!(c.drag.is_some());
+            assert!(c.autoscroll_repeat.is_some());
+            assert!(c.pane_drag.is_some());
+            assert!(c.pane_autoscroll_repeat.is_some());
+        }
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn clear_scrollback_clears_the_popup_and_not_the_pane_under_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let under = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let popup = rig.state.lock().await.sessions["main"]
+            .input_target()
+            .expect("input target");
+        assert_ne!(popup, under, "the popup takes input");
+        fill_history(&rig, under, "UNDER").await;
+        fill_history(&rig, popup, "POPUP").await;
+        let under_history = history_len(&rig, under).await;
+
+        rig.command(RemuxCommand::PaneClearScrollback).await;
+
+        assert_eq!(history_len(&rig, popup).await, 0);
+        assert_eq!(history_len(&rig, under).await, under_history);
+        {
+            let ps = rig.panes.lock().await;
+            assert!(!grid_holds(&ps[&popup].screen, "POPUP79"));
+            assert!(grid_holds(&ps[&under].screen, "UNDER79"));
         }
         rig.finish().await;
     }

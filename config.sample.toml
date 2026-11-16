@@ -737,10 +737,12 @@
 #                                     [zoom] mode says (refused in Monocle)
 #   PaneToggleZoomFloat             — Toggle a float zoom for the focused pane, whatever
 #                                     [zoom] mode says
-#   PaneClear                       — Send ^L to the focused pane and keep its scrollback
-#   PaneClearScrollback             — Clear the focused pane and drop its scrollback, then
-#                                     send ^L so the shell redraws its prompt. On the
-#                                     alternate screen only the scrollback is dropped
+#   PaneClear                       — Send ^L to the focused pane and keep its scrollback.
+#                                     A running command reads the ^L as input
+#   PaneClearScrollback             — Clear the focused pane and drop its scrollback. At a
+#                                     shell prompt it also sends ^L so the shell redraws
+#                                     the prompt; a running command is sent nothing. On
+#                                     the alternate screen only the scrollback is dropped
 #   PaneRename                      — Rename the focused pane (prompts)
 #   PaneMoveToTab                   — Move the focused pane to another tab (opens a picker)
 #   PopupToggle [position [size]]   — Toggle the popup terminal. A hidden popup opens

@@ -64,8 +64,8 @@ Most macOS terminals handle Cmd+K themselves: they clear their own screen and do
 
 | Key | Command | Does |
 |---|---|---|
-| Cmd+K | `PaneClearScrollback` | Clears the focused pane and drops its scrollback, then sends `Ctrl-l` so the shell redraws its prompt |
-| Cmd+L | `PaneClear` | Sends `Ctrl-l` to the focused pane, so the shell clears the screen, and keeps the scrollback |
+| Cmd+K | `PaneClearScrollback` | Clears the focused pane and drops its scrollback. At a shell prompt it also sends `Ctrl-l` so the shell redraws the prompt; a running command is sent nothing |
+| Cmd+L | `PaneClear` | Sends `Ctrl-l` to the focused pane, so the shell clears the screen, and keeps the scrollback. A running command gets the `Ctrl-l` as input, as in a plain terminal |
 
 | Terminal | Setting |
 |---|---|

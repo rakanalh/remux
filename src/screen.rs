@@ -443,7 +443,7 @@ impl Screen {
 
     /// Drop this screen's history and, on the primary screen, blank the grid
     /// and home the cursor. Returns whether the primary screen was cleared,
-    /// which is when the caller writes `^L` so the shell redraws its prompt.
+    /// which is when the caller may write `^L` so the shell redraws its prompt.
     ///
     /// On the alternate screen the history to drop is the primary screen's,
     /// parked in `saved_scrollback`, and the grid is left as it is: it belongs
@@ -451,8 +451,11 @@ impl Screen {
     /// would otherwise be left blank. The caller sends that application
     /// nothing, because `^L` is input to it and not always a redraw.
     pub fn clear_screen_and_history(&mut self) -> bool {
+        // The dropped lines count as evicted, so the absolute ids of the rows
+        // that remain do not move under a selection anchor that holds one.
         if self.alt_screen_active {
             if let Some(saved) = self.saved_scrollback.as_mut() {
+                self.lines_evicted += saved.len();
                 saved.clear();
             }
             return false;
@@ -461,6 +464,7 @@ impl Screen {
         self.cursor_x = 0;
         self.cursor_y = 0;
         self.pending_wrap = false;
+        self.lines_evicted += self.scrollback.len();
         self.scrollback.clear();
         self.history_cleared_from_view();
         true
@@ -3299,6 +3303,27 @@ mod tests {
         for r in 0..6 {
             assert_eq!(row_text(&s, r).trim_end(), "", "row {r} after resize");
         }
+    }
+
+    #[test]
+    fn clear_screen_and_history_keeps_absolute_row_ids_monotonic() {
+        let mut s = Screen::new(10, 3, 100);
+        for i in 0..20 {
+            s.process_output(format!("line{i}\r\n").as_bytes());
+        }
+        let top_before = s.abs_of_row(0, 0);
+        assert!(s.clear_screen_and_history());
+        assert_eq!(s.abs_of_row(0, 0), top_before, "primary screen");
+
+        for i in 0..20 {
+            s.process_output(format!("line{i}\r\n").as_bytes());
+        }
+        let top_before_alt = s.abs_of_row(0, 0);
+        s.process_output(b"\x1b[?1049h");
+        assert!(!s.clear_screen_and_history());
+        s.process_output(b"\x1b[?1049l");
+        assert!(s.scrollback.is_empty());
+        assert_eq!(s.abs_of_row(0, 0), top_before_alt, "alternate screen");
     }
 
     #[test]
