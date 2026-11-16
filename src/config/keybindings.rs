@@ -318,6 +318,13 @@ fn build_default_tree() -> HashMap<TreeKey, KeyNode> {
                     leaf_chain("move/eject right", &["PaneMoveRight", "EnterNormal"]),
                 ),
                 ('z', leaf_chain("zoom", &["PaneToggleZoom", "EnterNormal"])),
+                (
+                    'c',
+                    leaf_chain(
+                        "clear + scrollback",
+                        &["PaneClearScrollback", "EnterNormal"],
+                    ),
+                ),
                 ('o', leaf_chain("popup", &["PopupToggle", "EnterNormal"])),
                 ('m', leaf_chain("set master", &["SetMaster", "EnterNormal"])),
                 ('r', leaf("rename", "PaneRename")),
@@ -1033,6 +1040,9 @@ pub fn format_key_notation(ev: &NormalizedKeyEvent) -> String {
     if ev.modifiers.contains(KeyModifiers::ALT) {
         prefix.push_str("Alt-");
     }
+    if ev.modifiers.contains(KeyModifiers::SUPER) {
+        prefix.push_str("Cmd-");
+    }
     // Shift is only rendered explicitly for keys whose case does not already
     // encode it (character keys carry Shift via their uppercase form).
     let shift_char = matches!(ev.code, KeyCode::Char(_));
@@ -1187,6 +1197,18 @@ impl Default for ShortcutBindings {
         bindings.insert(alt_key('p'), cmd("PopupToggle"));
         bindings.insert(alt_key(' '), cmd("LayoutNext"));
         bindings.insert(alt_key('m'), cmd("SetMaster"));
+
+        // Cmd-k / Cmd-l arrive only from a terminal configured to send them
+        // as CSI u (`ESC [107;9u`), because a macOS terminal otherwise clears
+        // its own screen and tells remux nothing.
+        bindings.insert(
+            NormalizedKeyEvent::new(KeyCode::Char('k'), KeyModifiers::SUPER),
+            cmd("PaneClearScrollback"),
+        );
+        bindings.insert(
+            NormalizedKeyEvent::new(KeyCode::Char('l'), KeyModifiers::SUPER),
+            cmd("PaneClear"),
+        );
 
         Self { bindings }
     }
@@ -1466,6 +1488,8 @@ fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
         "PaneToggleZoom" => Some(RemuxCommand::PaneToggleZoom),
         "PaneToggleZoomFullscreen" => Some(RemuxCommand::PaneToggleZoomFullscreen),
         "PaneToggleZoomFloat" => Some(RemuxCommand::PaneToggleZoomFloat),
+        "PaneClear" => Some(RemuxCommand::PaneClear),
+        "PaneClearScrollback" => Some(RemuxCommand::PaneClearScrollback),
         "PopupToggle" => crate::config::PopupPlacement::from_args(args)
             .ok()
             .map(RemuxCommand::PopupToggle),
@@ -1603,6 +1627,11 @@ pub fn parse_key_notation(notation: &str) -> Option<KeyEvent> {
             (KeyModifiers::ALT, tail)
         } else if let Some(tail) = rest.strip_prefix("Shift-") {
             (KeyModifiers::SHIFT, tail)
+        } else if let Some(tail) = rest
+            .strip_prefix("Cmd-")
+            .or_else(|| rest.strip_prefix("Super-"))
+        {
+            (KeyModifiers::SUPER, tail)
         } else {
             break;
         };
@@ -4053,6 +4082,37 @@ mod tests {
             KeyCode::Char('-')
         );
         assert!(parse_key_notation("Alt-").is_none());
+    }
+
+    #[test]
+    fn cmd_and_super_parse_to_the_super_modifier_and_round_trip_as_cmd() {
+        for notation in ["Cmd-k", "Super-k"] {
+            let ev = parse_key_notation(notation).unwrap();
+            assert_eq!(ev.code, KeyCode::Char('k'), "{notation}");
+            assert_eq!(ev.modifiers, KeyModifiers::SUPER, "{notation}");
+            assert_eq!(format_key_notation(&NormalizedKeyEvent::from(ev)), "Cmd-k");
+        }
+        let ev = parse_key_notation("Ctrl-Cmd-Shift-Left").unwrap();
+        assert_eq!(
+            ev.modifiers,
+            KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::SHIFT
+        );
+        assert_eq!(
+            format_key_notation(&NormalizedKeyEvent::from(ev)),
+            "Ctrl-Cmd-Shift-Left"
+        );
+    }
+
+    #[test]
+    fn default_shortcuts_bind_cmd_k_and_cmd_l_to_the_clears() {
+        let shortcuts = ShortcutBindings::default();
+        let k = NormalizedKeyEvent::from(parse_key_notation("Cmd-k").unwrap());
+        let l = NormalizedKeyEvent::from(parse_key_notation("Cmd-l").unwrap());
+        assert_eq!(
+            shortcuts.bindings.get(&k),
+            Some(&cmd("PaneClearScrollback"))
+        );
+        assert_eq!(shortcuts.bindings.get(&l), Some(&cmd("PaneClear")));
     }
 
     #[test]

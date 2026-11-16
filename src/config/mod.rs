@@ -1578,6 +1578,35 @@ mod tests {
         assert!(!config.validate());
     }
 
+    #[test]
+    fn cmd_keys_from_the_config_file_bind_and_unbind() {
+        let config: Config = toml::from_str(
+            r#"
+            [keybindings.command]
+            "Super-k" = ""
+            "Cmd-j" = "PaneClear"
+            "#,
+        )
+        .unwrap();
+        let shortcuts = config.shortcut_bindings();
+        let key = |c| {
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::SUPER,
+            )
+        };
+        assert!(
+            shortcuts.lookup(&key('k')).is_none(),
+            "Super-k unbinds Cmd-k"
+        );
+        assert!(shortcuts.lookup(&key('j')).is_some(), "Cmd-j binds");
+        assert!(
+            shortcuts.lookup(&key('l')).is_some(),
+            "Cmd-l keeps its default"
+        );
+        assert!(config.validate());
+    }
+
     /// `config.sample.toml` is the user-facing list of what can be bound, so
     /// it is one more thing that can drift away from the registry. Every
     /// bindable action must be documented there.

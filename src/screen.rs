@@ -441,6 +441,31 @@ impl Screen {
         }
     }
 
+    /// Drop this screen's history and, on the primary screen, blank the grid
+    /// and home the cursor. Returns whether the primary screen was cleared,
+    /// which is when the caller writes `^L` so the shell redraws its prompt.
+    ///
+    /// On the alternate screen the history to drop is the primary screen's,
+    /// parked in `saved_scrollback`, and the grid is left as it is: it belongs
+    /// to a full-screen application, and an application that does not repaint
+    /// would otherwise be left blank. The caller sends that application
+    /// nothing, because `^L` is input to it and not always a redraw.
+    pub fn clear_screen_and_history(&mut self) -> bool {
+        if self.alt_screen_active {
+            if let Some(saved) = self.saved_scrollback.as_mut() {
+                saved.clear();
+            }
+            return false;
+        }
+        self.grid = vec![self.blank_row(); self.rows as usize];
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+        self.pending_wrap = false;
+        self.scrollback.clear();
+        self.history_cleared_from_view();
+        true
+    }
+
     /// The whole screen was cleared, so none of the scrollback belongs above
     /// what is on it any more: a taller screen must not pull it back into view.
     /// tmux resets `hscrolled` on the same clears. The alternate screen's
@@ -3249,6 +3274,47 @@ mod tests {
     /// Row `r` of the grid as a plain string.
     fn row_text(s: &Screen, r: usize) -> String {
         s.grid[r].iter().map(|c| c.c).collect()
+    }
+
+    #[test]
+    fn clear_screen_and_history_blanks_the_grid_and_drops_the_scrollback() {
+        let mut s = Screen::new(10, 3, 100);
+        for i in 0..20 {
+            s.process_output(format!("line{i}\r\n").as_bytes());
+        }
+        s.process_output(b"$ ");
+        assert!(!s.scrollback.is_empty());
+
+        assert!(s.clear_screen_and_history());
+
+        assert!(s.scrollback.is_empty());
+        assert_eq!(s.total_lines(), 3);
+        for r in 0..3 {
+            assert_eq!(row_text(&s, r).trim_end(), "", "row {r}");
+        }
+        assert_eq!((s.cursor_x, s.cursor_y), (0, 0));
+        // A taller screen must not pull the dropped lines back.
+        s.resize(10, 6);
+        assert!(s.scrollback.is_empty());
+        for r in 0..6 {
+            assert_eq!(row_text(&s, r).trim_end(), "", "row {r} after resize");
+        }
+    }
+
+    #[test]
+    fn clear_screen_and_history_on_the_alt_screen_drops_the_parked_history() {
+        let mut s = Screen::new(10, 3, 100);
+        for i in 0..20 {
+            s.process_output(format!("line{i}\r\n").as_bytes());
+        }
+        s.process_output(b"\x1b[?1049hAPP");
+
+        assert!(!s.clear_screen_and_history());
+        assert_eq!(row_text(&s, 0).trim_end(), "APP", "the app's grid is kept");
+
+        s.process_output(b"\x1b[?1049l");
+        assert!(!s.alt_screen_active);
+        assert!(s.scrollback.is_empty(), "{:?}", s.scrollback.len());
     }
 
     #[test]

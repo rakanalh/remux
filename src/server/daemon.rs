@@ -7808,6 +7808,10 @@ entries={} error={:?} truncated={}",
             }
             Ok(())
         }
+        ClientMessage::ClearPaneScrollback { pane_id } => {
+            clear_pane_scrollback(pane_id, state, panes, clients, config, prev_frames).await;
+            Ok(())
+        }
         ClientMessage::ScrollPane {
             pane_id,
             up,
@@ -8269,6 +8273,74 @@ async fn handle_input(
         }
     }
     Ok(())
+}
+
+/// `^L`: the shell's clear-screen key, which also makes a shell redraw its
+/// prompt and a full-screen application repaint.
+const CLEAR_SCREEN_KEY: u8 = 0x0c;
+
+/// Blank `pane_id`, drop its scrollback, and repaint every viewer of it.
+///
+/// The pane's session is looked up here, because the pane can have moved since
+/// the request was made. Every client's scroll offset and selection on the pane
+/// are dropped, not only the requester's: they address lines that no longer
+/// exist, and a client whose focused pane is still marked scrolled is skipped by
+/// `broadcast_full_render`.
+///
+/// The frame is broadcast here rather than left to the pane's output, because a
+/// foreground program that ignores `^L`, or an alternate-screen application that
+/// is sent nothing, produces no output.
+async fn clear_pane_scrollback(
+    pane_id: PaneId,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    {
+        let mut ps = panes.lock().await;
+        let Some(pane) = ps.get_mut(&pane_id) else {
+            log::info!("server: ClearPaneScrollback pane_id={pane_id} refused: pane is gone");
+            return;
+        };
+        let primary = pane.screen.clear_screen_and_history();
+        // Written under the same lock as the clear, so no output from the
+        // pane can land between the two and survive on the blank grid.
+        if primary {
+            pane.send_human_input(&[CLEAR_SCREEN_KEY]);
+        }
+        log::info!(
+            "server: cleared pane_id={pane_id} and its scrollback (alternate screen: {})",
+            !primary
+        );
+    }
+    {
+        let mut cls = clients.lock().await;
+        for c in cls.values_mut() {
+            if c.session_scroll.remove(&pane_id).is_some() {
+                c.needs_full_render = true;
+            }
+            c.pane_scroll.remove(&pane_id);
+            c.pane_selection.remove(&pane_id);
+            if c.prev_scroll_pane == Some(pane_id) {
+                c.prev_scroll_pane = None;
+                c.prev_scroll_offset = 0;
+            }
+            if c.mouse_selection.as_ref().map(|m| m.pane_id) == Some(pane_id) {
+                c.mouse_selection = None;
+            }
+        }
+    }
+    let session = state
+        .lock()
+        .await
+        .session_of_pane(pane_id)
+        .map(str::to_string);
+    if let Some(session) = session {
+        broadcast_full_render(&session, state, panes, clients, config, prev_frames).await;
+    }
+    stream_pane_content(pane_id, state, panes, clients).await;
 }
 
 /// Return this client's viewport to the live tail, repainting only if it moved.
@@ -9770,6 +9842,24 @@ async fn handle_command(
                 layout::set_pane_name(&mut tab.layout, tab.focused_pane, &name);
             }
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneClear | RemuxCommand::PaneClearScrollback => {
+            let pane_id = {
+                let st = state.lock().await;
+                st.sessions
+                    .get(&session_name)
+                    .and_then(Session::input_target)
+            };
+            let Some(pane_id) = pane_id else {
+                return Ok(());
+            };
+            if matches!(cmd, RemuxCommand::PaneClear) {
+                if let Some(pane) = panes.lock().await.get_mut(&pane_id) {
+                    pane.send_human_input(&[CLEAR_SCREEN_KEY]);
+                }
+                return Ok(());
+            }
+            clear_pane_scrollback(pane_id, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::SendKey(bytes) => {
             // Forward raw key bytes to the active pane's PTY.
@@ -22204,6 +22294,76 @@ mod popup_tests {
             )
             .await;
         (cells, hit_regions, fpr, pane_rects)
+    }
+
+    async fn fill_history(rig: &Rig, pane: PaneId, tag: &str) {
+        let mut ps = rig.panes.lock().await;
+        let screen = &mut ps.get_mut(&pane).expect("pane").screen;
+        for i in 0..80 {
+            screen.process_output(format!("{tag}{i}\r\n").as_bytes());
+        }
+        assert!(!screen.scrollback.is_empty());
+    }
+
+    async fn history_len(rig: &Rig, pane: PaneId) -> usize {
+        rig.panes.lock().await[&pane].screen.scrollback.len()
+    }
+
+    fn grid_holds(rig_screen: &crate::screen::Screen, needle: &str) -> bool {
+        rig_screen
+            .grid
+            .iter()
+            .any(|row| row.iter().map(|c| c.c).collect::<String>().contains(needle))
+    }
+
+    #[tokio::test]
+    async fn clear_scrollback_clears_only_the_focused_pane_and_its_scroll_offsets() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let left = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        let right = rig.split(dir.path()).await;
+        fill_history(&rig, left, "LEFT").await;
+        fill_history(&rig, right, "RIGHT").await;
+        let left_history = history_len(&rig, left).await;
+        let _other = rig.add_client(2, 100, 30, None).await;
+        for id in [CLIENT, 2] {
+            rig.clients
+                .lock()
+                .await
+                .get_mut(&id)
+                .unwrap()
+                .session_scroll
+                .insert(right, 3);
+        }
+
+        rig.command(RemuxCommand::PaneClearScrollback).await;
+
+        assert_eq!(history_len(&rig, right).await, 0);
+        {
+            let ps = rig.panes.lock().await;
+            assert!(!grid_holds(&ps[&right].screen, "RIGHT79"));
+            assert!(grid_holds(&ps[&left].screen, "LEFT79"));
+        }
+        assert_eq!(history_len(&rig, left).await, left_history);
+        for id in [CLIENT, 2] {
+            let cls = rig.clients.lock().await;
+            assert!(cls[&id].session_scroll.is_empty(), "client {id}");
+        }
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn clear_pane_keeps_the_scrollback() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let pane = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        fill_history(&rig, pane, "KEEP").await;
+        let before = history_len(&rig, pane).await;
+
+        rig.command(RemuxCommand::PaneClear).await;
+
+        assert_eq!(history_len(&rig, pane).await, before);
+        rig.finish().await;
     }
 
     #[tokio::test]

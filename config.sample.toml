@@ -460,6 +460,11 @@
 # "Alt-p" = "PopupToggle"
 # "Alt-m" = "SetMaster"
 # "Alt-Space" = "LayoutNext"
+# Cmd-k / Cmd-l reach remux only from a terminal that sends them as CSI u
+# (ESC[107;9u and ESC[108;9u); see the docs' macOS install notes. "Super-k"
+# is the same key.
+# "Cmd-k" = "PaneClearScrollback"
+# "Cmd-l" = "PaneClear"
 #
 # Popup keys. `PopupToggle` takes an optional position, so separate keys can
 # open the popup in different places. Every popup key is a show/hide toggle:
@@ -496,6 +501,7 @@
 # K = "PaneMoveUp; EnterNormal"
 # L = "PaneMoveRight; EnterNormal"
 # z = "PaneToggleZoom; EnterNormal"
+# c = "PaneClearScrollback; EnterNormal"
 # o = "PopupToggle; EnterNormal"
 # m = "SetMaster; EnterNormal"
 # r = "PaneRename"
@@ -731,6 +737,10 @@
 #                                     [zoom] mode says (refused in Monocle)
 #   PaneToggleZoomFloat             — Toggle a float zoom for the focused pane, whatever
 #                                     [zoom] mode says
+#   PaneClear                       — Send ^L to the focused pane and keep its scrollback
+#   PaneClearScrollback             — Clear the focused pane and drop its scrollback, then
+#                                     send ^L so the shell redraws its prompt. On the
+#                                     alternate screen only the scrollback is dropped
 #   PaneRename                      — Rename the focused pane (prompts)
 #   PaneMoveToTab                   — Move the focused pane to another tab (opens a picker)
 #   PopupToggle [position [size]]   — Toggle the popup terminal. A hidden popup opens
